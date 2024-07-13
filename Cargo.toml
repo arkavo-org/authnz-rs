@@ -1,0 +1,16 @@
+# https://doc.rust-lang.org/cargo/reference/manifest.html
+[package]
+name = "authnz-rs"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2"
+
+[dependencies]
+tokio = { version = "1.38.0", features = ["rt", "rt-multi-thread", "macros"] }
+axum = { version="0.7.5", features = ["http2", "tokio"] }
+webauthn-rs = { version="0.5.0", features = ["danger-allow-state-serialisation"] }
+tower = { version="0.4.13", features = ["full"] }
+tower-sessions = "0.12.2"
+thiserror = "1.0.62"
+log = "0.4.22"
+serde = { version = "1.0.204", features = ["derive"] }
