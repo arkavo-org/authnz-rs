@@ -1,16 +1,28 @@
 # https://doc.rust-lang.org/cargo/reference/manifest.html
 [package]
 name = "authnz-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "BSD-2"
 
+# export RUSTFLAGS="-C target-cpu=native"
+# cargo build --release
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# cargo flamegraph
+#debug = true
+
 [dependencies]
-tokio = { version = "1.38.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.38.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio-native-tls = "0.3.1"
 axum = { version="0.7.5", features = ["http2", "tokio"] }
+axum-server = { version = "0.6.0", features = ["tls-rustls"] }
 webauthn-rs = { version="0.5.0", features = ["danger-allow-state-serialisation"] }
 tower = { version="0.4.13", features = ["full"] }
 tower-sessions = "0.12.2"
 thiserror = "1.0.62"
 log = "0.4.22"
 serde = { version = "1.0.204", features = ["derive"] }
+serde_json = "1.0.120"
