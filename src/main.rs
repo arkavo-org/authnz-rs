@@ -44,7 +44,7 @@ async fn main() {
             SessionManagerLayer::new(session_store)
                 .with_name("authnz-rs")
                 .with_same_site(SameSite::Strict)
-                .with_secure(false) // TODO: change this to true when running on an HTTPS/production server instead of locally
+                .with_secure(settings.tls_enabled)
                 .with_expiry(Expiry::OnInactivity(Duration::seconds(600))),
         );
     // build our application with a route
