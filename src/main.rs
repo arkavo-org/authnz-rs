@@ -83,16 +83,13 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         // Effective domain name.
-        let rp_id = "localhost";
+        let rp_id = "webauthn.arkavo.net";
         // Url containing the effective domain name
         // MUST include the port number!
-        let rp_origin = Url::parse("http://localhost:8080").expect("Invalid URL");
+        let rp_origin = Url::parse("https://webauthn.arkavo.net").expect("Invalid URL");
         let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
-
-        // Now, with the builder you can define other options.
-        // Set a "nice" relying party name. Has no security properties and
-        // may be changed in the future.
-        let builder = builder.rp_name("Axum Webauthn-rs");
+        // Relying party name
+        let builder = builder.rp_name("Arkavo");
 
         // Consume the builder and create our webauthn instance.
         let webauthn = Arc::new(builder.build().expect("Invalid configuration"));
