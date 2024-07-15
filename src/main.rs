@@ -21,6 +21,7 @@ mod authn;
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     // Load configuration
     let settings = load_config().unwrap();
     // Load and cache the apple-app-site-association.json file
@@ -66,7 +67,10 @@ async fn main() {
             .await
             .unwrap();
     } else {
-        axum_server::from_tcp(listener);
+        axum_server::from_tcp(listener)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
     }
 }
 
@@ -90,15 +94,12 @@ impl AppState {
         let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
         // Relying party name
         let builder = builder.rp_name("Arkavo");
-
         // Consume the builder and create our webauthn instance.
         let webauthn = Arc::new(builder.build().expect("Invalid configuration"));
-
         let users = Arc::new(Mutex::new(AccountData {
             name_to_id: HashMap::new(),
             keys: HashMap::new(),
         }));
-
         AppState { webauthn, accounts: users }
     }
 }
