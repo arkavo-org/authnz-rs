@@ -116,7 +116,7 @@ pub async fn start_register(
     Ok(res)
 }
 
-// 3. The browser has completed it's steps and the user has created a public key
+// 3. The browser has completed its steps and the user has created a public key
 // on their device. Now we have the registration options sent to us, and we need
 // to verify these and persist them.
 

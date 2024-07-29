@@ -18,3 +18,6 @@ Cargo.lock
 
 /target
 /.idea
+/apple-app-site-association.json
+/fullchain.pem
+/privkey.pem
