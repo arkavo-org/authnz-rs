@@ -1,16 +1,21 @@
+use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials, UserNotFound};
+use crate::AppState;
+use axum::response::Response;
 use axum::{
     extract::{Extension, Json, Path},
     http::StatusCode,
     response::IntoResponse,
 };
-use axum::response::Response;
+use ecdsa::signature::{Signer, Verifier};
+use ecdsa::{Signature, VerifyingKey};
 use log::{error, info};
+use p256::NistP256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tower_sessions::Session;
-// 1. Import the prelude - this contains everything needed for the server to function.
+use uuid::Uuid;
 use webauthn_rs::prelude::*;
-use crate::AppState;
-use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials, UserNotFound};
 
 /*
  * Webauthn RS auth handlers.
@@ -79,7 +84,10 @@ pub async fn start_register(
 
     // Remove any previous registrations that may have occurred from the session.
     // assumption no need to wait or check a failure
-    session.remove_value("reg_state").await.expect("auth_state removal failed");
+    session
+        .remove_value("reg_state")
+        .await
+        .expect("auth_state removal failed");
 
     // If the user has any other credentials, we exclude these here, so they can't be duplicate registered.
     // It also hints to the browser that only new credentials should be "blinked" for interaction.
@@ -110,7 +118,7 @@ pub async fn start_register(
         }
         Err(e) => {
             info!("challenge_register -> {:?}", e);
-            return Err(WebauthnError::Unknown);
+            return Err(Unknown);
         }
     };
     Ok(res)
@@ -120,42 +128,79 @@ pub async fn start_register(
 // on their device. Now we have the registration options sent to us, and we need
 // to verify these and persist them.
 
+#[derive(Serialize, Deserialize)]
+struct AttestationEntity {
+    user_unique_id: Uuid,
+    credential_id: Base64UrlSafeData,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttestationEnvelope {
+    payload: AttestationEntity,
+    signature: Base64UrlSafeData,
+}
+
+impl AttestationEnvelope {
+    fn new(entity: AttestationEntity, app_state: &AppState) -> Self {
+        let payload_bytes = serde_json::to_vec(&entity).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
+
+        Self {
+            payload: entity,
+            signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
+        }
+    }
+    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
+        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
+
+        verifying_key.verify(&message, &signature).is_ok()
+    }
+}
+const SESSION_REG_STATE_KEY: &str = "reg_state";
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
-    Json(reg): Json<RegisterPublicKeyCredential>,
+    Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_unique_id, reg_state) = match session.get("reg_state").await? {
+    let (username, user_unique_id, reg_state) = match session.get(SESSION_REG_STATE_KEY).await? {
         Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
         None => {
             error!("Failed to get session");
-            return Err(WebauthnError::CorruptSession);
+            return Err(CorruptSession);
         }
     };
-
-    session.remove_value("reg_state").await.expect("auth_state removal failed");
-
+    session
+        .remove_value(SESSION_REG_STATE_KEY)
+        .await
+        .expect("auth_state removal failed");
     let res = match app_state
         .webauthn
-        .finish_passkey_registration(&reg, &reg_state)
+        .finish_passkey_registration(&registration_credential, &reg_state)
     {
-        Ok(sk) => {
+        Ok(session_key) => {
             let mut users_guard = app_state.accounts.lock().await;
-
-            //TODO: This is where we would store the credential in a db, or persist them in some other way.
+            // Store the credential in a database or persist in some other way.
             users_guard
                 .keys
                 .entry(user_unique_id)
-                .and_modify(|keys| keys.push(sk.clone()))
-                .or_insert_with(|| vec![sk.clone()]);
-
+                .and_modify(|keys| keys.push(session_key.clone()))
+                .or_insert_with(|| vec![session_key.clone()]);
             users_guard.name_to_id.insert(username, user_unique_id);
-
-            StatusCode::OK
+            // Send back JSON response with the registration credential.
+            let credential_id = Base64UrlSafeData::from(session_key.cred_id().to_vec());
+            let attestation_entity = AttestationEntity {
+                user_unique_id,
+                credential_id,
+            };
+            let envelope = AttestationEnvelope::new(attestation_entity, &app_state);
+            Json(envelope).into_response()
         }
-        Err(e) => {
-            error!("challenge_register -> {:?}", e);
-            StatusCode::BAD_REQUEST
+        Err(error) => {
+            error!("challenge_register -> {:?}", error);
+            StatusCode::BAD_REQUEST.into_response()
         }
     };
 
@@ -201,7 +246,10 @@ pub async fn start_authentication(
     // some other process.
 
     // Remove any previous authentication that may have occurred from the session.
-    session.remove_value("auth_state").await.expect("auth_state removal failed");
+    session
+        .remove_value("auth_state")
+        .await
+        .expect("auth_state removal failed");
 
     // Get the set of keys that the user possesses
     let users_guard = app_state.accounts.lock().await;
@@ -253,11 +301,13 @@ pub async fn finish_authentication(
     session: Session,
     Json(auth): Json<PublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) = session
-        .get("auth_state").await?
-        .ok_or(CorruptSession)?;
+    let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
+        session.get("auth_state").await?.ok_or(CorruptSession)?;
 
-    session.remove_value("auth_state").await.expect("auth_state removal failed");
+    session
+        .remove_value("auth_state")
+        .await
+        .expect("auth_state removal failed");
 
     let res = match app_state
         .webauthn
@@ -306,11 +356,11 @@ pub enum WebauthnError {
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let body = match self {
-            WebauthnError::CorruptSession => "Corrupt Session",
-            WebauthnError::UserNotFound => "User Not Found",
-            WebauthnError::Unknown => "Unknown Error",
-            WebauthnError::UserHasNoCredentials => "User Has No Credentials",
-            WebauthnError::InvalidSessionState(_) => "Deserialising Session failed",
+            CorruptSession => "Corrupt Session",
+            UserNotFound => "User Not Found",
+            Unknown => "Unknown Error",
+            UserHasNoCredentials => "User Has No Credentials",
+            WebauthnError::InvalidSessionState(_) => "Deserializing Session failed",
         };
 
         // its often easiest to implement `IntoResponse` by calling other implementations
