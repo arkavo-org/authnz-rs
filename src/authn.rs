@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
 use jsonwebtoken::{encode, EncodingKey, Header};
@@ -309,18 +310,17 @@ pub async fn finish_authentication(
 }
 
 fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
-    let my_claims = Claims {
+    let claims = Claims {
         sub: user_id.to_string(),
-        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
     };
+    println!("claims:{:?}", claims);
     let pem_bytes = app_state.signing_key_pem.contents();
+    println!("pem_bytes:{:?}", pem_bytes);
     let encoding_key = EncodingKey::from_ec_pem(pem_bytes)
-        .map_err(|_| WebauthnError::TokenCreationError)?;
-    let token = encode(
-        &Header::default(),
-        &my_claims,
-        &encoding_key)
-        .map_err(|_| WebauthnError::TokenCreationError)?;
+        .map_err(WebauthnError::InvalidPEM)?;
+    let token = encode(&Header::default(), &claims, &encoding_key)
+        .map_err(|err| WebauthnError::TokenCreationError(err))?;
     println!("token:{}", token);
     Ok(token)
 }
@@ -329,7 +329,7 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
 struct AuthResponse {
     jwt_token: String,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Claims {
     sub: String,
     exp: usize,
@@ -378,21 +378,23 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
-    #[error("Token creation failed")]
-    TokenCreationError,
+    #[error("Token creation error")]
+    TokenCreationError(jsonwebtoken::errors::Error),
+    #[error("invalid PEM key")]
+    InvalidPEM(#[source] jsonwebtoken::errors::Error),
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let body = match self {
-            CorruptSession => "Corrupt Session",
-            UserNotFound => "User Not Found",
-            Unknown => "Unknown Error",
-            UserHasNoCredentials => "User Has No Credentials",
-            WebauthnError::InvalidSessionState(_) => "Deserializing Session failed",
-            WebauthnError::TokenCreationError => "Token creation failed",
+            CorruptSession => "Corrupt Session".to_string(),
+            UserNotFound => "User Not Found".to_string(),
+            Unknown => "Unknown Error".to_string(),
+            UserHasNoCredentials => "User Has No Credentials".to_string(),
+            WebauthnError::InvalidSessionState(_) => "Deserializing Session failed".to_string(),
+            WebauthnError::TokenCreationError(err) => format!("Token creation failed: {}", err),
+            WebauthnError::InvalidPEM(err) => format!("invalid PEM key: {}", err),
         };
-
-        // its often easiest to implement `IntoResponse` by calling other implementations
+        // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }
