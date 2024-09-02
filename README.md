@@ -35,7 +35,7 @@ export PORT=8443
 export TLS_CERT_PATH=/path/to/fullchain.pem
 export TLS_KEY_PATH=/path/to/privkey.pem
 export SIGN_KEY_PATH=/path/to/signkey.pem
-export ENCODING_KEY_PATH=/path/to/signkey.pem
+export ENCODING_KEY_PATH=/path/to/encodekey.pem
 ```
 
 ## Notes

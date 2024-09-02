@@ -9,7 +9,7 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{encode, Header};
+use jsonwebtoken::{encode, Algorithm, Header};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -318,7 +318,9 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
         exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
     };
     println!("claims:{:?}", claims);
-    let token = encode(&Header::default(), &claims, &app_state.encoding_key)
+    // Specify the algorithm explicitly
+    let header = Header::new(Algorithm::ES256);
+    let token = encode(&header, &claims, &app_state.encoding_key)
         .map_err(|err| WebauthnError::TokenCreationError(err))?;
     println!("token:{}", token);
     Ok(token)
