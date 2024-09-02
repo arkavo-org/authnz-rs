@@ -12,6 +12,7 @@ use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
 use p256::{NistP256, SecretKey};
+use pem::Pem;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceBuilder;
 use tower_sessions::cookie::time::Duration;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub accounts: Arc<Mutex<AccountData>>,
     pub signing_key: Arc<SigningKey<NistP256>>,
+    pub signing_key_pem: Arc<Pem>,
 }
 
 pub struct AccountData {
@@ -41,7 +43,7 @@ async fn main() {
     // Load configuration
     let settings = load_config().unwrap();
     // Load and validate EC keys
-    let signing_key = load_ec_keys(&settings.sign_key_path).expect("Failed to load signing keys");
+    let (signing_key, signing_key_pem) = load_ec_keys(&settings.sign_key_path).expect("Failed to load signing keys");
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await;
     // Set up TLS if not disabled
@@ -71,6 +73,7 @@ async fn main() {
             keys: HashMap::new(),
         })),
         signing_key: Arc::new(signing_key),
+        signing_key_pem: Arc::new(signing_key_pem),
     };
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
@@ -156,15 +159,15 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     })
 }
 
-fn load_ec_keys(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {
+fn load_ec_keys(key_path: &str) -> Result<(SigningKey<NistP256>, Pem), Box<dyn std::error::Error>> {
     let file = File::open(key_path)?;
     let mut reader = BufReader::new(file);
     let mut contents = Vec::new();
     reader.read_to_end(&mut contents)?;
+
     let pem_keys = pem::parse_many(&contents)?;
-    // Ensure there is at least one PEM key
     if pem_keys.is_empty() {
-        return Err(Box::new(LoadKeysError::LoadFailed));
+        return Err(Box::new(LoadKeysError::KeysNotFound));
     }
 
     for pem in pem_keys {
@@ -172,13 +175,12 @@ fn load_ec_keys(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::err
             continue;
         }
         let key_bytes = pem.contents();
-        // Try to parse as P256
         if let Ok(secret_key) = SecretKey::from_sec1_der(&key_bytes) {
-            let signing_key: SigningKey<NistP256>;
-            signing_key = SigningKey::from(secret_key);
-            return Ok(signing_key);
+            let signing_key = SigningKey::from(secret_key);
+            return Ok((signing_key, pem));
         }
     }
+
     Err(Box::new(LoadKeysError::SigningKeyNotFound))
 }
 
@@ -201,7 +203,7 @@ async fn serve_apple_app_site_association(
 #[derive(Debug, thiserror::Error)]
 enum LoadKeysError {
     #[error("Failed to load EC keys")]
-    LoadFailed,
+    KeysNotFound,
     #[error("Signing key not found")]
     SigningKeyNotFound,
 }

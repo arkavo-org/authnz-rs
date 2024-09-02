@@ -8,6 +8,7 @@ use axum::{
 };
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
+use jsonwebtoken::{encode, EncodingKey, Header};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,8 @@ use webauthn_rs::prelude::*;
 // In this step, we are responding to the start reg(istration) request, and providing
 // the challenge to the browser.
 
+const SESSION_REG_STATE_KEY: &str = "reg_state";
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -85,7 +88,7 @@ pub async fn start_register(
     // Remove any previous registrations that may have occurred from the session.
     // assumption no need to wait or check a failure
     session
-        .remove_value("reg_state")
+        .remove_value(SESSION_REG_STATE_KEY)
         .await
         .expect("auth_state removal failed");
 
@@ -110,14 +113,14 @@ pub async fn start_register(
             // safe to store the reg_state into the session since it is not client controlled and
             // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
             session
-                .insert("reg_state", (username, user_unique_id, reg_state))
+                .insert(SESSION_REG_STATE_KEY, (username, user_unique_id, reg_state))
                 .await
                 .expect("Failed to insert");
             info!("Registration Successful!");
             Json(ccr)
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
+            error!("start_register -> {:?}", e);
             return Err(Unknown);
         }
     };
@@ -128,38 +131,6 @@ pub async fn start_register(
 // on their device. Now we have the registration options sent to us, and we need
 // to verify these and persist them.
 
-#[derive(Serialize, Deserialize)]
-struct AttestationEntity {
-    user_unique_id: Uuid,
-    credential_id: Base64UrlSafeData,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AttestationEnvelope {
-    payload: AttestationEntity,
-    signature: Base64UrlSafeData,
-}
-
-impl AttestationEnvelope {
-    fn new(entity: AttestationEntity, app_state: &AppState) -> Self {
-        let payload_bytes = serde_json::to_vec(&entity).unwrap();
-        let message = Sha256::digest(&payload_bytes);
-        let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
-
-        Self {
-            payload: entity,
-            signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
-        }
-    }
-    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
-        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
-        let message = Sha256::digest(&payload_bytes);
-        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
-
-        verifying_key.verify(&message, &signature).is_ok()
-    }
-}
-const SESSION_REG_STATE_KEY: &str = "reg_state";
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -199,7 +170,7 @@ pub async fn finish_register(
             Json(envelope).into_response()
         }
         Err(error) => {
-            error!("challenge_register -> {:?}", error);
+            error!("finish_register -> {:?}", error);
             StatusCode::BAD_REQUEST.into_response()
         }
     };
@@ -284,7 +255,7 @@ pub async fn start_authentication(
             Json(rcr)
         }
         Err(e) => {
-            info!("challenge_authenticate -> {:?}", e);
+            error!("start_authentication -> {:?}", e);
             return Err(Unknown);
         }
     };
@@ -303,41 +274,96 @@ pub async fn finish_authentication(
 ) -> Result<impl IntoResponse, WebauthnError> {
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
         session.get("auth_state").await?.ok_or(CorruptSession)?;
-
     session
         .remove_value("auth_state")
         .await
         .expect("auth_state removal failed");
-
     let res = match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
         Ok(auth_result) => {
             let mut users_guard = app_state.accounts.lock().await;
-
             // Update the credential counter, if possible.
             users_guard
                 .keys
                 .get_mut(&user_unique_id)
                 .map(|keys| {
                     keys.iter_mut().for_each(|sk| {
-                        // This will update the credential if it's the matching
-                        // one. Otherwise it's ignored. That is why it is safe to
-                        // iterate this over the full list.
                         sk.update_credential(&auth_result);
                     })
                 })
                 .ok_or(UserHasNoCredentials)?;
-            StatusCode::OK
+            // Generate JWT token
+            let token = generate_jwt(user_unique_id, &app_state)?;
+            // Return JSON response with JWT token
+            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
-            StatusCode::BAD_REQUEST
+            error!("finish_authentication -> {:?}", e);
+            Ok((StatusCode::BAD_REQUEST, Json(AuthResponse { jwt_token: String::new() })))
         }
     };
     info!("Authentication Successful!");
-    Ok(res)
+    res
+}
+
+fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
+    let my_claims = Claims {
+        sub: user_id.to_string(),
+        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+    };
+    let pem_bytes = app_state.signing_key_pem.contents();
+    let encoding_key = EncodingKey::from_ec_pem(pem_bytes)
+        .map_err(|_| WebauthnError::TokenCreationError)?;
+    let token = encode(
+        &Header::default(),
+        &my_claims,
+        &encoding_key)
+        .map_err(|_| WebauthnError::TokenCreationError)?;
+    println!("token:{}", token);
+    Ok(token)
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    jwt_token: String,
+}
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
+#[derive(Serialize, Deserialize)]
+struct AttestationEntity {
+    user_unique_id: Uuid,
+    credential_id: Base64UrlSafeData,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttestationEnvelope {
+    payload: AttestationEntity,
+    signature: Base64UrlSafeData,
+}
+
+impl AttestationEnvelope {
+    fn new(entity: AttestationEntity, app_state: &AppState) -> Self {
+        let payload_bytes = serde_json::to_vec(&entity).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
+
+        Self {
+            payload: entity,
+            signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
+        }
+    }
+    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
+        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
+
+        verifying_key.verify(&message, &signature).is_ok()
+    }
 }
 
 #[derive(Error, Debug)]
@@ -352,6 +378,8 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
+    #[error("Token creation failed")]
+    TokenCreationError,
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
@@ -361,6 +389,7 @@ impl IntoResponse for WebauthnError {
             Unknown => "Unknown Error",
             UserHasNoCredentials => "User Has No Credentials",
             WebauthnError::InvalidSessionState(_) => "Deserializing Session failed",
+            WebauthnError::TokenCreationError => "Token creation failed",
         };
 
         // its often easiest to implement `IntoResponse` by calling other implementations
