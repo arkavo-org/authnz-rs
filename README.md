@@ -1,20 +1,32 @@
 # authnz-rs
-Authentication and Entitlement WebAuthn and Smart Contract 
+
+Authentication and Entitlement WebAuthn and Smart Contract
 
 ## Getting Started
 
 ### Prerequisites
 
-1. Create key
+#### Create keys
+
+SIGN_KEY_PATH
+
 ```shell
 openssl ecparam -genkey -name prime256v1 -noout -out signkey.pem
 ```
 
-2. Verify key
+ENCODING_KEY_PATH
+
 ```shell
-openssl ec -in signkey.pem -text -noout
+openssl ecparam -genkey -noout -name prime256v1 \
+    | openssl pkcs8 -topk8 -nocrypt -out encodekey.pem
 ```
 
+#### Verify keys
+
+```shell
+openssl ec -in signkey.pem -text -noout
+openssl ec -in encodekey.pem -text -noout
+```
 
 ## Usage
 
@@ -23,6 +35,7 @@ export PORT=8443
 export TLS_CERT_PATH=/path/to/fullchain.pem
 export TLS_KEY_PATH=/path/to/privkey.pem
 export SIGN_KEY_PATH=/path/to/signkey.pem
+export ENCODING_KEY_PATH=/path/to/signkey.pem
 ```
 
 ## Notes

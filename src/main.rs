@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
+use jsonwebtoken::EncodingKey;
+use log::{debug, error};
 use p256::{NistP256, SecretKey};
-use pem::Pem;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceBuilder;
 use tower_sessions::cookie::time::Duration;
@@ -29,7 +30,7 @@ pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub accounts: Arc<Mutex<AccountData>>,
     pub signing_key: Arc<SigningKey<NistP256>>,
-    pub signing_key_pem: Arc<Pem>,
+    pub encoding_key: Arc<EncodingKey>,
 }
 
 pub struct AccountData {
@@ -43,7 +44,8 @@ async fn main() {
     // Load configuration
     let settings = load_config().unwrap();
     // Load and validate EC keys
-    let (signing_key, signing_key_pem) = load_ec_keys(&settings.sign_key_path).expect("Failed to load signing keys");
+    let (signing_key, encoding_key) = load_ec_keys(&settings.sign_key_path, &settings.encoding_key_path)
+        .expect("Failed to load keys");
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await;
     // Set up TLS if not disabled
@@ -73,7 +75,7 @@ async fn main() {
             keys: HashMap::new(),
         })),
         signing_key: Arc::new(signing_key),
-        signing_key_pem: Arc::new(signing_key_pem),
+        encoding_key: Arc::new(encoding_key),
     };
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
@@ -126,6 +128,7 @@ struct ServerSettings {
     tls_cert_path: String,
     tls_key_path: String,
     sign_key_path: String,
+    encoding_key_path: String,
     _enable_timing_logs: bool,
 }
 
@@ -152,6 +155,7 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
                 .to_string()
         }),
         sign_key_path: env::var("SIGN_KEY_PATH").expect("SIGN_KEY_PATH must be set"),
+        encoding_key_path: env::var("ENCODING_KEY_PATH").expect("ENCODING_KEY_PATH must be set"),
         _enable_timing_logs: env::var("ENABLE_TIMING_LOGS")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -159,29 +163,41 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     })
 }
 
-fn load_ec_keys(key_path: &str) -> Result<(SigningKey<NistP256>, Pem), Box<dyn std::error::Error>> {
-    let file = File::open(key_path)?;
-    let mut reader = BufReader::new(file);
-    let mut contents = Vec::new();
-    reader.read_to_end(&mut contents)?;
+fn load_ec_keys(sign_key_path: &str, encoding_key_path: &str) -> Result<(SigningKey<NistP256>, EncodingKey), Box<dyn std::error::Error>> {
+    debug!("Loading EC signing key from: {}", sign_key_path);
+    let signing_key = load_single_ec_key(sign_key_path)?;
 
-    let pem_keys = pem::parse_many(&contents)?;
-    if pem_keys.is_empty() {
-        return Err(Box::new(LoadKeysError::KeysNotFound));
+    debug!("Loading EC encoding key from: {}", encoding_key_path);
+    let encoding_key = EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?)
+        .map_err(|e| {
+            error!("Failed to create EncodingKey: {:?}", e);
+            LoadKeysError::InvalidKeyFormat
+        })?;
+
+    debug!("Successfully loaded EC keys");
+    Ok((signing_key, encoding_key))
+}
+
+fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {
+    let mut file = File::open(key_path)?;
+    let mut pem_contents = String::new();
+    file.read_to_string(&mut pem_contents)?;
+
+    debug!("Parsing PEM contents");
+    let pem = pem::parse(pem_contents)?;
+
+    if pem.tag() != "EC PRIVATE KEY" {
+        error!("PEM file does not contain an EC PRIVATE KEY");
+        return Err(Box::new(LoadKeysError::InvalidKeyType));
     }
 
-    for pem in pem_keys {
-        if pem.tag() != "EC PRIVATE KEY" {
-            continue;
-        }
-        let key_bytes = pem.contents();
-        if let Ok(secret_key) = SecretKey::from_sec1_der(&key_bytes) {
-            let signing_key = SigningKey::from(secret_key);
-            return Ok((signing_key, pem));
-        }
-    }
-
-    Err(Box::new(LoadKeysError::SigningKeyNotFound))
+    debug!("Attempting to create SigningKey from PEM contents");
+    let secret_key = SecretKey::from_sec1_der(pem.contents())
+        .map_err(|e| {
+            error!("Failed to parse EC PRIVATE KEY: {:?}", e);
+            LoadKeysError::InvalidKeyFormat
+        })?;
+    Ok(SigningKey::from(secret_key))
 }
 
 async fn load_apple_app_site_association() -> Arc<RwLock<serde_json::Value>> {
@@ -202,8 +218,8 @@ async fn serve_apple_app_site_association(
 
 #[derive(Debug, thiserror::Error)]
 enum LoadKeysError {
-    #[error("Failed to load EC keys")]
-    KeysNotFound,
-    #[error("Signing key not found")]
-    SigningKeyNotFound,
+    #[error("Invalid key format")]
+    InvalidKeyFormat,
+    #[error("Invalid key type")]
+    InvalidKeyType,
 }

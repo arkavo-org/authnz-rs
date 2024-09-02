@@ -9,7 +9,7 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{encode, Header};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,9 @@ pub async fn start_authentication(
     // Get the set of keys that the user possesses
     let users_guard = app_state.accounts.lock().await;
 
+    // FIXME get from signed request
+    // Failed to get authentication options: User Not Found
+
     // Look up their unique id from the username
     let user_unique_id = users_guard
         .name_to_id
@@ -315,11 +318,7 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
         exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
     };
     println!("claims:{:?}", claims);
-    let pem_bytes = app_state.signing_key_pem.contents();
-    println!("pem_bytes:{:?}", pem_bytes);
-    let encoding_key = EncodingKey::from_ec_pem(pem_bytes)
-        .map_err(WebauthnError::InvalidPEM)?;
-    let token = encode(&Header::default(), &claims, &encoding_key)
+    let token = encode(&Header::default(), &claims, &app_state.encoding_key)
         .map_err(|err| WebauthnError::TokenCreationError(err))?;
     println!("token:{}", token);
     Ok(token)
@@ -380,8 +379,6 @@ pub enum WebauthnError {
     InvalidSessionState(#[from] tower_sessions::session::Error),
     #[error("Token creation error")]
     TokenCreationError(jsonwebtoken::errors::Error),
-    #[error("invalid PEM key")]
-    InvalidPEM(#[source] jsonwebtoken::errors::Error),
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
@@ -392,7 +389,6 @@ impl IntoResponse for WebauthnError {
             UserHasNoCredentials => "User Has No Credentials".to_string(),
             WebauthnError::InvalidSessionState(_) => "Deserializing Session failed".to_string(),
             WebauthnError::TokenCreationError(err) => format!("Token creation failed: {}", err),
-            WebauthnError::InvalidPEM(err) => format!("invalid PEM key: {}", err),
         };
         // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
