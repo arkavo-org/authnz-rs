@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
-use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
 use tokio::sync::{Mutex, RwLock};
@@ -31,6 +31,7 @@ pub struct AppState {
     pub accounts: Arc<Mutex<AccountData>>,
     pub signing_key: Arc<SigningKey<NistP256>>,
     pub encoding_key: Arc<EncodingKey>,
+    pub decoding_key: Arc<DecodingKey>,
 }
 
 pub struct AccountData {
@@ -44,7 +45,7 @@ async fn main() {
     // Load configuration
     let settings = load_config().unwrap();
     // Load and validate EC keys
-    let (signing_key, encoding_key) = load_ec_keys(&settings.sign_key_path, &settings.encoding_key_path)
+    let (signing_key, encoding_key, decoding_key) = load_ec_keys(&settings.sign_key_path, &settings.encoding_key_path, &settings.decoding_key_path)
         .expect("Failed to load keys");
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await;
@@ -76,6 +77,7 @@ async fn main() {
         })),
         signing_key: Arc::new(signing_key),
         encoding_key: Arc::new(encoding_key),
+        decoding_key: Arc::new(decoding_key),
     };
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
@@ -129,6 +131,7 @@ struct ServerSettings {
     tls_key_path: String,
     sign_key_path: String,
     encoding_key_path: String,
+    decoding_key_path: String,
     _enable_timing_logs: bool,
 }
 
@@ -156,6 +159,7 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
         }),
         sign_key_path: env::var("SIGN_KEY_PATH").expect("SIGN_KEY_PATH must be set"),
         encoding_key_path: env::var("ENCODING_KEY_PATH").expect("ENCODING_KEY_PATH must be set"),
+        decoding_key_path: env::var("DECODING_KEY_PATH").expect("DECODING_KEY_PATH must be set"),
         _enable_timing_logs: env::var("ENABLE_TIMING_LOGS")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -163,7 +167,7 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     })
 }
 
-fn load_ec_keys(sign_key_path: &str, encoding_key_path: &str) -> Result<(SigningKey<NistP256>, EncodingKey), Box<dyn std::error::Error>> {
+fn load_ec_keys(sign_key_path: &str, encoding_key_path: &str, decoding_key_path: &str) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
 
@@ -174,8 +178,15 @@ fn load_ec_keys(sign_key_path: &str, encoding_key_path: &str) -> Result<(Signing
             LoadKeysError::InvalidKeyFormat
         })?;
 
+    debug!("Attempting to create DecodingKey from PEM contents");
+    let decoding_key = DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?)
+        .map_err(|e| {
+            error!("Failed to create DecodingKey: {:?}", e);
+            LoadKeysError::InvalidKeyFormat
+        })?;
+
     debug!("Successfully loaded EC keys");
-    Ok((signing_key, encoding_key))
+    Ok((signing_key, encoding_key, decoding_key))
 }
 
 fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {

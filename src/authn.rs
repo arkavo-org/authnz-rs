@@ -1,5 +1,6 @@
 use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials, UserNotFound};
 use crate::AppState;
+use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::{
     extract::{Extension, Json, Path},
@@ -9,7 +10,7 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{encode, Algorithm, Header};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, Header, TokenData, Validation};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -167,12 +168,21 @@ pub async fn finish_register(
                 user_unique_id,
                 credential_id,
             };
-            let envelope = AttestationEnvelope::new(attestation_entity, &app_state);
-            Json(envelope).into_response()
+            let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
+            let header = Header::new(Algorithm::ES256);
+            let token = encode(&header, &attestation_entity, &app_state.encoding_key)
+                .map_err(|err| WebauthnError::TokenCreationError(err))?;
+            println!("token:{}", token);
+            // Set the response header `X-Auth-Token` with the JWT.
+            let mut response = Json(envelope).into_response();
+            response.headers_mut().insert(
+                "X-Auth-Token",
+                token.parse().expect("Failed to parse JWT"),
+            );
         }
         Err(error) => {
             error!("finish_register -> {:?}", error);
-            StatusCode::BAD_REQUEST.into_response()
+            StatusCode::BAD_REQUEST.into_response();
         }
     };
 
@@ -212,6 +222,7 @@ pub async fn start_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
     // We get the username from the URL, but you could get this via form submission or
@@ -225,16 +236,29 @@ pub async fn start_authentication(
 
     // Get the set of keys that the user possesses
     let users_guard = app_state.accounts.lock().await;
-
-    // FIXME get from signed request
-    // Failed to get authentication options: User Not Found
-
-    // Look up their unique id from the username
-    let user_unique_id = users_guard
+    // Fix for Failed to get authentication options: User Not Found
+    // get JWT from header X-Auth_Token, verify JWT, then get and set user_unique_id
+    // Get JWT from header X-Auth-Token
+    let mut token_data: Option<TokenData<AttestationEntity>> = None;
+    if let Some(jwt_header) = headers.get("X-Auth-Token") {
+        let jwt = jwt_header
+            .to_str()
+            .map_err(|_| WebauthnError::InvalidToken)?;
+        // Verify JWT
+        let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
+        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &Validation::default())
+            .map_err(|_| WebauthnError::TokenDecodingError)?);
+    }
+    // Look up their unique id from the username else set from header
+    let user_unique_id_result = users_guard
         .name_to_id
         .get(&username)
         .copied()
-        .ok_or(UserNotFound)?;
+        .or_else(|| token_data.as_ref().map(|td| td.claims.user_unique_id));
+    if user_unique_id_result == None {
+        return Err(UserNotFound);
+    }
+    let user_unique_id = user_unique_id_result.unwrap();
 
     let allow_credentials = users_guard
         .keys
@@ -318,7 +342,6 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
         exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
     };
     println!("claims:{:?}", claims);
-    // Specify the algorithm explicitly
     let header = Header::new(Algorithm::ES256);
     let token = encode(&header, &claims, &app_state.encoding_key)
         .map_err(|err| WebauthnError::TokenCreationError(err))?;
@@ -335,7 +358,7 @@ struct Claims {
     sub: String,
     exp: usize,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct AttestationEntity {
     user_unique_id: Uuid,
     credential_id: Base64UrlSafeData,
@@ -381,6 +404,12 @@ pub enum WebauthnError {
     InvalidSessionState(#[from] tower_sessions::session::Error),
     #[error("Token creation error")]
     TokenCreationError(jsonwebtoken::errors::Error),
+    #[error("Missing token")]
+    MissingToken,
+    #[error("Invalid token")]
+    InvalidToken,
+    #[error("Token decoding error")]
+    TokenDecodingError,
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
@@ -391,6 +420,9 @@ impl IntoResponse for WebauthnError {
             UserHasNoCredentials => "User Has No Credentials".to_string(),
             WebauthnError::InvalidSessionState(_) => "Deserializing Session failed".to_string(),
             WebauthnError::TokenCreationError(err) => format!("Token creation failed: {}", err),
+            WebauthnError::MissingToken => "Missing token".to_string(),
+            WebauthnError::InvalidToken => "Invalid token".to_string(),
+            WebauthnError::TokenDecodingError => "Token decoding error".to_string(),
         };
         // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
