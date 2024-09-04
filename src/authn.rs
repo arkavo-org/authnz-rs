@@ -175,7 +175,7 @@ pub async fn finish_register(
             let header = Header::new(Algorithm::ES256);
             let token = encode(&header, &attestation_entity, &app_state.encoding_key)
                 .map_err(|err| TokenCreationError(err))?;
-            println!("token:{}", token);
+            // println!("token:{}", token);
             // Set the response header `X-Auth-Token` with the JWT.
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
@@ -248,7 +248,7 @@ pub async fn start_authentication(
     // Get JWT from header X-Auth-Token
     let mut token_data: Option<TokenData<AccountToken>> = None;
     if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        println!("jwt_header {:?}", jwt_header);
+        // println!("jwt_header {:?}", jwt_header);
         let jwt = jwt_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
@@ -259,8 +259,8 @@ pub async fn start_authentication(
         token_validation.validate_exp = false;
         token_data = Some(decode::<AccountToken>(jwt, &decoding_key, &token_validation)
             .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
-        println!("token_data {:?}", token_data);
-        println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
+        // println!("token_data {:?}", token_data);
+        // println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
     }
     // Look up their unique id from the username else set from header
     let user_unique_id_result = users_guard
@@ -272,10 +272,10 @@ pub async fn start_authentication(
         return Err(UserNotFound);
     }
     let user_unique_id = user_unique_id_result.unwrap();
-    println!("user_unique_id {:?}", user_unique_id);
+    // println!("user_unique_id {:?}", user_unique_id);
     // get passkey from X-Auth-Token
     let token_passkey = vec![token_data.unwrap().claims.passkey];
-    println!("token_passkey {:?}", token_passkey);
+    // println!("token_passkey {:?}", token_passkey);
     let mut allow_credentials = users_guard
         .keys
         .get(&user_unique_id);
@@ -332,7 +332,7 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             let mut users_guard = app_state.accounts.lock().await;
-            // Update the credential counter, if possible. 
+            // Update the credential counter, if possible.
             // FIXME record on blockchain, then check above for replay attach
             if let Some(keys) = users_guard.keys.get_mut(&user_unique_id) {
                 keys.iter_mut().for_each(|sk| {
@@ -358,11 +358,11 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
         sub: user_id.to_string(),
         exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
     };
-    println!("claims:{:?}", claims);
+    // println!("claims:{:?}", claims);
     let header = Header::new(Algorithm::ES256);
     let token = encode(&header, &claims, &app_state.encoding_key)
         .map_err(|err| TokenCreationError(err))?;
-    println!("token:{}", token);
+    // println!("token:{}", token);
     Ok(token)
 }
 
