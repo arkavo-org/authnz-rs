@@ -171,7 +171,7 @@ pub async fn finish_register(
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
             let header = Header::new(Algorithm::ES256);
             let token = encode(&header, &attestation_entity, &app_state.encoding_key)
-                .map_err(|err| WebauthnError::TokenCreationError(err))?;
+                .map_err(|err| TokenCreationError(err))?;
             println!("token:{}", token);
             // Set the response header `X-Auth-Token` with the JWT.
             let mut response = Json(envelope).into_response();
@@ -250,8 +250,8 @@ pub async fn start_authentication(
             .map_err(|_| WebauthnError::InvalidToken)?;
         // Verify JWT
         let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
-        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &Validation::default())
-            .map_err(|_| WebauthnError::TokenDecodingError)?);
+        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &Validation::new(Algorithm::ES256))
+            .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
     }
     // Look up their unique id from the username else set from header
     let user_unique_id_result = users_guard
@@ -348,7 +348,7 @@ fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnE
     println!("claims:{:?}", claims);
     let header = Header::new(Algorithm::ES256);
     let token = encode(&header, &claims, &app_state.encoding_key)
-        .map_err(|err| WebauthnError::TokenCreationError(err))?;
+        .map_err(|err| TokenCreationError(err))?;
     println!("token:{}", token);
     Ok(token)
 }
@@ -412,8 +412,8 @@ pub enum WebauthnError {
     MissingToken,
     #[error("Invalid token")]
     InvalidToken,
-    #[error("Token decoding error")]
-    TokenDecodingError,
+    #[error("Token decoding failed: {0}")]
+    TokenDecodingError(String),
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
@@ -426,7 +426,7 @@ impl IntoResponse for WebauthnError {
             TokenCreationError(err) => format!("Token creation failed: {}", err),
             MissingToken => "Missing token".to_string(),
             WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError => "Token decoding error".to_string()
+            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err)
         };
         // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
