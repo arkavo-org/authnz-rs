@@ -164,9 +164,10 @@ pub async fn finish_register(
             users_guard.name_to_id.insert(username, user_unique_id);
             // Send back JSON response with the registration credential.
             let credential_id = Base64UrlSafeData::from(session_key.cred_id().to_vec());
-            let attestation_entity = AttestationEntity {
+            let attestation_entity = AccountToken {
                 user_unique_id,
                 credential_id,
+                passkey: session_key,
                 sub: user_unique_id.to_string(),
                 exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
             };
@@ -245,8 +246,9 @@ pub async fn start_authentication(
     // Fix for Failed to get authentication options: User Not Found
     // get JWT from header X-Auth_Token, verify JWT, then get and set user_unique_id
     // Get JWT from header X-Auth-Token
-    let mut token_data: Option<TokenData<AttestationEntity>> = None;
+    let mut token_data: Option<TokenData<AccountToken>> = None;
     if let Some(jwt_header) = headers.get("X-Auth-Token") {
+        println!("jwt_header {:?}", jwt_header);
         let jwt = jwt_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
@@ -255,8 +257,10 @@ pub async fn start_authentication(
         let mut token_validation = Validation::new(Algorithm::ES256);
         token_validation.validate_nbf = false;
         token_validation.validate_exp = false;
-        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &token_validation)
+        token_data = Some(decode::<AccountToken>(jwt, &decoding_key, &token_validation)
             .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
+        println!("token_data {:?}", token_data);
+        println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
     }
     // Look up their unique id from the username else set from header
     let user_unique_id_result = users_guard
@@ -268,15 +272,22 @@ pub async fn start_authentication(
         return Err(UserNotFound);
     }
     let user_unique_id = user_unique_id_result.unwrap();
-
-    let allow_credentials = users_guard
+    println!("user_unique_id {:?}", user_unique_id);
+    // get passkey from X-Auth-Token
+    let token_passkey = vec![token_data.unwrap().claims.passkey];
+    println!("token_passkey {:?}", token_passkey);
+    let mut allow_credentials = users_guard
         .keys
-        .get(&user_unique_id)
-        .ok_or(UserHasNoCredentials)?;
-
+        .get(&user_unique_id);
+    if allow_credentials == None {
+        allow_credentials = Option::from(&token_passkey)
+    }
+    if allow_credentials == None {
+        return Err(UserHasNoCredentials);
+    }
     let res = match app_state
         .webauthn
-        .start_passkey_authentication(allow_credentials)
+        .start_passkey_authentication(allow_credentials.unwrap().as_ref())
     {
         Ok((rcr, auth_state)) => {
             // Drop the mutex to allow the mut borrows below to proceed
@@ -367,22 +378,23 @@ struct Claims {
     sub: String,
     exp: usize,
 }
-#[derive(Serialize, Deserialize, Clone)]
-struct AttestationEntity {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AccountToken {
     user_unique_id: Uuid,
     credential_id: Base64UrlSafeData,
+    passkey: Passkey,
     sub: String,
     exp: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AttestationEnvelope {
-    payload: AttestationEntity,
+    payload: AccountToken,
     signature: Base64UrlSafeData,
 }
 
 impl AttestationEnvelope {
-    fn new(entity: AttestationEntity, app_state: &AppState) -> Self {
+    fn new(entity: AccountToken, app_state: &AppState) -> Self {
         let payload_bytes = serde_json::to_vec(&entity).unwrap();
         let message = Sha256::digest(&payload_bytes);
         let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
