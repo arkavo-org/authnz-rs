@@ -1,30 +1,37 @@
-# https://doc.rust-lang.org/cargo/reference/manifest.html
 [package]
 name = "authnz-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "BSD-2"
 rust-version = "1.80.0"
 
-# export RUSTFLAGS="-C target-cpu=native"
-# cargo build --release
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-# cargo flamegraph
-#debug = true
 
 [dependencies]
-tokio = { version = "1.39.2", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.39.3", features = ["rt", "rt-multi-thread", "macros", "fs"] }
 tokio-native-tls = "0.3.1"
-axum = { version="0.7.5", features = ["http2", "tokio"] }
-axum-server = { version = "0.6.0", features = ["tls-rustls"] }
-webauthn-rs = { version="0.5.0", features = ["danger-allow-state-serialisation"] }
-tower = { version="0.4.13", features = ["full"] }
-tower-sessions = "0.12.2"
+axum = { version = "0.7.5", features = ["http2", "tokio"] }
+axum-server = { version = "0.7.1", features = ["tls-rustls"] }
+webauthn-rs = { version = "0.5.0", features = ["danger-allow-state-serialisation"] }
+tower = { version = "0.4.13", features = ["full"] }
+tower-sessions = "0.12.3"
 thiserror = "1.0.63"
 log = "0.4.22"
 serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.121"
-env_logger ="0.11.5"
+serde_json = "1.0.127"
+env_logger = "0.11.5"
+pem = "3.0.4"
+base64 = "0.22.1"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+p384 = { version = "0.13.0", features = ["ecdsa"] }
+p521 = { version = "0.13.3", features = ["ecdsa"] }
+ecdsa = { version = "0.16.9", features = ["signing", "std"] }
+rand_core = { version = "0.6.4", features = ["std"] }
+sha2 = "0.10.8"
+rand = "0.8.5"
+uuid = { version = "1.10.0", features = ["v4"] }
+jsonwebtoken = { version = "9.3.0", features = ["use_pem"] }
+chrono = "0.4.38"
