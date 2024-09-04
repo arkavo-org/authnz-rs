@@ -167,6 +167,8 @@ pub async fn finish_register(
             let attestation_entity = AttestationEntity {
                 user_unique_id,
                 credential_id,
+                sub: user_unique_id.to_string(),
+                exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
             };
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
             let header = Header::new(Algorithm::ES256);
@@ -369,6 +371,8 @@ struct Claims {
 struct AttestationEntity {
     user_unique_id: Uuid,
     credential_id: Base64UrlSafeData,
+    sub: String,
+    exp: usize,
 }
 
 #[derive(Serialize, Deserialize)]
