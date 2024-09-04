@@ -1,6 +1,6 @@
-use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials, UserNotFound};
+use crate::authn::WebauthnError::{CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown, UserHasNoCredentials, UserNotFound};
 use crate::AppState;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
 use axum::{
     extract::{Extension, Json, Path},
@@ -175,17 +175,23 @@ pub async fn finish_register(
             println!("token:{}", token);
             // Set the response header `X-Auth-Token` with the JWT.
             let mut response = Json(envelope).into_response();
-            response.headers_mut().insert(
-                "X-Auth-Token",
-                token.parse().expect("Failed to parse JWT"),
-            );
+            match HeaderValue::from_str(&token) {
+                Ok(header_value) => {
+                    response.headers_mut().insert("X-Auth-Token", header_value);
+                }
+                Err(_) => {
+                    return Err(MissingToken)
+                }
+            }
         }
         Err(error) => {
             error!("finish_register -> {:?}", error);
             StatusCode::BAD_REQUEST.into_response();
         }
     };
-
+    
+    // Debug print `res` to check if the `X-Auth-Token` header is being sent.
+    println!("{:?}", res); // Debugging line to print res
     Ok(res)
 }
 
@@ -418,11 +424,11 @@ impl IntoResponse for WebauthnError {
             UserNotFound => "User Not Found".to_string(),
             Unknown => "Unknown Error".to_string(),
             UserHasNoCredentials => "User Has No Credentials".to_string(),
-            WebauthnError::InvalidSessionState(_) => "Deserializing Session failed".to_string(),
-            WebauthnError::TokenCreationError(err) => format!("Token creation failed: {}", err),
-            WebauthnError::MissingToken => "Missing token".to_string(),
+            InvalidSessionState(_) => "Deserializing Session failed".to_string(),
+            TokenCreationError(err) => format!("Token creation failed: {}", err),
+            MissingToken => "Missing token".to_string(),
             WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError => "Token decoding error".to_string(),
+            WebauthnError::TokenDecodingError => "Token decoding error".to_string()
         };
         // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
