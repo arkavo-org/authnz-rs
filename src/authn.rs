@@ -250,7 +250,10 @@ pub async fn start_authentication(
             .map_err(|_| WebauthnError::InvalidToken)?;
         // Verify JWT
         let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
-        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &Validation::new(Algorithm::ES256))
+        let mut token_validation = Validation::new(Algorithm::ES256);
+        token_validation.validate_nbf = false;
+        token_validation.validate_exp = false;
+        token_data = Some(decode::<AttestationEntity>(jwt, &decoding_key, &token_validation)
             .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
     }
     // Look up their unique id from the username else set from header
