@@ -332,16 +332,13 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             let mut users_guard = app_state.accounts.lock().await;
-            // Update the credential counter, if possible.
-            users_guard
-                .keys
-                .get_mut(&user_unique_id)
-                .map(|keys| {
-                    keys.iter_mut().for_each(|sk| {
-                        sk.update_credential(&auth_result);
-                    })
-                })
-                .ok_or(UserHasNoCredentials)?;
+            // Update the credential counter, if possible. 
+            // FIXME record on blockchain, then check above for replay attach
+            if let Some(keys) = users_guard.keys.get_mut(&user_unique_id) {
+                keys.iter_mut().for_each(|sk| {
+                    sk.update_credential(&auth_result);
+                });
+            }
             // Generate JWT token
             let token = generate_jwt(user_unique_id, &app_state)?;
             // Return JSON response with JWT token
