@@ -1,16 +1,24 @@
+use crate::authn::WebauthnError::{CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown, UserHasNoCredentials, UserNotFound};
+use crate::AppState;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::Response;
 use axum::{
     extract::{Extension, Json, Path},
     http::StatusCode,
     response::IntoResponse,
 };
-use axum::response::Response;
+use chrono::Utc;
+use ecdsa::signature::{Signer, Verifier};
+use ecdsa::{Signature, VerifyingKey};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, Header, TokenData, Validation};
 use log::{error, info};
+use p256::NistP256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tower_sessions::Session;
-// 1. Import the prelude - this contains everything needed for the server to function.
+use uuid::Uuid;
 use webauthn_rs::prelude::*;
-use crate::AppState;
-use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials, UserNotFound};
 
 /*
  * Webauthn RS auth handlers.
@@ -51,6 +59,8 @@ use crate::authn::WebauthnError::{CorruptSession, Unknown, UserHasNoCredentials,
 // In this step, we are responding to the start reg(istration) request, and providing
 // the challenge to the browser.
 
+const SESSION_REG_STATE_KEY: &str = "reg_state";
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -79,7 +89,10 @@ pub async fn start_register(
 
     // Remove any previous registrations that may have occurred from the session.
     // assumption no need to wait or check a failure
-    session.remove_value("reg_state").await.expect("auth_state removal failed");
+    session
+        .remove_value(SESSION_REG_STATE_KEY)
+        .await
+        .expect("auth_state removal failed");
 
     // If the user has any other credentials, we exclude these here, so they can't be duplicate registered.
     // It also hints to the browser that only new credentials should be "blinked" for interaction.
@@ -102,15 +115,15 @@ pub async fn start_register(
             // safe to store the reg_state into the session since it is not client controlled and
             // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
             session
-                .insert("reg_state", (username, user_unique_id, reg_state))
+                .insert(SESSION_REG_STATE_KEY, (username, user_unique_id, reg_state))
                 .await
                 .expect("Failed to insert");
             info!("Registration Successful!");
             Json(ccr)
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
-            return Err(WebauthnError::Unknown);
+            error!("start_register -> {:?}", e);
+            return Err(Unknown);
         }
     };
     Ok(res)
@@ -123,42 +136,63 @@ pub async fn start_register(
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
-    Json(reg): Json<RegisterPublicKeyCredential>,
+    Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_unique_id, reg_state) = match session.get("reg_state").await? {
+    let (username, user_unique_id, reg_state) = match session.get(SESSION_REG_STATE_KEY).await? {
         Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
         None => {
             error!("Failed to get session");
-            return Err(WebauthnError::CorruptSession);
+            return Err(CorruptSession);
         }
     };
-
-    session.remove_value("reg_state").await.expect("auth_state removal failed");
-
+    session
+        .remove_value(SESSION_REG_STATE_KEY)
+        .await
+        .expect("auth_state removal failed");
     let res = match app_state
         .webauthn
-        .finish_passkey_registration(&reg, &reg_state)
+        .finish_passkey_registration(&registration_credential, &reg_state)
     {
-        Ok(sk) => {
+        Ok(session_key) => {
             let mut users_guard = app_state.accounts.lock().await;
-
-            //TODO: This is where we would store the credential in a db, or persist them in some other way.
+            // Store the credential in a database or persist in some other way.
             users_guard
                 .keys
                 .entry(user_unique_id)
-                .and_modify(|keys| keys.push(sk.clone()))
-                .or_insert_with(|| vec![sk.clone()]);
-
+                .and_modify(|keys| keys.push(session_key.clone()))
+                .or_insert_with(|| vec![session_key.clone()]);
             users_guard.name_to_id.insert(username, user_unique_id);
-
-            StatusCode::OK
+            // Send back JSON response with the registration credential.
+            let credential_id = Base64UrlSafeData::from(session_key.cred_id().to_vec());
+            let attestation_entity = AccountToken {
+                user_unique_id,
+                credential_id,
+                passkey: session_key,
+                sub: user_unique_id.to_string(),
+                exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
+            };
+            let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
+            let header = Header::new(Algorithm::ES256);
+            let token = encode(&header, &attestation_entity, &app_state.encoding_key)
+                .map_err(|err| TokenCreationError(err))?;
+            // println!("token:{}", token);
+            // Set the response header `X-Auth-Token` with the JWT.
+            let mut response = Json(envelope).into_response();
+            match HeaderValue::from_str(&token) {
+                Ok(header_value) => {
+                    response.headers_mut().insert("X-Auth-Token", header_value);
+                    response
+                }
+                Err(_) => {
+                    return Err(MissingToken)
+                }
+            }
         }
-        Err(e) => {
-            error!("challenge_register -> {:?}", e);
-            StatusCode::BAD_REQUEST
+        Err(error) => {
+            error!("finish_register -> {:?}", error);
+            StatusCode::BAD_REQUEST.into_response()
         }
     };
-
     Ok(res)
 }
 
@@ -195,32 +229,65 @@ pub async fn start_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
     // We get the username from the URL, but you could get this via form submission or
     // some other process.
 
     // Remove any previous authentication that may have occurred from the session.
-    session.remove_value("auth_state").await.expect("auth_state removal failed");
+    session
+        .remove_value("auth_state")
+        .await
+        .expect("auth_state removal failed");
 
     // Get the set of keys that the user possesses
     let users_guard = app_state.accounts.lock().await;
-
-    // Look up their unique id from the username
-    let user_unique_id = users_guard
+    // Fix for Failed to get authentication options: User Not Found
+    // get JWT from header X-Auth_Token, verify JWT, then get and set user_unique_id
+    // Get JWT from header X-Auth-Token
+    let mut token_data: Option<TokenData<AccountToken>> = None;
+    if let Some(jwt_header) = headers.get("X-Auth-Token") {
+        // println!("jwt_header {:?}", jwt_header);
+        let jwt = jwt_header
+            .to_str()
+            .map_err(|_| WebauthnError::InvalidToken)?;
+        // Verify JWT
+        let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
+        let mut token_validation = Validation::new(Algorithm::ES256);
+        token_validation.validate_nbf = false;
+        token_validation.validate_exp = false;
+        token_data = Some(decode::<AccountToken>(jwt, &decoding_key, &token_validation)
+            .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
+        // println!("token_data {:?}", token_data);
+        // println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
+    }
+    // Look up their unique id from the username else set from header
+    let user_unique_id_result = users_guard
         .name_to_id
         .get(&username)
         .copied()
-        .ok_or(UserNotFound)?;
-
-    let allow_credentials = users_guard
+        .or_else(|| token_data.as_ref().map(|td| td.claims.user_unique_id));
+    if user_unique_id_result == None {
+        return Err(UserNotFound);
+    }
+    let user_unique_id = user_unique_id_result.unwrap();
+    // println!("user_unique_id {:?}", user_unique_id);
+    // get passkey from X-Auth-Token
+    let token_passkey = vec![token_data.unwrap().claims.passkey];
+    // println!("token_passkey {:?}", token_passkey);
+    let mut allow_credentials = users_guard
         .keys
-        .get(&user_unique_id)
-        .ok_or(UserHasNoCredentials)?;
-
+        .get(&user_unique_id);
+    if allow_credentials == None {
+        allow_credentials = Option::from(&token_passkey)
+    }
+    if allow_credentials == None {
+        return Err(UserHasNoCredentials);
+    }
     let res = match app_state
         .webauthn
-        .start_passkey_authentication(allow_credentials)
+        .start_passkey_authentication(allow_credentials.unwrap().as_ref())
     {
         Ok((rcr, auth_state)) => {
             // Drop the mutex to allow the mut borrows below to proceed
@@ -236,7 +303,7 @@ pub async fn start_authentication(
             Json(rcr)
         }
         Err(e) => {
-            info!("challenge_authenticate -> {:?}", e);
+            error!("start_authentication -> {:?}", e);
             return Err(Unknown);
         }
     };
@@ -253,41 +320,94 @@ pub async fn finish_authentication(
     session: Session,
     Json(auth): Json<PublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) = session
-        .get("auth_state").await?
-        .ok_or(CorruptSession)?;
-
-    session.remove_value("auth_state").await.expect("auth_state removal failed");
-
+    let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
+        session.get("auth_state").await?.ok_or(CorruptSession)?;
+    session
+        .remove_value("auth_state")
+        .await
+        .expect("auth_state removal failed");
     let res = match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
         Ok(auth_result) => {
             let mut users_guard = app_state.accounts.lock().await;
-
             // Update the credential counter, if possible.
-            users_guard
-                .keys
-                .get_mut(&user_unique_id)
-                .map(|keys| {
-                    keys.iter_mut().for_each(|sk| {
-                        // This will update the credential if it's the matching
-                        // one. Otherwise it's ignored. That is why it is safe to
-                        // iterate this over the full list.
-                        sk.update_credential(&auth_result);
-                    })
-                })
-                .ok_or(UserHasNoCredentials)?;
-            StatusCode::OK
+            // FIXME record on blockchain, then check above for replay attach
+            if let Some(keys) = users_guard.keys.get_mut(&user_unique_id) {
+                keys.iter_mut().for_each(|sk| {
+                    sk.update_credential(&auth_result);
+                });
+            }
+            // Generate JWT token
+            let token = generate_jwt(user_unique_id, &app_state)?;
+            // Return JSON response with JWT token
+            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
-            StatusCode::BAD_REQUEST
+            error!("finish_authentication -> {:?}", e);
+            Ok((StatusCode::BAD_REQUEST, Json(AuthResponse { jwt_token: String::new() })))
         }
     };
     info!("Authentication Successful!");
-    Ok(res)
+    res
+}
+
+fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+    };
+    // println!("claims:{:?}", claims);
+    let header = Header::new(Algorithm::ES256);
+    let token = encode(&header, &claims, &app_state.encoding_key)
+        .map_err(|err| TokenCreationError(err))?;
+    // println!("token:{}", token);
+    Ok(token)
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    jwt_token: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AccountToken {
+    user_unique_id: Uuid,
+    credential_id: Base64UrlSafeData,
+    passkey: Passkey,
+    sub: String,
+    exp: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttestationEnvelope {
+    payload: AccountToken,
+    signature: Base64UrlSafeData,
+}
+
+impl AttestationEnvelope {
+    fn new(entity: AccountToken, app_state: &AppState) -> Self {
+        let payload_bytes = serde_json::to_vec(&entity).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
+
+        Self {
+            payload: entity,
+            signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
+        }
+    }
+    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
+        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
+        let message = Sha256::digest(&payload_bytes);
+        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
+
+        verifying_key.verify(&message, &signature).is_ok()
+    }
 }
 
 #[derive(Error, Debug)]
@@ -302,18 +422,29 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
+    #[error("Token creation error")]
+    TokenCreationError(jsonwebtoken::errors::Error),
+    #[error("Missing token")]
+    MissingToken,
+    #[error("Invalid token")]
+    InvalidToken,
+    #[error("Token decoding failed: {0}")]
+    TokenDecodingError(String),
 }
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let body = match self {
-            WebauthnError::CorruptSession => "Corrupt Session",
-            WebauthnError::UserNotFound => "User Not Found",
-            WebauthnError::Unknown => "Unknown Error",
-            WebauthnError::UserHasNoCredentials => "User Has No Credentials",
-            WebauthnError::InvalidSessionState(_) => "Deserialising Session failed",
+            CorruptSession => "Corrupt Session".to_string(),
+            UserNotFound => "User Not Found".to_string(),
+            Unknown => "Unknown Error".to_string(),
+            UserHasNoCredentials => "User Has No Credentials".to_string(),
+            InvalidSessionState(_) => "Deserializing Session failed".to_string(),
+            TokenCreationError(err) => format!("Token creation failed: {}", err),
+            MissingToken => "Missing token".to_string(),
+            WebauthnError::InvalidToken => "Invalid token".to_string(),
+            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err)
         };
-
-        // its often easiest to implement `IntoResponse` by calling other implementations
+        // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }
