@@ -178,6 +178,7 @@ pub async fn finish_register(
             match HeaderValue::from_str(&token) {
                 Ok(header_value) => {
                     response.headers_mut().insert("X-Auth-Token", header_value);
+                    response
                 }
                 Err(_) => {
                     return Err(MissingToken)
@@ -186,12 +187,9 @@ pub async fn finish_register(
         }
         Err(error) => {
             error!("finish_register -> {:?}", error);
-            StatusCode::BAD_REQUEST.into_response();
+            StatusCode::BAD_REQUEST.into_response()
         }
     };
-    
-    // Debug print `res` to check if the `X-Auth-Token` header is being sent.
-    println!("{:?}", res); // Debugging line to print res
     Ok(res)
 }
 
