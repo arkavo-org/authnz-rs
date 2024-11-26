@@ -3,14 +3,16 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
+use http::Uri;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
@@ -93,6 +95,7 @@ async fn main() {
             "/.well-known/apple-app-site-association",
             get(serve_apple_app_site_association),
         )
+        .route("/oauth/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
         .route("/authenticate/:username", get(start_authentication))
@@ -227,10 +230,286 @@ async fn serve_apple_app_site_association(
     axum::Json(json.clone())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OAuthProvider {
+    Patreon,
+    Twitch,
+    Discord,
+    Reddit,
+}
+
+impl FromStr for OAuthProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Sanitize input: trim whitespace, convert to lowercase, remove any special characters
+        let sanitized = s.trim().to_lowercase();
+
+        match sanitized.as_str() {
+            "patreon" => Ok(OAuthProvider::Patreon),
+            "twitch" => Ok(OAuthProvider::Twitch),
+            "discord" => Ok(OAuthProvider::Discord),
+            "reddit" => Ok(OAuthProvider::Reddit),
+            _ => Err(format!("Unknown OAuth provider: {}", s)),
+        }
+    }
+}
+
+// Sanitize the OAuth code
+fn sanitize_code(code: &str) -> String {
+    // OAuth codes are typically alphanumeric with possibly some special characters
+    // Remove any characters that aren't alphanumeric, '-', or '_'
+    code.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(1024) // Reasonable length limit for OAuth codes
+        .collect()
+}
+
+// Sanitize error messages
+fn sanitize_error(error: &str) -> String {
+    // Only allow alphanumeric characters and underscores in error messages
+    error.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .take(100) // Reasonable length limit for error messages
+        .collect()
+}
+
+impl OAuthProvider {
+    fn as_str(&self) -> &'static str {
+        match self {
+            OAuthProvider::Patreon => "patreon",
+            OAuthProvider::Twitch => "twitch",
+            OAuthProvider::Discord => "discord",
+            OAuthProvider::Reddit => "reddit",
+        }
+    }
+
+    fn get_redirect_uri(&self, code: &str) -> String {
+        format!("arkavo://oauth/{}?code={}", self.as_str(), sanitize_code(code))
+    }
+
+    fn get_error_uri(&self, error: &str) -> String {
+        format!("arkavo://oauth/{}?error={}", self.as_str(), sanitize_error(error))
+    }
+}
+
+async fn handle_oauth_callback(
+    uri: Uri,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Log incoming request (sanitized)
+    debug!("Received OAuth callback for provider: {}", provider.trim());
+
+    // Validate and parse the provider first
+    let provider = match OAuthProvider::from_str(&provider) {
+        Ok(provider) => provider,
+        Err(e) => {
+            error!("Invalid OAuth provider: {}", e);
+            return Redirect::temporary("arkavo://oauth/error?error=invalid_provider");
+        }
+    };
+
+    // Parse and validate query parameters
+    let query = uri.query().unwrap_or_default();
+    let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes())
+        .collect();
+
+    // Validate state parameter if provider requires it
+    if let Some(state) = params.get("state") {
+        if !validate_oauth_state(state) {
+            error!("Invalid OAuth state parameter for {:?}", provider);
+            return Redirect::temporary(&provider.get_error_uri("invalid_state"));
+        }
+    }
+
+    // Handle the authorization code
+    match params.get("code").map(|s| s.as_ref()) {
+        Some(code) if !code.is_empty() => {
+            debug!("Processing OAuth code for {:?}", provider);
+            Redirect::temporary(&provider.get_redirect_uri(code))
+        }
+        _ => {
+            // Check for error parameters from OAuth provider
+            if let Some(error) = params.get("error").map(|s| s.as_ref()) {
+                error!("OAuth error from provider: {}", error);
+                return Redirect::temporary(&provider.get_error_uri(error));
+            }
+
+            error!("No code provided in OAuth callback for {:?}", provider);
+            Redirect::temporary(&provider.get_error_uri("no_code"))
+        }
+    }
+}
+
+// Validate OAuth state parameter
+fn validate_oauth_state(state: &str) -> bool {
+    // State should be alphanumeric and reasonable length
+    if state.len() > 100 || state.is_empty() {
+        return false;
+    }
+
+    state.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
 #[derive(Debug, thiserror::Error)]
 enum LoadKeysError {
     #[error("Invalid key format")]
     InvalidKeyFormat,
     #[error("Invalid key type")]
     InvalidKeyType,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http::StatusCode;
+    use tower::ServiceExt;
+
+    // Helper function to create test app
+    fn create_test_app() -> Router {
+        Router::new()
+            .route("/oauth/:provider", get(handle_oauth_callback))
+    }
+
+    #[tokio::test]
+    async fn test_valid_oauth_providers() {
+        let app = create_test_app();
+        let providers = vec!["patreon", "twitch", "discord", "reddit"];
+
+        for provider in providers {
+            let code = "test_auth_code_123";
+            let uri = format!("/oauth/{}?code={}", provider, code);
+            let response = app.clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let location = response.headers().get("location").unwrap().to_str().unwrap();
+            assert_eq!(
+                location,
+                format!("arkavo://oauth/{}?code=test_auth_code_123", provider)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_oauth_provider() {
+        let app = create_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/invalid_provider?code=123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "arkavo://oauth/error?error=invalid_provider");
+    }
+
+    #[tokio::test]
+    async fn test_missing_code() {
+        let app = create_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/patreon")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "arkavo://oauth/patreon?error=no_code");
+    }
+
+    #[tokio::test]
+    async fn test_provider_case_insensitivity() {
+        let app = create_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/PATREON?code=123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "arkavo://oauth/patreon?code=123");
+    }
+
+    #[tokio::test]
+    async fn test_error_parameter_handling() {
+        let app = create_test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/patreon?error=access_denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "arkavo://oauth/patreon?error=access_denied");
+    }
+    
+    #[test]
+    fn test_provider_from_str() {
+        assert!(matches!(
+            OAuthProvider::from_str("patreon"),
+            Ok(OAuthProvider::Patreon)
+        ));
+        assert!(matches!(
+            OAuthProvider::from_str("PATREON"),
+            Ok(OAuthProvider::Patreon)
+        ));
+        assert!(matches!(
+            OAuthProvider::from_str(" patreon "),
+            Ok(OAuthProvider::Patreon)
+        ));
+        assert!(OAuthProvider::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_code() {
+        assert_eq!(sanitize_code("abc123"), "abc123");
+        assert_eq!(sanitize_code("abc<script>123"), "abcscript123");
+        assert_eq!(sanitize_code("abc-123_456"), "abc-123_456");
+
+        // Test length limit
+        let long_code = "a".repeat(2000);
+        assert_eq!(sanitize_code(&long_code).len(), 1024);
+    }
+
+    #[test]
+    fn test_sanitize_error() {
+        assert_eq!(sanitize_error("access_denied"), "access_denied");
+        assert_eq!(sanitize_error("error<script>"), "errorscript");
+
+        // Test length limit
+        let long_error = "e".repeat(200);
+        assert_eq!(sanitize_error(&long_error).len(), 100);
+    }
+
+    #[test]
+    fn test_validate_oauth_state() {
+        assert!(validate_oauth_state("valid_state_123"));
+        assert!(!validate_oauth_state(""));
+        assert!(!validate_oauth_state("invalid<script>state"));
+        assert!(!validate_oauth_state(&"a".repeat(101)));
+    }
 }
