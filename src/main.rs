@@ -95,7 +95,7 @@ async fn main() {
             "/.well-known/apple-app-site-association",
             get(serve_apple_app_site_association),
         )
-        .route("/oauth/:provider", get(handle_oauth_callback))
+        .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
         .route("/authenticate/:username", get(start_authentication))
@@ -231,6 +231,34 @@ async fn serve_apple_app_site_association(
 }
 
 #[derive(Debug, Clone, Copy)]
+enum OAuthClient {
+    Arkavo,
+    ArkavoCreator,
+}
+
+impl FromStr for OAuthClient {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sanitized = s.trim().to_lowercase();
+        match sanitized.as_str() {
+            "arkavo" => Ok(OAuthClient::Arkavo),
+            "arkavocreator" => Ok(OAuthClient::ArkavoCreator),
+            _ => Err(format!("Unknown OAuth client: {}", s))
+        }
+    }
+}
+
+impl OAuthClient {
+    fn as_scheme(&self) -> &'static str {
+        match self {
+            OAuthClient::Arkavo => "arkavo",
+            OAuthClient::ArkavoCreator => "arkavocreator",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 enum OAuthProvider {
     Patreon,
     Twitch,
@@ -284,28 +312,36 @@ impl OAuthProvider {
         }
     }
 
-    fn get_redirect_uri(&self, code: &str) -> String {
-        format!("arkavo://oauth/{}?code={}", self.as_str(), sanitize_code(code))
+    fn get_redirect_uri(&self, code: &str, client: OAuthClient) -> String {
+        format!("{}://oauth/{}?code={}", client.as_scheme(), self.as_str(), sanitize_code(code))
     }
 
-    fn get_error_uri(&self, error: &str) -> String {
-        format!("arkavo://oauth/{}?error={}", self.as_str(), sanitize_error(error))
+    fn get_error_uri(&self, error: &str, client: OAuthClient) -> String {
+        format!("{}://oauth/{}?error={}", client.as_scheme(), self.as_str(), sanitize_error(error))
     }
 }
 
 async fn handle_oauth_callback(
     uri: Uri,
-    axum::extract::Path(provider): axum::extract::Path<String>,
+    axum::extract::Path((client, provider)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    // Log incoming request (sanitized)
-    debug!("Received OAuth callback for provider: {}", provider.trim());
+    debug!("Received OAuth callback for client: {} and provider: {}", client.trim(), provider.trim());
 
-    // Validate and parse the provider first
+    // Validate and parse the client first
+    let client = match OAuthClient::from_str(&client) {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Invalid OAuth client: {}", e);
+            return Redirect::temporary("arkavo://oauth/error?error=invalid_client");
+        }
+    };
+
+    // Validate and parse the provider
     let provider = match OAuthProvider::from_str(&provider) {
         Ok(provider) => provider,
         Err(e) => {
             error!("Invalid OAuth provider: {}", e);
-            return Redirect::temporary("arkavo://oauth/error?error=invalid_provider");
+            return Redirect::temporary(&format!("{}://oauth/error?error=invalid_provider", client.as_scheme()));
         }
     };
 
@@ -318,7 +354,7 @@ async fn handle_oauth_callback(
     if let Some(state) = params.get("state") {
         if !validate_oauth_state(state) {
             error!("Invalid OAuth state parameter for {:?}", provider);
-            return Redirect::temporary(&provider.get_error_uri("invalid_state"));
+            return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
         }
     }
 
@@ -326,17 +362,17 @@ async fn handle_oauth_callback(
     match params.get("code").map(|s| s.as_ref()) {
         Some(code) if !code.is_empty() => {
             debug!("Processing OAuth code for {:?}", provider);
-            Redirect::temporary(&provider.get_redirect_uri(code))
+            Redirect::temporary(&provider.get_redirect_uri(code, client))
         }
         _ => {
             // Check for error parameters from OAuth provider
             if let Some(error) = params.get("error").map(|s| s.as_ref()) {
                 error!("OAuth error from provider: {}", error);
-                return Redirect::temporary(&provider.get_error_uri(error));
+                return Redirect::temporary(&provider.get_error_uri(error, client));
             }
 
             error!("No code provided in OAuth callback for {:?}", provider);
-            Redirect::temporary(&provider.get_error_uri("no_code"))
+            Redirect::temporary(&provider.get_error_uri("no_code", client))
         }
     }
 }
@@ -370,28 +406,31 @@ mod tests {
     // Helper function to create test app
     fn create_test_app() -> Router {
         Router::new()
-            .route("/oauth/:provider", get(handle_oauth_callback))
+            .route("/oauth/:client/:provider", get(handle_oauth_callback))
     }
 
     #[tokio::test]
     async fn test_valid_oauth_providers() {
         let app = create_test_app();
         let providers = vec!["patreon", "twitch", "discord", "reddit"];
+        let clients = vec!["arkavo", "arkavocreator"];
 
-        for provider in providers {
-            let code = "test_auth_code_123";
-            let uri = format!("/oauth/{}?code={}", provider, code);
-            let response = app.clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+        for client in clients {
+            for provider in providers.clone() {
+                let code = "test_auth_code_123";
+                let uri = format!("/oauth/{}/{}?code={}", client, provider, code);
+                let response = app.clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
 
-            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-            let location = response.headers().get("location").unwrap().to_str().unwrap();
-            assert_eq!(
-                location,
-                format!("arkavo://oauth/{}?code=test_auth_code_123", provider)
-            );
+                assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+                let location = response.headers().get("location").unwrap().to_str().unwrap();
+                assert_eq!(
+                    location,
+                    format!("{}://oauth/{}?code=test_auth_code_123", client, provider)
+                );
+            }
         }
     }
 
@@ -401,7 +440,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/oauth/invalid_provider?code=123")
+                    .uri("/oauth/arkavo/invalid_provider?code=123")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -419,7 +458,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/oauth/patreon")
+                    .uri("/oauth/arkavo/patreon")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -437,7 +476,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/oauth/PATREON?code=123")
+                    .uri("/oauth/arkavo/PATREON?code=123")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -455,7 +494,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/oauth/patreon?error=access_denied")
+                    .uri("/oauth/arkavo/patreon?error=access_denied")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -466,7 +505,7 @@ mod tests {
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "arkavo://oauth/patreon?error=access_denied");
     }
-    
+
     #[test]
     fn test_provider_from_str() {
         assert!(matches!(
