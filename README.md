@@ -79,6 +79,11 @@ curl -X POST http://localhost:8080/register/testuser \
 ```
 
 2. Authenticate:
+
+```shell
+curl  http://localhost:8080/authenticate/testuser
+```
+
 ```shell
 curl -X POST http://localhost:8080/authenticate/testuser \
   -H "Content-Type: application/json" \
