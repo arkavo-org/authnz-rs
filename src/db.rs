@@ -67,6 +67,7 @@ impl DynamoDBStore {
     }
 
     pub async fn create_user(&self, username: &str) -> Result<UserCredentials, DynamoDBError> {
+        println!("Creating new user in DynamoDB table: {}", self.credentials_table);
         // Generate DID use did:key method
         let key_pair = generate::<Ed25519KeyPair>(None);
         let did = format!("did:key:{}", &key_pair.public_key_bytes().to_base58());
@@ -116,6 +117,8 @@ impl DynamoDBStore {
         &self,
         username: &str,
     ) -> Result<Option<UserCredentials>, DynamoDBError> {
+        println!("Querying DynamoDB table: {}", self.credentials_table);
+        println!("Querying DynamoDB for user: {}", username);
         let result = self
             .client
             .query()
@@ -132,7 +135,7 @@ impl DynamoDBStore {
                 return Ok(Some(self.item_to_user_credentials(item)?));
             }
         }
-
+        println!("No user found for username: {}", username);
         Ok(None)
     }
 
@@ -141,6 +144,7 @@ impl DynamoDBStore {
         user_id: Uuid,
         credential: Passkey,
     ) -> Result<(), DynamoDBError> {
+        println!("Adding credential to DynamoDB table: {}", self.credentials_table);
         // Get existing credentials
         let result = self
             .client
@@ -186,31 +190,56 @@ impl DynamoDBStore {
         &self,
         item: &std::collections::HashMap<String, AttributeValue>,
     ) -> Result<UserCredentials, DynamoDBError> {
+        println!("Parsing item: {:?}", item);
+        let user_id = Uuid::parse_str(
+            item.get("user_id")
+                .ok_or_else(|| DynamoDBError::Internal("No user_id found".into()))?
+                .as_s()
+                .map_err(|_| DynamoDBError::Internal("Invalid user_id format".into()))?,
+        )?;
+        println!("Parsed user_id: {}", user_id);
+        let username = item
+            .get("username")
+            .ok_or_else(|| DynamoDBError::Internal("No username found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid username format".into()))?
+            .to_string();
+        println!("Parsed username: {}", username);
+        let credentials = if let Some(creds_av) = item.get("credentials") {
+            if let Ok(creds_str) = creds_av.as_s() {
+                // Deserialize from JSON string
+                serde_json::from_str::<Vec<Passkey>>(creds_str)?
+            } else if let Ok(creds_list) = creds_av.as_l() {
+                // Deserialize from DynamoDB list
+                creds_list
+                    .iter()
+                    .map(|av| {
+                        let cred_str = av
+                            .as_s()
+                            .map_err(|_| DynamoDBError::Internal("Invalid credential format".into()))?;
+                        serde_json::from_str::<Passkey>(cred_str)
+                            .map_err(|_| DynamoDBError::Internal("Invalid credential format".into()))
+                    })
+                    .collect::<Result<Vec<Passkey>, DynamoDBError>>()?
+            } else {
+                return Err(DynamoDBError::Internal("Invalid credentials format".into()));
+            }
+        } else {
+            Vec::new()
+        };
+        println!("Parsed credentials: {:?}", credentials);
+        let did = item
+            .get("did")
+            .ok_or_else(|| DynamoDBError::Internal("No DID found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid DID format".into()))?
+            .to_string();
+        println!("Parsed DID: {}", did);
         Ok(UserCredentials {
-            user_id: Uuid::parse_str(
-                item.get("user_id")
-                    .ok_or_else(|| DynamoDBError::Internal("No user_id found".into()))?
-                    .as_s()
-                    .map_err(|_| DynamoDBError::Internal("Invalid user_id format".into()))?,
-            )?,
-            username: item
-                .get("username")
-                .ok_or_else(|| DynamoDBError::Internal("No username found".into()))?
-                .as_s()
-                .map_err(|_| DynamoDBError::Internal("Invalid username format".into()))?
-                .to_string(),
-            credentials: serde_json::from_str(
-                item.get("credentials")
-                    .ok_or_else(|| DynamoDBError::Internal("No credentials found".into()))?
-                    .as_s()
-                    .map_err(|_| DynamoDBError::Internal("Invalid credentials format".into()))?,
-            )?,
-            did: item
-                .get("did")
-                .ok_or_else(|| DynamoDBError::Internal("No DID found".into()))?
-                .as_s()
-                .map_err(|_| DynamoDBError::Internal("Invalid DID format".into()))?
-                .to_string(),
+            user_id,
+            username,
+            credentials,
+            did,
         })
     }
 }

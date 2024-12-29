@@ -67,15 +67,20 @@ cargo test --test '*' --features integration
 ### Manual Testing
 
 1. Register a new user:
+
 ```shell
-curl -X POST https://localhost:8443/register/testuser \
+curl http://localhost:8080/register/testuser
+```
+
+```shell
+curl -X POST http://localhost:8080/register/testuser \
   -H "Content-Type: application/json" \
   -d '{"challenge": "..."}'
 ```
 
 2. Authenticate:
 ```shell
-curl -X POST https://localhost:8443/authenticate/testuser \
+curl -X POST http://localhost:8080/authenticate/testuser \
   -H "Content-Type: application/json" \
   -d '{"challenge": "..."}'
 ```
@@ -114,6 +119,7 @@ openssl ec -in decodekey.pem -text -noout
 1. Create Credentials Table:
 ```shell
 aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
     --table-name credentials \
     --attribute-definitions \
         AttributeName=user_id,AttributeType=S \
