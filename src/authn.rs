@@ -99,7 +99,7 @@ pub async fn finish_register(
         .get(SESSION_REG_STATE_KEY)
         .await?
         .ok_or(CorruptSession)?;
-
+    println!("{}", username);
     session
         .remove_value(SESSION_REG_STATE_KEY)
         .await
@@ -248,6 +248,7 @@ pub async fn finish_authentication(
         .finish_passkey_authentication(&auth, &auth_state)
     {
         Ok(auth_result) => {
+            println!("{:?}", auth_result);
             // Generate JWT token
             let token = generate_jwt(user_unique_id, &app_state)?;
             Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))

@@ -4,6 +4,7 @@ use aws_sdk_dynamodb::Client;
 use base58::ToBase58;
 use did_key::KeyMaterial;
 use did_key::{generate, Ed25519KeyPair};
+use log::error;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -78,7 +79,7 @@ impl DynamoDBStore {
         };
 
         // Store the initial user record
-        self.client
+        if let Err(err) = self.client
             .put_item()
             .table_name(&self.credentials_table)
             .item("user_id", AttributeValue::S(user.user_id.to_string()))
@@ -86,10 +87,14 @@ impl DynamoDBStore {
             .item("credentials", AttributeValue::L(vec![]))
             .item("did", AttributeValue::S(user.did.clone()))
             .send()
-            .await?;
+            .await
+        {
+            error!("Failed to write to credentials table: {:?}", err);
+            return Err(DynamoDBError::SdkError(err.to_string()));
+        }
 
         // Store the DID in the handles table
-        self.client
+        if let Err(err) = self.client
             .put_item()
             .table_name(&self.handles_table)
             .item(
@@ -98,7 +103,11 @@ impl DynamoDBStore {
             )
             .item("did", AttributeValue::S(user.did.clone()))
             .send()
-            .await?;
+            .await
+        {
+            error!("Failed to write to handles table: {:?}", err);
+            return Err(DynamoDBError::SdkError(err.to_string()));
+        }
 
         Ok(user)
     }

@@ -6,9 +6,9 @@ license = "BSD-2"
 rust-version = "1.83.0"
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+opt-level = 2  # Lower optimization level
+lto = false    # Disable LTO
+codegen-units = 16  # Increase parallelism
 
 [dependencies]
 tokio = { version = "1.39.3", features = ["rt", "rt-multi-thread", "macros", "fs"] }

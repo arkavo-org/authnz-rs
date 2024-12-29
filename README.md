@@ -2,7 +2,7 @@
 
 Authentication and Entitlement WebAuthn and Smart Contract
 
-## Getting Started
+## Deployment
 
 ### Environment Variables
 
@@ -22,6 +22,25 @@ export DYNAMODB_CREDENTIALS_TABLE=credentials
 export DYNAMODB_HANDLES_TABLE=dev-handles
 export AWS_REGION=your-region
 ```
+
+### DynamoDB
+
+```shell
+aws dynamodb create-table \
+    --table-name credentials \
+    --attribute-definitions \
+        AttributeName=user_id,AttributeType=S \
+        AttributeName=username,AttributeType=S \
+    --key-schema AttributeName=user_id,KeyType=HASH \
+    --global-secondary-indexes \
+        "[{
+            \"IndexName\": \"username-index\",
+            \"KeySchema\": [{\"AttributeName\":\"username\",\"KeyType\":\"HASH\"}],
+            \"Projection\":{\"ProjectionType\":\"ALL\"}
+        }]" \
+    --billing-mode PAY_PER_REQUEST
+```
+
 
 ## Testing
 
@@ -95,7 +114,6 @@ openssl ec -in decodekey.pem -text -noout
 1. Create Credentials Table:
 ```shell
 aws dynamodb create-table \
-    --endpoint-url http://localhost:8000 \
     --table-name credentials \
     --attribute-definitions \
         AttributeName=user_id,AttributeType=S \
