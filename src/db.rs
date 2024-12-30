@@ -133,7 +133,7 @@ impl DynamoDBStore {
             .table_name(&self.handles_table)
             .item(
                 "handle",
-                AttributeValue::S(format!("{}.arkavo.net", username)),
+                AttributeValue::S(format!("{}.arkavo.social", username)),
             )
             .item("did", AttributeValue::S(user.did.clone()))
             .send()
@@ -220,9 +220,9 @@ impl DynamoDBStore {
         credential: Passkey,
     ) -> Result<(), DynamoDBError> {
         info!(
-            "Adding credential to DynamoDB table: {}",
-            self.credentials_table
-        );
+        "Adding credential to DynamoDB table: {}",
+        self.credentials_table
+    );
 
         // Log the credential being added (safely)
         info!(
@@ -247,76 +247,62 @@ impl DynamoDBStore {
             if let Some(creds_av) = item.get("credentials") {
                 info!("Found existing credentials attribute: {:?}", creds_av);
 
-                if let Ok(creds_str) = creds_av.as_s() {
-                    info!("Parsing existing credentials from string");
-                    if creds_str.is_empty() {
-                        info!("Existing credentials string is empty, starting new list");
-                        Vec::new()
-                    } else {
-                        match serde_json::from_str::<Vec<Passkey>>(creds_str) {
-                            Ok(existing_creds) => {
-                                info!(
-                                    "Successfully parsed {} existing credentials",
-                                    existing_creds.len()
-                                );
-                                // Check for duplicate credential
-                                if existing_creds
-                                    .iter()
-                                    .any(|c| c.cred_id() == credential.cred_id())
-                                {
-                                    error!("Credential ID already exists for user");
-                                    return Err(DynamoDBError::CredentialError(
-                                        "Credential already registered".into(),
-                                    ));
+                if let Ok(creds_list) = creds_av.as_l() {
+                    info!("Found {} existing credentials", creds_list.len());
+                    let mut existing_creds = Vec::new();
+                    for cred_av in creds_list {
+                        if let Ok(cred_str) = cred_av.as_s() {
+                            match serde_json::from_str::<Passkey>(cred_str) {
+                                Ok(cred) => existing_creds.push(cred),
+                                Err(e) => {
+                                    error!("Failed to parse credential JSON: {}", e);
+                                    // Continue with other credentials
                                 }
-                                existing_creds
-                            }
-                            Err(e) => {
-                                error!("Failed to parse existing credentials: {}", e);
-                                return Err(DynamoDBError::SerdeJsonError(e));
                             }
                         }
                     }
+                    existing_creds
                 } else {
                     info!("Creating new credentials list");
                     Vec::new()
                 }
             } else {
-                info!("No existing credentials attribute, creating new list");
+                info!("No existing credentials attribute found");
                 Vec::new()
             }
         } else {
             error!("User {} not found in database", user_id);
-            return Err(DynamoDBError::Internal(format!(
-                "User {} not found",
-                user_id
-            )));
+            return Err(DynamoDBError::Internal(format!("User {} not found", user_id)));
         };
 
-        // Add new credential to the list
+        // Add new credential
         credentials.push(credential);
-        info!(
-            "Added new credential. Total credentials: {}",
-            credentials.len()
-        );
+        info!("Added new credential. Total credentials: {}", credentials.len());
 
-        // Serialize credentials to JSON string
-        let creds_json = match serde_json::to_string(&credentials) {
-            Ok(json) => json,
+        // Convert credentials to a list of AttributeValue::S
+        let cred_list: Vec<AttributeValue> = match credentials
+            .iter()
+            .map(|cred| {
+                serde_json::to_string(cred)
+                    .map(|s| AttributeValue::S(s))
+                    .map_err(DynamoDBError::SerdeJsonError)
+            })
+            .collect::<Result<Vec<_>, _>>() {
+            Ok(list) => list,
             Err(e) => {
                 error!("Failed to serialize credentials: {}", e);
-                return Err(DynamoDBError::SerdeJsonError(e));
+                return Err(e);
             }
         };
 
-        // Update the record with new credentials
+        // Update record with new credentials list
         match self
             .client
             .update_item()
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
             .update_expression("SET credentials = :credentials")
-            .expression_attribute_values(":credentials", AttributeValue::S(creds_json))
+            .expression_attribute_values(":credentials", AttributeValue::L(cred_list))
             .send()
             .await
         {
@@ -325,8 +311,18 @@ impl DynamoDBStore {
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to update credentials in DynamoDB: {}", e);
-                Err(DynamoDBError::from(e))
+                error!("Failed to update credentials: {:?}", e);
+                match e {
+                    SdkError::ServiceError(ref service_error) => {
+                        error!(
+                        "DynamoDB service error: code={:?}, message={:?}",
+                        service_error.err().meta().code(),
+                        service_error.err().meta().message()
+                    );
+                    }
+                    _ => error!("Unknown error type: {:?}", e),
+                }
+                Err(DynamoDBError::SdkError(e.to_string()))
             }
         }
     }
