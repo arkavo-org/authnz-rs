@@ -1,4 +1,8 @@
-use crate::authn::WebauthnError::{CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown, UserHasNoCredentials, UserNotFound};
+use crate::authn::WebauthnError::{
+    CorruptSession, DynamoDBOperationError, InvalidSessionState, MissingToken, TokenCreationError,
+    Unknown, UserHasNoCredentials, UserNotFound,
+};
+use crate::db::DynamoDBError;
 use crate::AppState;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
@@ -20,45 +24,6 @@ use tower_sessions::Session;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
-/*
- * Webauthn RS auth handlers.
- * These files use webauthn to process the data received from each route, and are closely tied to axum
- */
-
-// 2. The first step a client (user) will carry out is requesting a credential to be
-// registered. We need to provide a challenge for this. The work flow will be:
-//
-//          ┌───────────────┐     ┌───────────────┐      ┌───────────────┐
-//          │ Authenticator │     │    Browser    │      │     Site      │
-//          └───────────────┘     └───────────────┘      └───────────────┘
-//                  │                     │                      │
-//                  │                     │     1. Start Reg     │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-//                  │                     │                      │
-//                  │                     │     2. Challenge     │
-//                  │                     │◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
-//                  │                     │                      │
-//                  │  3. Select Token    │                      │
-//             ─ ─ ─│◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                      │
-//  4. Verify │     │                     │                      │
-//                  │  4. Yield PubKey    │                      │
-//            └ ─ ─▶│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶                      │
-//                  │                     │                      │
-//                  │                     │  5. Send Reg Opts    │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│─ ─ ─
-//                  │                     │                      │     │ 5. Verify
-//                  │                     │                      │         PubKey
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │─ ─ ─
-//                  │                     │                      │     │ 6. Persist
-//                  │                     │                      │       Credential
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │
-//                  │                     │                      │
-//
-// In this step, we are responding to the start reg(istration) request, and providing
-// the challenge to the browser.
-
 const SESSION_REG_STATE_KEY: &str = "reg_state";
 
 pub async fn start_register(
@@ -66,164 +31,180 @@ pub async fn start_register(
     session: Session,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    info!("Start register");
-    // We get the username from the URL, but you could get this via form submission or
-    // some other process. In some parts of Webauthn, you could also use this as a "display name"
-    // instead of a username. Generally you should consider that the user *can* and *will* change
-    // their username at any time.
+    info!("Start register for user: {}", username);
 
-    // Since a user's username could change at anytime, we need to bind to a unique id.
-    // We use uuid's for this purpose, and you should generate these randomly. If the
-    // username does exist and is found, we can match back to our unique id. This is
-    // important in authentication, where presented credentials may *only* provide
-    // the unique id, and not the username!
-
-    let user_unique_id = {
-        let users_guard = app_state.accounts.lock().await;
-        users_guard
-            .name_to_id
-            .get(&username)
-            .copied()
-            .unwrap_or_else(Uuid::new_v4)
+    // Add retry logic for the initial user query
+    let mut retry_count = 0;
+    let max_retries = 3;
+    let user = loop {
+        match app_state.db_store.get_user_by_name(&username).await {
+            Ok(Some(existing_user)) => {
+                info!("Found existing user: {}", username);
+                break existing_user;
+            }
+            Ok(None) => {
+                info!("User not found, creating new user: {}", username);
+                match app_state.db_store.create_user(&username).await {
+                    Ok(new_user) => break new_user,
+                    Err(err) => {
+                        error!("Failed to create user {}: {:?}", username, err);
+                        return Err(WebauthnError::UserCreationFailed(err.to_string()));
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Database error for {} (attempt {}): {:?}",
+                    username,
+                    retry_count + 1,
+                    err
+                );
+                if retry_count < max_retries {
+                    retry_count += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * (retry_count as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(WebauthnError::DynamoDBOperationError(err));
+            }
+        }
     };
 
-    // Remove any previous registrations that may have occurred from the session.
-    // assumption no need to wait or check a failure
-    session
-        .remove_value(SESSION_REG_STATE_KEY)
-        .await
-        .expect("auth_state removal failed");
+    // Clean up existing session state
+    if let Err(err) = session.remove_value(SESSION_REG_STATE_KEY).await {
+        error!("Failed to remove old registration state: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
 
-    // If the user has any other credentials, we exclude these here, so they can't be duplicate registered.
-    // It also hints to the browser that only new credentials should be "blinked" for interaction.
-    let exclude_credentials = {
-        let users_guard = app_state.accounts.lock().await;
-        users_guard
-            .keys
-            .get(&user_unique_id)
-            .map(|keys| keys.iter().map(|sk| sk.cred_id().clone()).collect())
+    // Set up WebAuthn registration
+    let exclude_credentials = if !user.credentials.is_empty() {
+        Some(
+            user.credentials
+                .iter()
+                .map(|c| c.cred_id().clone())
+                .collect(),
+        )
+    } else {
+        None
     };
 
-    let res = match app_state.webauthn.start_passkey_registration(
-        user_unique_id,
+    match app_state.webauthn.start_passkey_registration(
+        user.user_id,
         &username,
         &username,
         exclude_credentials,
     ) {
         Ok((ccr, reg_state)) => {
-            // Note that due to the session store in use being a server side memory store, this is
-            // safe to store the reg_state into the session since it is not client controlled and
-            // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
-            session
-                .insert(SESSION_REG_STATE_KEY, (username, user_unique_id, reg_state))
+            if let Err(err) = session
+                .insert(
+                    SESSION_REG_STATE_KEY,
+                    (username.clone(), user.user_id, reg_state),
+                )
                 .await
-                .expect("Failed to insert");
-            info!("Registration Successful!");
-            Json(ccr)
+            {
+                error!("Failed to save registration state: {:?}", err);
+                return Err(WebauthnError::InvalidSessionState(err));
+            }
+            info!("Registration started successfully for: {}", username);
+            Ok(Json(ccr))
         }
-        Err(e) => {
-            error!("start_register -> {:?}", e);
-            return Err(Unknown);
+        Err(err) => {
+            error!("WebAuthn registration failed for {}: {:?}", username, err);
+            Err(WebauthnError::Unknown)
         }
-    };
-    Ok(res)
+    }
 }
-
-// 3. The browser has completed its steps and the user has created a public key
-// on their device. Now we have the registration options sent to us, and we need
-// to verify these and persist them.
 
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_unique_id, reg_state) = match session.get(SESSION_REG_STATE_KEY).await? {
-        Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
-        None => {
-            error!("Failed to get session");
-            return Err(CorruptSession);
-        }
-    };
-    session
-        .remove_value(SESSION_REG_STATE_KEY)
-        .await
-        .expect("auth_state removal failed");
-    let res = match app_state
+    let (username, user_id, reg_state): (String, Uuid, PasskeyRegistration) =
+        session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
+            error!("No registration state found in session");
+            CorruptSession
+        })?;
+
+    info!(
+        "Finishing registration for user: {} ({})",
+        username, user_id
+    );
+
+    // Clean up session immediately to prevent reuse
+    if let Err(e) = session.remove_value(SESSION_REG_STATE_KEY).await {
+        error!("Failed to remove registration state from session: {}", e);
+        return Err(WebauthnError::SessionError(e.to_string()));
+    }
+
+    // Finish WebAuthn registration
+    match app_state
         .webauthn
         .finish_passkey_registration(&registration_credential, &reg_state)
     {
-        Ok(session_key) => {
-            let mut users_guard = app_state.accounts.lock().await;
-            // Store the credential in a database or persist in some other way.
-            users_guard
-                .keys
-                .entry(user_unique_id)
-                .and_modify(|keys| keys.push(session_key.clone()))
-                .or_insert_with(|| vec![session_key.clone()]);
-            users_guard.name_to_id.insert(username, user_unique_id);
-            // Send back JSON response with the registration credential.
-            let credential_id = Base64UrlSafeData::from(session_key.cred_id().to_vec());
+        Ok(passkey) => {
+            info!(
+                "WebAuthn registration successful for user: {}. Adding credential to database...",
+                username
+            );
+
+            // Store the credential in DynamoDB
+            match app_state
+                .db_store
+                .add_credential(user_id, passkey.clone())
+                .await
+            {
+                Ok(_) => {
+                    info!("Successfully stored credential for user: {}", username);
+                }
+                Err(e) => {
+                    error!("Failed to store credential: {}", e);
+                    return Err(WebauthnError::DynamoDBOperationError(e));
+                }
+            }
+
+            // Generate account token
+            let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
             let attestation_entity = AccountToken {
-                user_unique_id,
+                user_unique_id: user_id,
                 credential_id,
-                passkey: session_key,
-                sub: user_unique_id.to_string(),
+                passkey,
+                sub: user_id.to_string(),
                 exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
             };
+
+            // Create envelope
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
+
+            // Generate JWT token
             let header = Header::new(Algorithm::ES256);
-            let token = encode(&header, &attestation_entity, &app_state.encoding_key)
-                .map_err(|err| TokenCreationError(err))?;
-            // println!("token:{}", token);
-            // Set the response header `X-Auth-Token` with the JWT.
+            let token =
+                encode(&header, &attestation_entity, &app_state.encoding_key).map_err(|err| {
+                    error!("Failed to create JWT token: {}", err);
+                    TokenCreationError(err)
+                })?;
+
+            // Create response with token in header
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
                 Ok(header_value) => {
                     response.headers_mut().insert("X-Auth-Token", header_value);
-                    response
+                    Ok(response)
                 }
-                Err(_) => {
-                    return Err(MissingToken)
+                Err(e) => {
+                    error!("Failed to create header value from token: {}", e);
+                    Err(MissingToken)
                 }
             }
         }
         Err(error) => {
-            error!("finish_register -> {:?}", error);
-            StatusCode::BAD_REQUEST.into_response()
+            error!("WebAuthn registration failed for {}: {:?}", username, error);
+            Err(WebauthnError::WebAuthnError(error.to_string()))
         }
-    };
-    Ok(res)
+    }
 }
-
-// 4. Now that our public key has been registered, we can authenticate a user and verify
-// that they are the holder of that security token. The work flow is similar to registration.
-//
-//          ┌───────────────┐     ┌───────────────┐      ┌───────────────┐
-//          │ Authenticator │     │    Browser    │      │     Site      │
-//          └───────────────┘     └───────────────┘      └───────────────┘
-//                  │                     │                      │
-//                  │                     │     1. Start Auth    │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-//                  │                     │                      │
-//                  │                     │     2. Challenge     │
-//                  │                     │◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
-//                  │                     │                      │
-//                  │  3. Select Token    │                      │
-//             ─ ─ ─│◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                      │
-//  4. Verify │     │                     │                      │
-//                  │    4. Yield Sig     │                      │
-//            └ ─ ─▶│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶                      │
-//                  │                     │    5. Send Auth      │
-//                  │                     │        Opts          │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│─ ─ ─
-//                  │                     │                      │     │ 5. Verify
-//                  │                     │                      │          Sig
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │
-//                  │                     │                      │
-//
-// The user indicates the wish to start authentication and we need to provide a challenge.
 
 pub async fn start_authentication(
     Extension(app_state): Extension<AppState>,
@@ -232,72 +213,70 @@ pub async fn start_authentication(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
-    // We get the username from the URL, but you could get this via form submission or
-    // some other process.
 
-    // Remove any previous authentication that may have occurred from the session.
     session
         .remove_value("auth_state")
         .await
         .expect("auth_state removal failed");
 
-    // Get the set of keys that the user possesses
-    let users_guard = app_state.accounts.lock().await;
-    // Fix for Failed to get authentication options: User Not Found
-    // get JWT from header X-Auth_Token, verify JWT, then get and set user_unique_id
-    // Get JWT from header X-Auth-Token
+    // Get user from database or JWT
     let mut token_data: Option<TokenData<AccountToken>> = None;
     if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        // println!("jwt_header {:?}", jwt_header);
         let jwt = jwt_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
-        // Verify JWT
+
         let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
         let mut token_validation = Validation::new(Algorithm::ES256);
         token_validation.validate_nbf = false;
         token_validation.validate_exp = false;
-        token_data = Some(decode::<AccountToken>(jwt, &decoding_key, &token_validation)
-            .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
-        // println!("token_data {:?}", token_data);
-        // println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
+        token_data = Some(
+            decode::<AccountToken>(jwt, &decoding_key, &token_validation).map_err(|err| {
+                WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err))
+            })?,
+        );
     }
-    // Look up their unique id from the username else set from header
-    let user_unique_id_result = users_guard
-        .name_to_id
-        .get(&username)
-        .copied()
-        .or_else(|| token_data.as_ref().map(|td| td.claims.user_unique_id));
-    if user_unique_id_result == None {
-        return Err(UserNotFound);
-    }
-    let user_unique_id = user_unique_id_result.unwrap();
-    // println!("user_unique_id {:?}", user_unique_id);
-    // get passkey from X-Auth-Token
-    let token_passkey = vec![token_data.unwrap().claims.passkey];
-    // println!("token_passkey {:?}", token_passkey);
-    let mut allow_credentials = users_guard
-        .keys
-        .get(&user_unique_id);
-    if allow_credentials == None {
-        allow_credentials = Option::from(&token_passkey)
-    }
-    if allow_credentials == None {
-        return Err(UserHasNoCredentials);
-    }
+
+    // Try to get user from DB first, fallback to token data
+    let user = match app_state
+        .db_store
+        .get_user_by_name(&username)
+        .await
+        .map_err(DynamoDBOperationError)?
+    {
+        Some(user) => user,
+        None => {
+            if let Some(ref token_data) = token_data {
+                // Create temporary user from token data
+                crate::db::UserCredentials {
+                    user_id: token_data.claims.user_unique_id,
+                    username: username.clone(),
+                    credentials: vec![token_data.claims.passkey.clone()],
+                    did: String::new(), // Token doesn't contain DID
+                }
+            } else {
+                return Err(UserNotFound);
+            }
+        }
+    };
+
+    let credentials = if user.credentials.is_empty() {
+        if let Some(token_data) = &token_data {
+            vec![token_data.claims.passkey.clone()]
+        } else {
+            return Err(UserHasNoCredentials);
+        }
+    } else {
+        user.credentials.clone()
+    };
+
     let res = match app_state
         .webauthn
-        .start_passkey_authentication(allow_credentials.unwrap().as_ref())
+        .start_passkey_authentication(&credentials)
     {
         Ok((rcr, auth_state)) => {
-            // Drop the mutex to allow the mut borrows below to proceed
-            drop(users_guard);
-
-            // Note that due to the session store in use being a server side memory store, this is
-            // safe to store the auth_state into the session since it is not client controlled and
-            // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
             session
-                .insert("auth_state", (user_unique_id, auth_state))
+                .insert("auth_state", (user.user_id, auth_state))
                 .await
                 .expect("Failed to insert");
             Json(rcr)
@@ -310,11 +289,6 @@ pub async fn start_authentication(
     Ok(res)
 }
 
-// 5. The browser and user have completed their part of the processing. Only in the
-// case that the webauthn authenticate call returns Ok, is authentication considered
-// a success. If the browser does not complete this call, or *any* error occurs,
-// this is an authentication failure.
-
 pub async fn finish_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -322,59 +296,48 @@ pub async fn finish_authentication(
 ) -> Result<impl IntoResponse, WebauthnError> {
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
         session.get("auth_state").await?.ok_or(CorruptSession)?;
+
     session
         .remove_value("auth_state")
         .await
         .expect("auth_state removal failed");
+
     let res = match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
         Ok(auth_result) => {
-            let mut users_guard = app_state.accounts.lock().await;
-            // Update the credential counter, if possible.
-            // FIXME record on blockchain, then check above for replay attach
-            if let Some(keys) = users_guard.keys.get_mut(&user_unique_id) {
-                keys.iter_mut().for_each(|sk| {
-                    sk.update_credential(&auth_result);
-                });
-            }
+            println!("{:?}", auth_result);
             // Generate JWT token
             let token = generate_jwt(user_unique_id, &app_state)?;
-            // Return JSON response with JWT token
             Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
-            Ok((StatusCode::BAD_REQUEST, Json(AuthResponse { jwt_token: String::new() })))
+            Ok((
+                StatusCode::BAD_REQUEST,
+                Json(AuthResponse {
+                    jwt_token: String::new(),
+                }),
+            ))
         }
     };
     info!("Authentication Successful!");
     res
 }
 
-fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
-    };
-    // println!("claims:{:?}", claims);
-    let header = Header::new(Algorithm::ES256);
-    let token = encode(&header, &claims, &app_state.encoding_key)
-        .map_err(|err| TokenCreationError(err))?;
-    // println!("token:{}", token);
-    Ok(token)
-}
-
+// Existing helper functions and structs remain the same
 #[derive(Serialize)]
 struct AuthResponse {
     jwt_token: String,
 }
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Claims {
     sub: String,
     exp: usize,
 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AccountToken {
     user_unique_id: Uuid,
@@ -401,13 +364,22 @@ impl AttestationEnvelope {
             signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
         }
     }
+
     fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
         let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
         let message = Sha256::digest(&payload_bytes);
         let signature = Signature::from_der(self.signature.as_ref()).unwrap();
-
         verifying_key.verify(&message, &signature).is_ok()
     }
+}
+
+fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+    };
+    let header = Header::new(Algorithm::ES256);
+    encode(&header, &claims, &app_state.encoding_key).map_err(TokenCreationError)
 }
 
 #[derive(Error, Debug)]
@@ -430,7 +402,18 @@ pub enum WebauthnError {
     InvalidToken,
     #[error("Token decoding failed: {0}")]
     TokenDecodingError(String),
+    #[error("DynamoDB operation failed: {0}")]
+    DynamoDBOperationError(#[from] crate::db::DynamoDBError),
+    #[error("Invalid username format")]
+    InvalidUsername,
+    #[error("Failed to create user: {0}")]
+    UserCreationFailed(String),
+    #[error("WebAuthn operation failed: {0}")]
+    WebAuthnError(String),
+    #[error("Session operation failed: {0}")]
+    SessionError(String),
 }
+
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let body = match self {
@@ -442,9 +425,20 @@ impl IntoResponse for WebauthnError {
             TokenCreationError(err) => format!("Token creation failed: {}", err),
             MissingToken => "Missing token".to_string(),
             WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err)
+            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
+            WebauthnError::DynamoDBOperationError(err) => match err {
+                DynamoDBError::TableNotExists(table) => {
+                    format!("Service setup incomplete: {} table not configured", table)
+                }
+                _ => format!("Database operation failed: {}", err),
+            },
+            WebauthnError::InvalidUsername => "Invalid username format".to_string(),
+            WebauthnError::UserCreationFailed(reason) => {
+                format!("Failed to create user: {}", reason)
+            }
+            WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
+            WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
         };
-        // Often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }

@@ -1,14 +1,14 @@
 [package]
 name = "authnz-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "BSD-2"
-rust-version = "1.80.0"
+rust-version = "1.83.0"
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+opt-level = 2  # Lower optimization level
+lto = false    # Disable LTO
+codegen-units = 16  # Increase parallelism
 
 [dependencies]
 tokio = { version = "1.39.3", features = ["rt", "rt-multi-thread", "macros", "fs"] }
@@ -31,3 +31,7 @@ jsonwebtoken = { version = "9.3.0", features = ["use_pem"] }
 chrono = "0.4.38"
 form_urlencoded = "1.2.1"
 http = "1.1.0"
+aws-config = "1.5.12"
+aws-sdk-dynamodb = "1.57.0"
+did-key = "0.2.1"
+base58 = "0.2.0"
