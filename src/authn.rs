@@ -122,28 +122,50 @@ pub async fn finish_register(
     session: Session,
     Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_id, reg_state): (String, Uuid, PasskeyRegistration) = session
-        .get(SESSION_REG_STATE_KEY)
-        .await?
-        .ok_or(CorruptSession)?;
-    println!("{}", username);
-    session
-        .remove_value(SESSION_REG_STATE_KEY)
-        .await
-        .expect("auth_state removal failed");
+    let (username, user_id, reg_state): (String, Uuid, PasskeyRegistration) =
+        session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
+            error!("No registration state found in session");
+            CorruptSession
+        })?;
 
+    info!(
+        "Finishing registration for user: {} ({})",
+        username, user_id
+    );
+
+    // Clean up session immediately to prevent reuse
+    if let Err(e) = session.remove_value(SESSION_REG_STATE_KEY).await {
+        error!("Failed to remove registration state from session: {}", e);
+        return Err(WebauthnError::SessionError(e.to_string()));
+    }
+
+    // Finish WebAuthn registration
     match app_state
         .webauthn
         .finish_passkey_registration(&registration_credential, &reg_state)
     {
         Ok(passkey) => {
+            info!(
+                "WebAuthn registration successful for user: {}. Adding credential to database...",
+                username
+            );
+
             // Store the credential in DynamoDB
-            app_state
+            match app_state
                 .db_store
                 .add_credential(user_id, passkey.clone())
                 .await
-                .map_err(DynamoDBOperationError)?;
+            {
+                Ok(_) => {
+                    info!("Successfully stored credential for user: {}", username);
+                }
+                Err(e) => {
+                    error!("Failed to store credential: {}", e);
+                    return Err(WebauthnError::DynamoDBOperationError(e));
+                }
+            }
 
+            // Generate account token
             let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
             let attestation_entity = AccountToken {
                 user_unique_id: user_id,
@@ -153,23 +175,33 @@ pub async fn finish_register(
                 exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
             };
 
+            // Create envelope
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
-            let header = Header::new(Algorithm::ES256);
-            let token = encode(&header, &attestation_entity, &app_state.encoding_key)
-                .map_err(|err| TokenCreationError(err))?;
 
+            // Generate JWT token
+            let header = Header::new(Algorithm::ES256);
+            let token =
+                encode(&header, &attestation_entity, &app_state.encoding_key).map_err(|err| {
+                    error!("Failed to create JWT token: {}", err);
+                    TokenCreationError(err)
+                })?;
+
+            // Create response with token in header
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
                 Ok(header_value) => {
                     response.headers_mut().insert("X-Auth-Token", header_value);
                     Ok(response)
                 }
-                Err(_) => Err(MissingToken),
+                Err(e) => {
+                    error!("Failed to create header value from token: {}", e);
+                    Err(MissingToken)
+                }
             }
         }
         Err(error) => {
-            error!("finish_register -> {:?}", error);
-            Ok(StatusCode::BAD_REQUEST.into_response())
+            error!("WebAuthn registration failed for {}: {:?}", username, error);
+            Err(WebauthnError::WebAuthnError(error.to_string()))
         }
     }
 }

@@ -37,6 +37,9 @@ pub enum DynamoDBError {
 
     #[error("Table does not exist: {0}")]
     TableNotExists(String),
+
+    #[error("User not found: {0}")]
+    CredentialError(String),
 }
 
 impl<T> From<SdkError<T>> for DynamoDBError
@@ -216,11 +219,19 @@ impl DynamoDBStore {
         user_id: Uuid,
         credential: Passkey,
     ) -> Result<(), DynamoDBError> {
-        println!(
+        info!(
             "Adding credential to DynamoDB table: {}",
             self.credentials_table
         );
-        // Get existing credentials
+
+        // Log the credential being added (safely)
+        info!(
+            "Adding credential with ID: {:?} for user: {}",
+            credential.cred_id(),
+            user_id
+        );
+
+        // First verify the user exists
         let result = self
             .client
             .get_item()
@@ -230,35 +241,94 @@ impl DynamoDBStore {
             .await?;
 
         let mut credentials = if let Some(item) = result.item {
-            let creds_av = item
-                .get("credentials")
-                .ok_or_else(|| DynamoDBError::Internal("No credentials found".into()))?;
-            serde_json::from_str::<Vec<Passkey>>(
-                creds_av
-                    .as_s()
-                    .map_err(|_| DynamoDBError::Internal("Invalid credentials format".into()))?,
-            )?
+            info!("Found existing user record");
+
+            // Check if credentials field exists and get its current value
+            if let Some(creds_av) = item.get("credentials") {
+                info!("Found existing credentials attribute: {:?}", creds_av);
+
+                if let Ok(creds_str) = creds_av.as_s() {
+                    info!("Parsing existing credentials from string");
+                    if creds_str.is_empty() {
+                        info!("Existing credentials string is empty, starting new list");
+                        Vec::new()
+                    } else {
+                        match serde_json::from_str::<Vec<Passkey>>(creds_str) {
+                            Ok(existing_creds) => {
+                                info!(
+                                    "Successfully parsed {} existing credentials",
+                                    existing_creds.len()
+                                );
+                                // Check for duplicate credential
+                                if existing_creds
+                                    .iter()
+                                    .any(|c| c.cred_id() == credential.cred_id())
+                                {
+                                    error!("Credential ID already exists for user");
+                                    return Err(DynamoDBError::CredentialError(
+                                        "Credential already registered".into(),
+                                    ));
+                                }
+                                existing_creds
+                            }
+                            Err(e) => {
+                                error!("Failed to parse existing credentials: {}", e);
+                                return Err(DynamoDBError::SerdeJsonError(e));
+                            }
+                        }
+                    }
+                } else {
+                    info!("Creating new credentials list");
+                    Vec::new()
+                }
+            } else {
+                info!("No existing credentials attribute, creating new list");
+                Vec::new()
+            }
         } else {
-            Vec::new()
+            error!("User {} not found in database", user_id);
+            return Err(DynamoDBError::Internal(format!(
+                "User {} not found",
+                user_id
+            )));
         };
 
-        // Add new credential
+        // Add new credential to the list
         credentials.push(credential);
+        info!(
+            "Added new credential. Total credentials: {}",
+            credentials.len()
+        );
 
-        // Update record
-        self.client
+        // Serialize credentials to JSON string
+        let creds_json = match serde_json::to_string(&credentials) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize credentials: {}", e);
+                return Err(DynamoDBError::SerdeJsonError(e));
+            }
+        };
+
+        // Update the record with new credentials
+        match self
+            .client
             .update_item()
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
             .update_expression("SET credentials = :credentials")
-            .expression_attribute_values(
-                ":credentials",
-                AttributeValue::S(serde_json::to_string(&credentials)?),
-            )
+            .expression_attribute_values(":credentials", AttributeValue::S(creds_json))
             .send()
-            .await?;
-
-        Ok(())
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully updated credentials for user {}", user_id);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to update credentials in DynamoDB: {}", e);
+                Err(DynamoDBError::from(e))
+            }
+        }
     }
 
     fn item_to_user_credentials(
