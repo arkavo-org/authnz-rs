@@ -2,6 +2,7 @@ use crate::authn::WebauthnError::{
     CorruptSession, DynamoDBOperationError, InvalidSessionState, MissingToken, TokenCreationError,
     Unknown, UserHasNoCredentials, UserNotFound,
 };
+use crate::db::DynamoDBError;
 use crate::AppState;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
@@ -30,33 +31,54 @@ pub async fn start_register(
     session: Session,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    info!("Start register");
+    info!("Start register for user: {}", username);
 
-    // Get existing user or generate new UUID
-    let user = match app_state
-        .db_store
-        .get_user_by_name(&username)
-        .await
-        .map_err(DynamoDBOperationError)?
-    {
-        Some(existing_user) => existing_user,
-        None => {
-            // Create new user if they don't exist
-            app_state
-                .db_store
-                .create_user(&username)
-                .await
-                .map_err(DynamoDBOperationError)?
+    // Add retry logic for the initial user query
+    let mut retry_count = 0;
+    let max_retries = 3;
+    let user = loop {
+        match app_state.db_store.get_user_by_name(&username).await {
+            Ok(Some(existing_user)) => {
+                info!("Found existing user: {}", username);
+                break existing_user;
+            }
+            Ok(None) => {
+                info!("User not found, creating new user: {}", username);
+                match app_state.db_store.create_user(&username).await {
+                    Ok(new_user) => break new_user,
+                    Err(err) => {
+                        error!("Failed to create user {}: {:?}", username, err);
+                        return Err(WebauthnError::UserCreationFailed(err.to_string()));
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Database error for {} (attempt {}): {:?}",
+                    username,
+                    retry_count + 1,
+                    err
+                );
+                if retry_count < max_retries {
+                    retry_count += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * (retry_count as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(WebauthnError::DynamoDBOperationError(err));
+            }
         }
     };
 
-    // Remove any previous registrations from session
-    session
-        .remove_value(SESSION_REG_STATE_KEY)
-        .await
-        .expect("auth_state removal failed");
+    // Clean up existing session state
+    if let Err(err) = session.remove_value(SESSION_REG_STATE_KEY).await {
+        error!("Failed to remove old registration state: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
 
-    // Get existing credentials to exclude
+    // Set up WebAuthn registration
     let exclude_credentials = if !user.credentials.is_empty() {
         Some(
             user.credentials
@@ -68,26 +90,31 @@ pub async fn start_register(
         None
     };
 
-    let res = match app_state.webauthn.start_passkey_registration(
+    match app_state.webauthn.start_passkey_registration(
         user.user_id,
         &username,
         &username,
         exclude_credentials,
     ) {
         Ok((ccr, reg_state)) => {
-            session
-                .insert(SESSION_REG_STATE_KEY, (username, user.user_id, reg_state))
+            if let Err(err) = session
+                .insert(
+                    SESSION_REG_STATE_KEY,
+                    (username.clone(), user.user_id, reg_state),
+                )
                 .await
-                .expect("Failed to insert");
-            info!("Registration Started Successfully!");
-            Json(ccr)
+            {
+                error!("Failed to save registration state: {:?}", err);
+                return Err(WebauthnError::InvalidSessionState(err));
+            }
+            info!("Registration started successfully for: {}", username);
+            Ok(Json(ccr))
         }
-        Err(e) => {
-            error!("start_register -> {:?}", e);
-            return Err(Unknown);
+        Err(err) => {
+            error!("WebAuthn registration failed for {}: {:?}", username, err);
+            Err(WebauthnError::Unknown)
         }
-    };
-    Ok(res)
+    }
 }
 
 pub async fn finish_register(
@@ -345,6 +372,14 @@ pub enum WebauthnError {
     TokenDecodingError(String),
     #[error("DynamoDB operation failed: {0}")]
     DynamoDBOperationError(#[from] crate::db::DynamoDBError),
+    #[error("Invalid username format")]
+    InvalidUsername,
+    #[error("Failed to create user: {0}")]
+    UserCreationFailed(String),
+    #[error("WebAuthn operation failed: {0}")]
+    WebAuthnError(String),
+    #[error("Session operation failed: {0}")]
+    SessionError(String),
 }
 
 impl IntoResponse for WebauthnError {
@@ -359,9 +394,18 @@ impl IntoResponse for WebauthnError {
             MissingToken => "Missing token".to_string(),
             WebauthnError::InvalidToken => "Invalid token".to_string(),
             WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
-            WebauthnError::DynamoDBOperationError(err) => {
-                format!("Database operation failed: {}", err)
+            WebauthnError::DynamoDBOperationError(err) => match err {
+                DynamoDBError::TableNotExists(table) => {
+                    format!("Service setup incomplete: {} table not configured", table)
+                }
+                _ => format!("Database operation failed: {}", err),
+            },
+            WebauthnError::InvalidUsername => "Invalid username format".to_string(),
+            WebauthnError::UserCreationFailed(reason) => {
+                format!("Failed to create user: {}", reason)
             }
+            WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
+            WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
         };
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }

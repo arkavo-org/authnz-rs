@@ -4,7 +4,7 @@ use aws_sdk_dynamodb::Client;
 use base58::ToBase58;
 use did_key::KeyMaterial;
 use did_key::{generate, Ed25519KeyPair};
-use log::error;
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -34,6 +34,9 @@ pub enum DynamoDBError {
 
     #[error("Amazon SdkError: {0}")]
     SdkError(String),
+
+    #[error("Table does not exist: {0}")]
+    TableNotExists(String),
 }
 
 impl<T> From<SdkError<T>> for DynamoDBError
@@ -67,20 +70,31 @@ impl DynamoDBStore {
     }
 
     pub async fn create_user(&self, username: &str) -> Result<UserCredentials, DynamoDBError> {
-        println!("Creating new user in DynamoDB table: {}", self.credentials_table);
-        // Generate DID use did:key method
+        info!(
+            "Creating new user in DynamoDB. Table: {}, Username: {}",
+            self.credentials_table, username
+        );
+
+        // Validate inputs
+        if username.is_empty() {
+            return Err(DynamoDBError::Internal("Username cannot be empty".into()));
+        }
+
+        // Generate DID
         let key_pair = generate::<Ed25519KeyPair>(None);
         let did = format!("did:key:{}", &key_pair.public_key_bytes().to_base58());
+        info!("Generated DID: {}", did);
 
         let user = UserCredentials {
             user_id: Uuid::new_v4(),
             username: username.to_string(),
             credentials: Vec::new(),
-            did,
+            did: did.clone(),
         };
 
-        // Store the initial user record
-        if let Err(err) = self.client
+        // Try to create user record first
+        match self
+            .client
             .put_item()
             .table_name(&self.credentials_table)
             .item("user_id", AttributeValue::S(user.user_id.to_string()))
@@ -90,12 +104,28 @@ impl DynamoDBStore {
             .send()
             .await
         {
-            error!("Failed to write to credentials table: {:?}", err);
-            return Err(DynamoDBError::SdkError(err.to_string()));
+            Ok(_) => {
+                info!("Created user record in credentials table");
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!("Credentials table does not exist");
+                        return Err(DynamoDBError::TableNotExists("credentials".to_string()));
+                    }
+                    error!("Failed to write to credentials table: {:?}", err);
+                    return Err(DynamoDBError::SdkError(err.to_string()));
+                }
+                _ => {
+                    error!("Unknown error writing to credentials table: {:?}", err);
+                    return Err(DynamoDBError::SdkError(err.to_string()));
+                }
+            },
         }
 
-        // Store the DID in the handles table
-        if let Err(err) = self.client
+        // Now try to create handle record - if it fails due to missing table, return success anyway
+        match self
+            .client
             .put_item()
             .table_name(&self.handles_table)
             .item(
@@ -106,8 +136,27 @@ impl DynamoDBStore {
             .send()
             .await
         {
-            error!("Failed to write to handles table: {:?}", err);
-            return Err(DynamoDBError::SdkError(err.to_string()));
+            Ok(_) => {
+                info!("Created handle record");
+            }
+            Err(err) => {
+                match err {
+                    SdkError::ServiceError(ref service_error) => {
+                        if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                            // If handles table doesn't exist, log warning but don't fail the registration
+                            warn!("Handles table does not exist - handle will need to be created later");
+                        } else {
+                            error!("Failed to write to handles table: {:?}", err);
+                            // TODO: Should attempt to rollback credentials entry
+                            return Err(DynamoDBError::SdkError(err.to_string()));
+                        }
+                    }
+                    _ => {
+                        error!("Unknown error writing to handles table: {:?}", err);
+                        return Err(DynamoDBError::SdkError(err.to_string()));
+                    }
+                }
+            }
         }
 
         Ok(user)
@@ -117,9 +166,12 @@ impl DynamoDBStore {
         &self,
         username: &str,
     ) -> Result<Option<UserCredentials>, DynamoDBError> {
-        println!("Querying DynamoDB table: {}", self.credentials_table);
-        println!("Querying DynamoDB for user: {}", username);
-        let result = self
+        info!(
+            "Querying for user. Table: {}, Username: {}",
+            self.credentials_table, username
+        );
+
+        let result = match self
             .client
             .query()
             .table_name(&self.credentials_table)
@@ -128,15 +180,35 @@ impl DynamoDBStore {
             .expression_attribute_names("#username", "username")
             .expression_attribute_values(":username", AttributeValue::S(username.to_string()))
             .send()
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to query user {}: {:?}", username, err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
 
         if let Some(items) = result.items {
             if let Some(item) = items.first() {
-                return Ok(Some(self.item_to_user_credentials(item)?));
+                match self.item_to_user_credentials(item) {
+                    Ok(user) => {
+                        info!("Found user: {}", username);
+                        Ok(Some(user))
+                    }
+                    Err(err) => {
+                        error!("Failed to parse user data for {}: {:?}", username, err);
+                        Err(err)
+                    }
+                }
+            } else {
+                info!("No user found: {}", username);
+                Ok(None)
             }
+        } else {
+            info!("No items returned for username: {}", username);
+            Ok(None)
         }
-        println!("No user found for username: {}", username);
-        Ok(None)
     }
 
     pub async fn add_credential(
@@ -144,7 +216,10 @@ impl DynamoDBStore {
         user_id: Uuid,
         credential: Passkey,
     ) -> Result<(), DynamoDBError> {
-        println!("Adding credential to DynamoDB table: {}", self.credentials_table);
+        println!(
+            "Adding credential to DynamoDB table: {}",
+            self.credentials_table
+        );
         // Get existing credentials
         let result = self
             .client
@@ -214,11 +289,12 @@ impl DynamoDBStore {
                 creds_list
                     .iter()
                     .map(|av| {
-                        let cred_str = av
-                            .as_s()
-                            .map_err(|_| DynamoDBError::Internal("Invalid credential format".into()))?;
-                        serde_json::from_str::<Passkey>(cred_str)
-                            .map_err(|_| DynamoDBError::Internal("Invalid credential format".into()))
+                        let cred_str = av.as_s().map_err(|_| {
+                            DynamoDBError::Internal("Invalid credential format".into())
+                        })?;
+                        serde_json::from_str::<Passkey>(cred_str).map_err(|_| {
+                            DynamoDBError::Internal("Invalid credential format".into())
+                        })
                     })
                     .collect::<Result<Vec<Passkey>, DynamoDBError>>()?
             } else {
