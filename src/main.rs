@@ -16,7 +16,7 @@ use http::Uri;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_sessions::cookie::time::Duration;
 use tower_sessions::cookie::SameSite;
@@ -24,33 +24,37 @@ use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
+use crate::db::DynamoDBStore;
 
 mod authn;
+mod db;
 
 #[derive(Clone)]
 pub struct AppState {
     pub webauthn: Arc<Webauthn>,
-    pub accounts: Arc<Mutex<AccountData>>,
+    pub db_store: Arc<DynamoDBStore>,
     pub signing_key: Arc<SigningKey<NistP256>>,
     pub encoding_key: Arc<EncodingKey>,
     pub decoding_key: Arc<DecodingKey>,
 }
 
-pub struct AccountData {
-    pub name_to_id: HashMap<String, Uuid>,
-    pub keys: HashMap<Uuid, Vec<Passkey>>,
-}
-
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+
     // Load configuration
-    let settings = load_config().unwrap();
+    let settings = load_config()?;
+
     // Load and validate EC keys
-    let (signing_key, encoding_key, decoding_key) = load_ec_keys(&settings.sign_key_path, &settings.encoding_key_path, &settings.decoding_key_path)
-        .expect("Failed to load keys");
+    let (signing_key, encoding_key, decoding_key) = load_ec_keys(
+        &settings.sign_key_path,
+        &settings.encoding_key_path,
+        &settings.decoding_key_path,
+    )?;
+
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await;
+
     // Set up TLS if not disabled
     let tls_config = if settings.tls_enabled {
         Some(
@@ -58,29 +62,37 @@ async fn main() {
                 PathBuf::from(settings.tls_cert_path),
                 PathBuf::from(settings.tls_key_path),
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
         )
     } else {
         None
     };
+
     // Create the Webauthn instance
-    let rp_id = "webauthn.arkavo.net";
-    let rp_origin = Url::parse("https://webauthn.arkavo.net").expect("Invalid URL");
+    let rp_id = "arkavo.net";
+    let rp_origin = Url::parse("https://arkavo.net").expect("Invalid URL");
     let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
     let builder = builder.rp_name("Arkavo");
     let webauthn = Arc::new(builder.build().expect("Invalid configuration"));
+
+    // Initialize DynamoDB store
+    let db_store = DynamoDBStore::new(
+        env::var("DYNAMODB_CREDENTIALS_TABLE").unwrap_or_else(|_| "credentials".to_string()),
+        env::var("DYNAMODB_HANDLES_TABLE").unwrap_or_else(|_| "handles".to_string()),
+    )
+    .await
+    .expect("Failed to initialize DynamoDB store");
+
     // Create the app state
     let app_state = AppState {
         webauthn,
-        accounts: Arc::new(Mutex::new(AccountData {
-            name_to_id: HashMap::new(),
-            keys: HashMap::new(),
-        })),
+        db_store: Arc::new(db_store),
         signing_key: Arc::new(signing_key),
         encoding_key: Arc::new(encoding_key),
         decoding_key: Arc::new(decoding_key),
     };
+
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
         SessionManagerLayer::new(session_store)
@@ -89,7 +101,8 @@ async fn main() {
             .with_secure(settings.tls_enabled)
             .with_expiry(Expiry::OnInactivity(Duration::seconds(600))),
     );
-    // build our application with a route
+
+    // build our application with routes
     let app = Router::<()>::new()
         .route(
             "/.well-known/apple-app-site-association",
@@ -104,21 +117,24 @@ async fn main() {
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
         .fallback(handler_404);
-    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", settings.port)).unwrap();
+
+    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", settings.port))?;
     println!("Listening on: 0.0.0.0:{}", settings.port);
+
     if let Some(tls_config) = tls_config {
         axum_server::from_tcp_rustls(listener, tls_config)
             .serve(app.into_make_service())
-            .await
-            .unwrap();
+            .await?;
     } else {
         axum_server::from_tcp(listener)
             .serve(app.into_make_service())
-            .await
-            .unwrap();
+            .await?;
     }
+
+    Ok(())
 }
 
+// Rest of the code (helper functions, handler_404, etc.) remains the same
 async fn handler_404() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -138,6 +154,7 @@ struct ServerSettings {
     _enable_timing_logs: bool,
 }
 
+// Helper functions remain the same
 fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     let current_dir = env::current_dir()?;
 
@@ -170,20 +187,24 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     })
 }
 
-fn load_ec_keys(sign_key_path: &str, encoding_key_path: &str, decoding_key_path: &str) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
+fn load_ec_keys(
+    sign_key_path: &str,
+    encoding_key_path: &str,
+    decoding_key_path: &str,
+) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
 
     debug!("Loading EC encoding key from: {}", encoding_key_path);
-    let encoding_key = EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?)
-        .map_err(|e| {
+    let encoding_key =
+        EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?).map_err(|e| {
             error!("Failed to create EncodingKey: {:?}", e);
             LoadKeysError::InvalidKeyFormat
         })?;
 
     debug!("Attempting to create DecodingKey from PEM contents");
-    let decoding_key = DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?)
-        .map_err(|e| {
+    let decoding_key =
+        DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?).map_err(|e| {
             error!("Failed to create DecodingKey: {:?}", e);
             LoadKeysError::InvalidKeyFormat
         })?;
@@ -206,11 +227,10 @@ fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn st
     }
 
     debug!("Attempting to create SigningKey from PEM contents");
-    let secret_key = SecretKey::from_sec1_der(pem.contents())
-        .map_err(|e| {
-            error!("Failed to parse EC PRIVATE KEY: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
+    let secret_key = SecretKey::from_sec1_der(pem.contents()).map_err(|e| {
+        error!("Failed to parse EC PRIVATE KEY: {:?}", e);
+        LoadKeysError::InvalidKeyFormat
+    })?;
     Ok(SigningKey::from(secret_key))
 }
 
@@ -244,7 +264,7 @@ impl FromStr for OAuthClient {
         match sanitized.as_str() {
             "arkavo" => Ok(OAuthClient::Arkavo),
             "arkavocreator" => Ok(OAuthClient::ArkavoCreator),
-            _ => Err(format!("Unknown OAuth client: {}", s))
+            _ => Err(format!("Unknown OAuth client: {}", s)),
         }
     }
 }
@@ -296,7 +316,8 @@ fn sanitize_code(code: &str) -> String {
 // Sanitize error messages
 fn sanitize_error(error: &str) -> String {
     // Only allow alphanumeric characters and underscores in error messages
-    error.chars()
+    error
+        .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .take(100) // Reasonable length limit for error messages
         .collect()
@@ -313,11 +334,21 @@ impl OAuthProvider {
     }
 
     fn get_redirect_uri(&self, code: &str, client: OAuthClient) -> String {
-        format!("{}://oauth/{}?code={}", client.as_scheme(), self.as_str(), sanitize_code(code))
+        format!(
+            "{}://oauth/{}?code={}",
+            client.as_scheme(),
+            self.as_str(),
+            sanitize_code(code)
+        )
     }
 
     fn get_error_uri(&self, error: &str, client: OAuthClient) -> String {
-        format!("{}://oauth/{}?error={}", client.as_scheme(), self.as_str(), sanitize_error(error))
+        format!(
+            "{}://oauth/{}?error={}",
+            client.as_scheme(),
+            self.as_str(),
+            sanitize_error(error)
+        )
     }
 }
 
@@ -325,7 +356,11 @@ async fn handle_oauth_callback(
     uri: Uri,
     axum::extract::Path((client, provider)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    debug!("Received OAuth callback for client: {} and provider: {}", client.trim(), provider.trim());
+    debug!(
+        "Received OAuth callback for client: {} and provider: {}",
+        client.trim(),
+        provider.trim()
+    );
 
     // Validate and parse the client first
     let client = match OAuthClient::from_str(&client) {
@@ -341,14 +376,16 @@ async fn handle_oauth_callback(
         Ok(provider) => provider,
         Err(e) => {
             error!("Invalid OAuth provider: {}", e);
-            return Redirect::temporary(&format!("{}://oauth/error?error=invalid_provider", client.as_scheme()));
+            return Redirect::temporary(&format!(
+                "{}://oauth/error?error=invalid_provider",
+                client.as_scheme()
+            ));
         }
     };
 
     // Parse and validate query parameters
     let query = uri.query().unwrap_or_default();
-    let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes())
-        .collect();
+    let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
 
     // Validate state parameter if provider requires it
     if let Some(state) = params.get("state") {
@@ -384,7 +421,9 @@ fn validate_oauth_state(state: &str) -> bool {
         return false;
     }
 
-    state.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    state
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -405,8 +444,7 @@ mod tests {
 
     // Helper function to create test app
     fn create_test_app() -> Router {
-        Router::new()
-            .route("/oauth/:client/:provider", get(handle_oauth_callback))
+        Router::new().route("/oauth/:client/:provider", get(handle_oauth_callback))
     }
 
     #[tokio::test]
@@ -419,13 +457,19 @@ mod tests {
             for provider in providers.clone() {
                 let code = "test_auth_code_123";
                 let uri = format!("/oauth/{}/{}?code={}", client, provider, code);
-                let response = app.clone()
+                let response = app
+                    .clone()
                     .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                     .await
                     .unwrap();
 
                 assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-                let location = response.headers().get("location").unwrap().to_str().unwrap();
+                let location = response
+                    .headers()
+                    .get("location")
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
                 assert_eq!(
                     location,
                     format!("{}://oauth/{}?code=test_auth_code_123", client, provider)
@@ -448,7 +492,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "arkavo://oauth/error?error=invalid_provider");
     }
 
@@ -466,7 +515,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "arkavo://oauth/patreon?error=no_code");
     }
 
@@ -484,7 +538,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "arkavo://oauth/patreon?code=123");
     }
 
@@ -502,7 +561,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "arkavo://oauth/patreon?error=access_denied");
     }
 
