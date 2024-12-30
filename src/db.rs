@@ -1,9 +1,6 @@
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
-use base58::ToBase58;
-use did_key::KeyMaterial;
-use did_key::{generate, Ed25519KeyPair};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,6 +37,9 @@ pub enum DynamoDBError {
 
     #[error("User not found: {0}")]
     CredentialError(String),
+
+    #[error("Invalid DID format: {0}")]
+    InvalidDID(String),
 }
 
 impl<T> From<SdkError<T>> for DynamoDBError
@@ -72,10 +72,14 @@ impl DynamoDBStore {
         })
     }
 
-    pub async fn create_user(&self, username: &str) -> Result<UserCredentials, DynamoDBError> {
+    pub async fn create_user(
+        &self,
+        username: &str,
+        did: &str,
+    ) -> Result<UserCredentials, DynamoDBError> {
         info!(
-            "Creating new user in DynamoDB. Table: {}, Username: {}",
-            self.credentials_table, username
+            "Creating new user in DynamoDB. Table: {}, Username: {}, DID: {}",
+            self.credentials_table, username, did
         );
 
         // Validate inputs
@@ -83,16 +87,17 @@ impl DynamoDBStore {
             return Err(DynamoDBError::Internal("Username cannot be empty".into()));
         }
 
-        // Generate DID
-        let key_pair = generate::<Ed25519KeyPair>(None);
-        let did = format!("did:key:{}", &key_pair.public_key_bytes().to_base58());
-        info!("Generated DID: {}", did);
+        if !did.starts_with("did:key:") {
+            return Err(DynamoDBError::InvalidDID(
+                "DID must start with 'did:key:'".to_string(),
+            ));
+        }
 
         let user = UserCredentials {
             user_id: Uuid::new_v4(),
             username: username.to_string(),
             credentials: Vec::new(),
-            did: did.clone(),
+            did: did.to_string(),
         };
 
         // Try to create user record first
@@ -220,9 +225,9 @@ impl DynamoDBStore {
         credential: Passkey,
     ) -> Result<(), DynamoDBError> {
         info!(
-        "Adding credential to DynamoDB table: {}",
-        self.credentials_table
-    );
+            "Adding credential to DynamoDB table: {}",
+            self.credentials_table
+        );
 
         // Log the credential being added (safely)
         info!(
@@ -272,12 +277,18 @@ impl DynamoDBStore {
             }
         } else {
             error!("User {} not found in database", user_id);
-            return Err(DynamoDBError::Internal(format!("User {} not found", user_id)));
+            return Err(DynamoDBError::Internal(format!(
+                "User {} not found",
+                user_id
+            )));
         };
 
         // Add new credential
         credentials.push(credential);
-        info!("Added new credential. Total credentials: {}", credentials.len());
+        info!(
+            "Added new credential. Total credentials: {}",
+            credentials.len()
+        );
 
         // Convert credentials to a list of AttributeValue::S
         let cred_list: Vec<AttributeValue> = match credentials
@@ -287,7 +298,8 @@ impl DynamoDBStore {
                     .map(|s| AttributeValue::S(s))
                     .map_err(DynamoDBError::SerdeJsonError)
             })
-            .collect::<Result<Vec<_>, _>>() {
+            .collect::<Result<Vec<_>, _>>()
+        {
             Ok(list) => list,
             Err(e) => {
                 error!("Failed to serialize credentials: {}", e);
@@ -315,10 +327,10 @@ impl DynamoDBStore {
                 match e {
                     SdkError::ServiceError(ref service_error) => {
                         error!(
-                        "DynamoDB service error: code={:?}, message={:?}",
-                        service_error.err().meta().code(),
-                        service_error.err().meta().message()
-                    );
+                            "DynamoDB service error: code={:?}, message={:?}",
+                            service_error.err().meta().code(),
+                            service_error.err().meta().message()
+                        );
                     }
                     _ => error!("Unknown error type: {:?}", e),
                 }

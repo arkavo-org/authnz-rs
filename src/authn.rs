@@ -4,6 +4,7 @@ use crate::authn::WebauthnError::{
 };
 use crate::db::DynamoDBError;
 use crate::AppState;
+use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
 use axum::{
@@ -26,12 +27,30 @@ use webauthn_rs::prelude::*;
 
 const SESSION_REG_STATE_KEY: &str = "reg_state";
 
+#[derive(Deserialize)]
+pub struct RegisterParams {
+    pub handle: String,
+    pub did: String,
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
+    Query(params): Query<RegisterParams>, // Add query params
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start register for user: {}", username);
+
+    // Validate DID format
+    if !params.did.starts_with("did:key:") {
+        return Err(WebauthnError::InvalidDID(
+            "DID must start with 'did:key:'".to_string(),
+        ));
+    }
+    // Validate username starts with handle
+    if !params.handle.starts_with(&username) {
+        return Err(WebauthnError::InvalidHandle);
+    }
 
     // Add retry logic for the initial user query
     let mut retry_count = 0;
@@ -44,7 +63,7 @@ pub async fn start_register(
             }
             Ok(None) => {
                 info!("User not found, creating new user: {}", username);
-                match app_state.db_store.create_user(&username).await {
+                match app_state.db_store.create_user(&username, &params.did).await {
                     Ok(new_user) => break new_user,
                     Err(err) => {
                         error!("Failed to create user {}: {:?}", username, err);
@@ -405,13 +424,15 @@ pub enum WebauthnError {
     #[error("DynamoDB operation failed: {0}")]
     DynamoDBOperationError(#[from] crate::db::DynamoDBError),
     #[error("Invalid username format")]
-    InvalidUsername,
+    InvalidHandle,
     #[error("Failed to create user: {0}")]
     UserCreationFailed(String),
     #[error("WebAuthn operation failed: {0}")]
     WebAuthnError(String),
     #[error("Session operation failed: {0}")]
     SessionError(String),
+    #[error("Invalid DID format: {0}")]
+    InvalidDID(String),
 }
 
 impl IntoResponse for WebauthnError {
@@ -432,12 +453,13 @@ impl IntoResponse for WebauthnError {
                 }
                 _ => format!("Database operation failed: {}", err),
             },
-            WebauthnError::InvalidUsername => "Invalid username format".to_string(),
+            WebauthnError::InvalidHandle => "Handle must start with the username".to_string(),
             WebauthnError::UserCreationFailed(reason) => {
                 format!("Failed to create user: {}", reason)
             }
             WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
             WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
+            WebauthnError::InvalidDID(err) => format!("Invalid DID format: {}", err),
         };
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
