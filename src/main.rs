@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
-use http::Uri;
+use http::{header, Uri};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
@@ -247,7 +247,10 @@ async fn serve_apple_app_site_association(
     Extension(apple_app_site_association): Extension<Arc<RwLock<serde_json::Value>>>,
 ) -> impl IntoResponse {
     let json = apple_app_site_association.read().await;
-    axum::Json(json.clone())
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::Json(json.clone())
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
