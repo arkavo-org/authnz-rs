@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create the Webauthn instance
-    let rp_id = "arkavo.net";
-    let rp_origin = Url::parse("https://arkavo.net").expect("Invalid URL");
+    let rp_id = "webauthn.arkavo.net";
+    let rp_origin = Url::parse("https://webauthn.arkavo.net").expect("Invalid URL");
     let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
     let builder = builder.rp_name("Arkavo");
     let webauthn = Arc::new(builder.build().expect("Invalid configuration"));
