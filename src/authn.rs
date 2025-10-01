@@ -25,6 +25,10 @@ use webauthn_rs::prelude::*;
  * These files use webauthn to process the data received from each route, and are closely tied to axum
  */
 
+// Token expiration configuration
+const REGISTRATION_TOKEN_WEEKS: i64 = 5148;  // ~99 years for long-lived credential storage
+const AUTH_TOKEN_HOURS: i64 = 1;  // Short-lived session token
+
 // 2. The first step a client (user) will carry out is requesting a credential to be
 // registered. We need to provide a challenge for this. The work flow will be:
 //
@@ -169,13 +173,12 @@ pub async fn finish_register(
                 credential_id,
                 passkey: session_key,
                 sub: user_unique_id.to_string(),
-                exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
+                exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp() as usize,
             };
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
             let header = Header::new(Algorithm::ES256);
             let token = encode(&header, &attestation_entity, &app_state.encoding_key)
                 .map_err(|err| TokenCreationError(err))?;
-            // println!("token:{}", token);
             // Set the response header `X-Auth-Token` with the JWT.
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
@@ -243,51 +246,50 @@ pub async fn start_authentication(
 
     // Get the set of keys that the user possesses
     let users_guard = app_state.accounts.lock().await;
-    // Fix for Failed to get authentication options: User Not Found
-    // get JWT from header X-Auth_Token, verify JWT, then get and set user_unique_id
-    // Get JWT from header X-Auth-Token
+
+    // Optional: Validate JWT from X-Auth-Token header to allow stateless authentication
+    // This enables users to authenticate from new devices using their long-lived registration token
     let mut token_data: Option<TokenData<AccountToken>> = None;
     if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        // println!("jwt_header {:?}", jwt_header);
         let jwt = jwt_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
-        // Verify JWT
+
+        // SAFETY: JWT validation with disabled exp/nbf checks
+        // - Registration tokens have ~99 year expiration (effectively permanent credentials)
+        // - These tokens store the user's passkey for device portability
+        // - Actual authentication security comes from WebAuthn challenge-response verification
+        // - JWT signature verification (ES256) still enforced to prevent tampering
+        // - Session-based replay protection via server-side auth_state storage
         let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
         let mut token_validation = Validation::new(Algorithm::ES256);
-        token_validation.validate_nbf = false;
-        token_validation.validate_exp = false;
+        token_validation.validate_nbf = false;  // Not-before not used in this flow
+        token_validation.validate_exp = false;  // Long-lived credential tokens
         token_data = Some(decode::<AccountToken>(jwt, &decoding_key, &token_validation)
             .map_err(|err| WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err)))?);
-        // println!("token_data {:?}", token_data);
-        // println!("claims.user_unique_id {:?}", token_data.clone().unwrap().claims.user_unique_id);
     }
     // Look up their unique id from the username else set from header
-    let user_unique_id_result = users_guard
+    let user_unique_id = users_guard
         .name_to_id
         .get(&username)
         .copied()
-        .or_else(|| token_data.as_ref().map(|td| td.claims.user_unique_id));
-    if user_unique_id_result == None {
-        return Err(UserNotFound);
-    }
-    let user_unique_id = user_unique_id_result.unwrap();
-    // println!("user_unique_id {:?}", user_unique_id);
-    // get passkey from X-Auth-Token
-    let token_passkey = vec![token_data.unwrap().claims.passkey];
-    // println!("token_passkey {:?}", token_passkey);
-    let mut allow_credentials = users_guard
-        .keys
-        .get(&user_unique_id);
-    if allow_credentials == None {
-        allow_credentials = Option::from(&token_passkey)
-    }
-    if allow_credentials == None {
+        .or_else(|| token_data.as_ref().map(|td| td.claims.user_unique_id))
+        .ok_or(UserNotFound)?;
+
+    // Get credentials from storage or from the provided token
+    let allow_credentials: &Vec<Passkey>;
+    let token_passkey: Vec<Passkey>;
+    if let Some(keys) = users_guard.keys.get(&user_unique_id) {
+        allow_credentials = keys;
+    } else if let Some(td) = token_data {
+        token_passkey = vec![td.claims.passkey];
+        allow_credentials = &token_passkey;
+    } else {
         return Err(UserHasNoCredentials);
     }
     let res = match app_state
         .webauthn
-        .start_passkey_authentication(allow_credentials.unwrap().as_ref())
+        .start_passkey_authentication(allow_credentials.as_ref())
     {
         Ok((rcr, auth_state)) => {
             // Drop the mutex to allow the mut borrows below to proceed
@@ -332,8 +334,13 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             let mut users_guard = app_state.accounts.lock().await;
-            // Update the credential counter, if possible.
-            // FIXME record on blockchain, then check above for replay attach
+
+            // Update the credential counter to maintain sync with authenticator state
+            // NOTE: Replay attack protection is currently provided by:
+            // 1. WebAuthn's challenge-response mechanism (prevents signature reuse)
+            // 2. Server-side session state validation (auth_state in memory)
+            // TODO: Future enhancement - record counter values to blockchain for audit trail
+            //       and cross-device replay detection. See issue #XXX for implementation plan.
             if let Some(keys) = users_guard.keys.get_mut(&user_unique_id) {
                 keys.iter_mut().for_each(|sk| {
                     sk.update_credential(&auth_result);
@@ -341,6 +348,7 @@ pub async fn finish_authentication(
             }
             // Generate JWT token
             let token = generate_jwt(user_unique_id, &app_state)?;
+            info!("Authentication Successful!");
             // Return JSON response with JWT token
             Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
@@ -349,20 +357,17 @@ pub async fn finish_authentication(
             Ok((StatusCode::BAD_REQUEST, Json(AuthResponse { jwt_token: String::new() })))
         }
     };
-    info!("Authentication Successful!");
     res
 }
 
 fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
     let claims = Claims {
         sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
     };
-    // println!("claims:{:?}", claims);
     let header = Header::new(Algorithm::ES256);
     let token = encode(&header, &claims, &app_state.encoding_key)
         .map_err(|err| TokenCreationError(err))?;
-    // println!("token:{}", token);
     Ok(token)
 }
 

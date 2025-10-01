@@ -25,6 +25,9 @@ use crate::authn::{finish_authentication, finish_register, start_authentication,
 
 mod authn;
 
+// Session configuration
+const SESSION_TIMEOUT_SECONDS: i64 = 600;  // 10 minutes of inactivity
+
 #[derive(Clone)]
 pub struct AppState {
     pub webauthn: Arc<Webauthn>,
@@ -85,7 +88,7 @@ async fn main() {
             .with_name("authnz-rs")
             .with_same_site(SameSite::Strict)
             .with_secure(settings.tls_enabled)
-            .with_expiry(Expiry::OnInactivity(Duration::seconds(600))),
+            .with_expiry(Expiry::OnInactivity(Duration::seconds(SESSION_TIMEOUT_SECONDS))),
     );
     // build our application with a route
     let app = Router::<()>::new()
