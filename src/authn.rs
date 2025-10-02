@@ -1,7 +1,8 @@
 use crate::authn::WebauthnError::{
-    CorruptSession, DynamoDBOperationError, InvalidSessionState, MissingToken, TokenCreationError,
-    Unknown, UserHasNoCredentials, UserNotFound,
+    CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown,
+    UserHasNoCredentials, UserNotFound,
 };
+use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
 use crate::AppState;
 use axum::extract::Query;
@@ -15,7 +16,7 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, Header, TokenData, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, Header, TokenData, Validation};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -86,7 +87,7 @@ pub async fn start_register(
                     .await;
                     continue;
                 }
-                return Err(WebauthnError::DynamoDBOperationError(err));
+                return Err(WebauthnError::DynamoDBOperationError(Box::new(err)));
             }
         }
     };
@@ -180,18 +181,22 @@ pub async fn finish_register(
                 }
                 Err(e) => {
                     error!("Failed to store credential: {}", e);
-                    return Err(WebauthnError::DynamoDBOperationError(e));
+                    return Err(WebauthnError::DynamoDBOperationError(Box::new(e)));
                 }
             }
 
             // Generate account token
             let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
+            // SECURITY: Long-lived registration token (~99 years) is intentional.
+            // Security relies on WebAuthn passkey validation, not token expiration.
+            // The passkey ceremony provides replay protection and strong authentication.
             let attestation_entity = AccountToken {
                 user_unique_id: user_id,
                 credential_id,
                 passkey,
                 sub: user_id.to_string(),
-                exp: (Utc::now() + chrono::Duration::weeks(5148)).timestamp() as usize,
+                exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp()
+                    as usize,
             };
 
             // Create envelope
@@ -233,10 +238,10 @@ pub async fn start_authentication(
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
 
-    session
-        .remove_value("auth_state")
-        .await
-        .expect("auth_state removal failed");
+    if let Err(err) = session.remove_value("auth_state").await {
+        error!("Failed to remove old auth_state from session: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
 
     // Get user from database or JWT
     let mut token_data: Option<TokenData<AccountToken>> = None;
@@ -245,8 +250,13 @@ pub async fn start_authentication(
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
 
-        let decoding_key = DecodingKey::from((*app_state.decoding_key).clone());
+        let decoding_key = (*app_state.decoding_key).clone();
         let mut token_validation = Validation::new(Algorithm::ES256);
+        // SAFETY: JWT exp/nbf validation is intentionally disabled.
+        // Security model relies on WebAuthn ceremony validation, not token expiration.
+        // Long-lived registration tokens (~99 years) combined with WebAuthn provide
+        // replay protection via the passkey authentication ceremony and session management.
+        // Sessions expire after 10 minutes, providing time-based security boundaries.
         token_validation.validate_nbf = false;
         token_validation.validate_exp = false;
         token_data = Some(
@@ -261,7 +271,7 @@ pub async fn start_authentication(
         .db_store
         .get_user_by_name(&username)
         .await
-        .map_err(DynamoDBOperationError)?
+        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
     {
         Some(user) => user,
         None => {
@@ -279,6 +289,10 @@ pub async fn start_authentication(
         }
     };
 
+    // Credential retrieval strategy:
+    // 1. Prefer DB credentials (source of truth for registered users)
+    // 2. Fallback to JWT token passkey if user exists but has no stored credentials
+    // 3. Fail if neither is available (prevents invalid auth attempts)
     let credentials = if user.credentials.is_empty() {
         if let Some(token_data) = &token_data {
             vec![token_data.claims.passkey.clone()]
@@ -294,10 +308,13 @@ pub async fn start_authentication(
         .start_passkey_authentication(&credentials)
     {
         Ok((rcr, auth_state)) => {
-            session
+            if let Err(err) = session
                 .insert("auth_state", (user.user_id, auth_state))
                 .await
-                .expect("Failed to insert");
+            {
+                error!("Failed to insert auth_state into session: {:?}", err);
+                return Err(WebauthnError::InvalidSessionState(err));
+            }
             Json(rcr)
         }
         Err(e) => {
@@ -316,19 +333,20 @@ pub async fn finish_authentication(
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
         session.get("auth_state").await?.ok_or(CorruptSession)?;
 
-    session
-        .remove_value("auth_state")
-        .await
-        .expect("auth_state removal failed");
+    if let Err(err) = session.remove_value("auth_state").await {
+        error!("Failed to remove auth_state from session: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
 
     let res = match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
         Ok(auth_result) => {
-            println!("{:?}", auth_result);
+            log::debug!("Authentication result: {:?}", auth_result);
             // Generate JWT token
             let token = generate_jwt(user_unique_id, &app_state)?;
+            info!("Authentication successful for user: {}", user_unique_id);
             Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
         Err(e) => {
@@ -341,7 +359,6 @@ pub async fn finish_authentication(
             ))
         }
     };
-    info!("Authentication Successful!");
     res
 }
 
@@ -395,7 +412,7 @@ impl AttestationEnvelope {
 fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
     let claims = Claims {
         sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
     };
     let header = Header::new(Algorithm::ES256);
     encode(&header, &claims, &app_state.encoding_key).map_err(TokenCreationError)
@@ -422,7 +439,7 @@ pub enum WebauthnError {
     #[error("Token decoding failed: {0}")]
     TokenDecodingError(String),
     #[error("DynamoDB operation failed: {0}")]
-    DynamoDBOperationError(#[from] crate::db::DynamoDBError),
+    DynamoDBOperationError(#[from] Box<crate::db::DynamoDBError>),
     #[error("Invalid username format")]
     InvalidHandle,
     #[error("Failed to create user: {0}")]
@@ -447,7 +464,7 @@ impl IntoResponse for WebauthnError {
             MissingToken => "Missing token".to_string(),
             WebauthnError::InvalidToken => "Invalid token".to_string(),
             WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
-            WebauthnError::DynamoDBOperationError(err) => match err {
+            WebauthnError::DynamoDBOperationError(err) => match *err {
                 DynamoDBError::TableNotExists(table) => {
                     format!("Service setup incomplete: {} table not configured", table)
                 }
