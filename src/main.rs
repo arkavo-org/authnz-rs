@@ -24,9 +24,11 @@ use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
+use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
 
 mod authn;
+mod constants;
 mod db;
 
 #[derive(Clone)]
@@ -53,17 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Load and cache the apple-app-site-association.json file
-    let apple_app_site_association = load_apple_app_site_association().await;
+    let apple_app_site_association = load_apple_app_site_association().await?;
 
     // Set up TLS if not disabled
     let tls_config = if settings.tls_enabled {
         Some(
             RustlsConfig::from_pem_file(
-                PathBuf::from(settings.tls_cert_path),
-                PathBuf::from(settings.tls_key_path),
+                PathBuf::from(&settings.tls_cert_path),
+                PathBuf::from(&settings.tls_key_path),
             )
             .await
-            .unwrap(),
+            .map_err(|e| {
+                format!(
+                    "Failed to load TLS certificates from {} and {}: {}",
+                    settings.tls_cert_path, settings.tls_key_path, e
+                )
+            })?,
         )
     } else {
         None
@@ -71,10 +78,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the Webauthn instance
     let rp_id = "arkavo.net";
-    let rp_origin = Url::parse("https://arkavo.net").expect("Invalid URL");
-    let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
+    let rp_origin = Url::parse("https://arkavo.net")
+        .map_err(|e| format!("Failed to parse RP origin URL: {}", e))?;
+    let builder = WebauthnBuilder::new(rp_id, &rp_origin)
+        .map_err(|e| format!("Failed to create WebAuthn builder: {}", e))?;
     let builder = builder.rp_name("Arkavo");
-    let webauthn = Arc::new(builder.build().expect("Invalid configuration"));
+    let webauthn = Arc::new(
+        builder
+            .build()
+            .map_err(|e| format!("Failed to build WebAuthn instance: {}", e))?,
+    );
 
     // Initialize DynamoDB store
     let db_store = DynamoDBStore::new(
@@ -82,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_HANDLES_TABLE").unwrap_or_else(|_| "handles".to_string()),
     )
     .await
-    .expect("Failed to initialize DynamoDB store");
+    .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
 
     // Create the app state
     let app_state = AppState {
@@ -99,7 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_name("authnz-rs")
             .with_same_site(SameSite::Strict)
             .with_secure(settings.tls_enabled)
-            .with_expiry(Expiry::OnInactivity(Duration::seconds(600))),
+            .with_expiry(Expiry::OnInactivity(Duration::seconds(
+                SESSION_TIMEOUT_SECONDS,
+            ))),
     );
 
     // build our application with routes
@@ -154,8 +169,32 @@ struct ServerSettings {
     _enable_timing_logs: bool,
 }
 
-// Helper functions remain the same
+// Validate required environment variables on startup
+fn validate_env_vars() -> Result<(), Box<dyn std::error::Error>> {
+    let required_vars = ["SIGN_KEY_PATH", "ENCODING_KEY_PATH", "DECODING_KEY_PATH"];
+    let mut missing_vars = Vec::new();
+
+    for var in &required_vars {
+        if env::var(var).is_err() {
+            missing_vars.push(*var);
+        }
+    }
+
+    if !missing_vars.is_empty() {
+        return Err(format!(
+            "Missing required environment variables: {}",
+            missing_vars.join(", ")
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
+    // Validate required environment variables first
+    validate_env_vars()?;
+
     let current_dir = env::current_dir()?;
 
     Ok(ServerSettings {
@@ -177,9 +216,9 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
                 .unwrap()
                 .to_string()
         }),
-        sign_key_path: env::var("SIGN_KEY_PATH").expect("SIGN_KEY_PATH must be set"),
-        encoding_key_path: env::var("ENCODING_KEY_PATH").expect("ENCODING_KEY_PATH must be set"),
-        decoding_key_path: env::var("DECODING_KEY_PATH").expect("DECODING_KEY_PATH must be set"),
+        sign_key_path: env::var("SIGN_KEY_PATH").unwrap(),
+        encoding_key_path: env::var("ENCODING_KEY_PATH").unwrap(),
+        decoding_key_path: env::var("DECODING_KEY_PATH").unwrap(),
         _enable_timing_logs: env::var("ENABLE_TIMING_LOGS")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -234,13 +273,14 @@ fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn st
     Ok(SigningKey::from(secret_key))
 }
 
-async fn load_apple_app_site_association() -> Arc<RwLock<serde_json::Value>> {
+async fn load_apple_app_site_association(
+) -> Result<Arc<RwLock<serde_json::Value>>, Box<dyn std::error::Error>> {
     let content = tokio::fs::read_to_string("apple-app-site-association.json")
         .await
-        .expect("Failed to read apple-app-site-association.json");
-    let json: serde_json::Value =
-        serde_json::from_str(&content).expect("Failed to parse apple-app-site-association.json");
-    Arc::new(RwLock::new(json))
+        .map_err(|e| format!("Failed to read apple-app-site-association.json: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse apple-app-site-association.json: {}", e))?;
+    Ok(Arc::new(RwLock::new(json)))
 }
 
 async fn serve_apple_app_site_association(

@@ -18,7 +18,7 @@ pub struct UserCredentials {
 #[derive(Error, Debug)]
 pub enum DynamoDBError {
     #[error("AWS SDK error: {0}")]
-    AwsSdkError(#[from] aws_sdk_dynamodb::Error),
+    AwsSdkError(Box<aws_sdk_dynamodb::Error>),
 
     #[error("Serde JSON error: {0}")]
     SerdeJsonError(#[from] serde_json::Error),
@@ -42,6 +42,12 @@ pub enum DynamoDBError {
     InvalidDID(String),
 }
 
+impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
+    fn from(err: aws_sdk_dynamodb::Error) -> Self {
+        DynamoDBError::AwsSdkError(Box::new(err))
+    }
+}
+
 impl<T> From<SdkError<T>> for DynamoDBError
 where
     T: std::error::Error + Send + Sync + 'static,
@@ -62,7 +68,7 @@ impl DynamoDBStore {
         credentials_table: String,
         handles_table: String,
     ) -> Result<Self, DynamoDBError> {
-        let config = aws_config::load_from_env().await;
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
 
         Ok(Self {
@@ -155,12 +161,57 @@ impl DynamoDBStore {
                             warn!("Handles table does not exist - handle will need to be created later");
                         } else {
                             error!("Failed to write to handles table: {:?}", err);
-                            // TODO: Should attempt to rollback credentials entry
+                            // Attempt to rollback credentials entry
+                            warn!(
+                                "Attempting to rollback credentials entry for user: {}",
+                                user.user_id
+                            );
+                            if let Err(rollback_err) = self
+                                .client
+                                .delete_item()
+                                .table_name(&self.credentials_table)
+                                .key("user_id", AttributeValue::S(user.user_id.to_string()))
+                                .send()
+                                .await
+                            {
+                                error!(
+                                    "CRITICAL: Failed to rollback credentials for user {}: {:?}. Manual cleanup required.",
+                                    user.user_id, rollback_err
+                                );
+                            } else {
+                                info!(
+                                    "Successfully rolled back credentials entry for user: {}",
+                                    user.user_id
+                                );
+                            }
                             return Err(DynamoDBError::SdkError(err.to_string()));
                         }
                     }
                     _ => {
                         error!("Unknown error writing to handles table: {:?}", err);
+                        // Attempt to rollback credentials entry
+                        warn!(
+                            "Attempting to rollback credentials entry for user: {}",
+                            user.user_id
+                        );
+                        if let Err(rollback_err) = self
+                            .client
+                            .delete_item()
+                            .table_name(&self.credentials_table)
+                            .key("user_id", AttributeValue::S(user.user_id.to_string()))
+                            .send()
+                            .await
+                        {
+                            error!(
+                                "CRITICAL: Failed to rollback credentials for user {}: {:?}. Manual cleanup required.",
+                                user.user_id, rollback_err
+                            );
+                        } else {
+                            info!(
+                                "Successfully rolled back credentials entry for user: {}",
+                                user.user_id
+                            );
+                        }
                         return Err(DynamoDBError::SdkError(err.to_string()));
                     }
                 }
@@ -295,7 +346,7 @@ impl DynamoDBStore {
             .iter()
             .map(|cred| {
                 serde_json::to_string(cred)
-                    .map(|s| AttributeValue::S(s))
+                    .map(AttributeValue::S)
                     .map_err(DynamoDBError::SerdeJsonError)
             })
             .collect::<Result<Vec<_>, _>>()
@@ -343,21 +394,21 @@ impl DynamoDBStore {
         &self,
         item: &std::collections::HashMap<String, AttributeValue>,
     ) -> Result<UserCredentials, DynamoDBError> {
-        println!("Parsing item: {:?}", item);
+        log::debug!("Parsing item: {:?}", item);
         let user_id = Uuid::parse_str(
             item.get("user_id")
                 .ok_or_else(|| DynamoDBError::Internal("No user_id found".into()))?
                 .as_s()
                 .map_err(|_| DynamoDBError::Internal("Invalid user_id format".into()))?,
         )?;
-        println!("Parsed user_id: {}", user_id);
+        log::debug!("Parsed user_id: {}", user_id);
         let username = item
             .get("username")
             .ok_or_else(|| DynamoDBError::Internal("No username found".into()))?
             .as_s()
             .map_err(|_| DynamoDBError::Internal("Invalid username format".into()))?
             .to_string();
-        println!("Parsed username: {}", username);
+        log::debug!("Parsed username: {}", username);
         let credentials = if let Some(creds_av) = item.get("credentials") {
             if let Ok(creds_str) = creds_av.as_s() {
                 // Deserialize from JSON string
@@ -381,14 +432,14 @@ impl DynamoDBStore {
         } else {
             Vec::new()
         };
-        println!("Parsed credentials: {:?}", credentials);
+        log::debug!("Parsed credentials: {:?}", credentials);
         let did = item
             .get("did")
             .ok_or_else(|| DynamoDBError::Internal("No DID found".into()))?
             .as_s()
             .map_err(|_| DynamoDBError::Internal("Invalid DID format".into()))?
             .to_string();
-        println!("Parsed DID: {}", did);
+        log::debug!("Parsed DID: {}", did);
         Ok(UserCredentials {
             user_id,
             username,
