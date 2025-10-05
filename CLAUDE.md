@@ -176,10 +176,18 @@ The codebase uses thiserror for structured error handling:
 
 ## Testing Patterns
 
-- Unit tests in respective modules (main.rs has OAuth tests)
+- Unit tests in respective modules:
+  - `main.rs`: OAuth callback validation, provider parsing, input sanitization (9 tests)
+  - `authn.rs`: DID validation, handle validation, token expiration, error responses (5 tests)
+  - `db.rs`: DID format, error conversions, JSON serialization, error messages (8 tests)
 - Integration test skeleton in tests/integration_test.rs
 - Test app routing with tower::ServiceExt::oneshot for request simulation
 - Mock requests use axum::body::Body::empty()
+- Critical test coverage focuses on:
+  - Security: DID format validation, handle/username matching
+  - Error handling: All error types and conversions
+  - Data integrity: JSON serialization roundtrips
+  - Configuration: Token expiration constants
 
 ## Important Constants
 
