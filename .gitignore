@@ -20,3 +20,4 @@ Cargo.lock
 /.idea
 /apple-app-site-association.json
 /*.pem
+.DS_Store
