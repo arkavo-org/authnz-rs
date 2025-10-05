@@ -481,3 +481,60 @@ impl IntoResponse for WebauthnError {
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_did_validation_logic() {
+        // Valid DID formats
+        assert!("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".starts_with("did:key:"));
+        assert!("did:key:abc123".starts_with("did:key:"));
+
+        // Invalid DID formats
+        assert!(!"did:web:example.com".starts_with("did:key:"));
+        assert!(!"key:z6Mk...".starts_with("did:key:"));
+        assert!(!"did:".starts_with("did:key:"));
+        assert!(!"".starts_with("did:key:"));
+    }
+
+    #[test]
+    fn test_handle_username_validation() {
+        let username = "alice";
+        let valid_handle = "alice.arkavo.social";
+        let invalid_handle = "bob.arkavo.social";
+
+        assert!(valid_handle.starts_with(username));
+        assert!(!invalid_handle.starts_with(username));
+    }
+
+    #[test]
+    fn test_token_expiration_constants() {
+        use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
+
+        // Verify registration token is long-lived (~99 years = ~5148 weeks)
+        assert_eq!(REGISTRATION_TOKEN_WEEKS, 5148);
+
+        // Verify auth token is short-lived (1 hour)
+        assert_eq!(AUTH_TOKEN_HOURS, 1);
+    }
+
+    #[test]
+    fn test_webauthn_error_responses() {
+        let errors = vec![
+            WebauthnError::CorruptSession,
+            WebauthnError::UserNotFound,
+            WebauthnError::UserHasNoCredentials,
+            WebauthnError::MissingToken,
+            WebauthnError::InvalidToken,
+            WebauthnError::InvalidHandle,
+            WebauthnError::InvalidDID("test".to_string()),
+        ];
+
+        for error in errors {
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+}

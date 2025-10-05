@@ -1,9 +1,9 @@
 [package]
 name = "authnz-rs"
-version = "0.4.0"
-edition = "2021"
+version = "0.5.0"
+edition = "2024"
 license = "BSD-2"
-rust-version = "1.83.0"
+rust-version = "1.85.0"
 
 [profile.release]
 opt-level = 2  # Lower optimization level
@@ -11,27 +11,25 @@ lto = false    # Disable LTO
 codegen-units = 16  # Increase parallelism
 
 [dependencies]
-tokio = { version = "1.39.3", features = ["rt", "rt-multi-thread", "macros", "fs"] }
-axum = { version = "0.7.5", features = ["http2", "tokio"] }
-axum-server = { version = "0.7.1", features = ["tls-rustls"] }
-webauthn-rs = { version = "0.5.0", features = ["danger-allow-state-serialisation"] }
-tower = { version = "0.4.13", features = ["full"] }
-tower-sessions = "0.12.3"
-thiserror = "1.0.63"
-log = "0.4.22"
-serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.127"
-env_logger = "0.11.5"
-pem = "3.0.4"
-p256 = { version = "0.13.2", features = ["ecdsa"] }
-ecdsa = { version = "0.16.9", features = ["signing", "std"] }
-sha2 = "0.10.8"
-uuid = { version = "1.10.0", features = ["v4"] }
-jsonwebtoken = { version = "9.3.0", features = ["use_pem"] }
-chrono = "0.4.38"
-form_urlencoded = "1.2.1"
-http = "1.1.0"
-aws-config = "1.5.12"
-aws-sdk-dynamodb = "1.57.0"
-did-key = "0.2.1"
-base58 = "0.2.0"
+tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+axum = { version = "0.7", features = ["http2", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+tower = { version = "0.5", features = ["full"] }
+tower-sessions = "0.12"
+thiserror = "2.0"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+env_logger = "0.11"
+pem = "3.0"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["signing", "std"] }
+sha2 = "0.10"
+uuid = { version = "1.18", features = ["v4"] }
+jsonwebtoken = { version = "9.3", features = ["use_pem"] }
+chrono = "0.4"
+form_urlencoded = "1.2"
+http = "1.3"
+aws-config = "1.8"
+aws-sdk-dynamodb = "1.94"

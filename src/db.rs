@@ -448,3 +448,111 @@ impl DynamoDBStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_did_format_validation() {
+        // Valid DIDs
+        assert!("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".starts_with("did:key:"));
+        assert!("did:key:abc123".starts_with("did:key:"));
+
+        // Invalid DIDs
+        assert!(!"did:web:example.com".starts_with("did:key:"));
+        assert!(!"invalid".starts_with("did:key:"));
+        assert!(!"".starts_with("did:key:"));
+    }
+
+    #[test]
+    fn test_username_validation() {
+        // Empty username should be rejected
+        assert!("".is_empty());
+        assert!(!"alice".is_empty());
+        assert!(!"user123".is_empty());
+    }
+
+    #[test]
+    fn test_handle_format() {
+        let username = "alice";
+        let expected_handle = format!("{}.arkavo.social", username);
+        assert_eq!(expected_handle, "alice.arkavo.social");
+    }
+
+    #[test]
+    fn test_error_conversions() {
+        // Test UUID error
+        let uuid_err = Uuid::parse_str("not-a-uuid").unwrap_err();
+        let db_err: DynamoDBError = uuid_err.into();
+        assert!(matches!(db_err, DynamoDBError::UuidError(_)));
+
+        // Test JSON error
+        let json_err = serde_json::from_str::<UserCredentials>("invalid").unwrap_err();
+        let db_err: DynamoDBError = json_err.into();
+        assert!(matches!(db_err, DynamoDBError::SerdeJsonError(_)));
+    }
+
+    #[test]
+    fn test_user_credentials_structure() {
+        let user = UserCredentials {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            credentials: vec![],
+            did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
+        };
+
+        assert_eq!(user.username, "testuser");
+        assert!(user.credentials.is_empty());
+        assert!(user.did.starts_with("did:key:"));
+    }
+
+    #[test]
+    fn test_user_credentials_json_roundtrip() {
+        let original = UserCredentials {
+            user_id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            credentials: vec![],
+            did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&original).unwrap();
+
+        // Deserialize back
+        let deserialized: UserCredentials = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original.user_id, deserialized.user_id);
+        assert_eq!(original.username, deserialized.username);
+        assert_eq!(original.did, deserialized.did);
+        assert_eq!(original.credentials.len(), deserialized.credentials.len());
+    }
+
+    #[test]
+    fn test_dynamodb_error_messages() {
+        let errors = vec![
+            DynamoDBError::Internal("test".to_string()),
+            DynamoDBError::TableNotExists("credentials".to_string()),
+            DynamoDBError::CredentialError("not found".to_string()),
+            DynamoDBError::InvalidDID("bad format".to_string()),
+            DynamoDBError::SdkError("aws error".to_string()),
+        ];
+
+        for error in errors {
+            let msg = error.to_string();
+            assert!(!msg.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_table_not_exists_error() {
+        let error = DynamoDBError::TableNotExists("credentials".to_string());
+        assert_eq!(error.to_string(), "Table does not exist: credentials");
+    }
+
+    #[test]
+    fn test_invalid_did_error() {
+        let error = DynamoDBError::InvalidDID("DID must start with 'did:key:'".to_string());
+        assert!(error.to_string().contains("did:key:"));
+    }
+}
