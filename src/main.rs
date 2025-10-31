@@ -27,6 +27,7 @@ use crate::authn::{finish_authentication, finish_register, start_authentication,
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
 
+mod app_attest;
 mod authn;
 mod constants;
 mod db;
