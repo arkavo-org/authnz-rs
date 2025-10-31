@@ -30,6 +30,7 @@ use crate::db::DynamoDBStore;
 mod authn;
 mod constants;
 mod db;
+mod terminal_link;
 
 #[derive(Clone)]
 pub struct AppState {
