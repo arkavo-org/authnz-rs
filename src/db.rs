@@ -270,6 +270,47 @@ impl DynamoDBStore {
         }
     }
 
+    pub async fn get_user_by_id(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserCredentials>, DynamoDBError> {
+        info!(
+            "Getting user by ID. Table: {}, UserID: {}",
+            self.credentials_table, user_id
+        );
+
+        let result = match self
+            .client
+            .get_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to get user {}: {:?}", user_id, err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        if let Some(item) = result.item {
+            match self.item_to_user_credentials(&item) {
+                Ok(user) => {
+                    info!("Found user: {}", user_id);
+                    Ok(Some(user))
+                }
+                Err(err) => {
+                    error!("Failed to parse user data for {}: {:?}", user_id, err);
+                    Err(err)
+                }
+            }
+        } else {
+            info!("No user found with ID: {}", user_id);
+            Ok(None)
+        }
+    }
+
     pub async fn add_credential(
         &self,
         user_id: Uuid,

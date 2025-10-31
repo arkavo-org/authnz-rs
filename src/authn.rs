@@ -4,6 +4,9 @@ use crate::authn::WebauthnError::{
 };
 use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
+use crate::terminal_link::{
+    generate_terminal_link, AuthLevel, NPEClaims, PEClaims, PlatformState, SessionInfo,
+};
 use crate::AppState;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
@@ -325,10 +328,30 @@ pub async fn start_authentication(
     Ok(res)
 }
 
+// Authentication request with optional device attestation claims
+#[derive(Deserialize)]
+pub struct AuthenticationRequest {
+    #[serde(flatten)]
+    pub credential: PublicKeyCredential,
+    // Optional NPE claims from client (device attestation)
+    pub npe_claims: Option<ClientNPEClaims>,
+    // Optional DPoP JTI for token binding
+    pub dpop_jti: Option<String>,
+}
+
+// Client-provided NPE claims (to be validated by App Attest later)
+#[derive(Deserialize, Clone)]
+pub struct ClientNPEClaims {
+    pub platform_code: String,
+    pub platform_state: String, // Will be parsed to PlatformState enum
+    pub device_id: String,
+    pub app_version: String,
+}
+
 pub async fn finish_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
-    Json(auth): Json<PublicKeyCredential>,
+    Json(auth_req): Json<AuthenticationRequest>,
 ) -> Result<impl IntoResponse, WebauthnError> {
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
         session.get("auth_state").await?.ok_or(CorruptSession)?;
@@ -338,16 +361,89 @@ pub async fn finish_authentication(
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
+    // Get user from DB to retrieve DID
+    let user = app_state
+        .db_store
+        .get_user_by_id(user_unique_id)
+        .await
+        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
+        .ok_or(UserNotFound)?;
+
     let res = match app_state
         .webauthn
-        .finish_passkey_authentication(&auth, &auth_state)
+        .finish_passkey_authentication(&auth_req.credential, &auth_state)
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            // Generate JWT token
-            let token = generate_jwt(user_unique_id, &app_state)?;
-            info!("Authentication successful for user: {}", user_unique_id);
-            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
+
+            // Create PE claims (Person Entity - user identity)
+            let pe_claims = PEClaims {
+                user_id: user_unique_id.to_string(),
+                auth_level: AuthLevel::WebAuthn, // WebAuthn passkey authentication
+                timestamp: Utc::now(),
+                did: user.did.clone(),
+            };
+
+            // Create NPE claims if provided by client (Non-Person Entity - device)
+            let npe_claims = auth_req.npe_claims.as_ref().map(|client_npe| {
+                let platform_state = match client_npe.platform_state.to_lowercase().as_str() {
+                    "secure" => PlatformState::Secure,
+                    "jailbroken" => PlatformState::Jailbroken,
+                    "debugmode" => PlatformState::DebugMode,
+                    _ => PlatformState::Unknown,
+                };
+
+                NPEClaims {
+                    platform_code: client_npe.platform_code.clone(),
+                    platform_state,
+                    device_id: client_npe.device_id.clone(),
+                    app_version: client_npe.app_version.clone(),
+                    timestamp: Utc::now(),
+                }
+            });
+
+            // Generate session ID
+            let session_id = Uuid::new_v4();
+
+            // Create session info with 1 hour TTL (matching AUTH_TOKEN_HOURS)
+            let session_info = SessionInfo {
+                user_id: user_unique_id,
+                session_id,
+                ttl_seconds: (AUTH_TOKEN_HOURS * 3600) as i64,
+                did: user.did.clone(),
+            };
+
+            // Generate Terminal Link token
+            let terminal_link = generate_terminal_link(
+                session_info,
+                pe_claims,
+                npe_claims,
+                auth_req.dpop_jti.clone(),
+                &app_state,
+            )?;
+
+            info!(
+                "Authentication successful for user: {} (session: {})",
+                user_unique_id, session_id
+            );
+
+            // Return Terminal Link in X-Auth-Token header
+            let mut response = Json(AuthResponse {
+                jwt_token: terminal_link.clone(),
+                session_id: Some(session_id),
+            })
+            .into_response();
+
+            match HeaderValue::from_str(&terminal_link) {
+                Ok(header_value) => {
+                    response.headers_mut().insert("X-Auth-Token", header_value);
+                    Ok((StatusCode::OK, response))
+                }
+                Err(e) => {
+                    error!("Failed to create header value from Terminal Link: {}", e);
+                    Err(MissingToken)
+                }
+            }
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
@@ -355,7 +451,9 @@ pub async fn finish_authentication(
                 StatusCode::BAD_REQUEST,
                 Json(AuthResponse {
                     jwt_token: String::new(),
-                }),
+                    session_id: None,
+                })
+                .into_response(),
             ))
         }
     };
@@ -366,6 +464,8 @@ pub async fn finish_authentication(
 #[derive(Serialize)]
 struct AuthResponse {
     jwt_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<Uuid>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
