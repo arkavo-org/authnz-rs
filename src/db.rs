@@ -61,6 +61,7 @@ pub struct DynamoDBStore {
     client: Client,
     credentials_table: String,
     handles_table: String,
+    attestations_table: String,
 }
 
 impl DynamoDBStore {
@@ -70,11 +71,14 @@ impl DynamoDBStore {
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
+        let attestations_table = std::env::var("DYNAMODB_ATTESTATIONS_TABLE")
+            .unwrap_or_else(|_| "device_attestations".to_string());
 
         Ok(Self {
             client,
             credentials_table,
             handles_table,
+            attestations_table,
         })
     }
 
@@ -487,5 +491,182 @@ impl DynamoDBStore {
             credentials,
             did,
         })
+    }
+
+    // Device Attestation CRUD Operations
+
+    pub async fn save_device_attestation(
+        &self,
+        attestation: &crate::app_attest::DeviceAttestation,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Saving device attestation for device: {} (user: {})",
+            attestation.device_id, attestation.user_id
+        );
+
+        let attestation_json = serde_json::to_string(attestation)?;
+
+        self.client
+            .put_item()
+            .table_name(&self.attestations_table)
+            .item("device_id", AttributeValue::S(attestation.device_id.clone()))
+            .item("user_id", AttributeValue::S(attestation.user_id.to_string()))
+            .item("attestation_data", AttributeValue::S(attestation_json))
+            .item(
+                "counter",
+                AttributeValue::N(attestation.counter.to_string()),
+            )
+            .item(
+                "security_state",
+                AttributeValue::S(format!("{:?}", attestation.security_state)),
+            )
+            .item("platform", AttributeValue::S(attestation.platform.clone()))
+            .item(
+                "created_at",
+                AttributeValue::S(attestation.created_at.to_rfc3339()),
+            )
+            .item(
+                "last_used_at",
+                AttributeValue::S(attestation.last_used_at.to_rfc3339()),
+            )
+            .send()
+            .await?;
+
+        info!(
+            "Device attestation saved successfully for device: {}",
+            attestation.device_id
+        );
+        Ok(())
+    }
+
+    pub async fn get_device_attestation(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<crate::app_attest::DeviceAttestation>, DynamoDBError> {
+        info!(
+            "Getting device attestation for device: {} from table: {}",
+            device_id, self.attestations_table
+        );
+
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.attestations_table)
+            .key("device_id", AttributeValue::S(device_id.to_string()))
+            .send()
+            .await?;
+
+        if let Some(item) = result.item {
+            let attestation_json = item
+                .get("attestation_data")
+                .ok_or_else(|| DynamoDBError::Internal("No attestation_data found".into()))?
+                .as_s()
+                .map_err(|_| DynamoDBError::Internal("Invalid attestation_data format".into()))?;
+
+            let attestation: crate::app_attest::DeviceAttestation =
+                serde_json::from_str(attestation_json)?;
+
+            info!("Device attestation found for device: {}", device_id);
+            Ok(Some(attestation))
+        } else {
+            info!("No device attestation found for device: {}", device_id);
+            Ok(None)
+        }
+    }
+
+    pub async fn update_device_counter(
+        &self,
+        device_id: &str,
+        new_counter: u64,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Updating counter for device: {} to {}",
+            device_id, new_counter
+        );
+
+        let now = chrono::Utc::now();
+
+        self.client
+            .update_item()
+            .table_name(&self.attestations_table)
+            .key("device_id", AttributeValue::S(device_id.to_string()))
+            .update_expression("SET #counter = :new_counter, #last_used = :now")
+            .expression_attribute_names("#counter", "counter")
+            .expression_attribute_names("#last_used", "last_used_at")
+            .expression_attribute_values(":new_counter", AttributeValue::N(new_counter.to_string()))
+            .expression_attribute_values(":now", AttributeValue::S(now.to_rfc3339()))
+            .send()
+            .await?;
+
+        info!(
+            "Counter updated successfully for device: {}",
+            device_id
+        );
+        Ok(())
+    }
+
+    pub async fn update_device_security_state(
+        &self,
+        device_id: &str,
+        security_state: &crate::app_attest::SecurityState,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Updating security state for device: {} to {:?}",
+            device_id, security_state
+        );
+
+        self.client
+            .update_item()
+            .table_name(&self.attestations_table)
+            .key("device_id", AttributeValue::S(device_id.to_string()))
+            .update_expression("SET #state = :new_state")
+            .expression_attribute_names("#state", "security_state")
+            .expression_attribute_values(
+                ":new_state",
+                AttributeValue::S(format!("{:?}", security_state)),
+            )
+            .send()
+            .await?;
+
+        info!(
+            "Security state updated successfully for device: {}",
+            device_id
+        );
+        Ok(())
+    }
+
+    pub async fn get_user_devices(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::app_attest::DeviceAttestation>, DynamoDBError> {
+        info!("Getting all devices for user: {}", user_id);
+
+        // Note: This requires a GSI on user_id for efficient querying
+        let result = self
+            .client
+            .query()
+            .table_name(&self.attestations_table)
+            .index_name("user_id-index")
+            .key_condition_expression("#user_id = :user_id")
+            .expression_attribute_names("#user_id", "user_id")
+            .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await?;
+
+        let mut devices = Vec::new();
+        if let Some(items) = result.items {
+            for item in items {
+                if let Some(attestation_data) = item.get("attestation_data") {
+                    if let Ok(attestation_json) = attestation_data.as_s() {
+                        if let Ok(attestation) = serde_json::from_str(attestation_json) {
+                            devices.push(attestation);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("Found {} devices for user: {}", devices.len(), user_id);
+        Ok(devices)
     }
 }
