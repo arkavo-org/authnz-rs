@@ -26,10 +26,14 @@ use webauthn_rs::prelude::*;
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
+use crate::device_check::{
+    finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
+};
 
 mod authn;
 mod constants;
 mod db;
+mod device_check;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -93,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_store = DynamoDBStore::new(
         env::var("DYNAMODB_CREDENTIALS_TABLE").unwrap_or_else(|_| "credentials".to_string()),
         env::var("DYNAMODB_HANDLES_TABLE").unwrap_or_else(|_| "handles".to_string()),
+        env::var("DYNAMODB_DEVICE_BINDINGS_TABLE")
+            .unwrap_or_else(|_| "device_bindings".to_string()),
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -128,6 +134,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/register", post(finish_register))
         .route("/authenticate/:username", get(start_authentication))
         .route("/authenticate", post(finish_authentication))
+        // Apple DeviceCheck / App Attest endpoints
+        .route("/device-check/challenge/:username", get(generate_challenge))
+        .route("/device-check/attest", post(finish_attestation))
+        .route(
+            "/device-check/assert-challenge/:username",
+            get(generate_assertion_challenge),
+        )
+        .route("/device-check/assert", post(finish_assertion))
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))

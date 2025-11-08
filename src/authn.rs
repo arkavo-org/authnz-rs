@@ -369,9 +369,9 @@ struct AuthResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Claims {
-    sub: String,
-    exp: usize,
+pub struct Claims {
+    pub sub: String,
+    pub exp: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
