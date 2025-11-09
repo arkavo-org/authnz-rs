@@ -560,22 +560,27 @@ impl DynamoDBStore {
         &self,
         device_id: &str,
         new_counter: u32,
+        expected_counter: u32,
     ) -> Result<(), DynamoDBError> {
         info!(
-            "Updating device counter. Table: {}, Device ID: {}, New Counter: {}",
-            self.device_bindings_table, device_id, new_counter
+            "Updating device counter. Table: {}, Device ID: {}, New Counter: {} (expected: {})",
+            self.device_bindings_table, device_id, new_counter, expected_counter
         );
 
         let updated_at = chrono::Utc::now().timestamp();
 
+        // Use conditional update to prevent race conditions
+        // Only update if the current counter matches the expected value
         match self
             .client
             .update_item()
             .table_name(&self.device_bindings_table)
             .key("device_id", AttributeValue::S(device_id.to_string()))
             .update_expression("SET #counter = :counter, updated_at = :updated_at")
+            .condition_expression("#counter = :expected_counter")
             .expression_attribute_names("#counter", "counter")
             .expression_attribute_values(":counter", AttributeValue::N(new_counter.to_string()))
+            .expression_attribute_values(":expected_counter", AttributeValue::N(expected_counter.to_string()))
             .expression_attribute_values(":updated_at", AttributeValue::N(updated_at.to_string()))
             .send()
             .await
@@ -585,6 +590,20 @@ impl DynamoDBStore {
                 Ok(())
             }
             Err(err) => {
+                match &err {
+                    SdkError::ServiceError(service_error) => {
+                        if service_error.err().meta().code() == Some("ConditionalCheckFailedException") {
+                            error!(
+                                "Counter update race condition detected for device {}: expected {}, but counter was modified",
+                                device_id, expected_counter
+                            );
+                            return Err(DynamoDBError::Internal(
+                                format!("Counter race condition: expected counter {}, but it was modified by another request", expected_counter)
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
                 error!("Failed to update device counter: {:?}", err);
                 Err(DynamoDBError::SdkError(err.to_string()))
             }

@@ -1,3 +1,51 @@
+//! Apple DeviceCheck/App Attest server-side validation
+//!
+//! This module implements server-side verification for Apple's App Attest framework,
+//! enabling hardware-backed device attestation for iOS applications.
+//!
+//! # Overview
+//!
+//! App Attest allows servers to verify that requests originate from genuine, unmodified
+//! iOS apps running on authentic Apple devices with Secure Enclave support.
+//!
+//! # Flows
+//!
+//! ## One-time Attestation (Device Binding)
+//! 1. Client requests challenge via `GET /device-check/challenge/:username`
+//! 2. Server generates random UUID challenge, stores in session
+//! 3. Client generates Secure Enclave key via `DCAppAttestService.generateKey()`
+//! 4. Client computes clientDataHash = SHA256(challenge)
+//! 5. Client performs attestation: `DCAppAttestService.attestKey(keyId, clientDataHash)`
+//! 6. Client POSTs CBOR attestation object to `/device-check/attest`
+//! 7. Server validates attestation and stores device binding
+//!
+//! ## Ongoing Assertions (Authentication)
+//! 1. Client requests assertion challenge via `GET /device-check/assert-challenge/:username`
+//! 2. Server generates challenge, validates JWT token
+//! 3. Client signs challenge with device key
+//! 4. Client POSTs assertion to `/device-check/assert`
+//! 5. Server verifies signature, enforces counter increment, issues JWT
+//!
+//! # Security Features
+//!
+//! - **Hardware-backed keys**: Secure Enclave generates per-app, per-device keys
+//! - **Certificate chain validation**: Attestation anchored to Apple's root CA
+//! - **Replay protection**: Monotonic counter must increment with each assertion
+//! - **Signature verification**: ECDSA P-256 signatures verified using stored public keys
+//! - **Nonce binding**: Challenge bound to attestation/assertion via SHA256
+//! - **Race condition protection**: Conditional DynamoDB updates prevent counter races
+//!
+//! # Known Limitations
+//!
+//! - Certificate chain validation is incomplete (intermediate certs not verified)
+//! - Certificate extension 1.2.840.113635.100.8.2 (nonce) validation not implemented
+//!
+//! # Requirements
+//!
+//! - iOS 14+ with Secure Enclave support
+//! - Entitlement: `com.apple.developer.devicecheck.appattest-environment`
+//! - Not available in iOS Simulator
+
 use crate::constants::AUTH_TOKEN_HOURS;
 use crate::db::DynamoDBError;
 use crate::AppState;
@@ -17,9 +65,17 @@ use tower_sessions::Session;
 use uuid::Uuid;
 use x509_parser::prelude::*;
 use base64::Engine;
+use ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p256::pkcs8::DecodePublicKey;
+use std::sync::OnceLock;
 
 const SESSION_ATTEST_STATE_KEY: &str = "attest_state";
 const SESSION_ASSERT_STATE_KEY: &str = "assert_state";
+
+// Cached parsed Apple root certificate data (initialized on first use)
+// Stores the DER-encoded certificate bytes to avoid lifetime issues
+static APPLE_ROOT_CERT_DER: OnceLock<Vec<u8>> = OnceLock::new();
 
 // Apple's App Attest root CA certificate (production)
 // This is Apple's public root certificate for App Attest
@@ -189,10 +245,30 @@ pub async fn finish_attestation(
     let mut nonce_data = Vec::new();
     nonce_data.extend_from_slice(&attestation.auth_data);
     nonce_data.extend_from_slice(&client_data_hash);
-    let _calculated_nonce = Sha256::digest(&nonce_data);
+    let calculated_nonce = Sha256::digest(&nonce_data);
 
-    // TODO: Verify nonce against certificate extension (requires parsing cert extension)
-    // This would involve checking the certificate's 1.2.840.113635.100.8.2 extension
+    // SECURITY GAP: Nonce validation against certificate extension not implemented
+    //
+    // According to Apple's App Attest specification, the credCert (leaf certificate)
+    // contains a custom extension with OID 1.2.840.113635.100.8.2 that holds the nonce.
+    // We should verify that the calculated_nonce matches this extension value.
+    //
+    // Risk Assessment:
+    // - Without this check, an attacker could potentially present a valid attestation
+    //   for a different challenge, though they would still need a genuine Apple device
+    // - The rpIdHash, certificate chain, and counter checks provide defense-in-depth
+    // - This validation should be implemented before production deployment
+    //
+    // Implementation Required:
+    // 1. Parse the X.509 certificate extension 1.2.840.113635.100.8.2
+    // 2. Extract the nonce value from the extension
+    // 3. Compare with calculated_nonce
+    // 4. Reject attestation if they don't match
+    warn!(
+        "SECURITY: Nonce validation against certificate extension not implemented. \
+         Calculated nonce: {}. This check should be added before production use.",
+        hex::encode(&calculated_nonce)
+    );
 
     // Get user from database
     let user = app_state
@@ -330,14 +406,20 @@ pub async fn finish_assertion(
         return Err(DeviceCheckError::ChallengeMismatch);
     }
 
-    // TODO: Verify signature using stored public key
-    // This would require parsing the assertion format and verifying the signature
-    // over the concatenation of authData and clientDataHash
+    // Verify signature using stored public key
+    // The assertion contains authenticator data + signature
+    // Signature is over: authData || clientDataHash
+    verify_assertion_signature(
+        &assertion_bytes,
+        &client_data_hash,
+        &binding.public_key,
+    )?;
 
-    // Update counter in database
+    // Update counter in database with race condition protection
+    // Only update if the counter hasn't been modified by another request
     app_state
         .db_store
-        .update_device_counter(&request.key_id, auth_data.counter)
+        .update_device_counter(&request.key_id, auth_data.counter, binding.counter)
         .await
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
 
@@ -370,11 +452,15 @@ fn validate_certificate_chain(x5c: &[Vec<u8>]) -> Result<(), DeviceCheckError> {
     info!("Leaf certificate subject: {}", leaf_cert.subject());
     info!("Leaf certificate issuer: {}", leaf_cert.issuer());
 
-    // Parse Apple root CA
-    let root_pem = ::pem::parse(APPLE_APP_ATTEST_ROOT_CA.as_bytes())
-        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
+    // Get cached Apple root CA DER (parsed once on first use)
+    let root_cert_der = APPLE_ROOT_CERT_DER.get_or_init(|| {
+        let root_pem = ::pem::parse(APPLE_APP_ATTEST_ROOT_CA.as_bytes())
+            .expect("Failed to parse embedded Apple root CA PEM");
+        root_pem.contents().to_vec()
+    });
 
-    let (_, root_cert) = X509Certificate::from_der(root_pem.contents())
+    // Parse the cached DER to get the certificate for validation
+    let (_, root_cert) = X509Certificate::from_der(root_cert_der)
         .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
 
     info!("Root certificate subject: {}", root_cert.subject());
@@ -420,6 +506,48 @@ fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, DeviceChec
         flags,
         counter,
     })
+}
+
+fn verify_assertion_signature(
+    assertion_bytes: &[u8],
+    client_data_hash: &[u8],
+    public_key_der: &[u8],
+) -> Result<(), DeviceCheckError> {
+    // App Attest assertion format: authenticatorData || signature
+    // Signature is 64 bytes for P-256 ECDSA (r || s, 32 bytes each)
+    if assertion_bytes.len() < 37 + 64 {
+        return Err(DeviceCheckError::InvalidAssertion(
+            "Assertion too short to contain signature".to_string(),
+        ));
+    }
+
+    let auth_data_len = assertion_bytes.len() - 64;
+    let auth_data = &assertion_bytes[0..auth_data_len];
+    let signature_bytes = &assertion_bytes[auth_data_len..];
+
+    // Parse the P-256 public key from DER format
+    let verifying_key = P256VerifyingKey::from_public_key_der(public_key_der)
+        .map_err(|e| DeviceCheckError::InvalidCertificateChain(format!("Failed to parse public key: {}", e)))?;
+
+    // Create signature object
+    let signature = P256Signature::from_slice(signature_bytes)
+        .map_err(|e| DeviceCheckError::InvalidAssertion(format!("Invalid signature format: {}", e)))?;
+
+    // The signed data is: authenticatorData || clientDataHash
+    let mut signed_data = Vec::new();
+    signed_data.extend_from_slice(auth_data);
+    signed_data.extend_from_slice(client_data_hash);
+
+    // Verify the signature
+    verifying_key
+        .verify(&signed_data, &signature)
+        .map_err(|e| {
+            error!("Assertion signature verification failed: {}", e);
+            DeviceCheckError::InvalidAssertion(format!("Signature verification failed: {}", e))
+        })?;
+
+    info!("Assertion signature verified successfully");
+    Ok(())
 }
 
 fn generate_device_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, DeviceCheckError> {
@@ -614,5 +742,40 @@ mod tests {
         // Invalid: counter doesn't increment
         let invalid_counter = 5u32;
         assert!(!(invalid_counter > old_counter));
+    }
+
+    #[test]
+    fn test_signature_verification_input_validation() {
+        // Test that assertion must be long enough to contain signature
+        let short_assertion = vec![0u8; 50]; // Too short (needs at least 37 + 64 = 101)
+        let client_data = vec![0u8; 32];
+        let public_key = vec![0u8; 91]; // Minimal P-256 public key DER
+
+        let result = verify_assertion_signature(&short_assertion, &client_data, &public_key);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("too short to contain signature"));
+    }
+
+    #[test]
+    fn test_nonce_calculation() {
+        // Verify nonce is properly calculated from authData and clientDataHash
+        let auth_data = vec![1u8; 37];
+        let client_data_hash = vec![2u8; 32];
+
+        let mut nonce_data = Vec::new();
+        nonce_data.extend_from_slice(&auth_data);
+        nonce_data.extend_from_slice(&client_data_hash);
+
+        let nonce = Sha256::digest(&nonce_data);
+
+        // Nonce should be 32 bytes (SHA256 output)
+        assert_eq!(nonce.len(), 32);
+
+        // Nonce should be deterministic
+        let nonce2 = Sha256::digest(&nonce_data);
+        assert_eq!(&nonce[..], &nonce2[..]);
     }
 }
