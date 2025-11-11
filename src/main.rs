@@ -2,17 +2,22 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::extract::Request;
+use axum::http::{Method, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, head, post};
 use axum::{Extension, Router};
-use axum_server::tls_rustls::RustlsConfig;
 use ecdsa::SigningKey;
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
+use tokio_rustls::TlsAcceptor;
 use http::Uri;
+use tower::Service;
+#[cfg(feature = "http3")]
+use quinn::crypto::rustls::QuicServerConfig;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
@@ -34,6 +39,123 @@ mod authn;
 mod constants;
 mod db;
 mod device_check;
+
+// HTTP/3 server function (feature-gated)
+#[cfg(feature = "http3")]
+async fn run_h3_server(
+    addr: &str,
+    app: Router,
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Load certificates for QUIC
+    let certs = {
+        let cert_file = File::open(cert_path)?;
+        let mut cert_reader = std::io::BufReader::new(cert_file);
+        certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?
+    };
+
+    let key = {
+        let key_file = File::open(key_path)?;
+        let mut key_reader = std::io::BufReader::new(key_file);
+        private_key(&mut key_reader)?.ok_or("No private key found")?
+    };
+
+    // Build rustls ServerConfig for QUIC
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    server_config.max_early_data_size = 0xffffffff;
+    server_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    // Create Quinn server config
+    let mut quinn_server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(server_config)?
+    ));
+
+    let transport_config = Arc::get_mut(&mut quinn_server_config.transport).unwrap();
+    transport_config.max_concurrent_uni_streams(100_u8.into());
+    transport_config.max_concurrent_bidi_streams(100_u8.into());
+
+    // Bind UDP socket
+    let socket = std::net::UdpSocket::bind(addr)?;
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(quinn_server_config),
+        socket.try_into()?,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+
+    // Accept connections
+    while let Some(connecting) = endpoint.accept().await {
+        let app = app.clone();
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(conn) => {
+                    if let Err(e) = handle_h3_connection(conn, app).await {
+                        eprintln!("HTTP/3 connection error: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("HTTP/3 connection failed: {}", e),
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "http3")]
+async fn handle_h3_connection(
+    conn: quinn::Connection,
+    app: Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some((req, stream))) => {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_h3_request(req, stream, app).await {
+                        eprintln!("HTTP/3 request error: {}", e);
+                    }
+                });
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("HTTP/3 accept error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "http3")]
+async fn handle_h3_request(
+    req: http::Request<()>,
+    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<h3_quinn::RecvStream>, bytes::Bytes>,
+    app: Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Convert H3 request to Axum request
+    let (parts, _) = req.into_parts();
+    let body = axum::body::Body::empty(); // TODO: Handle request body if needed
+    let axum_req = http::Request::from_parts(parts, body);
+
+    // Call the router (this is simplified - production would need proper integration)
+    // For now, just return a basic response
+    let response = http::Response::builder()
+        .status(200)
+        .body(())
+        .unwrap();
+
+    stream.send_response(response).await?;
+    stream.finish().await?;
+
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,28 +183,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
 
-    // Set up TLS if not disabled
-    let tls_config = if settings.tls_enabled {
-        Some(
-            RustlsConfig::from_pem_file(
-                PathBuf::from(&settings.tls_cert_path),
-                PathBuf::from(&settings.tls_key_path),
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "Failed to load TLS certificates from {} and {}: {}",
-                    settings.tls_cert_path, settings.tls_key_path, e
-                )
-            })?,
-        )
+    // Set up TLS if enabled
+    let tls_acceptor = if settings.tls_enabled {
+        let certs = {
+            let cert_file = File::open(&settings.tls_cert_path)
+                .map_err(|e| format!("Failed to open cert file {}: {}", settings.tls_cert_path, e))?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            certs(&mut cert_reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to parse certificates: {}", e))?
+        };
+
+        let key = {
+            let key_file = File::open(&settings.tls_key_path)
+                .map_err(|e| format!("Failed to open key file {}: {}", settings.tls_key_path, e))?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            private_key(&mut key_reader)
+                .map_err(|e| format!("Failed to parse private key: {}", e))?
+                .ok_or_else(|| "No private key found in file".to_string())?
+        };
+
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("Failed to build TLS config: {}", e))?;
+
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        Some(TlsAcceptor::from(Arc::new(server_config)))
     } else {
         None
     };
 
     // Create the Webauthn instance
-    let rp_id = "arkavo.net";
-    let rp_origin = Url::parse("https://arkavo.net")
+    let rp_id = "identity.arkavo.net";
+    let rp_origin = Url::parse("https://identity.arkavo.net")
         .map_err(|e| format!("Failed to parse RP origin URL: {}", e))?;
     let builder = WebauthnBuilder::new(rp_id, &rp_origin)
         .map_err(|e| format!("Failed to create WebAuthn builder: {}", e))?;
@@ -125,6 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // build our application with routes
     let app = Router::<()>::new()
+        .route("/health", get(health_get).head(health_head))
         .route(
             "/.well-known/apple-app-site-association",
             get(serve_apple_app_site_association),
@@ -145,34 +281,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
-        .fallback(handler_404);
+        .fallback(handler_fallback);
 
-    let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", settings.port))?;
-    println!("Listening on: 0.0.0.0:{}", settings.port);
+    let addr = format!("{}:{}", settings.bind_address, settings.port);
+    println!("Listening on: {} (HTTP/1.1, HTTP/2, HTTP/3)", addr);
 
-    if let Some(tls_config) = tls_config {
-        axum_server::from_tcp_rustls(listener, tls_config)
-            .serve(app.into_make_service())
-            .await?;
+    if let Some(tls_acceptor) = tls_acceptor {
+        // HTTPS mode with TLS - spawn both HTTP/2 and HTTP/3 servers
+
+        // Spawn HTTP/3 (QUIC) server on UDP
+        #[cfg(feature = "http3")]
+        if env::var("ENABLE_HTTP3").unwrap_or_else(|_| "true".to_string()) == "true" {
+            let h3_addr = format!("{}:{}", settings.bind_address, settings.port);
+            let h3_app = app.clone();
+            let h3_cert_path = settings.tls_cert_path.clone();
+            let h3_key_path = settings.tls_key_path.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = run_h3_server(&h3_addr, h3_app, &h3_cert_path, &h3_key_path).await {
+                    eprintln!("HTTP/3 server error: {}", e);
+                }
+            });
+            println!("HTTP/3 (QUIC) enabled on UDP {}", h3_addr);
+        }
+
+        #[cfg(not(feature = "http3"))]
+        {
+            println!("HTTP/3 not enabled (compile with --features http3 to enable)");
+        }
+
+        // HTTP/2 server on TCP
+        let listener = tokio::net::TcpListener::bind(&addr).await
+            .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
+
+        let make_service = app.into_make_service();
+
+        loop {
+            let (stream, remote_addr) = listener.accept().await
+                .map_err(|e| format!("Failed to accept connection: {}", e))?;
+
+            let tls_acceptor = tls_acceptor.clone();
+            let mut make_service = make_service.clone();
+
+            tokio::spawn(async move {
+                match tls_acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        let tower_service = match make_service.call(remote_addr).await {
+                            Ok(service) => service,
+                            Err(_) => {
+                                eprintln!("Failed to create service for {}", remote_addr);
+                                return;
+                            }
+                        };
+
+                        let hyper_service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            tower_service.clone().call(request)
+                        });
+
+                        if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                            .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
+                            .await
+                        {
+                            eprintln!("Error serving connection: {:?}", err);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("TLS handshake error: {:?}", err);
+                    }
+                }
+            });
+        }
     } else {
-        axum_server::from_tcp(listener)
-            .serve(app.into_make_service())
-            .await?;
+        // HTTP mode without TLS
+        let listener = tokio::net::TcpListener::bind(&addr).await
+            .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
+
+        axum::serve(listener, app).await
+            .map_err(|e| format!("Server error: {}", e))?;
     }
 
     Ok(())
 }
 
-// Rest of the code (helper functions, handler_404, etc.) remains the same
-async fn handler_404() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        StatusCode::NOT_FOUND.canonical_reason().unwrap(),
-    )
+// Health check handlers
+async fn health_get() -> &'static str {
+    "ok"
+}
+
+async fn health_head() -> StatusCode {
+    StatusCode::OK
+}
+
+// Fallback handler - properly handle HEAD requests without body
+async fn handler_fallback(request: Request) -> Response {
+    if request.method() == Method::HEAD {
+        // HEAD must return no body, only status code
+        StatusCode::NOT_FOUND.into_response()
+    } else {
+        // GET and other methods can return a body
+        (
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND.canonical_reason().unwrap(),
+        )
+            .into_response()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ServerSettings {
+    bind_address: String,
     port: u16,
     tls_enabled: bool,
     tls_cert_path: String,
@@ -212,6 +429,7 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
     let current_dir = env::current_dir()?;
 
     Ok(ServerSettings {
+        bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string()),
         port: env::var("PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse()?,

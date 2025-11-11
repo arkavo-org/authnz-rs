@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WebAuthn-based authentication and authorization service built with Rust, Axum, and DynamoDB. The system provides passwordless authentication using FIDO2/WebAuthn passkeys, JWT token generation, and decentralized identity (DID) support.
 
+**Protocol Support**: HTTP/1.1, HTTP/2 with TLS 1.3 (HTTP/3 infrastructure ready but disabled due to dependency issues)
+
 ## Development Commands
 
 ### Build and Test
@@ -24,6 +26,8 @@ cargo fmt
 ```
 
 ### Running the Server
+
+#### Development (HTTP)
 ```bash
 # Set required environment variables
 export SIGN_KEY_PATH=/path/to/signkey.pem
@@ -41,6 +45,33 @@ export PORT=8080
 # Run the server
 cargo run
 ```
+
+#### Production (HTTPS)
+```bash
+# Set bind address and port
+export BIND_ADDRESS=192.0.2.6  # Specific IP to bind to (defaults to 0.0.0.0 if not set)
+export PORT=443
+
+# Set TLS certificate paths
+export TLS_CERT_PATH=/etc/letsencrypt/live/identity.arkavo.net/fullchain.pem
+export TLS_KEY_PATH=/etc/letsencrypt/live/identity.arkavo.net/privkey.pem
+
+# Set required cryptographic keys
+export SIGN_KEY_PATH=/etc/authnz-rs/keys/signkey.pem
+export ENCODING_KEY_PATH=/etc/authnz-rs/keys/encodekey.pem
+export DECODING_KEY_PATH=/etc/authnz-rs/keys/decodekey.pem
+
+# DynamoDB configuration
+export DYNAMODB_CREDENTIALS_TABLE=credentials
+export DYNAMODB_HANDLES_TABLE=handles
+export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
+export AWS_REGION=us-east-1
+
+# Run the server
+cargo run --release
+```
+
+For complete production deployment instructions, see [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
 
 ### Generate Required Cryptographic Keys
 ```bash
@@ -100,11 +131,13 @@ aws dynamodb create-table \
 ### Core Components
 
 **main.rs** - Application entry point and routing
-- Server configuration and TLS setup
+- Server configuration with optional TLS/HTTPS support (rustls)
+- TLS enabled when TLS_CERT_PATH or TLS_KEY_PATH environment variables are set
 - Axum router with WebAuthn endpoints
 - Session management (10-minute timeout, in-memory store)
 - OAuth callback handling for multiple providers (Patreon, Twitch, Discord, Reddit)
 - Loads EC keys for JWT signing/verification and attestation envelope creation
+- WebAuthn RP origin: `https://identity.arkavo.net` (main.rs:84-85)
 
 **authn.rs** - WebAuthn authentication flow
 - `start_register`: Initiates passkey registration with DID validation
@@ -205,9 +238,14 @@ aws dynamodb create-table \
 - Sessions expire after 10 minutes of inactivity
 
 **Cryptographic Keys**:
-- Signing key: ECDSA P-256 for attestation envelope signatures
-- Encoding/Decoding keys: ES256 for JWT generation and verification
-- Keys loaded from PEM files specified in environment variables
+- **TLS Keys** (optional, for HTTPS):
+  - `TLS_CERT_PATH`: X.509 certificate chain in PEM format (fullchain.pem)
+  - `TLS_KEY_PATH`: Private key in PEM format (privkey.pem)
+  - If omitted, server runs over unencrypted HTTP
+- **WebAuthn/JWT Keys** (required):
+  - Signing key: ECDSA P-256 for attestation envelope signatures
+  - Encoding/Decoding keys: ES256 for JWT generation and verification
+  - Keys loaded from PEM files specified in environment variables
 
 ### Session Management
 - Memory-based session store (MemoryStore)

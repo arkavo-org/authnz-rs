@@ -3,7 +3,7 @@ name = "authnz-rs"
 version = "0.5.0"
 edition = "2024"
 license = "BSD-2"
-rust-version = "1.85.0"
+rust-version = "1.91.1"
 
 [profile.release]
 opt-level = 2  # Lower optimization level
@@ -11,9 +11,17 @@ lto = false    # Disable LTO
 codegen-units = 16  # Increase parallelism
 
 [dependencies]
-tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "macros", "fs", "net", "io-util"] }
 axum = { version = "0.7", features = ["http2", "tokio"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+# HTTP/3 support (optional - enable with "http3" feature)
+h3 = { version = "0.0.6", optional = true }
+h3-quinn = { version = "0.0.8", optional = true }
+quinn = { version = "0.11", optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 tower = { version = "0.5", features = ["full"] }
 tower-sessions = "0.12"
@@ -32,9 +40,14 @@ chrono = "0.4"
 form_urlencoded = "1.2"
 http = "1.3"
 aws-config = "1.8"
-aws-sdk-dynamodb = "1.94"
+aws-sdk-dynamodb = "1.98"
+bytes = "1.9"
 # Security-critical dependencies - versions locked for audit trail
 ciborium = "=0.2.2"      # CBOR parsing for attestation objects
 x509-parser = "=0.16.0"  # Certificate chain validation
 base64 = "=0.22.1"       # Encoding/decoding for attestation data
 hex = "=0.4.3"           # Hex encoding for hashes
+
+[features]
+default = []
+http3 = ["h3", "h3-quinn", "quinn"]
