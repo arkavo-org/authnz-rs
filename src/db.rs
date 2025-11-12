@@ -61,12 +61,14 @@ pub struct DynamoDBStore {
     client: Client,
     credentials_table: String,
     handles_table: String,
+    device_bindings_table: String,
 }
 
 impl DynamoDBStore {
     pub async fn new(
         credentials_table: String,
         handles_table: String,
+        device_bindings_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -75,6 +77,7 @@ impl DynamoDBStore {
             client,
             credentials_table,
             handles_table,
+            device_bindings_table,
         })
     }
 
@@ -445,6 +448,233 @@ impl DynamoDBStore {
             username,
             credentials,
             did,
+        })
+    }
+
+    // Device binding methods for App Attest
+    pub async fn create_device_binding(
+        &self,
+        binding: &crate::device_check::DeviceBinding,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Creating device binding in DynamoDB. Table: {}, Device ID: {}",
+            self.device_bindings_table, binding.device_id
+        );
+
+        match self
+            .client
+            .put_item()
+            .table_name(&self.device_bindings_table)
+            .item("device_id", AttributeValue::S(binding.device_id.clone()))
+            .item("user_id", AttributeValue::S(binding.user_id.to_string()))
+            .item(
+                "public_key",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    binding.public_key.clone(),
+                )),
+            )
+            .item("counter", AttributeValue::N(binding.counter.to_string()))
+            .item("app_id", AttributeValue::S(binding.app_id.clone()))
+            .item(
+                "created_at",
+                AttributeValue::N(binding.created_at.to_string()),
+            )
+            .item(
+                "updated_at",
+                AttributeValue::N(binding.updated_at.to_string()),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully created device binding for device: {}",
+                    binding.device_id
+                );
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!("Device bindings table does not exist");
+                        return Err(DynamoDBError::TableNotExists(
+                            "device_bindings".to_string(),
+                        ));
+                    }
+                    error!("Failed to write to device bindings table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error writing to device bindings table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    pub async fn get_device_binding(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<crate::device_check::DeviceBinding>, DynamoDBError> {
+        info!(
+            "Querying for device binding. Table: {}, Device ID: {}",
+            self.device_bindings_table, device_id
+        );
+
+        let result = match self
+            .client
+            .get_item()
+            .table_name(&self.device_bindings_table)
+            .key("device_id", AttributeValue::S(device_id.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to query device binding {}: {:?}", device_id, err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        if let Some(item) = result.item {
+            match self.item_to_device_binding(&item) {
+                Ok(binding) => {
+                    info!("Found device binding: {}", device_id);
+                    Ok(Some(binding))
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to parse device binding data for {}: {:?}",
+                        device_id, err
+                    );
+                    Err(err)
+                }
+            }
+        } else {
+            info!("No device binding found: {}", device_id);
+            Ok(None)
+        }
+    }
+
+    pub async fn update_device_counter(
+        &self,
+        device_id: &str,
+        new_counter: u32,
+        expected_counter: u32,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Updating device counter. Table: {}, Device ID: {}, New Counter: {} (expected: {})",
+            self.device_bindings_table, device_id, new_counter, expected_counter
+        );
+
+        let updated_at = chrono::Utc::now().timestamp();
+
+        // Use conditional update to prevent race conditions
+        // Only update if the current counter matches the expected value
+        match self
+            .client
+            .update_item()
+            .table_name(&self.device_bindings_table)
+            .key("device_id", AttributeValue::S(device_id.to_string()))
+            .update_expression("SET #counter = :counter, updated_at = :updated_at")
+            .condition_expression("#counter = :expected_counter")
+            .expression_attribute_names("#counter", "counter")
+            .expression_attribute_values(":counter", AttributeValue::N(new_counter.to_string()))
+            .expression_attribute_values(":expected_counter", AttributeValue::N(expected_counter.to_string()))
+            .expression_attribute_values(":updated_at", AttributeValue::N(updated_at.to_string()))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully updated counter for device: {}", device_id);
+                Ok(())
+            }
+            Err(err) => {
+                match &err {
+                    SdkError::ServiceError(service_error) => {
+                        if service_error.err().meta().code() == Some("ConditionalCheckFailedException") {
+                            error!(
+                                "Counter update race condition detected for device {}: expected {}, but counter was modified",
+                                device_id, expected_counter
+                            );
+                            return Err(DynamoDBError::Internal(
+                                format!("Counter race condition: expected counter {}, but it was modified by another request", expected_counter)
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                error!("Failed to update device counter: {:?}", err);
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    fn item_to_device_binding(
+        &self,
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<crate::device_check::DeviceBinding, DynamoDBError> {
+        let device_id = item
+            .get("device_id")
+            .ok_or_else(|| DynamoDBError::Internal("No device_id found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid device_id format".into()))?
+            .to_string();
+
+        let user_id = Uuid::parse_str(
+            item.get("user_id")
+                .ok_or_else(|| DynamoDBError::Internal("No user_id found".into()))?
+                .as_s()
+                .map_err(|_| DynamoDBError::Internal("Invalid user_id format".into()))?,
+        )?;
+
+        let public_key = item
+            .get("public_key")
+            .ok_or_else(|| DynamoDBError::Internal("No public_key found".into()))?
+            .as_b()
+            .map_err(|_| DynamoDBError::Internal("Invalid public_key format".into()))?
+            .as_ref()
+            .to_vec();
+
+        let counter = item
+            .get("counter")
+            .ok_or_else(|| DynamoDBError::Internal("No counter found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid counter format".into()))?
+            .parse::<u32>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse counter".into()))?;
+
+        let app_id = item
+            .get("app_id")
+            .ok_or_else(|| DynamoDBError::Internal("No app_id found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid app_id format".into()))?
+            .to_string();
+
+        let created_at = item
+            .get("created_at")
+            .ok_or_else(|| DynamoDBError::Internal("No created_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid created_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse created_at".into()))?;
+
+        let updated_at = item
+            .get("updated_at")
+            .ok_or_else(|| DynamoDBError::Internal("No updated_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid updated_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse updated_at".into()))?;
+
+        Ok(crate::device_check::DeviceBinding {
+            device_id,
+            user_id,
+            public_key,
+            counter,
+            app_id,
+            created_at,
+            updated_at,
         })
     }
 }
