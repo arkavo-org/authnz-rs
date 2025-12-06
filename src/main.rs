@@ -39,6 +39,7 @@ mod authn;
 mod constants;
 mod db;
 mod device_check;
+mod ntdf_token;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -157,6 +158,8 @@ async fn handle_h3_request(
     Ok(())
 }
 
+use crate::ntdf_token::NtdfTokenBuilder;
+
 #[derive(Clone)]
 pub struct AppState {
     pub webauthn: Arc<Webauthn>,
@@ -164,6 +167,10 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey<NistP256>>,
     pub encoding_key: Arc<EncodingKey>,
     pub decoding_key: Arc<DecodingKey>,
+    /// Optional NTDF token builder for generating NTDF tokens
+    pub ntdf_builder: Option<Arc<NtdfTokenBuilder>>,
+    /// HTTP client for external RPC calls (reused, with timeout)
+    pub http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -238,6 +245,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
 
+    // Initialize NTDF token builder if configured
+    let ntdf_builder = load_ntdf_builder(&settings)?;
+    if ntdf_builder.is_some() {
+        log::info!("NTDF token generation enabled");
+    } else {
+        log::info!("NTDF token generation disabled (NTDF_KAS_URL and NTDF_KAS_PUBLIC_KEY_PATH not set)");
+    }
+
+    // Create HTTP client with timeout for RPC calls
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("Failed to create HTTP client");
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -245,6 +266,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key: Arc::new(signing_key),
         encoding_key: Arc::new(encoding_key),
         decoding_key: Arc::new(decoding_key),
+        ntdf_builder: ntdf_builder.map(Arc::new),
+        http_client,
     };
 
     let session_store = MemoryStore::default();
@@ -398,6 +421,9 @@ struct ServerSettings {
     encoding_key_path: String,
     decoding_key_path: String,
     _enable_timing_logs: bool,
+    // NTDF token configuration (optional)
+    ntdf_kas_url: Option<String>,
+    ntdf_kas_public_key_path: Option<String>,
 }
 
 // Validate required environment variables on startup
@@ -455,6 +481,8 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
+        ntdf_kas_url: env::var("NTDF_KAS_URL").ok(),
+        ntdf_kas_public_key_path: env::var("NTDF_KAS_PUBLIC_KEY_PATH").ok(),
     })
 }
 
@@ -482,6 +510,33 @@ fn load_ec_keys(
 
     debug!("Successfully loaded EC keys");
     Ok((signing_key, encoding_key, decoding_key))
+}
+
+fn load_ntdf_builder(
+    settings: &ServerSettings,
+) -> Result<Option<NtdfTokenBuilder>, Box<dyn std::error::Error>> {
+    match (&settings.ntdf_kas_url, &settings.ntdf_kas_public_key_path) {
+        (Some(kas_url), Some(key_path)) => {
+            debug!("Loading NTDF KAS public key from: {}", key_path);
+            let pem_bytes = std::fs::read(key_path)
+                .map_err(|e| format!("Failed to read NTDF KAS public key from {}: {}", key_path, e))?;
+
+            let builder = NtdfTokenBuilder::from_pem(&pem_bytes, kas_url.clone())
+                .map_err(|e| format!("Failed to create NTDF token builder: {}", e))?;
+
+            debug!("Successfully initialized NTDF token builder for KAS: {}", kas_url);
+            Ok(Some(builder))
+        }
+        (Some(_), None) => {
+            log::warn!("NTDF_KAS_URL set but NTDF_KAS_PUBLIC_KEY_PATH not set - NTDF disabled");
+            Ok(None)
+        }
+        (None, Some(_)) => {
+            log::warn!("NTDF_KAS_PUBLIC_KEY_PATH set but NTDF_KAS_URL not set - NTDF disabled");
+            Ok(None)
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {

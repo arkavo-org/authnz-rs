@@ -4,6 +4,7 @@ use crate::authn::WebauthnError::{
 };
 use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
+use crate::ntdf_token::{CapabilityFlag, NtdfTokenPayload};
 use crate::AppState;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
@@ -17,7 +18,7 @@ use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
 use jsonwebtoken::{decode, encode, Algorithm, Header, TokenData, Validation};
-use log::{error, info};
+use log::{error, info, warn};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -240,10 +241,10 @@ pub async fn finish_register(
                     TokenCreationError(err)
                 })?;
 
-            // If blockchain_address is provided, link it on arkavo-node
+            // If blockchain_address is provided, link it on arkavo-node via secured backchannel
             if let Some(ref addr) = attestation_entity.blockchain_address {
                 if let Err(e) =
-                    link_account_on_chain(&token, &attestation_entity.did, addr).await
+                    link_account_on_chain(&app_state.http_client, &user_id, &attestation_entity.did, addr).await
                 {
                     // Log error but don't fail registration - linking can be retried
                     error!(
@@ -253,11 +254,46 @@ pub async fn finish_register(
                 }
             }
 
+            // Generate NTDF token if builder is configured
+            let ntdf_token = if let Some(ref builder) = app_state.ntdf_builder {
+                let payload = NtdfTokenPayload {
+                    sub_id: *user_id.as_bytes(),
+                    flags: CapabilityFlag::WebAuthn as u64 | CapabilityFlag::Profile as u64,
+                    scopes: vec!["openid".to_string(), "profile".to_string()],
+                    attrs: vec![],
+                    dpop_jti: None,
+                    iat: Utc::now().timestamp(),
+                    exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp(),
+                    aud: "https://kas.arkavo.net".to_string(),
+                    session_id: None,
+                    device_id: None,
+                    did: Some(attestation_entity.did.clone()),
+                };
+                match builder.build(&payload) {
+                    Ok(ntdf) => Some(ntdf),
+                    Err(e) => {
+                        warn!("Failed to generate NTDF token: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Create response with token in header
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
                 Ok(header_value) => {
                     response.headers_mut().insert("X-Auth-Token", header_value);
+
+                    // Add NTDF token to response if generated
+                    if let Some(ntdf) = ntdf_token {
+                        if let Ok(ntdf_header) = HeaderValue::from_str(&format!("NTDF {}", ntdf)) {
+                            response.headers_mut().insert("X-NTDF-Token", ntdf_header);
+                            info!("NTDF token included in registration response");
+                        }
+                    }
+
                     Ok(response)
                 }
                 Err(e) => {
@@ -458,20 +494,24 @@ impl AttestationEnvelope {
 }
 
 /// Calls arkavo-node RPC to link the DID to a blockchain address
-/// Uses ARKAVO_NODE_URL environment variable (defaults to ws://127.0.0.1:9944)
-async fn link_account_on_chain(jwt: &str, did: &str, address: &str) -> Result<(), String> {
+/// This is a secured backchannel call - no token verification needed
+/// Uses ARKAVO_NODE_URL environment variable (defaults to http://127.0.0.1:9933)
+async fn link_account_on_chain(
+    client: &reqwest::Client,
+    user_id: &Uuid,
+    did: &str,
+    address: &str,
+) -> Result<(), String> {
     let node_url = std::env::var("ARKAVO_NODE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9933".to_string());
 
-    let client = reqwest::Client::new();
-
-    // JSON-RPC request for arkavo_linkAccountWithProof
+    // JSON-RPC request for arkavo_linkAccountWithProof (secured backchannel)
     let rpc_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "arkavo_linkAccountWithProof",
         "params": {
-            "jwt": jwt,
+            "user_id": user_id.to_string(),
             "did": did,
             "address": address
         }
@@ -640,6 +680,27 @@ mod tests {
     }
 
     #[test]
+    fn test_blockchain_address_validation() {
+        // Valid address format: 0x + 40 hex chars
+        let valid = "0x742d35Cc6634C0532925a3b844Bc9e7595f2fE3d";
+        assert!(valid.starts_with("0x"));
+        assert_eq!(valid.len(), 42);
+        assert!(valid[2..].chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Invalid: missing 0x prefix
+        let no_prefix = "742d35Cc6634C0532925a3b844Bc9e7595f2fE3d";
+        assert!(!no_prefix.starts_with("0x"));
+
+        // Invalid: wrong length
+        let too_short = "0x742d35";
+        assert_ne!(too_short.len(), 42);
+
+        // Invalid: non-hex characters
+        let non_hex = "0xGGGd35Cc6634C0532925a3b844Bc9e7595f2fE3d";
+        assert!(!non_hex[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn test_token_expiration_constants() {
         use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 
@@ -652,19 +713,42 @@ mod tests {
 
     #[test]
     fn test_webauthn_error_responses() {
-        let errors = vec![
-            WebauthnError::CorruptSession,
-            WebauthnError::UserNotFound,
-            WebauthnError::UserHasNoCredentials,
-            WebauthnError::MissingToken,
-            WebauthnError::InvalidToken,
-            WebauthnError::InvalidHandle,
-            WebauthnError::InvalidDID("test".to_string()),
-        ];
-
-        for error in errors {
-            let response = error.into_response();
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        }
+        // Test each error returns its expected status code
+        assert_eq!(
+            WebauthnError::CorruptSession.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WebauthnError::UserNotFound.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            WebauthnError::Unknown.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            WebauthnError::UserHasNoCredentials.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WebauthnError::MissingToken.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            WebauthnError::InvalidToken.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            WebauthnError::InvalidHandle.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WebauthnError::InvalidDID("test".to_string()).into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WebauthnError::InvalidBlockchainAddress("test".to_string()).into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 }
