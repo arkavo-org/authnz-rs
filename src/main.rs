@@ -175,6 +175,12 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install rustls crypto provider before any TLS operations
+    // Required because both 'ring' and 'aws-lc-rs' are enabled via transitive dependencies
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     env_logger::init();
 
     // Load configuration
