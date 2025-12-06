@@ -23,3 +23,4 @@ Cargo.lock
 
 # Production-specific files (deployment configs, secrets, etc.)
 *production*
+.DS_Store

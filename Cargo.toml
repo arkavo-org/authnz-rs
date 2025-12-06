@@ -47,6 +47,8 @@ ciborium = "=0.2.2"      # CBOR parsing for attestation objects
 x509-parser = "=0.16.0"  # Certificate chain validation
 base64 = "=0.22.1"       # Encoding/decoding for attestation data
 hex = "=0.4.3"           # Hex encoding for hashes
+# HTTP client for arkavo-node RPC calls
+reqwest = { version = "0.12", features = ["json"] }
 
 [features]
 default = []

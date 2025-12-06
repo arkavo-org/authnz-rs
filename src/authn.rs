@@ -32,6 +32,9 @@ const SESSION_REG_STATE_KEY: &str = "reg_state";
 pub struct RegisterParams {
     pub handle: String,
     pub did: String,
+    /// Optional EVM-compatible blockchain address (H160, 20 bytes as hex with 0x prefix)
+    /// Used for transactional account linking with arkavo-node
+    pub blockchain_address: Option<String>,
 }
 
 pub async fn start_register(
@@ -51,6 +54,20 @@ pub async fn start_register(
     // Validate username starts with handle
     if !params.handle.starts_with(&username) {
         return Err(WebauthnError::InvalidHandle);
+    }
+
+    // Validate blockchain address format if provided (0x + 40 hex chars)
+    if let Some(ref addr) = params.blockchain_address {
+        if !addr.starts_with("0x") || addr.len() != 42 {
+            return Err(WebauthnError::InvalidBlockchainAddress(
+                "Address must be 0x-prefixed 20-byte hex (42 chars total)".to_string(),
+            ));
+        }
+        if !addr[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WebauthnError::InvalidBlockchainAddress(
+                "Address must contain only hex characters".to_string(),
+            ));
+        }
     }
 
     // Add retry logic for the initial user query
@@ -120,7 +137,13 @@ pub async fn start_register(
             if let Err(err) = session
                 .insert(
                     SESSION_REG_STATE_KEY,
-                    (username.clone(), user.user_id, reg_state),
+                    (
+                        username.clone(),
+                        user.user_id,
+                        reg_state,
+                        params.did.clone(),
+                        params.blockchain_address.clone(),
+                    ),
                 )
                 .await
             {
@@ -142,11 +165,16 @@ pub async fn finish_register(
     session: Session,
     Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_id, reg_state): (String, Uuid, PasskeyRegistration) =
-        session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
-            error!("No registration state found in session");
-            CorruptSession
-        })?;
+    let (username, user_id, reg_state, did, blockchain_address): (
+        String,
+        Uuid,
+        PasskeyRegistration,
+        String,
+        Option<String>,
+    ) = session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
+        error!("No registration state found in session");
+        CorruptSession
+    })?;
 
     info!(
         "Finishing registration for user: {} ({})",
@@ -197,6 +225,8 @@ pub async fn finish_register(
                 sub: user_id.to_string(),
                 exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp()
                     as usize,
+                did,
+                blockchain_address,
             };
 
             // Create envelope
@@ -209,6 +239,19 @@ pub async fn finish_register(
                     error!("Failed to create JWT token: {}", err);
                     TokenCreationError(err)
                 })?;
+
+            // If blockchain_address is provided, link it on arkavo-node
+            if let Some(ref addr) = attestation_entity.blockchain_address {
+                if let Err(e) =
+                    link_account_on_chain(&token, &attestation_entity.did, addr).await
+                {
+                    // Log error but don't fail registration - linking can be retried
+                    error!(
+                        "Failed to link account on arkavo-node (did={}, addr={}): {}",
+                        attestation_entity.did, addr, e
+                    );
+                }
+            }
 
             // Create response with token in header
             let mut response = Json(envelope).into_response();
@@ -381,6 +424,11 @@ struct AccountToken {
     passkey: Passkey,
     sub: String,
     exp: usize,
+    /// Decentralized Identifier (did:key:...)
+    did: String,
+    /// Optional EVM-compatible blockchain address for transactional linking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blockchain_address: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -407,6 +455,56 @@ impl AttestationEnvelope {
         let signature = Signature::from_der(self.signature.as_ref()).unwrap();
         verifying_key.verify(&message, &signature).is_ok()
     }
+}
+
+/// Calls arkavo-node RPC to link the DID to a blockchain address
+/// Uses ARKAVO_NODE_URL environment variable (defaults to ws://127.0.0.1:9944)
+async fn link_account_on_chain(jwt: &str, did: &str, address: &str) -> Result<(), String> {
+    let node_url = std::env::var("ARKAVO_NODE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9933".to_string());
+
+    let client = reqwest::Client::new();
+
+    // JSON-RPC request for arkavo_linkAccountWithProof
+    let rpc_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "arkavo_linkAccountWithProof",
+        "params": {
+            "jwt": jwt,
+            "did": did,
+            "address": address
+        }
+    });
+
+    let response = client
+        .post(&node_url)
+        .json(&rpc_request)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to arkavo-node: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "arkavo-node returned error status: {}",
+            response.status()
+        ));
+    }
+
+    let rpc_response: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
+
+    if let Some(error) = rpc_response.get("error") {
+        return Err(format!("RPC error: {}", error));
+    }
+
+    info!(
+        "Successfully linked account on arkavo-node: did={}, address={}",
+        did, address
+    );
+    Ok(())
 }
 
 fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
@@ -450,35 +548,67 @@ pub enum WebauthnError {
     SessionError(String),
     #[error("Invalid DID format: {0}")]
     InvalidDID(String),
+    #[error("Invalid blockchain address: {0}")]
+    InvalidBlockchainAddress(String),
 }
 
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
-        let body = match self {
-            CorruptSession => "Corrupt Session".to_string(),
-            UserNotFound => "User Not Found".to_string(),
-            Unknown => "Unknown Error".to_string(),
-            UserHasNoCredentials => "User Has No Credentials".to_string(),
-            InvalidSessionState(_) => "Deserializing Session failed".to_string(),
-            TokenCreationError(err) => format!("Token creation failed: {}", err),
-            MissingToken => "Missing token".to_string(),
-            WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
-            WebauthnError::DynamoDBOperationError(err) => match *err {
-                DynamoDBError::TableNotExists(table) => {
-                    format!("Service setup incomplete: {} table not configured", table)
-                }
-                _ => format!("Database operation failed: {}", err),
-            },
-            WebauthnError::InvalidHandle => "Handle must start with the username".to_string(),
-            WebauthnError::UserCreationFailed(reason) => {
-                format!("Failed to create user: {}", reason)
+        let (status, body) = match self {
+            CorruptSession => (StatusCode::BAD_REQUEST, "Corrupt Session".to_string()),
+            UserNotFound => (StatusCode::NOT_FOUND, "User Not Found".to_string()),
+            Unknown => (StatusCode::INTERNAL_SERVER_ERROR, "Unknown Error".to_string()),
+            UserHasNoCredentials => {
+                (StatusCode::BAD_REQUEST, "User Has No Credentials".to_string())
             }
-            WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
-            WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
-            WebauthnError::InvalidDID(err) => format!("Invalid DID format: {}", err),
+            InvalidSessionState(_) => (
+                StatusCode::BAD_REQUEST,
+                "Deserializing Session failed".to_string(),
+            ),
+            TokenCreationError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Token creation failed: {}", err),
+            ),
+            MissingToken => (StatusCode::UNAUTHORIZED, "Missing token".to_string()),
+            WebauthnError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
+            WebauthnError::TokenDecodingError(err) => {
+                (StatusCode::UNAUTHORIZED, format!("Token decoding error: {}", err))
+            }
+            WebauthnError::DynamoDBOperationError(err) => match *err {
+                DynamoDBError::TableNotExists(table) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Service setup incomplete: {} table not configured", table),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Database operation failed: {}", err),
+                ),
+            },
+            WebauthnError::InvalidHandle => (
+                StatusCode::BAD_REQUEST,
+                "Handle must start with the username".to_string(),
+            ),
+            WebauthnError::UserCreationFailed(reason) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create user: {}", reason),
+            ),
+            WebauthnError::WebAuthnError(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("WebAuthn operation failed: {}", err),
+            ),
+            WebauthnError::SessionError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Session operation failed: {}", err),
+            ),
+            WebauthnError::InvalidDID(err) => {
+                (StatusCode::BAD_REQUEST, format!("Invalid DID format: {}", err))
+            }
+            WebauthnError::InvalidBlockchainAddress(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid blockchain address: {}", err),
+            ),
         };
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        (status, body).into_response()
     }
 }
 
