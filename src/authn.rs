@@ -135,6 +135,8 @@ pub async fn start_register(
         exclude_credentials,
     ) {
         Ok((ccr, reg_state)) => {
+            // Normalize blockchain address to lowercase for consistency
+            let normalized_address = params.blockchain_address.as_ref().map(|a| a.to_lowercase());
             if let Err(err) = session
                 .insert(
                     SESSION_REG_STATE_KEY,
@@ -143,7 +145,7 @@ pub async fn start_register(
                         user.user_id,
                         reg_state,
                         params.did.clone(),
-                        params.blockchain_address.clone(),
+                        normalized_address,
                     ),
                 )
                 .await
@@ -243,15 +245,15 @@ pub async fn finish_register(
 
             // If blockchain_address is provided, link it on arkavo-node via secured backchannel
             if let Some(ref addr) = attestation_entity.blockchain_address {
-                if let Err(e) =
-                    link_account_on_chain(&app_state.http_client, &user_id, &attestation_entity.did, addr).await
-                {
-                    // Log error but don't fail registration - linking can be retried
-                    error!(
-                        "Failed to link account on arkavo-node (did={}, addr={}): {}",
-                        attestation_entity.did, addr, e
-                    );
-                }
+                link_account_on_chain(&app_state.http_client, &user_id, &attestation_entity.did, addr)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to link account on arkavo-node (did={}, addr={}): {}",
+                            attestation_entity.did, addr, e
+                        );
+                        WebauthnError::AccountLinkingFailed(e)
+                    })?;
             }
 
             // Generate NTDF token if builder is configured
@@ -496,6 +498,7 @@ impl AttestationEnvelope {
 /// Calls arkavo-node RPC to link the DID to a blockchain address
 /// This is a secured backchannel call - no token verification needed
 /// Uses ARKAVO_NODE_URL environment variable (defaults to http://127.0.0.1:9933)
+/// Retries up to 3 times with exponential backoff on transient failures
 async fn link_account_on_chain(
     client: &reqwest::Client,
     user_id: &Uuid,
@@ -517,34 +520,56 @@ async fn link_account_on_chain(
         }
     });
 
-    let response = client
-        .post(&node_url)
-        .json(&rpc_request)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to arkavo-node: {}", e))?;
+    let max_retries = 3;
+    let mut last_error = String::new();
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "arkavo-node returned error status: {}",
-            response.status()
-        ));
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            let delay = std::time::Duration::from_millis(100 * (1 << attempt));
+            tokio::time::sleep(delay).await;
+            info!(
+                "Retrying account linking (attempt {}/{})",
+                attempt + 1,
+                max_retries
+            );
+        }
+
+        match client.post(&node_url).json(&rpc_request).send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    last_error = format!(
+                        "arkavo-node returned error status: {}",
+                        response.status()
+                    );
+                    continue;
+                }
+
+                match response.json::<serde_json::Value>().await {
+                    Ok(rpc_response) => {
+                        if let Some(error) = rpc_response.get("error") {
+                            last_error = format!("RPC error: {}", error);
+                            continue;
+                        }
+                        info!(
+                            "Successfully linked account on arkavo-node: did={}, address={}",
+                            did, address
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        last_error = format!("Failed to parse RPC response: {}", e);
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = format!("Failed to connect to arkavo-node: {}", e);
+                continue;
+            }
+        }
     }
 
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
-
-    if let Some(error) = rpc_response.get("error") {
-        return Err(format!("RPC error: {}", error));
-    }
-
-    info!(
-        "Successfully linked account on arkavo-node: did={}, address={}",
-        did, address
-    );
-    Ok(())
+    Err(last_error)
 }
 
 fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
@@ -590,6 +615,8 @@ pub enum WebauthnError {
     InvalidDID(String),
     #[error("Invalid blockchain address: {0}")]
     InvalidBlockchainAddress(String),
+    #[error("Account linking failed: {0}")]
+    AccountLinkingFailed(String),
 }
 
 impl IntoResponse for WebauthnError {
@@ -646,6 +673,10 @@ impl IntoResponse for WebauthnError {
             WebauthnError::InvalidBlockchainAddress(err) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid blockchain address: {}", err),
+            ),
+            WebauthnError::AccountLinkingFailed(err) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Account linking failed: {}", err),
             ),
         };
         (status, body).into_response()
@@ -749,6 +780,10 @@ mod tests {
         assert_eq!(
             WebauthnError::InvalidBlockchainAddress("test".to_string()).into_response().status(),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WebauthnError::AccountLinkingFailed("test".to_string()).into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }
