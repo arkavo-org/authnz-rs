@@ -50,12 +50,10 @@ hex = "=0.4.3"           # Hex encoding for hashes
 # HTTP client for arkavo-node RPC calls
 reqwest = { version = "0.12", features = ["json"] }
 
-# NTDF Token generation
+# NTDF Token generation (uses opentdf-rs for NanoTDF encryption)
 z85 = "3.0"
-aes-gcm = "0.10"
-hkdf = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }
-# opentdf-rs v0.8.0 - NanoTDF Collection support
+# opentdf-rs v0.8.0 - NanoTDF with correct HKDF salt (SHA256("L1L"))
 # Source: https://github.com/arkavo-org/opentdf-rs/releases/tag/0.8.0
 opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.8.0" }
 opentdf-crypto = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.8.0", features = ["kem-ec"] }

@@ -4,27 +4,17 @@
 //! <https://github.com/arkavo-org/specifications/ntdf-token>
 //!
 //! Wire format: `Authorization: NTDF <Z85-encoded-nanotdf>`
+//!
+//! This module uses the opentdf-rs library for NanoTDF encryption, ensuring
+//! correct HKDF salt (SHA256("L1L")) and spec-compliant binary format.
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::KeyInit;
-use aes_gcm::aead::{Aead, Key};
-use aes_gcm::Aes256Gcm;
-use hkdf::Hkdf;
 use log::{debug, info};
-use p256::ecdh::EphemeralSecret;
+use opentdf_crypto::tdf::nanotdf::NanoTdfBuilder;
+use opentdf_protocol::nanotdf::header::EccMode;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::DecodePublicKey;
 use p256::PublicKey;
-use rand_core::OsRng;
-use sha2::Sha256;
-use std::io::Write;
 use thiserror::Error;
-
-/// NanoTDF HKDF salt (from opentdf_protocol specification)
-/// This is SHA256("L1L") for version 1.2 compatibility
-const HKDF_SALT: [u8; 32] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-];
 
 /// Capability flags for NTDF token payload
 #[repr(u64)]
@@ -162,23 +152,20 @@ pub enum NtdfTokenError {
     #[error("KAS public key not configured")]
     NoKasPublicKey,
 
-    #[error("ECDH key agreement failed: {0}")]
-    EcdhError(String),
+    #[error("NanoTDF encryption failed: {0}")]
+    EncryptionFailed(String),
 
-    #[error("AES-GCM encryption failed")]
-    EncryptionFailed,
-
-    #[error("Z85 encoding failed: {0}")]
-    Z85EncodeError(String),
+    #[error("NanoTDF serialization failed: {0}")]
+    SerializationFailed(String),
 
     #[error("Invalid key format: {0}")]
     InvalidKeyFormat(String),
 }
 
-/// Builder for generating NTDF tokens
+/// Builder for generating NTDF tokens using opentdf-rs
 pub struct NtdfTokenBuilder {
-    /// KAS public key for ECDH
-    kas_public_key: PublicKey,
+    /// KAS public key bytes (compressed SEC1 format)
+    kas_public_key_bytes: Vec<u8>,
     /// KAS URL to embed in token header
     kas_url: String,
 }
@@ -190,8 +177,10 @@ impl NtdfTokenBuilder {
     /// * `kas_public_key` - The KAS P-256 public key for ECDH encryption
     /// * `kas_url` - The KAS URL to embed in the token header
     pub fn new(kas_public_key: PublicKey, kas_url: String) -> Self {
+        // Convert to compressed SEC1 format (33 bytes for P-256)
+        let kas_public_key_bytes = kas_public_key.to_encoded_point(true).as_bytes().to_vec();
         Self {
-            kas_public_key,
+            kas_public_key_bytes,
             kas_url,
         }
     }
@@ -229,47 +218,47 @@ impl NtdfTokenBuilder {
     /// Build an NTDF token from the given payload
     ///
     /// Returns a Z85-encoded NanoTDF token string
+    ///
+    /// Uses opentdf-rs for NanoTDF generation with:
+    /// - P-256 (secp256r1) ECDH key agreement
+    /// - HKDF-SHA256 with salt = SHA256("L1L") per NanoTDF spec
+    /// - AES-256-GCM encryption
+    /// - Embedded plaintext policy containing the serialized payload
     pub fn build(&self, payload: &NtdfTokenPayload) -> Result<String, NtdfTokenError> {
-        debug!("Building NTDF token for sub_id={:?}", hex::encode(payload.sub_id));
+        debug!(
+            "Building NTDF token for sub_id={:?}",
+            hex::encode(payload.sub_id)
+        );
 
         // 1. Serialize payload to binary
         let plaintext = payload.to_bytes();
         debug!("Payload serialized: {} bytes", plaintext.len());
 
-        // 2. Generate ephemeral key pair for ECDH
-        let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
-        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+        // 2. Use opentdf-rs NanoTdfBuilder for encryption
+        // The library handles:
+        // - Ephemeral key generation
+        // - ECDH key agreement
+        // - HKDF key derivation with correct NanoTDF salt (SHA256("L1L"))
+        // - AES-256-GCM encryption
+        // - Binary format assembly
+        let nanotdf = NanoTdfBuilder::new()
+            .kas_url(&self.kas_url)
+            .policy_plaintext(plaintext.clone())
+            .ecc_mode(EccMode::Secp256r1)
+            .encrypt(&plaintext, &self.kas_public_key_bytes)
+            .map_err(|e| NtdfTokenError::EncryptionFailed(e.to_string()))?;
 
-        // 3. ECDH key agreement
-        let shared_secret = ephemeral_secret.diffie_hellman(&self.kas_public_key);
-        let shared_bytes = shared_secret.raw_secret_bytes();
+        debug!("NanoTDF encryption complete");
 
-        debug!("ECDH key agreement complete");
+        // 3. Serialize to bytes
+        let nanotdf_bytes = nanotdf
+            .to_bytes()
+            .map_err(|e| NtdfTokenError::SerializationFailed(e.to_string()))?;
 
-        // 4. HKDF key derivation
-        let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), shared_bytes);
-        let mut aes_key = [0u8; 32];
-        hkdf.expand(b"", &mut aes_key)
-            .map_err(|_| NtdfTokenError::EcdhError("HKDF expansion failed".into()))?;
+        debug!("NanoTDF serialized: {} bytes", nanotdf_bytes.len());
 
-        // 5. AES-256-GCM encryption (zero nonce per NanoTDF spec)
-        let nonce = GenericArray::from_slice(&[0u8; 12]);
-        let key = Key::<Aes256Gcm>::from(aes_key);
-        let cipher = Aes256Gcm::new(&key);
-
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|_| NtdfTokenError::EncryptionFailed)?;
-
-        debug!("Encrypted payload: {} bytes", ciphertext.len());
-
-        // 6. Build NanoTDF structure
-        let nanotdf = self.build_nanotdf(&ephemeral_public, &ciphertext)?;
-
-        debug!("NanoTDF built: {} bytes", nanotdf.len());
-
-        // 7. Z85 encode
-        let z85_token = z85::encode(&nanotdf);
+        // 4. Z85 encode
+        let z85_token = z85::encode(&nanotdf_bytes);
 
         info!(
             "NTDF token generated: {} chars, sub_id={}",
@@ -278,45 +267,6 @@ impl NtdfTokenBuilder {
         );
 
         Ok(z85_token)
-    }
-
-    /// Build NanoTDF binary structure
-    fn build_nanotdf(
-        &self,
-        ephemeral_public: &PublicKey,
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, NtdfTokenError> {
-        let mut buf = Vec::new();
-
-        // Magic number "L1" + version byte (0x4C for v1.2)
-        buf.write_all(b"L1L").map_err(|_| NtdfTokenError::EncryptionFailed)?;
-
-        // KAS URL (length-prefixed, 1 byte length for short URLs)
-        let kas_bytes = self.kas_url.as_bytes();
-        if kas_bytes.len() > 255 {
-            return Err(NtdfTokenError::InvalidKeyFormat("KAS URL too long".into()));
-        }
-        buf.push(kas_bytes.len() as u8);
-        buf.write_all(kas_bytes).map_err(|_| NtdfTokenError::EncryptionFailed)?;
-
-        // ECC and binding mode byte:
-        // Bits 7-4: ECC mode (0 = secp256r1)
-        // Bits 3-2: Binding mode (0 = no binding)
-        // Bits 1-0: Symmetric cipher (0 = AES-256-GCM)
-        buf.push(0x00);
-
-        // Ephemeral public key (compressed SEC1 format, 33 bytes for P-256)
-        let ephemeral_bytes = ephemeral_public.to_sec1_bytes();
-        buf.write_all(&ephemeral_bytes).map_err(|_| NtdfTokenError::EncryptionFailed)?;
-
-        // Payload: length (3 bytes big-endian) + ciphertext
-        let len = ciphertext.len();
-        buf.push(((len >> 16) & 0xFF) as u8);
-        buf.push(((len >> 8) & 0xFF) as u8);
-        buf.push((len & 0xFF) as u8);
-        buf.write_all(ciphertext).map_err(|_| NtdfTokenError::EncryptionFailed)?;
-
-        Ok(buf)
     }
 }
 
@@ -361,5 +311,46 @@ mod tests {
         assert_eq!(flags & CapabilityFlag::Profile as u64, 0x01);
         assert_eq!(flags & CapabilityFlag::DeviceAttested as u64, 0x10);
         assert_eq!(flags & CapabilityFlag::Email as u64, 0x00);
+    }
+
+    #[test]
+    fn test_ntdf_token_roundtrip() {
+        use p256::SecretKey;
+        use rand_core::OsRng;
+
+        // Generate a test key pair
+        let secret_key = SecretKey::random(&mut OsRng);
+        let public_key = secret_key.public_key();
+
+        // Create builder
+        let builder = NtdfTokenBuilder::new(public_key, "https://kas.arkavo.net".to_string());
+
+        // Create payload
+        let payload = NtdfTokenPayload {
+            sub_id: [0x42; 16],
+            flags: CapabilityFlag::WebAuthn as u64,
+            scopes: vec!["openid".to_string()],
+            attrs: vec![],
+            dpop_jti: None,
+            iat: 1700000000,
+            exp: 1700003600,
+            aud: "https://kas.arkavo.net".to_string(),
+            session_id: None,
+            device_id: None,
+            did: None,
+        };
+
+        // Build token
+        let token = builder.build(&payload).expect("Token generation failed");
+
+        // Verify it's valid Z85
+        assert!(!token.is_empty());
+
+        // Decode Z85 and verify it's valid NanoTDF
+        let decoded = z85::decode(&token).expect("Z85 decode failed");
+        assert!(decoded.len() > 3);
+
+        // Verify magic number "L1L"
+        assert_eq!(&decoded[0..3], b"L1L", "Invalid NanoTDF magic number");
     }
 }
