@@ -57,7 +57,7 @@ use axum::{
 };
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -143,9 +143,16 @@ struct AttestationObject {
     auth_data: Vec<u8>,
 }
 
+/// Apple App Attest attestation statement (CBOR format)
+/// https://developer.apple.com/documentation/devicecheck/validating_apps_that_connect_to_your_server
 #[derive(Debug, Deserialize)]
 struct AttestationStatement {
+    /// Certificate chain (leaf cert first, then intermediate, then root)
     x5c: Vec<Vec<u8>>,
+    /// Apple's attestation receipt for ongoing fraud risk assessment
+    /// Note: Currently unused but preserved for future fraud detection integration
+    /// See: https://developer.apple.com/documentation/devicecheck/assessing_fraud_risk
+    #[allow(dead_code)]
     receipt: Option<Vec<u8>>,
 }
 
@@ -240,6 +247,30 @@ pub async fn finish_attestation(
             auth_data.counter
         )));
     }
+
+    // Verify authenticator flags
+    // For attestation, User Present (UP) must be set
+    if !auth_data.user_present() {
+        return Err(DeviceCheckError::InvalidAuthenticatorData(
+            "User Present (UP) flag not set in authenticator data".to_string(),
+        ));
+    }
+
+    // For attestation, Attested Credential Data (AT) flag should be set
+    if !auth_data.has_attested_credential() {
+        warn!(
+            "Attested Credential (AT) flag not set - attestation may be incomplete. \
+             rp_id_hash: {}",
+            auth_data.rp_id_hash_str
+        );
+    }
+
+    debug!(
+        "Authenticator flags validated: UP={}, AT={}, raw_flags=0x{:02x}",
+        auth_data.user_present(),
+        auth_data.has_attested_credential(),
+        auth_data.flags
+    );
 
     // Calculate nonce: SHA256(authData || clientDataHash)
     let mut nonce_data = Vec::new();
@@ -387,6 +418,21 @@ pub async fn finish_assertion(
     // Parse authenticator data from assertion
     let auth_data = parse_authenticator_data(&assertion_bytes)?;
 
+    // Verify authenticator flags
+    // For assertion, User Present (UP) must be set
+    if !auth_data.user_present() {
+        return Err(DeviceCheckError::InvalidAuthenticatorData(
+            "User Present (UP) flag not set in assertion".to_string(),
+        ));
+    }
+
+    debug!(
+        "Assertion authenticator flags: UP={}, flags=0x{:02x}, rp_id_hash={}",
+        auth_data.user_present(),
+        auth_data.flags,
+        auth_data.rp_id_hash_str
+    );
+
     // Verify counter has incremented
     if auth_data.counter <= binding.counter {
         return Err(DeviceCheckError::InvalidCounter(format!(
@@ -480,12 +526,45 @@ fn extract_public_key_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, DeviceCheckE
     Ok(public_key)
 }
 
+/// Authenticator data flags per WebAuthn/FIDO specification
+/// https://www.w3.org/TR/webauthn-2/#sctn-authenticator-data
+mod auth_flags {
+    /// User Present (UP) - bit 0
+    pub const USER_PRESENT: u8 = 0x01;
+    /// User Verified (UV) - bit 2
+    #[allow(dead_code)]
+    pub const USER_VERIFIED: u8 = 0x04;
+    /// Attested credential data included (AT) - bit 6
+    pub const ATTESTED_CREDENTIAL: u8 = 0x40;
+    /// Extension data included (ED) - bit 7
+    #[allow(dead_code)]
+    pub const EXTENSION_DATA: u8 = 0x80;
+}
+
 #[derive(Debug)]
 struct AuthenticatorData {
+    /// SHA-256 hash of the RP ID (32 bytes)
+    /// Note: Raw bytes kept for potential future validation; rp_id_hash_str used for storage
+    #[allow(dead_code)]
     rp_id_hash: Vec<u8>,
+    /// Hex-encoded RP ID hash for storage/comparison
     rp_id_hash_str: String,
+    /// Authenticator flags byte
     flags: u8,
+    /// Signature counter (monotonic, for replay protection)
     counter: u32,
+}
+
+impl AuthenticatorData {
+    /// Check if User Present flag is set
+    fn user_present(&self) -> bool {
+        self.flags & auth_flags::USER_PRESENT != 0
+    }
+
+    /// Check if Attested Credential Data flag is set
+    fn has_attested_credential(&self) -> bool {
+        self.flags & auth_flags::ATTESTED_CREDENTIAL != 0
+    }
 }
 
 fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, DeviceCheckError> {

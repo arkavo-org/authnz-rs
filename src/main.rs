@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, head, post};
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use ecdsa::SigningKey;
 use rustls::ServerConfig;
