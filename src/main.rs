@@ -196,6 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
 
+    // Load and cache the webauthn.json config file
+    let webauthn_config = load_webauthn_config().await?;
+
     // Set up TLS if enabled
     let tls_acceptor = if settings.tls_enabled {
         let certs = {
@@ -294,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/.well-known/apple-app-site-association",
             get(serve_apple_app_site_association),
         )
+        .route("/.well-known/webauthn", get(serve_webauthn_well_known))
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
@@ -310,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
+        .layer(Extension(webauthn_config))
         .fallback(handler_fallback);
 
     let addr = format!("{}:{}", settings.bind_address, settings.port);
@@ -566,20 +571,44 @@ fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn st
     Ok(SigningKey::from(secret_key))
 }
 
-async fn load_apple_app_site_association(
-) -> Result<Arc<RwLock<serde_json::Value>>, Box<dyn std::error::Error>> {
+// Newtype wrappers to distinguish Extension types
+#[derive(Clone)]
+struct AppleAppSiteAssociation(Arc<RwLock<serde_json::Value>>);
+
+#[derive(Clone)]
+struct WebAuthnConfig(Arc<RwLock<serde_json::Value>>);
+
+async fn load_apple_app_site_association() -> Result<AppleAppSiteAssociation, Box<dyn std::error::Error>>
+{
     let content = tokio::fs::read_to_string("apple-app-site-association.json")
         .await
         .map_err(|e| format!("Failed to read apple-app-site-association.json: {}", e))?;
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse apple-app-site-association.json: {}", e))?;
-    Ok(Arc::new(RwLock::new(json)))
+    Ok(AppleAppSiteAssociation(Arc::new(RwLock::new(json))))
 }
 
 async fn serve_apple_app_site_association(
-    Extension(apple_app_site_association): Extension<Arc<RwLock<serde_json::Value>>>,
+    Extension(apple_app_site_association): Extension<AppleAppSiteAssociation>,
 ) -> impl IntoResponse {
-    let json = apple_app_site_association.read().await;
+    let json = apple_app_site_association.0.read().await;
+    axum::Json(json.clone())
+}
+
+async fn load_webauthn_config() -> Result<WebAuthnConfig, Box<dyn std::error::Error>> {
+    let path = std::env::var("WEBAUTHN_CONFIG_PATH").unwrap_or_else(|_| "webauthn.json".to_string());
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
+    Ok(WebAuthnConfig(Arc::new(RwLock::new(json))))
+}
+
+async fn serve_webauthn_well_known(
+    Extension(webauthn_config): Extension<WebAuthnConfig>,
+) -> impl IntoResponse {
+    let json = webauthn_config.0.read().await;
     axum::Json(json.clone())
 }
 
