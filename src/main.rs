@@ -30,7 +30,7 @@ use webauthn_rs::prelude::*;
 
 use crate::agent::{
     authorize_agent, generate_agent_challenge, issue_agent_token, list_delegations,
-    revoke_delegation,
+    revoke_delegation, serve_agent_configuration,
 };
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
@@ -305,6 +305,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(serve_apple_app_site_association),
         )
         .route("/.well-known/webauthn", get(serve_webauthn_well_known))
+        .route(
+            "/.well-known/agent-configuration",
+            get(serve_agent_configuration),
+        )
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))

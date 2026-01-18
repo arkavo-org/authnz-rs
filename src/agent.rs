@@ -75,6 +75,99 @@ pub mod entitlements {
 }
 
 // ============================================================================
+// Agent Configuration Discovery (OpenID-style)
+// ============================================================================
+
+/// Agent configuration metadata returned at /.well-known/agent-configuration
+///
+/// Follows the pattern of OpenID Connect Discovery but for agent delegation.
+/// See: https://openid.net/specs/openid-connect-discovery-1_0.html
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentConfiguration {
+    /// URL of the agent delegation service
+    pub issuer: String,
+
+    /// Endpoint for authorizing new agent delegations
+    pub agent_authorization_endpoint: String,
+
+    /// Endpoint for listing delegations
+    pub agent_delegations_endpoint: String,
+
+    /// Endpoint for revoking delegations (base path, append /:did)
+    pub agent_revocation_endpoint: String,
+
+    /// Endpoint for requesting a challenge for token issuance
+    pub agent_challenge_endpoint: String,
+
+    /// Endpoint for exchanging signed proof for token
+    pub agent_token_endpoint: String,
+
+    /// Supported entitlement URIs that can be delegated
+    pub entitlements_supported: Vec<&'static str>,
+
+    /// Maximum depth of delegation chain (human -> agent1 -> agent2 -> ...)
+    pub max_delegation_depth: u8,
+
+    /// Maximum number of agents a single user can delegate to
+    pub max_agents_per_user: u32,
+
+    /// Lifetime of issued agent tokens in seconds
+    pub agent_token_lifetime_seconds: i64,
+
+    /// Time-to-live for challenge in seconds
+    pub challenge_ttl_seconds: i64,
+
+    /// Supported DID methods for agent identity
+    pub did_methods_supported: Vec<&'static str>,
+
+    /// Supported proof signing algorithms
+    pub proof_signing_alg_values_supported: Vec<&'static str>,
+
+    /// Deep link URI scheme for mobile authorization
+    pub authorization_deep_link_scheme: String,
+}
+
+impl AgentConfiguration {
+    /// Build configuration for the given issuer URL
+    pub fn new(issuer: &str) -> Self {
+        let base = issuer.trim_end_matches('/');
+        Self {
+            issuer: base.to_string(),
+            agent_authorization_endpoint: format!("{}/agents/authorize", base),
+            agent_delegations_endpoint: format!("{}/agents/delegations", base),
+            agent_revocation_endpoint: format!("{}/agents/delegations", base),
+            agent_challenge_endpoint: format!("{}/agents/challenge", base),
+            agent_token_endpoint: format!("{}/agents/token", base),
+            entitlements_supported: vec![
+                entitlements::ACTION_READ,
+                entitlements::ACTION_WRITE,
+                entitlements::ACTION_EXECUTE,
+                entitlements::ACTION_DELEGATE,
+                entitlements::ACTION_ADMIN,
+                entitlements::MESH_ORCHESTRATOR,
+                entitlements::MESH_WORKER,
+            ],
+            max_delegation_depth: MAX_DELEGATION_DEPTH,
+            max_agents_per_user: MAX_AGENTS_PER_USER,
+            agent_token_lifetime_seconds: AGENT_TOKEN_DAYS * 24 * 60 * 60,
+            challenge_ttl_seconds: AGENT_CHALLENGE_TTL_SECONDS,
+            did_methods_supported: vec!["did:key"],
+            proof_signing_alg_values_supported: vec!["EdDSA"],
+            authorization_deep_link_scheme: "arkavo://agent/authorize".to_string(),
+        }
+    }
+}
+
+/// GET /.well-known/agent-configuration
+///
+/// Returns agent delegation service metadata for discovery.
+/// Similar to OpenID Connect Discovery's /.well-known/openid-configuration
+pub async fn serve_agent_configuration() -> impl IntoResponse {
+    let config = AgentConfiguration::new("https://identity.arkavo.net");
+    Json(config)
+}
+
+// ============================================================================
 // Request/Response Types
 // ============================================================================
 
@@ -930,5 +1023,48 @@ mod tests {
         assert!(entitlements::ACTION_WRITE.starts_with("https://arkavo.ai/"));
         assert!(entitlements::ACTION_DELEGATE.contains("delegate"));
         assert!(entitlements::MESH_ORCHESTRATOR.contains("mesh"));
+    }
+
+    #[test]
+    fn test_agent_configuration() {
+        let config = AgentConfiguration::new("https://identity.arkavo.net");
+
+        // Verify issuer
+        assert_eq!(config.issuer, "https://identity.arkavo.net");
+
+        // Verify endpoints
+        assert_eq!(
+            config.agent_authorization_endpoint,
+            "https://identity.arkavo.net/agents/authorize"
+        );
+        assert_eq!(
+            config.agent_challenge_endpoint,
+            "https://identity.arkavo.net/agents/challenge"
+        );
+        assert_eq!(
+            config.agent_token_endpoint,
+            "https://identity.arkavo.net/agents/token"
+        );
+
+        // Verify supported entitlements include all defined entitlements
+        assert!(config.entitlements_supported.contains(&entitlements::ACTION_READ));
+        assert!(config.entitlements_supported.contains(&entitlements::ACTION_DELEGATE));
+
+        // Verify limits match constants
+        assert_eq!(config.max_delegation_depth, MAX_DELEGATION_DEPTH);
+        assert_eq!(config.max_agents_per_user, MAX_AGENTS_PER_USER);
+
+        // Verify supported methods
+        assert!(config.did_methods_supported.contains(&"did:key"));
+        assert!(config.proof_signing_alg_values_supported.contains(&"EdDSA"));
+    }
+
+    #[test]
+    fn test_agent_configuration_trailing_slash() {
+        let config = AgentConfiguration::new("https://identity.arkavo.net/");
+
+        // Should strip trailing slash
+        assert_eq!(config.issuer, "https://identity.arkavo.net");
+        assert!(!config.agent_authorization_endpoint.contains("//agents"));
     }
 }
