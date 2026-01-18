@@ -28,6 +28,10 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
+use crate::agent::{
+    authorize_agent, generate_agent_challenge, issue_agent_token, list_delegations,
+    revoke_delegation,
+};
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
@@ -35,6 +39,7 @@ use crate::device_check::{
     finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
 };
 
+mod agent;
 mod authn;
 mod constants;
 mod db;
@@ -250,6 +255,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_HANDLES_TABLE").unwrap_or_else(|_| "handles".to_string()),
         env::var("DYNAMODB_DEVICE_BINDINGS_TABLE")
             .unwrap_or_else(|_| "device_bindings".to_string()),
+        env::var("DYNAMODB_AGENT_DELEGATIONS_TABLE")
+            .unwrap_or_else(|_| "agent_delegations".to_string()),
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -311,6 +318,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(generate_assertion_challenge),
         )
         .route("/device-check/assert", post(finish_assertion))
+        // Agent delegation endpoints
+        .route("/agents/authorize", post(authorize_agent))
+        .route("/agents/delegations", get(list_delegations))
+        .route("/agents/delegations/:did", axum::routing::delete(revoke_delegation))
+        .route("/agents/challenge", get(generate_agent_challenge))
+        .route("/agents/token", post(issue_agent_token))
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
@@ -750,11 +763,11 @@ async fn handle_oauth_callback(
     let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
 
     // Validate state parameter if provider requires it
-    if let Some(state) = params.get("state") {
-        if !validate_oauth_state(state) {
-            error!("Invalid OAuth state parameter for {:?}", provider);
-            return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
-        }
+    if let Some(state) = params.get("state")
+        && !validate_oauth_state(state)
+    {
+        error!("Invalid OAuth state parameter for {:?}", provider);
+        return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
     }
 
     // Handle the authorization code

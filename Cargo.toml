@@ -58,6 +58,10 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.8.0" }
 opentdf-crypto = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.8.0", features = ["kem-ec"] }
 opentdf-protocol = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.8.0" }
+
+# Agent delegation (did:key parsing and signature verification)
+bs58 = "0.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 [features]
 default = []
 http3 = ["h3", "h3-quinn", "quinn"]

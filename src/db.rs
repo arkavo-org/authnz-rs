@@ -15,6 +15,35 @@ pub struct UserCredentials {
     pub did: String,
 }
 
+/// Agent delegation record for agent-to-agent delegation chains
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDelegation {
+    /// Agent's DID (did:key:z6Mk...)
+    pub agent_did: String,
+    /// Type of delegator: "human" or "agent"
+    pub delegator_type: String,
+    /// Delegator's identifier (UUID for human, DID for agent)
+    pub delegator_id: String,
+    /// Delegator's username (if human)
+    pub delegator_username: Option<String>,
+    /// Entitlements granted to the agent (arkavo.ai URIs)
+    pub entitlements: Vec<String>,
+    /// Human-readable name for the agent
+    pub name: String,
+    /// Delegation depth (0 = direct from human)
+    pub depth: u8,
+    /// Original human's UUID (root of delegation chain)
+    pub root_user_id: Uuid,
+    /// Full DID chain for audit (from root to immediate delegator)
+    pub chain: Vec<String>,
+    /// Creation timestamp (Unix epoch)
+    pub created_at: i64,
+    /// Expiration timestamp (optional, Unix epoch)
+    pub expires_at: Option<i64>,
+    /// Revocation timestamp (optional, Unix epoch)
+    pub revoked_at: Option<i64>,
+}
+
 #[derive(Error, Debug)]
 pub enum DynamoDBError {
     #[error("AWS SDK error: {0}")]
@@ -62,6 +91,7 @@ pub struct DynamoDBStore {
     credentials_table: String,
     handles_table: String,
     device_bindings_table: String,
+    agent_delegations_table: String,
 }
 
 impl DynamoDBStore {
@@ -69,6 +99,7 @@ impl DynamoDBStore {
         credentials_table: String,
         handles_table: String,
         device_bindings_table: String,
+        agent_delegations_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -78,6 +109,7 @@ impl DynamoDBStore {
             credentials_table,
             handles_table,
             device_bindings_table,
+            agent_delegations_table,
         })
     }
 
@@ -590,19 +622,16 @@ impl DynamoDBStore {
                 Ok(())
             }
             Err(err) => {
-                match &err {
-                    SdkError::ServiceError(service_error) => {
-                        if service_error.err().meta().code() == Some("ConditionalCheckFailedException") {
-                            error!(
-                                "Counter update race condition detected for device {}: expected {}, but counter was modified",
-                                device_id, expected_counter
-                            );
-                            return Err(DynamoDBError::Internal(
-                                format!("Counter race condition: expected counter {}, but it was modified by another request", expected_counter)
-                            ));
-                        }
-                    }
-                    _ => {}
+                if let SdkError::ServiceError(service_error) = &err
+                    && service_error.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    error!(
+                        "Counter update race condition detected for device {}: expected {}, but counter was modified",
+                        device_id, expected_counter
+                    );
+                    return Err(DynamoDBError::Internal(
+                        format!("Counter race condition: expected counter {}, but it was modified by another request", expected_counter)
+                    ));
                 }
                 error!("Failed to update device counter: {:?}", err);
                 Err(DynamoDBError::SdkError(err.to_string()))
@@ -675,6 +704,435 @@ impl DynamoDBStore {
             app_id,
             created_at,
             updated_at,
+        })
+    }
+
+    // Agent delegation methods
+
+    /// Create a new agent delegation record
+    pub async fn create_agent_delegation(
+        &self,
+        delegation: &AgentDelegation,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Creating agent delegation in DynamoDB. Table: {}, Agent DID: {}",
+            self.agent_delegations_table, delegation.agent_did
+        );
+
+        let mut item_builder = self
+            .client
+            .put_item()
+            .table_name(&self.agent_delegations_table)
+            .item("agent_did", AttributeValue::S(delegation.agent_did.clone()))
+            .item(
+                "delegator_type",
+                AttributeValue::S(delegation.delegator_type.clone()),
+            )
+            .item(
+                "delegator_id",
+                AttributeValue::S(delegation.delegator_id.clone()),
+            )
+            .item(
+                "entitlements",
+                AttributeValue::L(
+                    delegation
+                        .entitlements
+                        .iter()
+                        .map(|e| AttributeValue::S(e.clone()))
+                        .collect(),
+                ),
+            )
+            .item("name", AttributeValue::S(delegation.name.clone()))
+            .item("depth", AttributeValue::N(delegation.depth.to_string()))
+            .item(
+                "root_user_id",
+                AttributeValue::S(delegation.root_user_id.to_string()),
+            )
+            .item(
+                "chain",
+                AttributeValue::L(
+                    delegation
+                        .chain
+                        .iter()
+                        .map(|d| AttributeValue::S(d.clone()))
+                        .collect(),
+                ),
+            )
+            .item(
+                "created_at",
+                AttributeValue::N(delegation.created_at.to_string()),
+            );
+
+        // Add optional fields
+        if let Some(username) = &delegation.delegator_username {
+            item_builder = item_builder.item(
+                "delegator_username",
+                AttributeValue::S(username.clone()),
+            );
+        }
+
+        if let Some(expires_at) = delegation.expires_at {
+            item_builder =
+                item_builder.item("expires_at", AttributeValue::N(expires_at.to_string()));
+        }
+
+        if let Some(revoked_at) = delegation.revoked_at {
+            item_builder =
+                item_builder.item("revoked_at", AttributeValue::N(revoked_at.to_string()));
+        }
+
+        match item_builder.send().await {
+            Ok(_) => {
+                info!(
+                    "Successfully created agent delegation for: {}",
+                    delegation.agent_did
+                );
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!("Agent delegations table does not exist");
+                        return Err(DynamoDBError::TableNotExists(
+                            "agent_delegations".to_string(),
+                        ));
+                    }
+                    error!("Failed to write to agent delegations table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!(
+                        "Unknown error writing to agent delegations table: {:?}",
+                        err
+                    );
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Get an agent delegation by agent DID
+    pub async fn get_agent_delegation(
+        &self,
+        agent_did: &str,
+    ) -> Result<Option<AgentDelegation>, DynamoDBError> {
+        info!(
+            "Querying for agent delegation. Table: {}, Agent DID: {}",
+            self.agent_delegations_table, agent_did
+        );
+
+        let result = match self
+            .client
+            .get_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to query agent delegation {}: {:?}", agent_did, err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        if let Some(item) = result.item {
+            match self.item_to_agent_delegation(&item) {
+                Ok(delegation) => {
+                    info!("Found agent delegation: {}", agent_did);
+                    Ok(Some(delegation))
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to parse agent delegation data for {}: {:?}",
+                        agent_did, err
+                    );
+                    Err(err)
+                }
+            }
+        } else {
+            info!("No agent delegation found: {}", agent_did);
+            Ok(None)
+        }
+    }
+
+    /// List all delegations for a root user
+    pub async fn list_delegations_by_root_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<AgentDelegation>, DynamoDBError> {
+        info!(
+            "Listing agent delegations for root user. Table: {}, User ID: {}",
+            self.agent_delegations_table, user_id
+        );
+
+        let result = match self
+            .client
+            .query()
+            .table_name(&self.agent_delegations_table)
+            .index_name("root_user_id-index")
+            .key_condition_expression("root_user_id = :root_user_id")
+            .expression_attribute_values(
+                ":root_user_id",
+                AttributeValue::S(user_id.to_string()),
+            )
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!(
+                    "Failed to list delegations for user {}: {:?}",
+                    user_id, err
+                );
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        let mut delegations = Vec::new();
+        if let Some(items) = result.items {
+            for item in items {
+                match self.item_to_agent_delegation(&item) {
+                    Ok(delegation) => delegations.push(delegation),
+                    Err(err) => {
+                        warn!("Failed to parse delegation item: {:?}", err);
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Found {} delegations for user {}",
+            delegations.len(),
+            user_id
+        );
+        Ok(delegations)
+    }
+
+    /// Count delegations for a root user
+    pub async fn count_delegations_by_root_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<u32, DynamoDBError> {
+        info!(
+            "Counting agent delegations for root user. Table: {}, User ID: {}",
+            self.agent_delegations_table, user_id
+        );
+
+        let result = match self
+            .client
+            .query()
+            .table_name(&self.agent_delegations_table)
+            .index_name("root_user_id-index")
+            .key_condition_expression("root_user_id = :root_user_id")
+            .filter_expression("attribute_not_exists(revoked_at)")
+            .expression_attribute_values(
+                ":root_user_id",
+                AttributeValue::S(user_id.to_string()),
+            )
+            .select(aws_sdk_dynamodb::types::Select::Count)
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!(
+                    "Failed to count delegations for user {}: {:?}",
+                    user_id, err
+                );
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        let count = result.count as u32;
+        info!("User {} has {} active delegations", user_id, count);
+        Ok(count)
+    }
+
+    /// Revoke an agent delegation
+    pub async fn revoke_delegation(&self, agent_did: &str) -> Result<(), DynamoDBError> {
+        info!(
+            "Revoking agent delegation. Table: {}, Agent DID: {}",
+            self.agent_delegations_table, agent_did
+        );
+
+        let revoked_at = chrono::Utc::now().timestamp();
+
+        match self
+            .client
+            .update_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .update_expression("SET revoked_at = :revoked_at")
+            .expression_attribute_values(
+                ":revoked_at",
+                AttributeValue::N(revoked_at.to_string()),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully revoked delegation for: {}", agent_did);
+                Ok(())
+            }
+            Err(err) => {
+                error!("Failed to revoke delegation: {:?}", err);
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    /// Revoke all delegations that have the given DID in their chain (cascade revocation)
+    pub async fn revoke_delegations_with_chain(&self, did: &str) -> Result<u32, DynamoDBError> {
+        info!(
+            "Revoking delegations with DID in chain. Table: {}, DID: {}",
+            self.agent_delegations_table, did
+        );
+
+        // Scan for delegations with this DID in their chain
+        // Note: In production, consider using a GSI for better performance
+        let result = match self
+            .client
+            .scan()
+            .table_name(&self.agent_delegations_table)
+            .filter_expression(
+                "contains(#chain, :did) AND attribute_not_exists(revoked_at)",
+            )
+            .expression_attribute_names("#chain", "chain")
+            .expression_attribute_values(":did", AttributeValue::S(did.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to scan for delegations with chain: {:?}", err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        let mut revoked_count = 0u32;
+        if let Some(items) = result.items {
+            for item in items {
+                if let Some(agent_did_av) = item.get("agent_did")
+                    && let Ok(agent_did) = agent_did_av.as_s()
+                {
+                    if let Err(err) = self.revoke_delegation(agent_did).await {
+                        warn!("Failed to revoke delegation {}: {:?}", agent_did, err);
+                    } else {
+                        revoked_count += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Revoked {} delegations with DID {} in chain",
+            revoked_count, did
+        );
+        Ok(revoked_count)
+    }
+
+    fn item_to_agent_delegation(
+        &self,
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<AgentDelegation, DynamoDBError> {
+        let agent_did = item
+            .get("agent_did")
+            .ok_or_else(|| DynamoDBError::Internal("No agent_did found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid agent_did format".into()))?
+            .to_string();
+
+        let delegator_type = item
+            .get("delegator_type")
+            .ok_or_else(|| DynamoDBError::Internal("No delegator_type found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid delegator_type format".into()))?
+            .to_string();
+
+        let delegator_id = item
+            .get("delegator_id")
+            .ok_or_else(|| DynamoDBError::Internal("No delegator_id found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid delegator_id format".into()))?
+            .to_string();
+
+        let delegator_username = item
+            .get("delegator_username")
+            .and_then(|av| av.as_s().ok())
+            .map(|s| s.to_string());
+
+        let entitlements = item
+            .get("entitlements")
+            .ok_or_else(|| DynamoDBError::Internal("No entitlements found".into()))?
+            .as_l()
+            .map_err(|_| DynamoDBError::Internal("Invalid entitlements format".into()))?
+            .iter()
+            .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
+            .collect();
+
+        let name = item
+            .get("name")
+            .ok_or_else(|| DynamoDBError::Internal("No name found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid name format".into()))?
+            .to_string();
+
+        let depth = item
+            .get("depth")
+            .ok_or_else(|| DynamoDBError::Internal("No depth found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid depth format".into()))?
+            .parse::<u8>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse depth".into()))?;
+
+        let root_user_id = Uuid::parse_str(
+            item.get("root_user_id")
+                .ok_or_else(|| DynamoDBError::Internal("No root_user_id found".into()))?
+                .as_s()
+                .map_err(|_| DynamoDBError::Internal("Invalid root_user_id format".into()))?,
+        )?;
+
+        let chain = item
+            .get("chain")
+            .ok_or_else(|| DynamoDBError::Internal("No chain found".into()))?
+            .as_l()
+            .map_err(|_| DynamoDBError::Internal("Invalid chain format".into()))?
+            .iter()
+            .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
+            .collect();
+
+        let created_at = item
+            .get("created_at")
+            .ok_or_else(|| DynamoDBError::Internal("No created_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid created_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse created_at".into()))?;
+
+        let expires_at = item
+            .get("expires_at")
+            .and_then(|av| av.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok());
+
+        let revoked_at = item
+            .get("revoked_at")
+            .and_then(|av| av.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok());
+
+        Ok(AgentDelegation {
+            agent_did,
+            delegator_type,
+            delegator_id,
+            delegator_username,
+            entitlements,
+            name,
+            depth,
+            root_user_id,
+            chain,
+            created_at,
+            expires_at,
+            revoked_at,
         })
     }
 }

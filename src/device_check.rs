@@ -298,7 +298,7 @@ pub async fn finish_attestation(
     warn!(
         "SECURITY: Nonce validation against certificate extension not implemented. \
          Calculated nonce: {}. This check should be added before production use.",
-        hex::encode(&calculated_nonce)
+        hex::encode(calculated_nonce)
     );
 
     // Get user from database

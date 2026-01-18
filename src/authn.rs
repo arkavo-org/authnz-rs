@@ -270,6 +270,10 @@ pub async fn finish_register(
                     session_id: None,
                     device_id: None,
                     did: Some(attestation_entity.did.clone()),
+                    delegator_id: None,
+                    root_user_id: None,
+                    delegation_depth: None,
+                    delegation_chain: None,
                 };
                 match builder.build(&payload) {
                     Ok(ntdf) => Some(ntdf),
@@ -289,11 +293,11 @@ pub async fn finish_register(
                     response.headers_mut().insert("X-Auth-Token", header_value);
 
                     // Add NTDF token to response if generated
-                    if let Some(ntdf) = ntdf_token {
-                        if let Ok(ntdf_header) = HeaderValue::from_str(&format!("NTDF {}", ntdf)) {
-                            response.headers_mut().insert("X-NTDF-Token", ntdf_header);
-                            info!("NTDF token included in registration response");
-                        }
+                    if let Some(ntdf) = ntdf_token
+                        && let Ok(ntdf_header) = HeaderValue::from_str(&format!("NTDF {}", ntdf))
+                    {
+                        response.headers_mut().insert("X-NTDF-Token", ntdf_header);
+                        info!("NTDF token included in registration response");
                     }
 
                     Ok(response)
@@ -419,7 +423,7 @@ pub async fn finish_authentication(
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
-    let res = match app_state
+    match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
@@ -439,8 +443,7 @@ pub async fn finish_authentication(
                 }),
             ))
         }
-    };
-    res
+    }
 }
 
 // Existing helper functions and structs remain the same

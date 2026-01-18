@@ -29,6 +29,8 @@ pub enum CapabilityFlag {
     BiometricAuth = 0x20,
     WebAuthn = 0x40,
     PlatformSecure = 0x80,
+    /// Token issued to a delegated agent (CLI, mesh worker, etc.)
+    AgentDelegated = 0x100,
 }
 
 /// Attribute types for NTDF token payload
@@ -67,6 +69,14 @@ pub struct NtdfTokenPayload {
     pub device_id: Option<String>,
     /// Decentralized Identifier (optional)
     pub did: Option<String>,
+    /// Immediate delegator's UUID (for agent delegation)
+    pub delegator_id: Option<[u8; 16]>,
+    /// Original human's UUID (root of delegation chain)
+    pub root_user_id: Option<[u8; 16]>,
+    /// Delegation chain depth (0 = direct from human, max 5)
+    pub delegation_depth: Option<u8>,
+    /// Full DID chain for audit trail (delegator DIDs from root to immediate)
+    pub delegation_chain: Option<Vec<String>>,
 }
 
 impl NtdfTokenPayload {
@@ -138,6 +148,44 @@ impl NtdfTokenPayload {
             buf.push(1);
             buf.extend_from_slice(&(did.len() as u16).to_le_bytes());
             buf.extend_from_slice(did.as_bytes());
+        } else {
+            buf.push(0);
+        }
+
+        // delegator_id_present (1 byte)
+        if let Some(delegator_id) = &self.delegator_id {
+            buf.push(1);
+            buf.extend_from_slice(delegator_id);
+        } else {
+            buf.push(0);
+        }
+
+        // root_user_id_present (1 byte)
+        if let Some(root_user_id) = &self.root_user_id {
+            buf.push(1);
+            buf.extend_from_slice(root_user_id);
+        } else {
+            buf.push(0);
+        }
+
+        // delegation_depth_present (1 byte)
+        if let Some(depth) = &self.delegation_depth {
+            buf.push(1);
+            buf.push(*depth);
+        } else {
+            buf.push(0);
+        }
+
+        // delegation_chain_present (1 byte)
+        if let Some(chain) = &self.delegation_chain {
+            buf.push(1);
+            // chain_length (2 bytes, u16 little-endian)
+            buf.extend_from_slice(&(chain.len() as u16).to_le_bytes());
+            for did in chain {
+                // Each DID: length (2 bytes) + string bytes
+                buf.extend_from_slice(&(did.len() as u16).to_le_bytes());
+                buf.extend_from_slice(did.as_bytes());
+            }
         } else {
             buf.push(0);
         }
@@ -288,6 +336,10 @@ mod tests {
             session_id: None,
             device_id: None,
             did: Some("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string()),
+            delegator_id: None,
+            root_user_id: None,
+            delegation_depth: None,
+            delegation_chain: None,
         };
 
         let bytes = payload.to_bytes();
@@ -338,6 +390,10 @@ mod tests {
             session_id: None,
             device_id: None,
             did: None,
+            delegator_id: None,
+            root_user_id: None,
+            delegation_depth: None,
+            delegation_chain: None,
         };
 
         // Build token
