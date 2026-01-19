@@ -9,7 +9,7 @@ use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::{Extension, Router};
+use axum::{Extension, Json, Router};
 use ecdsa::SigningKey;
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
@@ -18,7 +18,7 @@ use http::Uri;
 use tower::Service;
 #[cfg(feature = "http3")]
 use quinn::crypto::rustls::QuicServerConfig;
-use log::{debug, error};
+use log::{debug, error, info};
 use p256::{NistP256, SecretKey};
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -46,6 +46,7 @@ mod constants;
 mod db;
 mod device_check;
 mod ntdf_token;
+mod patreon;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -178,6 +179,8 @@ pub struct AppState {
     pub ntdf_decoder: Option<Arc<NtdfTokenDecoder>>,
     /// HTTP client for external RPC calls (reused, with timeout)
     pub http_client: reqwest::Client,
+    /// Patreon client for OAuth operations
+    pub patreon_client: Option<Arc<patreon::PatreonClient>>,
 }
 
 #[tokio::main]
@@ -281,6 +284,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to create HTTP client");
 
+    // Initialize Patreon client if credentials are configured
+    let patreon_client = match (
+        env::var("PATREON_CLIENT_ID").ok(),
+        env::var("PATREON_CLIENT_SECRET").ok(),
+    ) {
+        (Some(client_id), Some(client_secret)) => {
+            log::info!("Patreon account linking enabled");
+            Some(Arc::new(patreon::PatreonClient::new(client_id, client_secret)))
+        }
+        _ => {
+            log::info!("Patreon account linking disabled (PATREON_CLIENT_ID and PATREON_CLIENT_SECRET not set)");
+            None
+        }
+    };
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -289,6 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ntdf_builder: ntdf_builder.map(Arc::new),
         ntdf_decoder: ntdf_decoder.map(Arc::new),
         http_client,
+        patreon_client,
     };
 
     let session_store = MemoryStore::default();
@@ -335,6 +354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/agents/token", post(issue_agent_token))
         // Account management endpoints
         .route("/account", axum::routing::delete(delete_account))
+        // Account linking endpoints
+        .route("/link/patreon", post(link_patreon))
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
@@ -820,6 +841,124 @@ enum LoadKeysError {
     InvalidKeyFormat,
     #[error("Invalid key type")]
     InvalidKeyType,
+}
+
+// MARK: - Patreon Account Linking
+
+use crate::ntdf_token::{AttributeType, NtdfTokenPayload};
+
+#[derive(Debug, serde::Deserialize)]
+struct PatreonLinkRequest {
+    authorization_code: String,
+    redirect_uri: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PatreonLinkResponse {
+    ntdf_token: String,
+    tier_level: u8,
+    is_active_patron: bool,
+}
+
+/// Links a Patreon account to the user's Arkavo account.
+///
+/// 1. Validates the incoming NTDF token
+/// 2. Exchanges the authorization code for Patreon tokens
+/// 3. Fetches the user's tier from Patreon API
+/// 4. Issues a new NTDF token with the SubscriptionTier attribute
+async fn link_patreon(
+    Extension(state): Extension<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<PatreonLinkRequest>,
+) -> Result<Json<PatreonLinkResponse>, (StatusCode, String)> {
+    // Get and validate the auth token
+    let auth_token = headers
+        .get("X-Auth-Token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing X-Auth-Token header".to_string()))?;
+
+    // Validate token and extract user info
+    let decoder = state.ntdf_decoder.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "NTDF token decoding not configured".to_string(),
+    ))?;
+
+    let payload = decoder.decode(auth_token).map_err(|e| {
+        error!("Failed to decode NTDF token: {}", e);
+        (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
+    })?;
+
+    let sub_id = payload.sub_id;
+
+    // Get Patreon client
+    let patreon_client = state.patreon_client.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Patreon linking not configured".to_string(),
+    ))?;
+
+    // Exchange authorization code for tokens
+    let token_response = patreon_client
+        .exchange_code(&request.authorization_code, &request.redirect_uri)
+        .await
+        .map_err(|e| {
+            error!("Patreon token exchange failed: {}", e);
+            (StatusCode::BAD_REQUEST, format!("Token exchange failed: {}", e))
+        })?;
+
+    // Fetch user tier information
+    let tier_info = patreon_client
+        .get_user_tier(&token_response.access_token)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch Patreon tier: {}", e);
+            (StatusCode::BAD_REQUEST, format!("Failed to fetch tier: {}", e))
+        })?;
+
+    info!(
+        "Linked Patreon account for user {:?}: tier_level={}, active={}",
+        hex::encode(sub_id),
+        tier_info.tier_level,
+        tier_info.is_active_patron
+    );
+
+    // Generate new NTDF token with SubscriptionTier attribute
+    let builder = state.ntdf_builder.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "NTDF token generation not configured".to_string(),
+    ))?;
+
+    // Build new payload with tier attribute
+    let now = chrono::Utc::now().timestamp();
+    let new_payload = NtdfTokenPayload {
+        sub_id,
+        flags: payload.flags,
+        scopes: payload.scopes.clone(),
+        attrs: vec![
+            (AttributeType::SubscriptionTier as u8, tier_info.tier_level as u32),
+        ],
+        dpop_jti: None,
+        iat: now,
+        exp: now + 86400 * 30, // 30 days
+        aud: payload.aud.clone(),
+        session_id: payload.session_id,
+        device_id: payload.device_id.clone(),
+        did: payload.did.clone(),
+        delegator_id: None,
+        root_user_id: None,
+        delegation_depth: None,
+        delegation_chain: None,
+    };
+
+    let new_token = builder.build(&new_payload).map_err(|e| {
+        error!("Failed to generate NTDF token: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Token generation failed: {}", e))
+    })?;
+
+    Ok(Json(PatreonLinkResponse {
+        ntdf_token: new_token,
+        tier_level: tier_info.tier_level,
+        is_active_patron: tier_info.is_active_patron,
+    }))
 }
 
 #[cfg(test)]
