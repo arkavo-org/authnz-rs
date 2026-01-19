@@ -1,10 +1,10 @@
 use crate::authn::WebauthnError::{
-    CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown,
+    CorruptSession, InvalidSessionState, MissingToken, Unknown,
     UserHasNoCredentials, UserNotFound,
 };
 use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
-use crate::ntdf_token::{CapabilityFlag, NtdfTokenPayload};
+use crate::ntdf_token::{CapabilityFlag, NtdfTokenError, NtdfTokenPayload};
 use crate::AppState;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
@@ -17,7 +17,6 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{decode, encode, Algorithm, Header, TokenData, Validation};
 use log::{error, info, warn};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -216,7 +215,7 @@ pub async fn finish_register(
                 }
             }
 
-            // Generate account token
+            // Generate account token data for attestation envelope
             let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
             // SECURITY: Long-lived registration token (~99 years) is intentional.
             // Security relies on WebAuthn passkey validation, not token expiration.
@@ -232,16 +231,8 @@ pub async fn finish_register(
                 blockchain_address,
             };
 
-            // Create envelope
+            // Create attestation envelope with ECDSA signature
             let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
-
-            // Generate JWT token
-            let header = Header::new(Algorithm::ES256);
-            let token =
-                encode(&header, &attestation_entity, &app_state.encoding_key).map_err(|err| {
-                    error!("Failed to create JWT token: {}", err);
-                    TokenCreationError(err)
-                })?;
 
             // If blockchain_address is provided, link it on arkavo-node via secured backchannel
             if let Some(ref addr) = attestation_entity.blockchain_address {
@@ -256,57 +247,48 @@ pub async fn finish_register(
                     })?;
             }
 
-            // Generate NTDF token if builder is configured
-            let ntdf_token = if let Some(ref builder) = app_state.ntdf_builder {
-                let payload = NtdfTokenPayload {
-                    sub_id: *user_id.as_bytes(),
-                    flags: CapabilityFlag::WebAuthn as u64 | CapabilityFlag::Profile as u64,
-                    scopes: vec!["openid".to_string(), "profile".to_string()],
-                    attrs: vec![],
-                    dpop_jti: None,
-                    iat: Utc::now().timestamp(),
-                    exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp(),
-                    aud: "https://kas.arkavo.net".to_string(),
-                    session_id: None,
-                    device_id: None,
-                    did: Some(attestation_entity.did.clone()),
-                    delegator_id: None,
-                    root_user_id: None,
-                    delegation_depth: None,
-                    delegation_chain: None,
-                };
-                match builder.build(&payload) {
-                    Ok(ntdf) => Some(ntdf),
-                    Err(e) => {
-                        warn!("Failed to generate NTDF token: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
+            // Generate NTDF token (required)
+            let ntdf_builder = app_state.ntdf_builder
+                .as_ref()
+                .ok_or_else(|| {
+                    error!("NTDF token builder not configured");
+                    WebauthnError::NtdfNotConfigured
+                })?;
+
+            let payload = NtdfTokenPayload {
+                sub_id: *user_id.as_bytes(),
+                flags: CapabilityFlag::WebAuthn as u64 | CapabilityFlag::Profile as u64,
+                scopes: vec!["openid".to_string(), "profile".to_string()],
+                attrs: vec![],
+                dpop_jti: None,
+                iat: Utc::now().timestamp(),
+                exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp(),
+                aud: "https://kas.arkavo.net".to_string(),
+                session_id: None,
+                device_id: None,
+                did: Some(attestation_entity.did.clone()),
+                delegator_id: None,
+                root_user_id: None,
+                delegation_depth: None,
+                delegation_chain: None,
             };
 
-            // Create response with token in header
+            let ntdf_token = ntdf_builder.build(&payload).map_err(|e| {
+                error!("Failed to generate NTDF token: {}", e);
+                WebauthnError::TokenCreationError(e)
+            })?;
+
+            // Create response with NTDF token in header
             let mut response = Json(envelope).into_response();
-            match HeaderValue::from_str(&token) {
-                Ok(header_value) => {
-                    response.headers_mut().insert("X-Auth-Token", header_value);
+            let ntdf_header = HeaderValue::from_str(&format!("NTDF {}", ntdf_token))
+                .map_err(|e| {
+                    error!("Failed to create header value from NTDF token: {}", e);
+                    MissingToken
+                })?;
+            response.headers_mut().insert("X-NTDF-Token", ntdf_header);
+            info!("NTDF token included in registration response");
 
-                    // Add NTDF token to response if generated
-                    if let Some(ntdf) = ntdf_token
-                        && let Ok(ntdf_header) = HeaderValue::from_str(&format!("NTDF {}", ntdf))
-                    {
-                        response.headers_mut().insert("X-NTDF-Token", ntdf_header);
-                        info!("NTDF token included in registration response");
-                    }
-
-                    Ok(response)
-                }
-                Err(e) => {
-                    error!("Failed to create header value from token: {}", e);
-                    Err(MissingToken)
-                }
-            }
+            Ok(response)
         }
         Err(error) => {
             error!("WebAuthn registration failed for {}: {:?}", username, error);
@@ -328,65 +310,69 @@ pub async fn start_authentication(
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
-    // Get user from database or JWT
-    let mut token_data: Option<TokenData<AccountToken>> = None;
-    if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        let jwt = jwt_header
+    // Decode NTDF token if provided (optional, for user identification)
+    let mut token_user_id: Option<Uuid> = None;
+    if let Some(ntdf_header) = headers.get("X-NTDF-Token") {
+        let header_value = ntdf_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
 
-        let decoding_key = (*app_state.decoding_key).clone();
-        let mut token_validation = Validation::new(Algorithm::ES256);
-        // SAFETY: JWT exp/nbf validation is intentionally disabled.
+        let ntdf_decoder = app_state.ntdf_decoder
+            .as_ref()
+            .ok_or(WebauthnError::NtdfNotConfigured)?;
+
+        // SAFETY: NTDF exp/nbf validation is intentionally disabled in the decoder.
         // Security model relies on WebAuthn ceremony validation, not token expiration.
         // Long-lived registration tokens (~99 years) combined with WebAuthn provide
         // replay protection via the passkey authentication ceremony and session management.
         // Sessions expire after 10 minutes, providing time-based security boundaries.
-        token_validation.validate_nbf = false;
-        token_validation.validate_exp = false;
-        token_data = Some(
-            decode::<AccountToken>(jwt, &decoding_key, &token_validation).map_err(|err| {
-                WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err))
-            })?,
-        );
+        let payload = ntdf_decoder.decode_header(header_value).map_err(|err| {
+            WebauthnError::TokenDecodingError(format!("Error decoding NTDF token: {}", err))
+        })?;
+
+        token_user_id = Some(Uuid::from_bytes(payload.sub_id));
     }
 
-    // Try to get user from DB first, fallback to token data
+    // Get user from database (required for WebAuthn ceremony)
     let user = match app_state
         .db_store
         .get_user_by_name(&username)
         .await
         .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
     {
-        Some(user) => user,
+        Some(user) => {
+            // Verify token user_id matches if token was provided
+            if let Some(tid) = token_user_id
+                && tid != user.user_id
+            {
+                warn!(
+                    "Token user_id {} does not match DB user_id {} for username {}",
+                    tid, user.user_id, username
+                );
+                return Err(WebauthnError::InvalidToken);
+            }
+            user
+        }
         None => {
-            if let Some(ref token_data) = token_data {
-                // Create temporary user from token data
-                crate::db::UserCredentials {
-                    user_id: token_data.claims.user_unique_id,
-                    username: username.clone(),
-                    credentials: vec![token_data.claims.passkey.clone()],
-                    did: String::new(), // Token doesn't contain DID
-                }
+            // Try to look up by user_id from token if username lookup failed
+            if let Some(tid) = token_user_id {
+                app_state
+                    .db_store
+                    .get_user_by_id(tid)
+                    .await
+                    .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
+                    .ok_or(UserNotFound)?
             } else {
                 return Err(UserNotFound);
             }
         }
     };
 
-    // Credential retrieval strategy:
-    // 1. Prefer DB credentials (source of truth for registered users)
-    // 2. Fallback to JWT token passkey if user exists but has no stored credentials
-    // 3. Fail if neither is available (prevents invalid auth attempts)
-    let credentials = if user.credentials.is_empty() {
-        if let Some(token_data) = &token_data {
-            vec![token_data.claims.passkey.clone()]
-        } else {
-            return Err(UserHasNoCredentials);
-        }
-    } else {
-        user.credentials.clone()
-    };
+    // Credentials must come from database (source of truth)
+    if user.credentials.is_empty() {
+        return Err(UserHasNoCredentials);
+    }
+    let credentials = user.credentials.clone();
 
     let res = match app_state
         .webauthn
@@ -429,33 +415,27 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            // Generate JWT token
-            let token = generate_jwt(user_unique_id, &app_state)?;
+            // Generate NTDF token
+            let token = generate_ntdf_token(user_unique_id, &app_state)?;
             info!("Authentication successful for user: {}", user_unique_id);
-            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
+            Ok((StatusCode::OK, Json(AuthResponse { ntdf_token: token })))
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
             Ok((
                 StatusCode::BAD_REQUEST,
                 Json(AuthResponse {
-                    jwt_token: String::new(),
+                    ntdf_token: String::new(),
                 }),
             ))
         }
     }
 }
 
-// Existing helper functions and structs remain the same
+// Helper functions and structs
 #[derive(Serialize)]
 struct AuthResponse {
-    jwt_token: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
+    ntdf_token: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -575,13 +555,30 @@ async fn link_account_on_chain(
     Err(last_error)
 }
 
-fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
+fn generate_ntdf_token(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
+    let ntdf_builder = app_state.ntdf_builder
+        .as_ref()
+        .ok_or(WebauthnError::NtdfNotConfigured)?;
+
+    let payload = NtdfTokenPayload {
+        sub_id: *user_id.as_bytes(),
+        flags: CapabilityFlag::WebAuthn as u64,
+        scopes: vec!["openid".to_string()],
+        attrs: vec![],
+        dpop_jti: None,
+        iat: Utc::now().timestamp(),
+        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp(),
+        aud: "https://kas.arkavo.net".to_string(),
+        session_id: None,
+        device_id: None,
+        did: None,
+        delegator_id: None,
+        root_user_id: None,
+        delegation_depth: None,
+        delegation_chain: None,
     };
-    let header = Header::new(Algorithm::ES256);
-    encode(&header, &claims, &app_state.encoding_key).map_err(TokenCreationError)
+
+    ntdf_builder.build(&payload).map_err(WebauthnError::TokenCreationError)
 }
 
 #[derive(Error, Debug)]
@@ -596,8 +593,8 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
-    #[error("Token creation error")]
-    TokenCreationError(jsonwebtoken::errors::Error),
+    #[error("Token creation error: {0}")]
+    TokenCreationError(NtdfTokenError),
     #[error("Missing token")]
     MissingToken,
     #[error("Invalid token")]
@@ -620,6 +617,8 @@ pub enum WebauthnError {
     InvalidBlockchainAddress(String),
     #[error("Account linking failed: {0}")]
     AccountLinkingFailed(String),
+    #[error("NTDF token system not configured")]
+    NtdfNotConfigured,
 }
 
 impl IntoResponse for WebauthnError {
@@ -635,7 +634,7 @@ impl IntoResponse for WebauthnError {
                 StatusCode::BAD_REQUEST,
                 "Deserializing Session failed".to_string(),
             ),
-            TokenCreationError(err) => (
+            WebauthnError::TokenCreationError(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Token creation failed: {}", err),
             ),
@@ -680,6 +679,10 @@ impl IntoResponse for WebauthnError {
             WebauthnError::AccountLinkingFailed(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Account linking failed: {}", err),
+            ),
+            WebauthnError::NtdfNotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NTDF token system not configured".to_string(),
             ),
         };
         (status, body).into_response()

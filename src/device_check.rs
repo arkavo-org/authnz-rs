@@ -48,6 +48,7 @@
 
 use crate::constants::AUTH_TOKEN_HOURS;
 use crate::db::DynamoDBError;
+use crate::ntdf_token::{CapabilityFlag, NtdfTokenPayload};
 use crate::AppState;
 use axum::http::HeaderMap;
 use axum::{
@@ -56,7 +57,6 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -132,7 +132,7 @@ pub struct AttestationResponse {
 
 #[derive(Debug, Serialize)]
 pub struct AssertionResponse {
-    pub jwt_token: String,
+    pub ntdf_token: String,
 }
 
 // CBOR structures for App Attest
@@ -344,18 +344,17 @@ pub async fn generate_assertion_challenge(
 ) -> Result<impl IntoResponse, DeviceCheckError> {
     info!("Generating assertion challenge for user: {}", username);
 
-    // Verify JWT token
-    if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        let jwt = jwt_header
+    // Verify NTDF token
+    if let Some(ntdf_header) = headers.get("X-NTDF-Token") {
+        let header_value = ntdf_header
             .to_str()
             .map_err(|_| DeviceCheckError::InvalidToken)?;
 
-        let decoding_key = (*app_state.decoding_key).clone();
-        let mut token_validation = Validation::new(Algorithm::ES256);
-        token_validation.validate_nbf = false;
-        token_validation.validate_exp = false;
+        let ntdf_decoder = app_state.ntdf_decoder
+            .as_ref()
+            .ok_or(DeviceCheckError::NtdfNotConfigured)?;
 
-        let _token_data = decode::<crate::authn::Claims>(jwt, &decoding_key, &token_validation)
+        let _payload = ntdf_decoder.decode_header(header_value)
             .map_err(|err| {
                 DeviceCheckError::TokenDecodingError(format!("Error decoding token: {}", err))
             })?;
@@ -469,12 +468,12 @@ pub async fn finish_assertion(
         .await
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
 
-    // Generate JWT token
-    let token = generate_device_jwt(binding.user_id, &app_state)?;
+    // Generate NTDF token
+    let token = generate_device_ntdf_token(binding.user_id, &app_state)?;
 
     info!("Assertion successful for key_id: {}", request.key_id);
 
-    Ok(Json(AssertionResponse { jwt_token: token }))
+    Ok(Json(AssertionResponse { ntdf_token: token }))
 }
 
 // Helper functions
@@ -629,20 +628,30 @@ fn verify_assertion_signature(
     Ok(())
 }
 
-fn generate_device_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, DeviceCheckError> {
-    #[derive(Serialize)]
-    struct Claims {
-        sub: String,
-        exp: usize,
-    }
+fn generate_device_ntdf_token(user_id: Uuid, app_state: &AppState) -> Result<String, DeviceCheckError> {
+    let ntdf_builder = app_state.ntdf_builder
+        .as_ref()
+        .ok_or(DeviceCheckError::NtdfNotConfigured)?;
 
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
+    let payload = NtdfTokenPayload {
+        sub_id: *user_id.as_bytes(),
+        flags: CapabilityFlag::DeviceAttested as u64 | CapabilityFlag::WebAuthn as u64,
+        scopes: vec!["openid".to_string()],
+        attrs: vec![],
+        dpop_jti: None,
+        iat: Utc::now().timestamp(),
+        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp(),
+        aud: "https://kas.arkavo.net".to_string(),
+        session_id: None,
+        device_id: None,
+        did: None,
+        delegator_id: None,
+        root_user_id: None,
+        delegation_depth: None,
+        delegation_chain: None,
     };
 
-    let header = Header::new(Algorithm::ES256);
-    encode(&header, &claims, &app_state.encoding_key).map_err(DeviceCheckError::TokenCreationError)
+    ntdf_builder.build(&payload).map_err(DeviceCheckError::TokenCreationError)
 }
 
 #[derive(Error, Debug)]
@@ -659,8 +668,8 @@ pub enum DeviceCheckError {
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
 
-    #[error("Token creation error")]
-    TokenCreationError(jsonwebtoken::errors::Error),
+    #[error("Token creation error: {0}")]
+    TokenCreationError(crate::ntdf_token::NtdfTokenError),
 
     #[error("Missing token")]
     MissingToken,
@@ -676,6 +685,9 @@ pub enum DeviceCheckError {
 
     #[error("Session operation failed: {0}")]
     SessionError(String),
+
+    #[error("NTDF token system not configured")]
+    NtdfNotConfigured,
 
     #[error("Invalid attestation object: {0}")]
     InvalidAttestationObject(String),
@@ -734,6 +746,7 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::InvalidClientData(err) => format!("Invalid client data: {}", err),
             DeviceCheckError::ChallengeMismatch => "Challenge mismatch".to_string(),
             DeviceCheckError::InvalidAssertion(err) => format!("Invalid assertion: {}", err),
+            DeviceCheckError::NtdfNotConfigured => "NTDF token system not configured".to_string(),
         };
         (StatusCode::BAD_REQUEST, body).into_response()
     }

@@ -53,7 +53,6 @@ use axum::{
 };
 use chrono::Utc;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use jsonwebtoken::{decode, Algorithm, Validation};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -402,23 +401,21 @@ pub async fn list_delegations(
 ) -> Result<impl IntoResponse, AgentError> {
     info!("Listing agent delegations");
 
-    // Parse JWT to get user_id
-    let jwt = headers
-        .get("X-Auth-Token")
+    // Parse NTDF token to get user_id
+    let header_value = headers
+        .get("X-NTDF-Token")
         .ok_or(AgentError::MissingToken)?
         .to_str()
         .map_err(|_| AgentError::InvalidToken)?;
 
-    let decoding_key = (*app_state.decoding_key).clone();
-    let mut token_validation = Validation::new(Algorithm::ES256);
-    token_validation.validate_nbf = false;
-    token_validation.validate_exp = false;
+    let ntdf_decoder = app_state.ntdf_decoder
+        .as_ref()
+        .ok_or(AgentError::NtdfNotConfigured)?;
 
-    let token_data = decode::<crate::authn::Claims>(jwt, &decoding_key, &token_validation)
+    let payload = ntdf_decoder.decode_header(header_value)
         .map_err(|e| AgentError::TokenDecodingError(format!("Error decoding token: {}", e)))?;
 
-    let user_id = Uuid::parse_str(&token_data.claims.sub)
-        .map_err(|e| AgentError::TokenDecodingError(format!("Invalid user_id in token: {}", e)))?;
+    let user_id = Uuid::from_bytes(payload.sub_id);
 
     // List delegations
     let delegations = app_state
@@ -456,23 +453,21 @@ pub async fn revoke_delegation(
 ) -> Result<impl IntoResponse, AgentError> {
     info!("Revoking agent delegation: {}", agent_did);
 
-    // Parse JWT to get user_id
-    let jwt = headers
-        .get("X-Auth-Token")
+    // Parse NTDF token to get user_id
+    let header_value = headers
+        .get("X-NTDF-Token")
         .ok_or(AgentError::MissingToken)?
         .to_str()
         .map_err(|_| AgentError::InvalidToken)?;
 
-    let decoding_key = (*app_state.decoding_key).clone();
-    let mut token_validation = Validation::new(Algorithm::ES256);
-    token_validation.validate_nbf = false;
-    token_validation.validate_exp = false;
+    let ntdf_decoder = app_state.ntdf_decoder
+        .as_ref()
+        .ok_or(AgentError::NtdfNotConfigured)?;
 
-    let token_data = decode::<crate::authn::Claims>(jwt, &decoding_key, &token_validation)
+    let payload = ntdf_decoder.decode_header(header_value)
         .map_err(|e| AgentError::TokenDecodingError(format!("Error decoding token: {}", e)))?;
 
-    let user_id = Uuid::parse_str(&token_data.claims.sub)
-        .map_err(|e| AgentError::TokenDecodingError(format!("Invalid user_id in token: {}", e)))?;
+    let user_id = Uuid::from_bytes(payload.sub_id);
 
     // Verify the delegation exists and belongs to this user
     let delegation = app_state
@@ -745,29 +740,25 @@ async fn parse_auth_header(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, String, Option<String>, Uuid, u8, Vec<String>, Vec<String>), AgentError> {
-    // Try JWT first (human delegator)
-    if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        let jwt = jwt_header
+    // Try NTDF token first (human delegator)
+    if let Some(ntdf_header) = headers.get("X-NTDF-Token") {
+        let header_value = ntdf_header
             .to_str()
             .map_err(|_| AgentError::InvalidToken)?;
 
-        let decoding_key = (*app_state.decoding_key).clone();
-        let mut token_validation = Validation::new(Algorithm::ES256);
-        token_validation.validate_nbf = false;
-        token_validation.validate_exp = false;
+        let ntdf_decoder = app_state.ntdf_decoder
+            .as_ref()
+            .ok_or(AgentError::NtdfNotConfigured)?;
 
-        let token_data = decode::<crate::authn::Claims>(jwt, &decoding_key, &token_validation)
+        let payload = ntdf_decoder.decode_header(header_value)
             .map_err(|e| AgentError::TokenDecodingError(format!("Error decoding token: {}", e)))?;
 
-        let user_id = Uuid::parse_str(&token_data.claims.sub)
-            .map_err(|e| {
-                AgentError::TokenDecodingError(format!("Invalid user_id in token: {}", e))
-            })?;
+        let user_id = Uuid::from_bytes(payload.sub_id);
 
         // Get user to retrieve username
         let user = app_state
             .db_store
-            .get_user_by_name(&token_data.claims.sub)
+            .get_user_by_id(user_id)
             .await
             .ok()
             .flatten();

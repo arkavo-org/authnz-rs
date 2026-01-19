@@ -18,7 +18,6 @@ use http::Uri;
 use tower::Service;
 #[cfg(feature = "http3")]
 use quinn::crypto::rustls::QuicServerConfig;
-use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
 use tokio::sync::RwLock;
@@ -28,6 +27,7 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
+use crate::account::delete_account;
 use crate::agent::{
     authorize_agent, generate_agent_challenge, issue_agent_token, list_delegations,
     revoke_delegation, serve_agent_configuration,
@@ -39,6 +39,7 @@ use crate::device_check::{
     finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
 };
 
+mod account;
 mod agent;
 mod authn;
 mod constants;
@@ -163,17 +164,18 @@ async fn handle_h3_request(
     Ok(())
 }
 
-use crate::ntdf_token::NtdfTokenBuilder;
+use crate::ntdf_token::{NtdfTokenBuilder, NtdfTokenDecoder};
 
 #[derive(Clone)]
 pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub db_store: Arc<DynamoDBStore>,
+    /// Signing key for attestation envelope ECDSA signatures
     pub signing_key: Arc<SigningKey<NistP256>>,
-    pub encoding_key: Arc<EncodingKey>,
-    pub decoding_key: Arc<DecodingKey>,
     /// Optional NTDF token builder for generating NTDF tokens
     pub ntdf_builder: Option<Arc<NtdfTokenBuilder>>,
+    /// Optional NTDF token decoder for validating NTDF tokens
+    pub ntdf_decoder: Option<Arc<NtdfTokenDecoder>>,
     /// HTTP client for external RPC calls (reused, with timeout)
     pub http_client: reqwest::Client,
 }
@@ -191,12 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let settings = load_config()?;
 
-    // Load and validate EC keys
-    let (signing_key, encoding_key, decoding_key) = load_ec_keys(
-        &settings.sign_key_path,
-        &settings.encoding_key_path,
-        &settings.decoding_key_path,
-    )?;
+    // Load EC signing key for attestation envelope
+    let signing_key = load_signing_key(&settings.sign_key_path)?;
 
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
@@ -269,6 +267,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("NTDF token generation disabled (NTDF_KAS_URL and NTDF_KAS_PUBLIC_KEY_PATH not set)");
     }
 
+    // Initialize NTDF token decoder if configured
+    let ntdf_decoder = load_ntdf_decoder(&settings)?;
+    if ntdf_decoder.is_some() {
+        log::info!("NTDF token decoding enabled");
+    } else {
+        log::info!("NTDF token decoding disabled (NTDF_KAS_PRIVATE_KEY_PATH not set)");
+    }
+
     // Create HTTP client with timeout for RPC calls
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -280,9 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webauthn,
         db_store: Arc::new(db_store),
         signing_key: Arc::new(signing_key),
-        encoding_key: Arc::new(encoding_key),
-        decoding_key: Arc::new(decoding_key),
         ntdf_builder: ntdf_builder.map(Arc::new),
+        ntdf_decoder: ntdf_decoder.map(Arc::new),
         http_client,
     };
 
@@ -328,6 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/agents/delegations/:did", axum::routing::delete(revoke_delegation))
         .route("/agents/challenge", get(generate_agent_challenge))
         .route("/agents/token", post(issue_agent_token))
+        // Account management endpoints
+        .route("/account", axum::routing::delete(delete_account))
         .layer(Extension(app_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
@@ -445,18 +452,18 @@ struct ServerSettings {
     tls_enabled: bool,
     tls_cert_path: String,
     tls_key_path: String,
+    /// Signing key for attestation envelope (required)
     sign_key_path: String,
-    encoding_key_path: String,
-    decoding_key_path: String,
     _enable_timing_logs: bool,
     // NTDF token configuration (optional)
     ntdf_kas_url: Option<String>,
     ntdf_kas_public_key_path: Option<String>,
+    ntdf_kas_private_key_path: Option<String>,
 }
 
 // Validate required environment variables on startup
 fn validate_env_vars() -> Result<(), Box<dyn std::error::Error>> {
-    let required_vars = ["SIGN_KEY_PATH", "ENCODING_KEY_PATH", "DECODING_KEY_PATH"];
+    let required_vars = ["SIGN_KEY_PATH"];
     let mut missing_vars = Vec::new();
 
     for var in &required_vars {
@@ -503,41 +510,21 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
                 .to_string()
         }),
         sign_key_path: env::var("SIGN_KEY_PATH").unwrap(),
-        encoding_key_path: env::var("ENCODING_KEY_PATH").unwrap(),
-        decoding_key_path: env::var("DECODING_KEY_PATH").unwrap(),
         _enable_timing_logs: env::var("ENABLE_TIMING_LOGS")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
         ntdf_kas_url: env::var("NTDF_KAS_URL").ok(),
         ntdf_kas_public_key_path: env::var("NTDF_KAS_PUBLIC_KEY_PATH").ok(),
+        ntdf_kas_private_key_path: env::var("NTDF_KAS_PRIVATE_KEY_PATH").ok(),
     })
 }
 
-fn load_ec_keys(
-    sign_key_path: &str,
-    encoding_key_path: &str,
-    decoding_key_path: &str,
-) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
+fn load_signing_key(sign_key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
-
-    debug!("Loading EC encoding key from: {}", encoding_key_path);
-    let encoding_key =
-        EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?).map_err(|e| {
-            error!("Failed to create EncodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
-
-    debug!("Attempting to create DecodingKey from PEM contents");
-    let decoding_key =
-        DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?).map_err(|e| {
-            error!("Failed to create DecodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
-
-    debug!("Successfully loaded EC keys");
-    Ok((signing_key, encoding_key, decoding_key))
+    debug!("Successfully loaded EC signing key");
+    Ok(signing_key)
 }
 
 fn load_ntdf_builder(
@@ -564,6 +551,28 @@ fn load_ntdf_builder(
             Ok(None)
         }
         (None, None) => Ok(None),
+    }
+}
+
+fn load_ntdf_decoder(
+    settings: &ServerSettings,
+) -> Result<Option<NtdfTokenDecoder>, Box<dyn std::error::Error>> {
+    match &settings.ntdf_kas_private_key_path {
+        Some(key_path) => {
+            debug!("Loading NTDF KAS private key from: {}", key_path);
+            let pem_bytes = std::fs::read(key_path)
+                .map_err(|e| format!("Failed to read NTDF KAS private key from {}: {}", key_path, e))?;
+
+            // Create decoder with exp validation disabled
+            // Security model relies on WebAuthn ceremony validation, not token expiration
+            let decoder = NtdfTokenDecoder::from_pem(&pem_bytes)
+                .map_err(|e| format!("Failed to create NTDF token decoder: {}", e))?
+                .validate_exp(false);
+
+            debug!("Successfully initialized NTDF token decoder");
+            Ok(Some(decoder))
+        }
+        None => Ok(None),
     }
 }
 

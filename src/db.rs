@@ -1032,6 +1032,252 @@ impl DynamoDBStore {
         Ok(revoked_count)
     }
 
+    /// Get a user by their primary key (user_id)
+    pub async fn get_user_by_id(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserCredentials>, DynamoDBError> {
+        info!(
+            "Querying for user by ID. Table: {}, User ID: {}",
+            self.credentials_table, user_id
+        );
+
+        let result = match self
+            .client
+            .get_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Failed to query user {}: {:?}", user_id, err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        if let Some(item) = result.item {
+            match self.item_to_user_credentials(&item) {
+                Ok(user) => {
+                    info!("Found user: {}", user_id);
+                    Ok(Some(user))
+                }
+                Err(err) => {
+                    error!("Failed to parse user data for {}: {:?}", user_id, err);
+                    Err(err)
+                }
+            }
+        } else {
+            info!("No user found: {}", user_id);
+            Ok(None)
+        }
+    }
+
+    /// Delete user credentials from the credentials table
+    pub async fn delete_user_credentials(&self, user_id: Uuid) -> Result<(), DynamoDBError> {
+        info!(
+            "Deleting user credentials. Table: {}, User ID: {}",
+            self.credentials_table, user_id
+        );
+
+        match self
+            .client
+            .delete_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully deleted credentials for user: {}", user_id);
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!("Credentials table does not exist");
+                        return Err(DynamoDBError::TableNotExists("credentials".to_string()));
+                    }
+                    error!("Failed to delete from credentials table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error deleting from credentials table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Delete a handle by username
+    pub async fn delete_handle(&self, username: &str) -> Result<(), DynamoDBError> {
+        let handle = format!("{}.arkavo.social", username);
+        info!(
+            "Deleting handle. Table: {}, Handle: {}",
+            self.handles_table, handle
+        );
+
+        match self
+            .client
+            .delete_item()
+            .table_name(&self.handles_table)
+            .key("handle", AttributeValue::S(handle.clone()))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully deleted handle: {}", handle);
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        // If handles table doesn't exist, log warning but don't fail
+                        warn!("Handles table does not exist - skipping handle deletion");
+                        return Ok(());
+                    }
+                    error!("Failed to delete from handles table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error deleting from handles table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Delete all device bindings for a user (scan + batch delete)
+    pub async fn delete_device_bindings_by_user(&self, user_id: Uuid) -> Result<u32, DynamoDBError> {
+        info!(
+            "Deleting device bindings for user. Table: {}, User ID: {}",
+            self.device_bindings_table, user_id
+        );
+
+        // Scan for all device bindings belonging to this user
+        let result = match self
+            .client
+            .scan()
+            .table_name(&self.device_bindings_table)
+            .filter_expression("user_id = :user_id")
+            .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err
+                    && service_error.err().meta().code() == Some("ResourceNotFoundException")
+                {
+                    warn!("Device bindings table does not exist - skipping");
+                    return Ok(0);
+                }
+                error!("Failed to scan device bindings: {:?}", err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        let mut deleted_count = 0u32;
+        if let Some(items) = result.items {
+            for item in items {
+                if let Some(device_id_av) = item.get("device_id")
+                    && let Ok(device_id) = device_id_av.as_s()
+                {
+                    match self
+                        .client
+                        .delete_item()
+                        .table_name(&self.device_bindings_table)
+                        .key("device_id", AttributeValue::S(device_id.to_string()))
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {
+                            deleted_count += 1;
+                            info!("Deleted device binding: {}", device_id);
+                        }
+                        Err(e) => {
+                            warn!("Failed to delete device binding {}: {:?}", device_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Deleted {} device bindings for user {}",
+            deleted_count, user_id
+        );
+        Ok(deleted_count)
+    }
+
+    /// Delete all agent delegations for a root user
+    pub async fn delete_delegations_by_root_user(&self, user_id: Uuid) -> Result<u32, DynamoDBError> {
+        info!(
+            "Deleting agent delegations for root user. Table: {}, User ID: {}",
+            self.agent_delegations_table, user_id
+        );
+
+        // Query using the root_user_id-index GSI
+        let result = match self
+            .client
+            .query()
+            .table_name(&self.agent_delegations_table)
+            .index_name("root_user_id-index")
+            .key_condition_expression("root_user_id = :root_user_id")
+            .expression_attribute_values(
+                ":root_user_id",
+                AttributeValue::S(user_id.to_string()),
+            )
+            .send()
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err
+                    && service_error.err().meta().code() == Some("ResourceNotFoundException")
+                {
+                    warn!("Agent delegations table does not exist - skipping");
+                    return Ok(0);
+                }
+                error!("Failed to query agent delegations: {:?}", err);
+                return Err(DynamoDBError::from(err));
+            }
+        };
+
+        let mut deleted_count = 0u32;
+        if let Some(items) = result.items {
+            for item in items {
+                if let Some(agent_did_av) = item.get("agent_did")
+                    && let Ok(agent_did) = agent_did_av.as_s()
+                {
+                    match self
+                        .client
+                        .delete_item()
+                        .table_name(&self.agent_delegations_table)
+                        .key("agent_did", AttributeValue::S(agent_did.to_string()))
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {
+                            deleted_count += 1;
+                            info!("Deleted agent delegation: {}", agent_did);
+                        }
+                        Err(e) => {
+                            warn!("Failed to delete agent delegation {}: {:?}", agent_did, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Deleted {} agent delegations for user {}",
+            deleted_count, user_id
+        );
+        Ok(deleted_count)
+    }
+
     fn item_to_agent_delegation(
         &self,
         item: &std::collections::HashMap<String, AttributeValue>,

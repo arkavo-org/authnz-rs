@@ -35,7 +35,6 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "ecdh"] }
 ecdsa = { version = "0.16", features = ["signing", "std", "verifying"] }
 sha2 = "0.10"
 uuid = { version = "1.18", features = ["v4"] }
-jsonwebtoken = { version = "9.3", features = ["use_pem"] }
 chrono = "0.4"
 form_urlencoded = "1.2"
 http = "1.3"
