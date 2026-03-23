@@ -151,6 +151,25 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST
 ```
 
+3. Create Device Bindings Table:
+```shell
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name device_bindings \
+    --attribute-definitions \
+        AttributeName=device_id,AttributeType=S \
+        AttributeName=user_id,AttributeType=S \
+    --key-schema AttributeName=device_id,KeyType=HASH \
+    --global-secondary-indexes \
+        "[{
+            \"IndexName\": \"user_id-index\",
+            \"KeySchema\": [{\"AttributeName\":\"user_id\",\"KeyType\":\"HASH\"}],
+            \"Projection\":{\"ProjectionType\":\"ALL\"},
+            \"ProvisionedThroughput\":{\"ReadCapacityUnits\":5,\"WriteCapacityUnits\":5}
+        }]" \
+    --billing-mode PAY_PER_REQUEST
+```
+
 ### AWS Configuration
 
 Configure AWS credentials using one of:

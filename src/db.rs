@@ -1148,19 +1148,20 @@ impl DynamoDBStore {
         }
     }
 
-    /// Delete all device bindings for a user (scan + batch delete)
+    /// Delete all device bindings for a user (query by user_id-index GSI + batch delete)
     pub async fn delete_device_bindings_by_user(&self, user_id: Uuid) -> Result<u32, DynamoDBError> {
         info!(
             "Deleting device bindings for user. Table: {}, User ID: {}",
             self.device_bindings_table, user_id
         );
 
-        // Scan for all device bindings belonging to this user
+        // Query using the user_id-index GSI for all device bindings belonging to this user
         let result = match self
             .client
-            .scan()
+            .query()
             .table_name(&self.device_bindings_table)
-            .filter_expression("user_id = :user_id")
+            .index_name("user_id-index")
+            .key_condition_expression("user_id = :user_id")
             .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
             .send()
             .await
