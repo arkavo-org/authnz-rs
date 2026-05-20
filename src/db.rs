@@ -1,6 +1,6 @@
+use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use aws_sdk_dynamodb::Client;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -161,7 +161,9 @@ impl DynamoDBStore {
                     SdkError::ServiceError(ref service_error) => {
                         if service_error.err().meta().code() == Some("ResourceNotFoundException") {
                             // If handles table doesn't exist, log warning but don't fail the registration
-                            warn!("Handles table does not exist - handle will need to be created later");
+                            warn!(
+                                "Handles table does not exist - handle will need to be created later"
+                            );
                         } else {
                             error!("Failed to write to handles table: {:?}", err);
                             // Attempt to rollback credentials entry
@@ -497,9 +499,7 @@ impl DynamoDBStore {
                 SdkError::ServiceError(ref service_error) => {
                     if service_error.err().meta().code() == Some("ResourceNotFoundException") {
                         error!("Device bindings table does not exist");
-                        return Err(DynamoDBError::TableNotExists(
-                            "device_bindings".to_string(),
-                        ));
+                        return Err(DynamoDBError::TableNotExists("device_bindings".to_string()));
                     }
                     error!("Failed to write to device bindings table: {:?}", err);
                     Err(DynamoDBError::SdkError(err.to_string()))
@@ -580,7 +580,10 @@ impl DynamoDBStore {
             .condition_expression("#counter = :expected_counter")
             .expression_attribute_names("#counter", "counter")
             .expression_attribute_values(":counter", AttributeValue::N(new_counter.to_string()))
-            .expression_attribute_values(":expected_counter", AttributeValue::N(expected_counter.to_string()))
+            .expression_attribute_values(
+                ":expected_counter",
+                AttributeValue::N(expected_counter.to_string()),
+            )
             .expression_attribute_values(":updated_at", AttributeValue::N(updated_at.to_string()))
             .send()
             .await
@@ -592,14 +595,17 @@ impl DynamoDBStore {
             Err(err) => {
                 match &err {
                     SdkError::ServiceError(service_error) => {
-                        if service_error.err().meta().code() == Some("ConditionalCheckFailedException") {
+                        if service_error.err().meta().code()
+                            == Some("ConditionalCheckFailedException")
+                        {
                             error!(
                                 "Counter update race condition detected for device {}: expected {}, but counter was modified",
                                 device_id, expected_counter
                             );
-                            return Err(DynamoDBError::Internal(
-                                format!("Counter race condition: expected counter {}, but it was modified by another request", expected_counter)
-                            ));
+                            return Err(DynamoDBError::Internal(format!(
+                                "Counter race condition: expected counter {}, but it was modified by another request",
+                                expected_counter
+                            )));
                         }
                     }
                     _ => {}

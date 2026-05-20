@@ -1,10 +1,10 @@
+use crate::AppState;
 use crate::authn::WebauthnError::{
     CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown,
     UserHasNoCredentials, UserNotFound,
 };
 use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
-use crate::AppState;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
@@ -16,7 +16,7 @@ use axum::{
 use chrono::Utc;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{decode, encode, Algorithm, Header, TokenData, Validation};
+use jsonwebtoken::{Algorithm, Header, TokenData, Validation, decode, encode};
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
