@@ -731,6 +731,11 @@ pub enum AuthorizeError {
     InvalidArkavoJwt(String),
     #[error("invalid Apple id_token: {0}")]
     InvalidAppleIdToken(String),
+    #[error(
+        "idp=apple requires the OIDC `nonce` query parameter (used as the Apple nonce). \
+         No nonce was supplied — refusing to validate Apple id_token."
+    )]
+    AppleNonceRequired,
     #[error("apple_signin error: {0}")]
     AppleSigninError(#[from] apple_signin::AppleSigninError),
     #[error("database error: {0}")]
@@ -744,6 +749,7 @@ impl IntoResponse for AuthorizeError {
             AuthorizeError::InvalidArkavoJwt(_) | AuthorizeError::InvalidAppleIdToken(_) => {
                 (StatusCode::UNAUTHORIZED, "invalid_token")
             }
+            AuthorizeError::AppleNonceRequired => (StatusCode::BAD_REQUEST, "invalid_request"),
             AuthorizeError::AppleSigninError(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
             AuthorizeError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
@@ -775,7 +781,20 @@ async fn resolve_user(
                 AuthorizeError::InvalidAppleIdToken("id_token is required for idp=apple".into())
             })?;
 
-        let apple_claims = apple_signin::verify_apple_id_token(apple, &token).await?;
+        // For the authorize flow the OIDC `nonce` query parameter doubles as
+        // the Apple nonce: the client uses the same value when invoking Apple
+        // Sign In, Apple echoes it in the id_token, and we verify the match.
+        // We refuse to validate Apple tokens without a nonce — this is the
+        // mandatory anti-replay binding for the upstream Apple ceremony.
+        let nonce = params
+            .nonce
+            .as_deref()
+            .ok_or(AuthorizeError::AppleNonceRequired)?;
+        if nonce.is_empty() {
+            return Err(AuthorizeError::AppleNonceRequired);
+        }
+
+        let apple_claims = apple_signin::verify_apple_id_token(apple, &token, nonce).await?;
         return apple_signin::map_apple_user(app_state, &apple_claims)
             .await
             .map_err(|e| AuthorizeError::Database(e.to_string()));
@@ -951,6 +970,12 @@ mod tests {
         let a = test_jwk();
         let b = test_jwk();
         assert_eq!(a.kid, b.kid);
+    }
+
+    #[test]
+    fn test_authorize_error_apple_nonce_required_is_400() {
+        let resp = AuthorizeError::AppleNonceRequired.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

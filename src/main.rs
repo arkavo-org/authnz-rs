@@ -28,7 +28,9 @@ use tower_sessions::cookie::time::Duration;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
-use crate::apple_signin::{AppleJwksCache, apple_callback_handler, apple_idtoken_handler};
+use crate::apple_signin::{
+    AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_nonce_handler,
+};
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
@@ -285,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/token", post(oidc_token))
         .route("/oauth/userinfo", get(oidc_userinfo))
         // Sign in with Apple
+        .route("/oauth/apple/nonce", get(apple_nonce_handler))
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
         .route("/oauth/apple/callback", post(apple_callback_handler))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
