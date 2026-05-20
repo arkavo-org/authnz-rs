@@ -33,3 +33,6 @@ pub const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 
 /// Apple OIDC issuer (used to validate `iss` claim on Apple id_tokens)
 pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
+
+/// OIDC refresh token lifetime in seconds (30 days)
+pub const REFRESH_TOKEN_LIFETIME_SECONDS: i64 = 2592000;

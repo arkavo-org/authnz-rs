@@ -1,3 +1,4 @@
+use fred::interfaces::ClientLike;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -38,8 +39,8 @@ use crate::device_check::{
     finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
 };
 use crate::oidc::{
-    AuthorizationCodeStore, OidcConfig, authorize as oidc_authorize, discovery as oidc_discovery,
-    jwks as oidc_jwks, token as oidc_token, userinfo as oidc_userinfo,
+    AuthorizationCodeStore, OidcConfig, RefreshTokenStore, authorize as oidc_authorize,
+    discovery as oidc_discovery, jwks as oidc_jwks, token as oidc_token, userinfo as oidc_userinfo,
 };
 
 mod apple_signin;
@@ -253,12 +254,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decoding_key: Arc::new(decoding_key),
     };
 
+    // Set up Redis Client using fred
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_config = fred::types::RedisConfig::from_url(&redis_url).unwrap_or_else(|_| {
+        log::warn!(
+            "Invalid REDIS_URL '{}', falling back to default config",
+            redis_url
+        );
+        fred::types::RedisConfig::default()
+    });
+    let redis_client = fred::clients::RedisClient::new(redis_config, None, None, None);
+
+    // Spawn connection in the background so a connection failure doesn't crash app startup
+    let redis_conn_client = redis_client.clone();
+    tokio::spawn(async move {
+        let _conn_handle = redis_conn_client.connect();
+        if let Err(err) = redis_conn_client.wait_for_connect().await {
+            log::error!("Failed to connect to Redis: {:?}", err);
+        } else {
+            log::info!("Successfully connected to Redis");
+        }
+    });
+
     // OIDC provider configuration (issuer, JWKS, registered clients).
     let oidc_config = Arc::new(
         OidcConfig::from_env(&settings.decoding_key_path)
             .map_err(|e| format!("Failed to load OIDC configuration: {}", e))?,
     );
-    let oidc_code_store = AuthorizationCodeStore::new();
+    let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
+    let oidc_refresh_store = RefreshTokenStore::new(redis_client);
     let apple_jwks_cache = Arc::new(AppleJwksCache::new());
 
     let session_store = MemoryStore::default();
@@ -307,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(app_state))
         .layer(Extension(oidc_config))
         .layer(Extension(oidc_code_store))
+        .layer(Extension(oidc_refresh_store))
         .layer(Extension(apple_jwks_cache))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))

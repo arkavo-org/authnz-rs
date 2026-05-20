@@ -30,6 +30,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use chrono::Utc;
+use fred::interfaces::{ClientLike, KeysInterface};
 use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, encode};
 use log::{debug, error, info, warn};
 use p256::PublicKey;
@@ -123,7 +124,7 @@ pub struct OidcClaims {
 }
 
 /// Information about an authenticated user used to mint OIDC tokens.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
     /// Stable subject identifier used in the `sub` claim.
     /// Format: `apple:<apple_sub>` or `arkavo:<uuid>` so it's clear which IdP issued.
@@ -139,9 +140,9 @@ pub struct AuthenticatedUser {
 }
 
 /// Stored authorization code metadata, keyed by the random code value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
-struct AuthorizationCodeRecord {
+pub struct AuthorizationCodeRecord {
     client_id: String,
     redirect_uri: String,
     scope: String,
@@ -154,35 +155,193 @@ struct AuthorizationCodeRecord {
     expires_at: i64,
 }
 
-/// In-memory authorization code store.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RefreshTokenRecord {
+    pub subject: String,
+    pub client_id: String,
+    pub scopes: String,
+    pub expires_at: i64,
+    pub created_at: i64,
+}
+
+/// Redis-backed (with local in-memory fallback) authorization code store.
 ///
 /// Authorization codes are short-lived (10 minutes) and single-use.
-/// For multi-instance deployments this should be replaced with a shared store.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuthorizationCodeStore {
-    inner: Arc<Mutex<HashMap<String, AuthorizationCodeRecord>>>,
+    redis: fred::clients::RedisClient,
+    local_fallback: Arc<Mutex<HashMap<String, AuthorizationCodeRecord>>>,
 }
 
 impl AuthorizationCodeStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn insert(&self, code: String, record: AuthorizationCodeRecord) {
-        let mut map = self.inner.lock().unwrap();
-        // Best-effort cleanup of expired codes on each insert.
-        let now = Utc::now().timestamp();
-        map.retain(|_, v| v.expires_at > now);
-        map.insert(code, record);
-    }
-
-    fn take(&self, code: &str) -> Option<AuthorizationCodeRecord> {
-        let mut map = self.inner.lock().unwrap();
-        let record = map.remove(code)?;
-        if record.expires_at < Utc::now().timestamp() {
-            return None;
+    pub fn new(redis: fred::clients::RedisClient) -> Self {
+        Self {
+            redis,
+            local_fallback: Arc::new(Mutex::new(HashMap::new())),
         }
-        Some(record)
+    }
+
+    pub async fn insert(
+        &self,
+        code: String,
+        record: AuthorizationCodeRecord,
+    ) -> Result<(), String> {
+        let key = format!("oidc:code:{}", code);
+        if self.redis.is_connected() {
+            let value = serde_json::to_string(&record)
+                .map_err(|e| format!("Serialization failed: {}", e))?;
+            let _: () = self
+                .redis
+                .set(
+                    &key,
+                    value,
+                    Some(fred::types::Expiration::EX(600)),
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|e| format!("Redis set failed: {}", e))?;
+            Ok(())
+        } else {
+            log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
+            let mut map = self.local_fallback.lock().unwrap();
+            let now = Utc::now().timestamp();
+            map.retain(|_, v| v.expires_at > now);
+            map.insert(code, record);
+            Ok(())
+        }
+    }
+
+    pub async fn take(&self, code: &str) -> Result<Option<AuthorizationCodeRecord>, String> {
+        let key = format!("oidc:code:{}", code);
+        if self.redis.is_connected() {
+            let val: Option<String> = self
+                .redis
+                .get(&key)
+                .await
+                .map_err(|e| format!("Redis get failed: {}", e))?;
+            if let Some(json_str) = val {
+                // Delete immediately on retrieval (single-use)
+                let _: () = self
+                    .redis
+                    .del(&key)
+                    .await
+                    .map_err(|e| format!("Redis del failed: {}", e))?;
+                let record: AuthorizationCodeRecord = serde_json::from_str(&json_str)
+                    .map_err(|e| format!("Deserialization failed: {}", e))?;
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
+        } else {
+            log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
+            let mut map = self.local_fallback.lock().unwrap();
+            if let Some(record) = map.remove(code) {
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Redis-backed (with local in-memory fallback) refresh token store.
+///
+/// Stores SHA-256 hash of refresh tokens with 30-day automatic expiration.
+#[derive(Clone)]
+pub struct RefreshTokenStore {
+    redis: fred::clients::RedisClient,
+    local_fallback: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
+}
+
+impl RefreshTokenStore {
+    pub fn new(redis: fred::clients::RedisClient) -> Self {
+        Self {
+            redis,
+            local_fallback: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn hash_token(&self, token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    pub async fn insert(&self, token: &str, record: RefreshTokenRecord) -> Result<(), String> {
+        let token_hash = self.hash_token(token);
+        let key = format!("oidc:refresh:{}", token_hash);
+        let ttl_seconds = crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
+
+        if self.redis.is_connected() {
+            let value = serde_json::to_string(&record)
+                .map_err(|e| format!("Serialization failed: {}", e))?;
+            let _: () = self
+                .redis
+                .set(
+                    &key,
+                    value,
+                    Some(fred::types::Expiration::EX(ttl_seconds)),
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|e| format!("Redis set failed: {}", e))?;
+            Ok(())
+        } else {
+            log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
+            let mut map = self.local_fallback.lock().unwrap();
+            let now = Utc::now().timestamp();
+            map.retain(|_, v| v.expires_at > now);
+            map.insert(token_hash, record);
+            Ok(())
+        }
+    }
+
+    pub async fn take(&self, token: &str) -> Result<Option<RefreshTokenRecord>, String> {
+        let token_hash = self.hash_token(token);
+        let key = format!("oidc:refresh:{}", token_hash);
+
+        if self.redis.is_connected() {
+            let val: Option<String> = self
+                .redis
+                .get(&key)
+                .await
+                .map_err(|e| format!("Redis get failed: {}", e))?;
+            if let Some(json_str) = val {
+                // Delete immediately on retrieval (Refresh Token Rotation)
+                let _: () = self
+                    .redis
+                    .del(&key)
+                    .await
+                    .map_err(|e| format!("Redis del failed: {}", e))?;
+                let record: RefreshTokenRecord = serde_json::from_str(&json_str)
+                    .map_err(|e| format!("Deserialization failed: {}", e))?;
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
+        } else {
+            log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
+            let mut map = self.local_fallback.lock().unwrap();
+            if let Some(record) = map.remove(&token_hash) {
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -292,7 +451,7 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         response_types_supported: vec!["code"],
         subject_types_supported: vec!["public"],
         id_token_signing_alg_values_supported: vec!["ES256"],
-        scopes_supported: vec!["openid", "email", "profile"],
+        scopes_supported: vec!["openid", "email", "profile", "offline_access"],
         token_endpoint_auth_methods_supported: vec![
             "client_secret_post",
             "client_secret_basic",
@@ -312,7 +471,7 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
             "arkavo_roles",
             "arkavo_entitlements",
         ],
-        grant_types_supported: vec!["authorization_code"],
+        grant_types_supported: vec!["authorization_code", "client_credentials", "refresh_token"],
         code_challenge_methods_supported: vec!["S256"],
     };
     Json(doc)
@@ -425,19 +584,29 @@ pub async fn authorize(
     // Mint an authorization code.
     let code = generate_authz_code();
     let expires_at = Utc::now().timestamp() + AUTHORIZATION_CODE_LIFETIME_SECONDS;
-    code_store.insert(
-        code.clone(),
-        AuthorizationCodeRecord {
-            client_id: client.client_id.clone(),
-            redirect_uri: params.redirect_uri.clone(),
-            scope,
-            nonce: params.nonce.clone(),
-            code_challenge: params.code_challenge.clone(),
-            code_challenge_method: params.code_challenge_method.clone(),
-            user,
-            expires_at,
-        },
-    );
+    if let Err(err) = code_store
+        .insert(
+            code.clone(),
+            AuthorizationCodeRecord {
+                client_id: client.client_id.clone(),
+                redirect_uri: params.redirect_uri.clone(),
+                scope,
+                nonce: params.nonce.clone(),
+                code_challenge: params.code_challenge.clone(),
+                code_challenge_method: params.code_challenge_method.clone(),
+                user,
+                expires_at,
+            },
+        )
+        .await
+    {
+        error!("Failed to store authorization code: {}", err);
+        return oidc_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Internal server error",
+        );
+    }
 
     // Redirect back to the relying party with code + state.
     let mut redirect = format!("{}?code={}", params.redirect_uri, code);
@@ -457,6 +626,8 @@ pub struct TokenForm {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub code_verifier: Option<String>,
+    pub refresh_token: Option<String>,
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,24 +637,53 @@ pub struct TokenResponse {
     pub expires_in: i64,
     pub id_token: String,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
-/// Token endpoint: exchanges an authorization code for tokens.
+/// Token endpoint: exchanges an authorization code, client credentials, or refresh token for tokens.
 pub async fn token(
     Extension(app_state): Extension<AppState>,
     Extension(oidc): Extension<Arc<OidcConfig>>,
     Extension(code_store): Extension<AuthorizationCodeStore>,
+    Extension(refresh_store): Extension<RefreshTokenStore>,
     headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Response {
-    if form.grant_type != "authorization_code" {
-        return oidc_error_response(
+    match form.grant_type.as_str() {
+        "authorization_code" => {
+            handle_authorization_code_grant(
+                app_state,
+                oidc,
+                code_store,
+                refresh_store,
+                headers,
+                form,
+            )
+            .await
+        }
+        "client_credentials" => {
+            handle_client_credentials_grant(app_state, oidc, headers, form).await
+        }
+        "refresh_token" => {
+            handle_refresh_token_grant(app_state, oidc, refresh_store, headers, form).await
+        }
+        _ => oidc_error_response(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Only authorization_code is supported",
-        );
+            "Unsupported grant_type. Supported: authorization_code, client_credentials, refresh_token",
+        ),
     }
+}
 
+async fn handle_authorization_code_grant(
+    app_state: AppState,
+    oidc: Arc<OidcConfig>,
+    code_store: AuthorizationCodeStore,
+    refresh_store: RefreshTokenStore,
+    headers: HeaderMap,
+    form: TokenForm,
+) -> Response {
     let code = match form.code.as_deref() {
         Some(c) if !c.is_empty() => c,
         _ => {
@@ -495,9 +695,9 @@ pub async fn token(
         }
     };
 
-    let record = match code_store.take(code) {
-        Some(r) => r,
-        None => {
+    let record = match code_store.take(code).await {
+        Ok(Some(r)) => r,
+        _ => {
             return oidc_error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
@@ -638,9 +838,39 @@ pub async fn token(
         }
     };
 
+    // Issue standard refresh token if offline_access is requested
+    let mut refresh_token = None;
+    if record
+        .scope
+        .split_whitespace()
+        .any(|s| s == "offline_access")
+    {
+        let r_token = generate_refresh_token();
+        let expires_at = now + crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
+        let refresh_record = RefreshTokenRecord {
+            subject: record.user.subject.clone(),
+            client_id: record.client_id.clone(),
+            scopes: record.scope.clone(),
+            expires_at,
+            created_at: now,
+        };
+        if let Err(err) = refresh_store.insert(&r_token, refresh_record).await {
+            error!("Failed to store refresh token: {}", err);
+            return oidc_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue refresh token",
+            );
+        }
+        refresh_token = Some(r_token);
+    }
+
     info!(
-        "Issued OIDC tokens for client={} sub={} idp={}",
-        record.client_id, record.user.subject, record.user.idp
+        "Issued OIDC tokens for client={} sub={} idp={} (refresh={})",
+        record.client_id,
+        record.user.subject,
+        record.user.idp,
+        refresh_token.is_some()
     );
 
     let mut response = Json(TokenResponse {
@@ -649,6 +879,7 @@ pub async fn token(
         expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
         id_token,
         scope: record.scope,
+        refresh_token,
     })
     .into_response();
     // OAuth2 requires Cache-Control: no-store and Pragma: no-cache on token responses.
@@ -661,6 +892,326 @@ pub async fn token(
         axum::http::HeaderValue::from_static("no-cache"),
     );
     response
+}
+
+async fn handle_client_credentials_grant(
+    app_state: AppState,
+    oidc: Arc<OidcConfig>,
+    headers: HeaderMap,
+    form: TokenForm,
+) -> Response {
+    let (presented_client_id, presented_client_secret) =
+        extract_client_credentials(&headers, &form);
+    let presented_client_id = match presented_client_id {
+        Some(id) => id,
+        None => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "client_id is required",
+            );
+        }
+    };
+
+    let client = match oidc.clients.get(&presented_client_id) {
+        Some(c) => c,
+        None => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "Unknown client_id",
+            );
+        }
+    };
+
+    match (&client.client_secret, &presented_client_secret) {
+        (Some(expected), Some(given)) if constant_time_eq(expected, given) => {}
+        _ => {
+            return oidc_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "Invalid client credentials",
+            );
+        }
+    }
+
+    let now = Utc::now().timestamp();
+    let exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
+    let client_subject = format!("client:{}", client.client_id);
+    let scope = form.scope.unwrap_or_else(|| "openid".to_string());
+
+    let id_claims = OidcClaims {
+        iss: oidc.issuer.clone(),
+        sub: client_subject.clone(),
+        aud: client.client_id.clone(),
+        exp,
+        iat: now,
+        nonce: None,
+        email: None,
+        email_verified: None,
+        idp: "client_credentials".to_string(),
+        arkavo_account_id: client_subject.clone(),
+        arkavo_roles: vec!["service-account".to_string()],
+        // Grant standard entitlements so service accounts can encrypt/decrypt OpenTDF payloads
+        arkavo_entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+    };
+
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(oidc.signing_kid.clone());
+
+    let id_token = match encode(&header, &id_claims, &app_state.encoding_key) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to encode id_token: {}", e);
+            return oidc_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue id_token",
+            );
+        }
+    };
+    let access_token = match encode(&header, &id_claims, &app_state.encoding_key) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to encode access_token: {}", e);
+            return oidc_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue access_token",
+            );
+        }
+    };
+
+    info!(
+        "Issued OIDC client credentials tokens for client_id={}",
+        client.client_id
+    );
+
+    let mut response = Json(TokenResponse {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
+        id_token,
+        scope,
+        refresh_token: None,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+async fn handle_refresh_token_grant(
+    app_state: AppState,
+    oidc: Arc<OidcConfig>,
+    refresh_store: RefreshTokenStore,
+    headers: HeaderMap,
+    form: TokenForm,
+) -> Response {
+    let r_token = match form.refresh_token.as_deref() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "refresh_token is required",
+            );
+        }
+    };
+
+    // Authenticate the client (if client_secret exists, must authenticate)
+    let (presented_client_id, presented_client_secret) =
+        extract_client_credentials(&headers, &form);
+    let presented_client_id = match presented_client_id {
+        Some(id) => id,
+        None => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "client_id is required",
+            );
+        }
+    };
+
+    let client = match oidc.clients.get(&presented_client_id) {
+        Some(c) => c,
+        None => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "Unknown client_id",
+            );
+        }
+    };
+
+    if let Some(expected_secret) = &client.client_secret {
+        match &presented_client_secret {
+            Some(given) if constant_time_eq(expected_secret, given) => {}
+            _ => {
+                return oidc_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "Invalid client credentials",
+                );
+            }
+        }
+    }
+
+    // Retrieve and rotate (delete) token from Redis
+    let record = match refresh_store.take(r_token).await {
+        Ok(Some(rec)) => rec,
+        _ => {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "Invalid, expired, or rotated refresh token",
+            );
+        }
+    };
+
+    if record.client_id != presented_client_id {
+        return oidc_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Client ID mismatch",
+        );
+    }
+
+    let now = Utc::now().timestamp();
+    if record.expires_at < now {
+        return oidc_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Refresh token has expired",
+        );
+    }
+
+    // Resolve standard roles and entitlements based on subject pattern
+    let (roles, entitlements, idp) = if record.subject.starts_with("client:") {
+        (
+            vec!["service-account".to_string()],
+            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+            "client_credentials".to_string(),
+        )
+    } else {
+        let auth_idp = if record.subject.starts_with("apple:") {
+            "apple"
+        } else {
+            "webauthn"
+        };
+        (
+            vec!["user".to_string()],
+            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+            auth_idp.to_string(),
+        )
+    };
+
+    let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
+    let at_exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
+
+    let id_claims = OidcClaims {
+        iss: oidc.issuer.clone(),
+        sub: record.subject.clone(),
+        aud: record.client_id.clone(),
+        exp: id_exp,
+        iat: now,
+        nonce: None,
+        email: None,
+        email_verified: None,
+        idp,
+        arkavo_account_id: record.subject.clone(),
+        arkavo_roles: roles,
+        arkavo_entitlements: entitlements,
+    };
+    let mut access_claims = id_claims.clone();
+    access_claims.exp = at_exp;
+
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(oidc.signing_kid.clone());
+
+    let id_token = match encode(&header, &id_claims, &app_state.encoding_key) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to encode id_token: {}", e);
+            return oidc_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue id_token",
+            );
+        }
+    };
+    let access_token = match encode(&header, &access_claims, &app_state.encoding_key) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to encode access_token: {}", e);
+            return oidc_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue access_token",
+            );
+        }
+    };
+
+    // Rotate refresh token (issue a brand new one)
+    let new_refresh_token = generate_refresh_token();
+    let expires_at = now + crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
+    let new_refresh_record = RefreshTokenRecord {
+        subject: record.subject.clone(),
+        client_id: record.client_id.clone(),
+        scopes: record.scopes.clone(),
+        expires_at,
+        created_at: now,
+    };
+    if let Err(err) = refresh_store
+        .insert(&new_refresh_token, new_refresh_record)
+        .await
+    {
+        error!("Failed to store rotated refresh token: {}", err);
+        return oidc_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Failed to issue rotated refresh token",
+        );
+    }
+
+    info!(
+        "Rotated OIDC refresh tokens for client_id={} sub={}",
+        record.client_id, record.subject
+    );
+
+    let mut response = Json(TokenResponse {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
+        id_token,
+        scope: record.scopes,
+        refresh_token: Some(new_refresh_token),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+fn generate_refresh_token() -> String {
+    let part1 = Uuid::new_v4();
+    let part2 = Uuid::new_v4();
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(part1.as_bytes());
+    bytes.extend_from_slice(part2.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[derive(Debug, Serialize)]
@@ -1003,9 +1554,14 @@ mod tests {
         assert!(a.len() >= 40, "authz code too short: {}", a.len());
     }
 
-    #[test]
-    fn test_authorization_code_store_roundtrip() {
-        let store = AuthorizationCodeStore::new();
+    fn test_redis() -> fred::clients::RedisClient {
+        let config = fred::types::RedisConfig::default();
+        fred::clients::RedisClient::new(config, None, None, None)
+    }
+
+    #[tokio::test]
+    async fn test_authorization_code_store_roundtrip() {
+        let store = AuthorizationCodeStore::new(test_redis());
         let code = "abc".to_string();
         let user = AuthenticatedUser {
             subject: "apple:123".into(),
@@ -1026,15 +1582,15 @@ mod tests {
             user,
             expires_at: Utc::now().timestamp() + 60,
         };
-        store.insert(code.clone(), record);
-        assert!(store.take(&code).is_some());
+        store.insert(code.clone(), record).await.unwrap();
+        assert!(store.take(&code).await.unwrap().is_some());
         // single-use: second take returns None
-        assert!(store.take(&code).is_none());
+        assert!(store.take(&code).await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_authorization_code_store_expired_take_returns_none() {
-        let store = AuthorizationCodeStore::new();
+    #[tokio::test]
+    async fn test_authorization_code_store_expired_take_returns_none() {
+        let store = AuthorizationCodeStore::new(test_redis());
         let code = "expired".to_string();
         let user = AuthenticatedUser {
             subject: "apple:123".into(),
@@ -1055,8 +1611,27 @@ mod tests {
             user,
             expires_at: Utc::now().timestamp() - 1,
         };
-        store.insert(code.clone(), record);
-        assert!(store.take(&code).is_none());
+        store.insert(code.clone(), record).await.unwrap();
+        assert!(store.take(&code).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_store_roundtrip() {
+        let store = RefreshTokenStore::new(test_redis());
+        let token = "some-secure-token-value-123456789";
+        let record = RefreshTokenRecord {
+            subject: "client:opentdf".into(),
+            client_id: "opentdf".into(),
+            scopes: "openid offline_access".into(),
+            expires_at: Utc::now().timestamp() + 600,
+            created_at: Utc::now().timestamp(),
+        };
+        store.insert(token, record).await.unwrap();
+        let taken = store.take(token).await.unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().client_id, "opentdf");
+        // rotated/single-use: second take returns None
+        assert!(store.take(token).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1174,5 +1749,164 @@ mod tests {
         assert!(json.contains("arkavo_account_id"));
         assert!(json.contains("arkavo_roles"));
         assert!(json.contains("arkavo_entitlements"));
+    }
+
+    #[tokio::test]
+    async fn test_client_credentials_grant() {
+        use p256::pkcs8::EncodePrivateKey;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
+        let secret = SecretKey::new(scalar);
+        let der = secret.to_pkcs8_der().unwrap();
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
+
+        let app_state = AppState {
+            webauthn: Arc::new(
+                webauthn_rs::WebauthnBuilder::new(
+                    "identity.arkavo.net",
+                    &url::Url::parse("https://identity.arkavo.net").unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+            ),
+            db_store: Arc::new(
+                crate::db::DynamoDBStore::new(
+                    "credentials".to_string(),
+                    "handles".to_string(),
+                    "device_bindings".to_string(),
+                )
+                .await
+                .unwrap(),
+            ),
+            signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
+            encoding_key: Arc::new(encoding_key),
+            decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+        };
+
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "test-client".to_string(),
+            OidcClient {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                redirect_uris: vec![],
+            },
+        );
+        let oidc = Arc::new(oidc);
+
+        let form = TokenForm {
+            grant_type: "client_credentials".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: Some("test-client".to_string()),
+            client_secret: Some("test-secret".to_string()),
+            code_verifier: None,
+            refresh_token: None,
+            scope: None,
+        };
+
+        let headers = HeaderMap::new();
+        let resp = handle_client_credentials_grant(app_state, oidc, headers, form).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!body["access_token"].as_str().unwrap().is_empty());
+        assert!(!body["id_token"].as_str().unwrap().is_empty());
+        assert_eq!(body["scope"].as_str().unwrap(), "openid");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_grant() {
+        use p256::pkcs8::EncodePrivateKey;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
+        let secret = SecretKey::new(scalar);
+        let der = secret.to_pkcs8_der().unwrap();
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
+
+        let app_state = AppState {
+            webauthn: Arc::new(
+                webauthn_rs::WebauthnBuilder::new(
+                    "identity.arkavo.net",
+                    &url::Url::parse("https://identity.arkavo.net").unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+            ),
+            db_store: Arc::new(
+                crate::db::DynamoDBStore::new(
+                    "credentials".to_string(),
+                    "handles".to_string(),
+                    "device_bindings".to_string(),
+                )
+                .await
+                .unwrap(),
+            ),
+            signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
+            encoding_key: Arc::new(encoding_key),
+            decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+        };
+
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "test-client".to_string(),
+            OidcClient {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                redirect_uris: vec![],
+            },
+        );
+        let oidc = Arc::new(oidc);
+
+        let refresh_store = RefreshTokenStore::new(test_redis());
+        let token = "my-refresh-token-123";
+        let record = RefreshTokenRecord {
+            subject: "apple:123".into(),
+            client_id: "test-client".into(),
+            scopes: "openid offline_access".into(),
+            expires_at: Utc::now().timestamp() + 3600,
+            created_at: Utc::now().timestamp(),
+        };
+        refresh_store.insert(token, record).await.unwrap();
+
+        let form = TokenForm {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: Some("test-client".to_string()),
+            client_secret: Some("test-secret".to_string()),
+            code_verifier: None,
+            refresh_token: Some(token.to_string()),
+            scope: None,
+        };
+
+        let headers = HeaderMap::new();
+        let resp =
+            handle_refresh_token_grant(app_state, oidc, refresh_store.clone(), headers, form).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!body["access_token"].as_str().unwrap().is_empty());
+        assert!(!body["id_token"].as_str().unwrap().is_empty());
+        assert!(!body["refresh_token"].as_str().unwrap().is_empty());
+
+        // Verification of rotation: original token must be gone
+        assert!(refresh_store.take(token).await.unwrap().is_none());
     }
 }
