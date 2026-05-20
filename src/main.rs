@@ -1,3 +1,4 @@
+use fred::interfaces::ClientLike;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -8,37 +9,46 @@ use std::sync::Arc;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, head, post};
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use ecdsa::SigningKey;
-use rustls::ServerConfig;
-use rustls_pemfile::{certs, private_key};
-use tokio_rustls::TlsAcceptor;
 use http::Uri;
-use tower::Service;
-#[cfg(feature = "http3")]
-use quinn::crypto::rustls::QuicServerConfig;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{debug, error};
 use p256::{NistP256, SecretKey};
+#[cfg(feature = "http3")]
+use quinn::crypto::rustls::QuicServerConfig;
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
 use tokio::sync::RwLock;
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 use tower::ServiceBuilder;
-use tower_sessions::cookie::time::Duration;
 use tower_sessions::cookie::SameSite;
+use tower_sessions::cookie::time::Duration;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
+use crate::apple_signin::{
+    AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_nonce_handler,
+};
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
 use crate::device_check::{
     finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
 };
+use crate::oidc::{
+    AuthorizationCodeStore, OidcConfig, RefreshTokenStore, authorize as oidc_authorize,
+    discovery as oidc_discovery, jwks as oidc_jwks, token as oidc_token, userinfo as oidc_userinfo,
+};
 
+mod apple_signin;
 mod authn;
 mod constants;
 mod db;
 mod device_check;
+mod oidc;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -70,9 +80,8 @@ async fn run_h3_server(
     server_config.alpn_protocols = vec![b"h3".to_vec()];
 
     // Create Quinn server config
-    let mut quinn_server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(server_config)?
-    ));
+    let mut quinn_server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_config)?));
 
     let transport_config = Arc::get_mut(&mut quinn_server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(100_u8.into());
@@ -146,10 +155,7 @@ async fn handle_h3_request(
 
     // Call the router (this is simplified - production would need proper integration)
     // For now, just return a basic response
-    let response = http::Response::builder()
-        .status(200)
-        .body(())
-        .unwrap();
+    let response = http::Response::builder().status(200).body(()).unwrap();
 
     stream.send_response(response).await?;
     stream.finish().await?;
@@ -186,8 +192,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up TLS if enabled
     let tls_acceptor = if settings.tls_enabled {
         let certs = {
-            let cert_file = File::open(&settings.tls_cert_path)
-                .map_err(|e| format!("Failed to open cert file {}: {}", settings.tls_cert_path, e))?;
+            let cert_file = File::open(&settings.tls_cert_path).map_err(|e| {
+                format!("Failed to open cert file {}: {}", settings.tls_cert_path, e)
+            })?;
             let mut cert_reader = std::io::BufReader::new(cert_file);
             certs(&mut cert_reader)
                 .collect::<Result<Vec<_>, _>>()
@@ -247,6 +254,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decoding_key: Arc::new(decoding_key),
     };
 
+    // Set up Redis Client using fred
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_config = fred::types::RedisConfig::from_url(&redis_url).unwrap_or_else(|_| {
+        log::warn!(
+            "Invalid REDIS_URL '{}', falling back to default config",
+            redis_url
+        );
+        fred::types::RedisConfig::default()
+    });
+    let redis_client = fred::clients::RedisClient::new(redis_config, None, None, None);
+
+    // Spawn connection in the background so a connection failure doesn't crash app startup
+    let redis_conn_client = redis_client.clone();
+    tokio::spawn(async move {
+        let _conn_handle = redis_conn_client.connect();
+        if let Err(err) = redis_conn_client.wait_for_connect().await {
+            log::error!("Failed to connect to Redis: {:?}", err);
+        } else {
+            log::info!("Successfully connected to Redis");
+        }
+    });
+
+    // OIDC provider configuration (issuer, JWKS, registered clients).
+    let oidc_config = Arc::new(
+        OidcConfig::from_env(&settings.decoding_key_path)
+            .map_err(|e| format!("Failed to load OIDC configuration: {}", e))?,
+    );
+    let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
+    let oidc_refresh_store = RefreshTokenStore::new(redis_client);
+    let apple_jwks_cache = Arc::new(AppleJwksCache::new());
+
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
         SessionManagerLayer::new(session_store)
@@ -265,6 +303,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/.well-known/apple-app-site-association",
             get(serve_apple_app_site_association),
         )
+        // OIDC discovery + JWKS (advertise this server as an OIDC provider)
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks.json", get(oidc_jwks))
+        // OIDC endpoints
+        .route("/oauth/authorize", get(oidc_authorize))
+        .route("/oauth/token", post(oidc_token))
+        .route("/oauth/userinfo", get(oidc_userinfo))
+        // Sign in with Apple
+        .route("/oauth/apple/nonce", get(apple_nonce_handler))
+        .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
+        .route("/oauth/apple/callback", post(apple_callback_handler))
+        // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
@@ -279,6 +329,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/device-check/assert", post(finish_assertion))
         .layer(Extension(app_state))
+        .layer(Extension(oidc_config))
+        .layer(Extension(oidc_code_store))
+        .layer(Extension(oidc_refresh_store))
+        .layer(Extension(apple_jwks_cache))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
         .fallback(handler_fallback);
@@ -311,13 +365,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // HTTP/2 server on TCP
-        let listener = tokio::net::TcpListener::bind(&addr).await
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
             .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
 
         let make_service = app.into_make_service();
 
         loop {
-            let (stream, remote_addr) = listener.accept().await
+            let (stream, remote_addr) = listener
+                .accept()
+                .await
                 .map_err(|e| format!("Failed to accept connection: {}", e))?;
 
             let tls_acceptor = tls_acceptor.clone();
@@ -334,13 +391,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        let hyper_service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                            tower_service.clone().call(request)
-                        });
+                        let hyper_service = hyper::service::service_fn(
+                            move |request: hyper::Request<hyper::body::Incoming>| {
+                                tower_service.clone().call(request)
+                            },
+                        );
 
-                        if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                            .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
-                            .await
+                        if let Err(err) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
+                        .await
                         {
                             eprintln!("Error serving connection: {:?}", err);
                         }
@@ -353,10 +414,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // HTTP mode without TLS
-        let listener = tokio::net::TcpListener::bind(&addr).await
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
             .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
 
-        axum::serve(listener, app).await
+        axum::serve(listener, app)
+            .await
             .map_err(|e| format!("Server error: {}", e))?;
     }
 
@@ -505,8 +568,8 @@ fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn st
     Ok(SigningKey::from(secret_key))
 }
 
-async fn load_apple_app_site_association(
-) -> Result<Arc<RwLock<serde_json::Value>>, Box<dyn std::error::Error>> {
+async fn load_apple_app_site_association()
+-> Result<Arc<RwLock<serde_json::Value>>, Box<dyn std::error::Error>> {
     let content = tokio::fs::read_to_string("apple-app-site-association.json")
         .await
         .map_err(|e| format!("Failed to read apple-app-site-association.json: {}", e))?;
@@ -660,11 +723,11 @@ async fn handle_oauth_callback(
     let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
 
     // Validate state parameter if provider requires it
-    if let Some(state) = params.get("state") {
-        if !validate_oauth_state(state) {
-            error!("Invalid OAuth state parameter for {:?}", provider);
-            return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
-        }
+    if let Some(state) = params.get("state")
+        && !validate_oauth_state(state)
+    {
+        error!("Invalid OAuth state parameter for {:?}", provider);
+        return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
     }
 
     // Handle the authorization code

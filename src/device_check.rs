@@ -46,29 +46,29 @@
 //! - Entitlement: `com.apple.developer.devicecheck.appattest-environment`
 //! - Not available in iOS Simulator
 
+use crate::AppState;
 use crate::constants::AUTH_TOKEN_HOURS;
 use crate::db::DynamoDBError;
-use crate::AppState;
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path},
     http::StatusCode,
     response::IntoResponse,
 };
+use base64::Engine;
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, Header, Validation};
+use ecdsa::signature::Verifier;
+use jsonwebtoken::{Algorithm, Header, Validation, decode, encode};
 use log::{error, info, warn};
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use thiserror::Error;
 use tower_sessions::Session;
 use uuid::Uuid;
 use x509_parser::prelude::*;
-use base64::Engine;
-use ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use p256::pkcs8::DecodePublicKey;
-use std::sync::OnceLock;
 
 const SESSION_ATTEST_STATE_KEY: &str = "attest_state";
 const SESSION_ASSERT_STATE_KEY: &str = "assert_state";
@@ -120,7 +120,7 @@ pub struct AttestationRequest {
 #[derive(Debug, Deserialize)]
 pub struct AssertionRequest {
     pub key_id: String,
-    pub assertion: String,      // Base64 encoded
+    pub assertion: String,        // Base64 encoded
     pub client_data_hash: String, // Base64 encoded (SHA256 of challenge)
 }
 
@@ -144,6 +144,7 @@ struct AttestationObject {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AttestationStatement {
     x5c: Vec<Vec<u8>>,
     receipt: Option<Vec<u8>>,
@@ -162,7 +163,10 @@ pub async fn generate_challenge(
 
     // Store challenge in session for verification
     if let Err(err) = session
-        .insert(SESSION_ATTEST_STATE_KEY, (username.clone(), challenge.clone()))
+        .insert(
+            SESSION_ATTEST_STATE_KEY,
+            (username.clone(), challenge.clone()),
+        )
         .await
     {
         error!("Failed to save attestation state: {:?}", err);
@@ -179,7 +183,10 @@ pub async fn finish_attestation(
     session: Session,
     Json(request): Json<AttestationRequest>,
 ) -> Result<impl IntoResponse, DeviceCheckError> {
-    info!("Finishing App Attest attestation for key_id: {}", request.key_id);
+    info!(
+        "Finishing App Attest attestation for key_id: {}",
+        request.key_id
+    );
 
     // Retrieve challenge from session
     let (username, challenge): (String, String) = session
@@ -267,7 +274,7 @@ pub async fn finish_attestation(
     warn!(
         "SECURITY: Nonce validation against certificate extension not implemented. \
          Calculated nonce: {}. This check should be added before production use.",
-        hex::encode(&calculated_nonce)
+        hex::encode(calculated_nonce)
     );
 
     // Get user from database
@@ -337,7 +344,10 @@ pub async fn generate_assertion_challenge(
 
     // Store challenge in session
     if let Err(err) = session
-        .insert(SESSION_ASSERT_STATE_KEY, (username.clone(), challenge.clone()))
+        .insert(
+            SESSION_ASSERT_STATE_KEY,
+            (username.clone(), challenge.clone()),
+        )
         .await
     {
         error!("Failed to save assertion state: {:?}", err);
@@ -409,11 +419,7 @@ pub async fn finish_assertion(
     // Verify signature using stored public key
     // The assertion contains authenticator data + signature
     // Signature is over: authData || clientDataHash
-    verify_assertion_signature(
-        &assertion_bytes,
-        &client_data_hash,
-        &binding.public_key,
-    )?;
+    verify_assertion_signature(&assertion_bytes, &client_data_hash, &binding.public_key)?;
 
     // Update counter in database with race condition protection
     // Only update if the counter hasn't been modified by another request
@@ -481,6 +487,7 @@ fn extract_public_key_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, DeviceCheckE
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AuthenticatorData {
     rp_id_hash: Vec<u8>,
     rp_id_hash_str: String,
@@ -526,12 +533,14 @@ fn verify_assertion_signature(
     let signature_bytes = &assertion_bytes[auth_data_len..];
 
     // Parse the P-256 public key from DER format
-    let verifying_key = P256VerifyingKey::from_public_key_der(public_key_der)
-        .map_err(|e| DeviceCheckError::InvalidCertificateChain(format!("Failed to parse public key: {}", e)))?;
+    let verifying_key = P256VerifyingKey::from_public_key_der(public_key_der).map_err(|e| {
+        DeviceCheckError::InvalidCertificateChain(format!("Failed to parse public key: {}", e))
+    })?;
 
     // Create signature object
-    let signature = P256Signature::from_slice(signature_bytes)
-        .map_err(|e| DeviceCheckError::InvalidAssertion(format!("Invalid signature format: {}", e)))?;
+    let signature = P256Signature::from_slice(signature_bytes).map_err(|e| {
+        DeviceCheckError::InvalidAssertion(format!("Invalid signature format: {}", e))
+    })?;
 
     // The signed data is: authenticatorData || clientDataHash
     let mut signed_data = Vec::new();
@@ -741,7 +750,7 @@ mod tests {
 
         // Invalid: counter doesn't increment
         let invalid_counter = 5u32;
-        assert!(!(invalid_counter > old_counter));
+        assert!(invalid_counter <= old_counter);
     }
 
     #[test]
@@ -753,10 +762,12 @@ mod tests {
 
         let result = verify_assertion_signature(&short_assertion, &client_data, &public_key);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("too short to contain signature"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("too short to contain signature")
+        );
     }
 
     #[test]

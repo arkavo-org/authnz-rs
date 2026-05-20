@@ -188,10 +188,100 @@ cargo clippy
 7. Monitor and log authentication attempts
 8. Regularly update dependencies
 
+## OIDC Provider
+
+This service can act as an OpenID Connect identity provider for OpenTDF and
+other relying parties.
+
+| Endpoint                              | Purpose                                       |
+| ------------------------------------- | --------------------------------------------- |
+| `GET /.well-known/openid-configuration` | OIDC discovery document                     |
+| `GET /.well-known/jwks.json`            | Public ES256 signing key as a JWK           |
+| `GET /oauth/authorize`                  | Authorization endpoint (code flow)          |
+| `POST /oauth/token`                     | Token endpoint                              |
+| `GET /oauth/userinfo`                   | UserInfo endpoint                           |
+| `GET /oauth/apple/nonce`                | Issue server-side nonce for Apple native flow |
+| `POST /oauth/apple/idtoken`             | Native Sign in with Apple (id_token + nonce)|
+| `POST /oauth/apple/callback`            | Web-flow Apple callback — **disabled (501)** until full code-exchange + state-bound nonce land |
+
+### Apple Sign In security gates
+
+Every accepted Apple id_token must clear all of:
+
+1. **Signature** against Apple's JWKS (`https://appleid.apple.com/auth/keys`),
+   cached for 1 hour with force-refresh on `kid` miss.
+2. **Issuer**: `iss == https://appleid.apple.com`.
+3. **Audience**: `aud` must equal one of the configured `APPLE_CLIENT_ID`
+   values. `APPLE_CLIENT_ID` accepts a comma-separated list so an iOS bundle
+   id and a web Service ID can coexist on the same deployment.
+4. **Nonce**: a server-issued nonce is **required**. For the native flow the
+   client must first call `GET /oauth/apple/nonce` (session-bound, single-use,
+   10-minute TTL). For `GET /oauth/authorize?idp=apple` the OIDC `nonce`
+   query parameter is reused as the Apple nonce. In both cases the id_token's
+   `nonce` claim must match the raw nonce verbatim *or* its hex SHA-256 (per
+   Apple's recommended client-side hashing pattern). Comparison is
+   constant-time.
+5. **`exp`/`iat`** via `jsonwebtoken::Validation`.
+
+The web callback (`POST /oauth/apple/callback`) is intentionally rejected
+with HTTP 501 until full code-exchange (signed client-secret JWT against
+Apple's `/auth/token`) and state-bound nonce verification are implemented.
+This is a deliberate "fail loudly" choice: a misconfigured Apple Service ID
+that posts a code-only callback returns a clear error instead of being
+silently accepted.
+
+Identity mapping is persistent: `map_apple_user` writes an `apple-<sub>` row
+to the DynamoDB credentials table on first login, and every subsequent login
+re-fetches the row. The Apple `sub` is the canonical account key; email is
+treated as optional metadata so private-relay address rotation does not
+break identity continuity.
+
+Token claims issued for OpenTDF compatibility:
+
+```json
+{
+  "iss": "https://identity.arkavo.net",
+  "sub": "apple:APPLE_SUB",
+  "aud": "opentdf",
+  "email": "user@privaterelay.appleid.com",
+  "email_verified": true,
+  "idp": "apple",
+  "arkavo_account_id": "uuid",
+  "arkavo_roles": ["user"],
+  "arkavo_entitlements": ["tdf:create", "tdf:decrypt"]
+}
+```
+
+Configure OpenTDF to trust this issuer:
+
+```
+issuer = https://identity.arkavo.net
+jwks_uri = https://identity.arkavo.net/.well-known/jwks.json
+username_claim = sub
+group_claim = arkavo_roles
+```
+
+### Required configuration
+
+```env
+export OIDC_ISSUER=https://identity.arkavo.net          # default
+export OIDC_CLIENT_ID=opentdf
+export OIDC_CLIENT_SECRET=...                           # optional; public clients use PKCE
+export OIDC_REDIRECT_URIS=https://opentdf.example/cb,https://opentdf.example/oauth/cb
+export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS bundle + web Service ID
+```
+
 ## Future Improvements
 
-- Implement key rotation
-- Add an endpoint to retrieve public keys
+- Implement key rotation (JWKS currently exposes a single static key derived
+  from `DECODING_KEY_PATH`; rotation requires multi-key issuance with overlap)
+- Apple OAuth code-exchange flow (client-secret JWT signed with Apple
+  developer private key)
+- Persist OIDC roles/entitlements per Arkavo account (today defaults are baked
+  into the upstream-auth resolution)
+- Replace in-memory OIDC `AuthorizationCodeStore` with a shared store
+  (DynamoDB/Redis) for multi-instance deployments
+- Refresh tokens / `offline_access` scope
 - Implement signature verification on the client-side
 - Enhance error handling and logging for key operations
 - Consider using a key management service for production environments
