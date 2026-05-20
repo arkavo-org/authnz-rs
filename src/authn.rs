@@ -338,7 +338,7 @@ pub async fn finish_authentication(
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
-    let res = match app_state
+    match app_state
         .webauthn
         .finish_passkey_authentication(&auth, &auth_state)
     {
@@ -358,8 +358,7 @@ pub async fn finish_authentication(
                 }),
             ))
         }
-    };
-    res
+    }
 }
 
 // Existing helper functions and structs remain the same

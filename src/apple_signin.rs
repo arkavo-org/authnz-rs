@@ -603,6 +603,29 @@ pub async fn apple_callback_handler(Json(_form): Json<AppleCallbackForm>) -> Res
         .into_response()
 }
 
+// Allow the binary crate's `Serialize` derive on `AppleNonceResponse` to be
+// reconstructed by tests via `serde_json::from_slice`. (`AppleNonceResponse`
+// is `Serialize`-only in production; tests need to deserialize, so add a
+// permissive Deserialize impl behind cfg(test).)
+#[cfg(test)]
+impl<'de> serde::Deserialize<'de> for AppleNonceResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper {
+            nonce: String,
+            expires_in: i64,
+        }
+        let h = Helper::deserialize(deserializer)?;
+        Ok(AppleNonceResponse {
+            nonce: h.nonce,
+            expires_in: h.expires_in,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,28 +905,5 @@ mod tests {
         let v2: AppleNonceResponse = serde_json::from_slice(&body2).unwrap();
         // Two separate session-less requests must not return the same nonce.
         assert_ne!(v1.nonce, v2.nonce);
-    }
-}
-
-// Allow the binary crate's `Serialize` derive on `AppleNonceResponse` to be
-// reconstructed by tests via `serde_json::from_slice`. (`AppleNonceResponse`
-// is `Serialize`-only in production; tests need to deserialize, so add a
-// permissive Deserialize impl behind cfg(test).)
-#[cfg(test)]
-impl<'de> serde::Deserialize<'de> for AppleNonceResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Helper {
-            nonce: String,
-            expires_in: i64,
-        }
-        let h = Helper::deserialize(deserializer)?;
-        Ok(AppleNonceResponse {
-            nonce: h.nonce,
-            expires_in: h.expires_in,
-        })
     }
 }

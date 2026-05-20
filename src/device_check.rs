@@ -144,6 +144,7 @@ struct AttestationObject {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AttestationStatement {
     x5c: Vec<Vec<u8>>,
     receipt: Option<Vec<u8>>,
@@ -273,7 +274,7 @@ pub async fn finish_attestation(
     warn!(
         "SECURITY: Nonce validation against certificate extension not implemented. \
          Calculated nonce: {}. This check should be added before production use.",
-        hex::encode(&calculated_nonce)
+        hex::encode(calculated_nonce)
     );
 
     // Get user from database
@@ -486,6 +487,7 @@ fn extract_public_key_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, DeviceCheckE
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AuthenticatorData {
     rp_id_hash: Vec<u8>,
     rp_id_hash_str: String,
@@ -748,7 +750,7 @@ mod tests {
 
         // Invalid: counter doesn't increment
         let invalid_counter = 5u32;
-        assert!(!(invalid_counter > old_counter));
+        assert!(invalid_counter <= old_counter);
     }
 
     #[test]

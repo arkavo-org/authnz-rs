@@ -292,7 +292,7 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         response_types_supported: vec!["code"],
         subject_types_supported: vec!["public"],
         id_token_signing_alg_values_supported: vec!["ES256"],
-        scopes_supported: vec!["openid", "email", "profile", "offline_access"],
+        scopes_supported: vec!["openid", "email", "profile"],
         token_endpoint_auth_methods_supported: vec![
             "client_secret_post",
             "client_secret_basic",

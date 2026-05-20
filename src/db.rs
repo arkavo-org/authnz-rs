@@ -594,19 +594,18 @@ impl DynamoDBStore {
             }
             Err(err) => {
                 match &err {
-                    SdkError::ServiceError(service_error) => {
+                    SdkError::ServiceError(service_error)
                         if service_error.err().meta().code()
-                            == Some("ConditionalCheckFailedException")
-                        {
-                            error!(
-                                "Counter update race condition detected for device {}: expected {}, but counter was modified",
-                                device_id, expected_counter
-                            );
-                            return Err(DynamoDBError::Internal(format!(
-                                "Counter race condition: expected counter {}, but it was modified by another request",
-                                expected_counter
-                            )));
-                        }
+                            == Some("ConditionalCheckFailedException") =>
+                    {
+                        error!(
+                            "Counter update race condition detected for device {}: expected {}, but counter was modified",
+                            device_id, expected_counter
+                        );
+                        return Err(DynamoDBError::Internal(format!(
+                            "Counter race condition: expected counter {}, but it was modified by another request",
+                            expected_counter
+                        )));
                     }
                     _ => {}
                 }
@@ -704,9 +703,12 @@ mod tests {
     #[test]
     fn test_username_validation() {
         // Empty username should be rejected
-        assert!("".is_empty());
-        assert!(!"alice".is_empty());
-        assert!(!"user123".is_empty());
+        let empty = "";
+        let alice = "alice";
+        let user123 = "user123";
+        assert!(empty.is_empty());
+        assert!(!alice.is_empty());
+        assert!(!user123.is_empty());
     }
 
     #[test]

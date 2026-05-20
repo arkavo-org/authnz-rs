@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, head, post};
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use ecdsa::SigningKey;
 use http::Uri;
@@ -698,11 +698,11 @@ async fn handle_oauth_callback(
     let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
 
     // Validate state parameter if provider requires it
-    if let Some(state) = params.get("state") {
-        if !validate_oauth_state(state) {
-            error!("Invalid OAuth state parameter for {:?}", provider);
-            return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
-        }
+    if let Some(state) = params.get("state")
+        && !validate_oauth_state(state)
+    {
+        error!("Invalid OAuth state parameter for {:?}", provider);
+        return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
     }
 
     // Handle the authorization code
