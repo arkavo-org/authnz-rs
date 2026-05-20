@@ -42,6 +42,16 @@ export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 # Optional: Set port (defaults to 8080)
 export PORT=8080
 
+# Optional: OIDC provider configuration (required to act as an OIDC IdP)
+export OIDC_ISSUER=https://identity.arkavo.net
+export OIDC_CLIENT_ID=opentdf
+export OIDC_CLIENT_SECRET=<shared-secret-or-omit-for-public-PKCE-clients>
+export OIDC_REDIRECT_URIS=https://opentdf.example/callback,https://opentdf.example/oauth/cb
+
+# Optional: Sign in with Apple. Accepts a comma-separated list so the same
+# AuthNZ instance can serve an iOS bundle id + web Service ID.
+export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
+
 # Run the server
 cargo run
 ```
@@ -157,6 +167,47 @@ aws dynamodb create-table \
 - Graceful handling of missing handles table during user creation
 - Device binding CRUD operations for App Attest
 
+**oidc.rs** - OpenID Connect (OIDC) Provider endpoints
+- `/.well-known/openid-configuration`: Discovery document
+- `/.well-known/jwks.json`: JWKS (advertises the EC P-256 signing key as a JWK)
+- `/oauth/authorize`: Authorization endpoint (code flow with PKCE)
+- `/oauth/token`: Token endpoint (issues ID + access tokens, ES256-signed)
+- `/oauth/userinfo`: UserInfo endpoint
+- Issues OpenTDF-compatible claims: `iss`, `sub` (e.g. `apple:APPLE_SUB` or
+  `arkavo:UUID`), `aud`, `email`, `email_verified`, `idp`,
+  `arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`
+- Authorization codes stored in an in-memory `AuthorizationCodeStore` (10-min
+  lifetime, single-use). For multi-instance deployments swap for a shared store.
+- Confidential clients use `client_secret`; public clients must use PKCE (S256).
+- Upstream authentication: WebAuthn-issued Arkavo JWT (via `X-Auth-Token`) or
+  Apple id_token (via `idp=apple` + `id_token` query/`X-Apple-Id-Token` header).
+
+**apple_signin.rs** - Sign in with Apple integration
+- Validates Apple-issued id_tokens against Apple's JWKS (cached 1h with
+  force-refresh on `kid` miss in case Apple rotated keys)
+- Every accepted id_token must clear:
+  - **Signature** vs Apple JWKS
+  - **`iss`** = `https://appleid.apple.com`
+  - **`aud`** ∈ comma-separated `APPLE_CLIENT_ID` list (iOS bundle + web
+    Service ID can coexist on the same deployment)
+  - **`nonce`** must match the server-issued nonce (verbatim or hex SHA-256;
+    constant-time compare). No nonce ⇒ refuse.
+  - **`exp`/`iat`** via `jsonwebtoken::Validation`
+- `GET /oauth/apple/nonce`: issues a 256-bit server nonce, persists in session
+- `POST /oauth/apple/idtoken`: Native flow — client must have called
+  `/oauth/apple/nonce` first; server consumes session nonce (single-use) and
+  validates the id_token against it
+- `POST /oauth/apple/callback`: **explicitly disabled** (HTTP 501). Apple web
+  callback requires both code-exchange (signed client-secret JWT against
+  Apple's token endpoint) *and* state-bound nonce verification. Until both
+  are implemented this endpoint always rejects, so misconfigured Apple
+  Service IDs fail loudly rather than being silently accepted.
+- `map_apple_user` persists `apple:<sub> → arkavo_account_id` in DynamoDB
+  (credentials table, keyed by `apple-<sanitized_sub>` username). Apple `sub`
+  is the canonical join key — email is optional metadata and never used to
+  locate accounts (private-relay rotation safe).
+- Requires `APPLE_CLIENT_ID` to be set (one or more comma-separated values).
+
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
 - `finish_attestation`: Validates attestation object, stores device binding
@@ -194,6 +245,22 @@ aws dynamodb create-table \
    - Validates client (arkavo, arkavocreator) and provider parameters
    - Sanitizes OAuth codes and error messages to prevent injection
    - Redirects to app-specific deep links (e.g., `arkavo://oauth/patreon?code=...`)
+
+5. **OIDC Provider Flow (for OpenTDF and other RPs)**:
+   - Relying party (RP) redirects user-agent to `/oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=openid&state=...&nonce=...`
+   - User-agent must already be authenticated via an upstream source:
+     - WebAuthn: present a valid Arkavo JWT via `X-Auth-Token` header
+     - Apple: pass `idp=apple` + Apple `id_token` (validated against Apple
+       JWKS). The OIDC `nonce` query parameter is **required** for
+       `idp=apple` and doubles as the Apple nonce — the client must use the
+       same value when invoking Apple Sign In so the id_token's `nonce`
+       claim matches (verbatim or hex SHA-256).
+   - Server resolves/provisions the Arkavo account, mints a single-use
+     authorization code, redirects back to `redirect_uri` with `code` + `state`
+   - RP exchanges code at `/oauth/token` (HTTP Basic or form auth; PKCE for
+     public clients). Server returns `access_token` + `id_token` (both ES256,
+     1h lifetime) with OpenTDF-compatible claims
+   - RP can call `/oauth/userinfo` with `Authorization: Bearer <access_token>`
 
 4. **Apple DeviceCheck/App Attest Flow**:
    - **One-time Attestation**:
@@ -269,6 +336,10 @@ The codebase uses thiserror for structured error handling:
   - `authn.rs`: DID validation, handle validation, token expiration, error responses (5 tests)
   - `db.rs`: DID format, error conversions, JSON serialization, error messages (8 tests)
   - `device_check.rs`: Challenge generation, authenticator data parsing, counter validation, error responses (6 tests)
+  - `oidc.rs`: JWK serialization/thumbprint, PKCE S256 verifier, authorization code
+    store lifecycle, discovery/JWKS endpoint shape, claim serialization (10 tests)
+  - `apple_signin.rs`: id_token claim deserialization, error status mapping,
+    username sanitization, hash stability (6 tests)
 - Integration test skeleton in tests/integration_test.rs
 - Test app routing with tower::ServiceExt::oneshot for request simulation
 - Mock requests use axum::body::Body::empty()
