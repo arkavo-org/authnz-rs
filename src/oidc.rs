@@ -369,20 +369,70 @@ impl OidcConfig {
 }
 
 fn load_clients_from_env() -> Result<HashMap<String, OidcClient>, String> {
-    let mut clients = HashMap::new();
+    parse_clients_from_env_vars(env::vars())
+}
 
-    // Primary client (typically OpenTDF). Format:
-    //   OIDC_CLIENT_ID=opentdf
-    //   OIDC_CLIENT_SECRET=...                 (optional; public client without)
-    //   OIDC_REDIRECT_URIS=https://a,https://b (comma-separated)
-    if let Ok(client_id) = env::var("OIDC_CLIENT_ID") {
-        let client_secret = env::var("OIDC_CLIENT_SECRET").ok();
-        let redirect_uris = env::var("OIDC_REDIRECT_URIS")
-            .map_err(|_| "OIDC_CLIENT_ID is set but OIDC_REDIRECT_URIS is missing".to_string())?
+/// Parse RP registrations from a `(key, value)` env iterator.
+///
+/// Each registered relying party is configured by a triple of env vars keyed
+/// by an operator-chosen `<TAG>` (typically matching the RP's `client_id`,
+/// upper-cased):
+///
+/// ```text
+///   OIDC_CLIENT_<TAG>_ID             = the RP's client_id
+///   OIDC_CLIENT_<TAG>_SECRET         = optional; omit for public PKCE-only RPs
+///   OIDC_CLIENT_<TAG>_REDIRECT_URIS  = comma-separated registered redirect URIs
+/// ```
+///
+/// Returns an empty map (with a warning) when no tags are configured. Errors
+/// when a tag has `_ID` but no `_REDIRECT_URIS`, when `_REDIRECT_URIS` is
+/// empty after trimming, or when two tags resolve to the same `client_id`.
+fn parse_clients_from_env_vars<I>(vars: I) -> Result<HashMap<String, OidcClient>, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let env_map: HashMap<String, String> = vars.into_iter().collect();
+
+    let tags: Vec<String> = env_map
+        .keys()
+        .filter_map(|k| {
+            k.strip_prefix("OIDC_CLIENT_")
+                .and_then(|rest| rest.strip_suffix("_ID"))
+                .filter(|tag| !tag.is_empty())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    let mut clients: HashMap<String, OidcClient> = HashMap::new();
+    for tag in tags {
+        let client_id = env_map[&format!("OIDC_CLIENT_{}_ID", tag)].clone();
+        let client_secret = env_map
+            .get(&format!("OIDC_CLIENT_{}_SECRET", tag))
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let redirects_key = format!("OIDC_CLIENT_{}_REDIRECT_URIS", tag);
+        let redirect_uris: Vec<String> = env_map
+            .get(&redirects_key)
+            .ok_or_else(|| {
+                format!(
+                    "OIDC_CLIENT_{}_ID is set but {} is missing",
+                    tag, redirects_key
+                )
+            })?
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        if redirect_uris.is_empty() {
+            return Err(format!("{} has no values", redirects_key));
+        }
+
+        if let Some(existing) = clients.get(&client_id) {
+            return Err(format!(
+                "Duplicate OIDC client_id `{}` configured under multiple tags",
+                existing.client_id
+            ));
+        }
 
         clients.insert(
             client_id.clone(),
@@ -392,10 +442,13 @@ fn load_clients_from_env() -> Result<HashMap<String, OidcClient>, String> {
                 redirect_uris,
             },
         );
-    } else {
+    }
+
+    if clients.is_empty() {
         warn!(
-            "OIDC_CLIENT_ID not set; /oauth/authorize and /oauth/token will reject all clients. \
-             Configure OIDC_CLIENT_ID, optional OIDC_CLIENT_SECRET, and OIDC_REDIRECT_URIS."
+            "No OIDC relying parties configured; /oauth/authorize and /oauth/token will reject all clients. \
+             Register at least one RP via OIDC_CLIENT_<TAG>_ID, optional OIDC_CLIENT_<TAG>_SECRET, \
+             and OIDC_CLIENT_<TAG>_REDIRECT_URIS."
         );
     }
 
@@ -1527,6 +1580,86 @@ mod tests {
     fn test_authorize_error_apple_nonce_required_is_400() {
         let resp = AuthorizeError::AppleNonceRequired.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn env_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_clients_multiple_rps() {
+        let vars = env_vars(&[
+            ("OIDC_CLIENT_OPENTDF_ID", "opentdf"),
+            ("OIDC_CLIENT_OPENTDF_SECRET", "shh"),
+            ("OIDC_CLIENT_OPENTDF_REDIRECT_URIS", "https://a/cb,https://b/cb"),
+            ("OIDC_CLIENT_NATIVEAPP_ID", "arkavo-ios"),
+            ("OIDC_CLIENT_NATIVEAPP_REDIRECT_URIS", "arkavo://oauth/cb"),
+            // Unrelated env var must be ignored.
+            ("SOME_OTHER_VAR", "ignored"),
+        ]);
+        let clients = parse_clients_from_env_vars(vars).unwrap();
+        assert_eq!(clients.len(), 2);
+
+        let opentdf = clients.get("opentdf").unwrap();
+        assert_eq!(opentdf.client_secret.as_deref(), Some("shh"));
+        assert_eq!(
+            opentdf.redirect_uris,
+            vec!["https://a/cb".to_string(), "https://b/cb".to_string()]
+        );
+
+        let native = clients.get("arkavo-ios").unwrap();
+        // Empty/missing secret → public PKCE-only client.
+        assert!(native.client_secret.is_none());
+        assert_eq!(native.redirect_uris, vec!["arkavo://oauth/cb".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_clients_empty_secret_treated_as_public() {
+        let vars = env_vars(&[
+            ("OIDC_CLIENT_FOO_ID", "foo"),
+            ("OIDC_CLIENT_FOO_SECRET", ""),
+            ("OIDC_CLIENT_FOO_REDIRECT_URIS", "https://x/cb"),
+        ]);
+        let clients = parse_clients_from_env_vars(vars).unwrap();
+        assert!(clients["foo"].client_secret.is_none());
+    }
+
+    #[test]
+    fn test_parse_clients_missing_redirects_errors() {
+        let vars = env_vars(&[("OIDC_CLIENT_FOO_ID", "foo")]);
+        let err = parse_clients_from_env_vars(vars).unwrap_err();
+        assert!(err.contains("OIDC_CLIENT_FOO_REDIRECT_URIS"));
+    }
+
+    #[test]
+    fn test_parse_clients_empty_redirects_errors() {
+        let vars = env_vars(&[
+            ("OIDC_CLIENT_FOO_ID", "foo"),
+            ("OIDC_CLIENT_FOO_REDIRECT_URIS", " , , "),
+        ]);
+        let err = parse_clients_from_env_vars(vars).unwrap_err();
+        assert!(err.contains("has no values"));
+    }
+
+    #[test]
+    fn test_parse_clients_duplicate_client_id_errors() {
+        let vars = env_vars(&[
+            ("OIDC_CLIENT_A_ID", "same"),
+            ("OIDC_CLIENT_A_REDIRECT_URIS", "https://x/cb"),
+            ("OIDC_CLIENT_B_ID", "same"),
+            ("OIDC_CLIENT_B_REDIRECT_URIS", "https://y/cb"),
+        ]);
+        let err = parse_clients_from_env_vars(vars).unwrap_err();
+        assert!(err.contains("Duplicate OIDC client_id"));
+    }
+
+    #[test]
+    fn test_parse_clients_empty_env_returns_empty_map() {
+        let clients = parse_clients_from_env_vars(env_vars(&[])).unwrap();
+        assert!(clients.is_empty());
     }
 
     #[test]
