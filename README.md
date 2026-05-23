@@ -265,9 +265,15 @@ group_claim = arkavo_roles
 
 ```env
 export OIDC_ISSUER=https://identity.arkavo.net          # default
-export OIDC_CLIENT_ID=opentdf
-export OIDC_CLIENT_SECRET=...                           # optional; public clients use PKCE
-export OIDC_REDIRECT_URIS=https://opentdf.example/cb,https://opentdf.example/oauth/cb
+
+# Register one or more relying parties using tagged env vars. <TAG> is an
+# operator-chosen identifier (typically the upper-cased client_id) used only
+# to group each RP's three vars; it does not appear in tokens.
+export OIDC_CLIENT_OPENTDF_ID=opentdf
+export OIDC_CLIENT_OPENTDF_SECRET=...                           # optional; public clients use PKCE
+export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/cb,https://opentdf.example/oauth/cb
+# Additional RPs follow the same OIDC_CLIENT_<TAG>_{ID,SECRET,REDIRECT_URIS} pattern.
+
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS bundle + web Service ID
 ```
 

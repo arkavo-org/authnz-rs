@@ -42,11 +42,21 @@ export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 # Optional: Set port (defaults to 8080)
 export PORT=8080
 
-# Optional: OIDC provider configuration (required to act as an OIDC IdP)
+# Optional: OIDC provider configuration (required to act as an OIDC IdP).
+# Issuer URL appears in tokens and the discovery doc.
 export OIDC_ISSUER=https://identity.arkavo.net
-export OIDC_CLIENT_ID=opentdf
-export OIDC_CLIENT_SECRET=<shared-secret-or-omit-for-public-PKCE-clients>
-export OIDC_REDIRECT_URIS=https://opentdf.example/callback,https://opentdf.example/oauth/cb
+
+# Register one or more relying parties (RPs) using tagged env vars. <TAG> is
+# an operator-chosen identifier (typically the upper-cased client_id) used
+# only to group each RP's three vars together — it does not appear in tokens.
+# Each RP needs an _ID and _REDIRECT_URIS; _SECRET is optional (omit or
+# leave blank for public PKCE-only clients).
+export OIDC_CLIENT_OPENTDF_ID=opentdf
+export OIDC_CLIENT_OPENTDF_SECRET=<shared-secret-or-omit-for-public-PKCE-clients>
+export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https://opentdf.example/oauth/cb
+# Additional RPs follow the same pattern with a different tag:
+# export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
+# export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
 
 # Optional: Sign in with Apple. Accepts a comma-separated list so the same
 # AuthNZ instance can serve an iOS bundle id + web Service ID.
