@@ -146,7 +146,7 @@ impl ArkavoClaims {
 
 use ciborium::value::{Integer, Value};
 use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
-use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
 
 pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
     let payload = claims_to_cbor(claims)?;
@@ -395,6 +395,69 @@ fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct VerifyOptions<'a> {
+    pub expected_iss: Option<&'a str>,
+    pub expected_aud: Option<&'a str>,
+    pub now: i64,
+    pub skew_secs: i64,
+}
+
+pub const DEFAULT_SKEW_SECS: i64 = 60;
+
+pub fn verify(
+    bytes: &[u8],
+    key: &VerifyingKey,
+    opts: &VerifyOptions,
+) -> Result<ArkavoClaims, CwtError> {
+    let sign1 = coset::CoseSign1::from_slice(bytes).map_err(|_| CwtError::Malformed)?;
+
+    // Strictness: alg MUST be ES256 in the PROTECTED header.
+    match sign1.protected.header.alg {
+        Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
+        _ => return Err(CwtError::UnsupportedAlg),
+    }
+
+    // Verify signature.
+    let payload = sign1.payload.as_ref().ok_or(CwtError::Malformed)?.clone();
+    sign1
+        .verify_signature(b"", |sig_bytes, to_verify| {
+            let sig = Signature::from_slice(sig_bytes).map_err(|_| ())?;
+            key.verify(to_verify, &sig).map_err(|_| ())
+        })
+        .map_err(|_| CwtError::InvalidSignature)?;
+
+    let claims = claims_from_cbor(&payload)?;
+
+    // iss check.
+    if let Some(want) = opts.expected_iss {
+        if claims.iss != want {
+            return Err(CwtError::IssuerMismatch);
+        }
+    }
+
+    // aud check.
+    if let Some(want) = opts.expected_aud {
+        let matches_aud = match &claims.aud {
+            Audience::Single(s) => s == want,
+            Audience::Multiple(v) => v.iter().any(|s| s == want),
+        };
+        if !matches_aud {
+            return Err(CwtError::AudienceMismatch);
+        }
+    }
+
+    // exp / iat with ±skew.
+    if claims.exp <= opts.now - opts.skew_secs {
+        return Err(CwtError::Expired);
+    }
+    if claims.iat > opts.now + opts.skew_secs {
+        return Err(CwtError::NotYetValid);
+    }
+
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +635,121 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 16]);
         let result = claims_from_cbor(&bytes);
         assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+    }
+
+    #[test]
+    fn verify_roundtrip_succeeds() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let decoded = verify(&bytes, &vk, &opts).expect("verify");
+        assert_eq!(decoded.sub, "sub-1");
+    }
+
+    #[test]
+    fn verify_rejects_wrong_key() {
+        let (sk, _vk) = test_keypair();
+        let (_sk2, vk2) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk2, &opts);
+        assert!(matches!(result, Err(CwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_payload() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let mut bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        // Flip a bit somewhere in the middle (likely in the payload).
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk, &opts);
+        assert!(matches!(result, Err(CwtError::InvalidSignature) | Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn verify_rejects_non_es256_alg() {
+        let (sk, vk) = test_keypair();
+        // Manually build a COSE_Sign1 with alg=ES384 but still ES256-signed,
+        // simulating an attacker swapping the alg field.
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let payload = claims_to_cbor(&claims).unwrap();
+
+        let protected = coset::HeaderBuilder::new()
+            .algorithm(coset::iana::Algorithm::ES384)
+            .key_id(test_kid())
+            .build();
+
+        let sign1 = coset::CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |to_sign| {
+                let sig: p256::ecdsa::Signature = sk.sign(to_sign);
+                sig.to_bytes().to_vec()
+            })
+            .build();
+        let bytes = sign1.to_vec().unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk, &opts);
+        assert!(matches!(result, Err(CwtError::UnsupportedAlg)), "got {:?}", result);
+    }
+
+    #[test]
+    fn verify_rejects_missing_alg() {
+        // Build a COSE_Sign1 with NO algorithm in protected header.
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let payload = claims_to_cbor(&claims).unwrap();
+        let (sk, vk) = test_keypair();
+
+        let protected = coset::HeaderBuilder::new()
+            .key_id(test_kid())
+            .build();
+
+        let sign1 = coset::CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |to_sign| {
+                let sig: p256::ecdsa::Signature = sk.sign(to_sign);
+                sig.to_bytes().to_vec()
+            })
+            .build();
+        let bytes = sign1.to_vec().unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk, &opts);
+        assert!(matches!(result, Err(CwtError::UnsupportedAlg)), "got {:?}", result);
     }
 }
