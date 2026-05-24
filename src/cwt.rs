@@ -144,6 +144,7 @@ impl ArkavoClaims {
     }
 }
 
+use base64::Engine;
 use ciborium::value::{Integer, Value};
 use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
@@ -470,6 +471,16 @@ pub fn verify(
     }
 
     Ok(claims)
+}
+
+pub fn encode_for_header(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn decode_from_header(s: &str) -> Result<Vec<u8>, CwtError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|_| CwtError::Malformed)
 }
 
 #[cfg(test)]
@@ -898,5 +909,31 @@ mod tests {
         let sign1 = coset::CoseSign1::from_slice(&bytes).unwrap();
         let decoded = claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert!(decoded.cnf.is_none());
+    }
+
+    #[test]
+    fn encode_for_header_is_unpadded_base64url() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let encoded = encode_for_header(&bytes);
+        // No padding, no '+' or '/' chars.
+        assert!(!encoded.contains('='));
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+
+        let decoded = decode_from_header(&encoded).expect("decode");
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        verify(&decoded, &vk, &opts).expect("verify roundtrip via header transport");
+    }
+
+    #[test]
+    fn decode_from_header_rejects_invalid_base64() {
+        assert!(matches!(decode_from_header("!!!not-base64!!!"), Err(CwtError::Malformed)));
     }
 }
