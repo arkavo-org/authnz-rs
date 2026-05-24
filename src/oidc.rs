@@ -98,6 +98,10 @@ pub struct DiscoveryDocument {
     pub claims_supported: Vec<&'static str>,
     pub grant_types_supported: Vec<&'static str>,
     pub code_challenge_methods_supported: Vec<&'static str>,
+    #[serde(rename = "arkavo_access_token_format")]
+    pub arkavo_access_token_format: String,
+    #[serde(rename = "arkavo_cose_keys_uri")]
+    pub arkavo_cose_keys_uri: String,
 }
 
 /// OIDC claims issued in ID/access tokens.
@@ -526,6 +530,8 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         ],
         grant_types_supported: vec!["authorization_code", "client_credentials", "refresh_token"],
         code_challenge_methods_supported: vec!["S256"],
+        arkavo_access_token_format: "application/cwt".to_string(),
+        arkavo_cose_keys_uri: format!("{}/.well-known/cose-keys", oidc.issuer.trim_end_matches('/')),
     };
     Json(doc)
 }
@@ -1991,6 +1997,52 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|c| c == "arkavo_entitlements")
+        );
+        // Extension fields for CWT-aware RPs
+        assert_eq!(v["arkavo_access_token_format"], "application/cwt");
+        let cose_uri = v["arkavo_cose_keys_uri"].as_str().expect("string");
+        assert!(
+            cose_uri.ends_with("/.well-known/cose-keys"),
+            "unexpected cose_uri: {}",
+            cose_uri
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_doc_includes_arkavo_extensions() {
+        let oidc = test_oidc_config();
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .layer(Extension(oidc));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        assert_eq!(body_json["arkavo_access_token_format"], "application/cwt");
+        let uri = body_json["arkavo_cose_keys_uri"]
+            .as_str()
+            .expect("arkavo_cose_keys_uri must be a string");
+        assert!(
+            uri.ends_with("/.well-known/cose-keys"),
+            "got {}",
+            uri
+        );
+        assert_eq!(
+            uri,
+            "https://identity.arkavo.net/.well-known/cose-keys"
         );
     }
 
