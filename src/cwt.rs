@@ -144,6 +144,215 @@ impl ArkavoClaims {
     }
 }
 
+use ciborium::value::{Integer, Value};
+
+fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+
+    entries.push((Value::Integer(1.into()), Value::Text(c.iss.clone())));
+    entries.push((Value::Integer(2.into()), Value::Text(c.sub.clone())));
+    entries.push((
+        Value::Integer(3.into()),
+        match &c.aud {
+            Audience::Single(s) => Value::Text(s.clone()),
+            Audience::Multiple(v) => {
+                Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect())
+            }
+        },
+    ));
+    entries.push((Value::Integer(4.into()), Value::Integer(c.exp.into())));
+    entries.push((Value::Integer(6.into()), Value::Integer(c.iat.into())));
+    entries.push((Value::Integer(7.into()), Value::Bytes(c.cti.to_vec())));
+
+    if let Some(cnf) = &c.cnf {
+        let mut cnf_entries: Vec<(Value, Value)> = Vec::new();
+        // Serialize CoseKey via coset's AsCborValue.
+        use coset::AsCborValue;
+        let cose_key_value = cnf
+            .cose_key
+            .clone()
+            .to_cbor_value()
+            .map_err(|_| CwtError::Malformed)?;
+        cnf_entries.push((Value::Integer(1.into()), cose_key_value));
+        cnf_entries.push((Value::Integer(2.into()), Value::Bytes(cnf.kid.clone())));
+        entries.push((Value::Integer(8.into()), Value::Map(cnf_entries)));
+    }
+
+    if let Some(v) = &c.custom.idp {
+        entries.push((Value::Text("idp".into()), Value::Text(v.clone())));
+    }
+    if let Some(v) = &c.custom.email {
+        entries.push((Value::Text("email".into()), Value::Text(v.clone())));
+    }
+    if let Some(v) = c.custom.email_verified {
+        entries.push((Value::Text("email_verified".into()), Value::Bool(v)));
+    }
+    if let Some(v) = &c.custom.arkavo_account_id {
+        entries.push((
+            Value::Text("arkavo_account_id".into()),
+            Value::Text(v.clone()),
+        ));
+    }
+    if let Some(v) = &c.custom.arkavo_roles {
+        entries.push((
+            Value::Text("arkavo_roles".into()),
+            Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect()),
+        ));
+    }
+    if let Some(v) = &c.custom.arkavo_entitlements {
+        entries.push((
+            Value::Text("arkavo_entitlements".into()),
+            Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect()),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut bytes)
+        .map_err(|_| CwtError::Malformed)?;
+    Ok(bytes)
+}
+
+fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
+    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
+    let Value::Map(entries) = value else {
+        return Err(CwtError::Malformed);
+    };
+
+    // Reject duplicate keys.
+    {
+        let mut seen_ints: Vec<i128> = Vec::new();
+        let mut seen_strs: Vec<String> = Vec::new();
+        for (k, _) in &entries {
+            match k {
+                Value::Integer(i) => {
+                    let n: i128 = (*i).into();
+                    if seen_ints.contains(&n) {
+                        return Err(CwtError::Malformed);
+                    }
+                    seen_ints.push(n);
+                }
+                Value::Text(s) => {
+                    if seen_strs.contains(s) {
+                        return Err(CwtError::Malformed);
+                    }
+                    seen_strs.push(s.clone());
+                }
+                _ => return Err(CwtError::Malformed),
+            }
+        }
+    }
+
+    let mut iss: Option<String> = None;
+    let mut sub: Option<String> = None;
+    let mut aud: Option<Audience> = None;
+    let mut exp: Option<i64> = None;
+    let mut iat: Option<i64> = None;
+    let mut cti: Option<[u8; 16]> = None;
+    let mut cnf: Option<Cnf> = None;
+    let mut custom = CustomClaims::default();
+
+    let int_label = |i: &Integer| -> i128 { (*i).into() };
+
+    for (k, v) in entries {
+        match (k, v) {
+            (Value::Integer(i), Value::Text(s)) if int_label(&i) == 1 => iss = Some(s),
+            (Value::Integer(i), Value::Text(s)) if int_label(&i) == 2 => sub = Some(s),
+            (Value::Integer(i), Value::Text(s)) if int_label(&i) == 3 => {
+                aud = Some(Audience::Single(s))
+            }
+            (Value::Integer(i), Value::Array(a)) if int_label(&i) == 3 => {
+                let parts: Result<Vec<String>, _> = a
+                    .into_iter()
+                    .map(|x| match x {
+                        Value::Text(s) => Ok(s),
+                        _ => Err(CwtError::Malformed),
+                    })
+                    .collect();
+                aud = Some(Audience::Multiple(parts?));
+            }
+            (Value::Integer(i), Value::Integer(n)) if int_label(&i) == 4 => {
+                let v: i128 = n.into();
+                exp = Some(v as i64);
+            }
+            (Value::Integer(i), Value::Integer(n)) if int_label(&i) == 6 => {
+                let v: i128 = n.into();
+                iat = Some(v as i64);
+            }
+            (Value::Integer(i), Value::Bytes(b)) if int_label(&i) == 7 => {
+                if b.len() != 16 {
+                    return Err(CwtError::Malformed);
+                }
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&b);
+                cti = Some(arr);
+            }
+            (Value::Integer(i), Value::Map(map)) if int_label(&i) == 8 => {
+                let mut cose_key: Option<coset::CoseKey> = None;
+                let mut kid: Option<Vec<u8>> = None;
+                for (kk, vv) in map {
+                    match (kk, vv) {
+                        (Value::Integer(j), val) if int_label(&j) == 1 => {
+                            use coset::AsCborValue;
+                            cose_key = Some(
+                                coset::CoseKey::from_cbor_value(val)
+                                    .map_err(|_| CwtError::Malformed)?,
+                            );
+                        }
+                        (Value::Integer(j), Value::Bytes(b)) if int_label(&j) == 2 => {
+                            kid = Some(b);
+                        }
+                        _ => {}
+                    }
+                }
+                cnf = Some(Cnf {
+                    cose_key: cose_key.ok_or(CwtError::Malformed)?,
+                    kid: kid.unwrap_or_default(),
+                });
+            }
+            (Value::Text(s), Value::Text(t)) if s == "idp" => custom.idp = Some(t),
+            (Value::Text(s), Value::Text(t)) if s == "email" => custom.email = Some(t),
+            (Value::Text(s), Value::Bool(b)) if s == "email_verified" => {
+                custom.email_verified = Some(b)
+            }
+            (Value::Text(s), Value::Text(t)) if s == "arkavo_account_id" => {
+                custom.arkavo_account_id = Some(t)
+            }
+            (Value::Text(s), Value::Array(a)) if s == "arkavo_roles" => {
+                let parts: Result<Vec<String>, _> = a
+                    .into_iter()
+                    .map(|x| match x {
+                        Value::Text(t) => Ok(t),
+                        _ => Err(CwtError::Malformed),
+                    })
+                    .collect();
+                custom.arkavo_roles = Some(parts?);
+            }
+            (Value::Text(s), Value::Array(a)) if s == "arkavo_entitlements" => {
+                let parts: Result<Vec<String>, _> = a
+                    .into_iter()
+                    .map(|x| match x {
+                        Value::Text(t) => Ok(t),
+                        _ => Err(CwtError::Malformed),
+                    })
+                    .collect();
+                custom.arkavo_entitlements = Some(parts?);
+            }
+            _ => {} // Ignore unknown claims (forward-compat).
+        }
+    }
+
+    Ok(ArkavoClaims {
+        iss: iss.ok_or(CwtError::MissingClaim("iss"))?,
+        sub: sub.ok_or(CwtError::MissingClaim("sub"))?,
+        aud: aud.ok_or(CwtError::MissingClaim("aud"))?,
+        exp: exp.ok_or(CwtError::MissingClaim("exp"))?,
+        iat: iat.ok_or(CwtError::MissingClaim("iat"))?,
+        cti: cti.ok_or(CwtError::MissingClaim("cti"))?,
+        cnf,
+        custom,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +402,49 @@ mod tests {
         let a = ArkavoClaims::auth("iss", "sub", 1);
         let b = ArkavoClaims::auth("iss", "sub", 1);
         assert_ne!(a.cti, b.cti);
+    }
+
+    #[test]
+    fn cbor_roundtrip_minimal_claims() {
+        let c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = claims_to_cbor(&c).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.iss, c.iss);
+        assert_eq!(decoded.sub, c.sub);
+        assert_eq!(decoded.aud, c.aud);
+        assert_eq!(decoded.exp, c.exp);
+        assert_eq!(decoded.iat, c.iat);
+        assert_eq!(decoded.cti, c.cti);
+        assert!(decoded.cnf.is_none());
+    }
+
+    #[test]
+    fn cbor_roundtrip_full_oidc_claims() {
+        let c = ArkavoClaims::oidc_access("iss-1", "arkavo:abc", "opentdf", 1)
+            .with_idp("arkavo")
+            .with_email("a@b.c", true)
+            .with_arkavo_account_id("acct-1")
+            .with_arkavo_roles(vec!["reader".into(), "writer".into()])
+            .with_arkavo_entitlements(vec!["ent-a".into()]);
+        let bytes = claims_to_cbor(&c).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.custom.idp, c.custom.idp);
+        assert_eq!(decoded.custom.email, c.custom.email);
+        assert_eq!(decoded.custom.email_verified, c.custom.email_verified);
+        assert_eq!(decoded.custom.arkavo_account_id, c.custom.arkavo_account_id);
+        assert_eq!(decoded.custom.arkavo_roles, c.custom.arkavo_roles);
+        assert_eq!(
+            decoded.custom.arkavo_entitlements,
+            c.custom.arkavo_entitlements
+        );
+    }
+
+    #[test]
+    fn cbor_decode_rejects_duplicate_keys() {
+        // Hand-craft CBOR: map with two entries for key 1 (iss).
+        // 0xa3 = map(3 entries); 0x01 = uint 1; 0x61, 'a' = tstr "a"; 0x01 = uint 1; 0x61, 'b' = tstr "b"; 0x02 = uint 2; 0x61, 'c' = tstr "c"
+        let bytes = vec![0xa3, 0x01, 0x61, b'a', 0x01, 0x61, b'b', 0x02, 0x61, b'c'];
+        let result = claims_from_cbor(&bytes);
+        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
     }
 }
