@@ -14,7 +14,7 @@
 //! `arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`.
 //!
 //! Authentication during the authorize step is delegated to an upstream
-//! identity source (WebAuthn-issued Arkavo JWT, Apple Sign In, etc.).
+//! identity source (WebAuthn-issued Arkavo CWT, Apple Sign In, etc.).
 //! Operators MUST configure allowed clients/redirect URIs via environment
 //! variables (see [`OidcConfig`]).
 
@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use chrono::Utc;
 use fred::interfaces::{ClientLike, KeysInterface};
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, Header, encode};
 use log::{debug, error, info, warn};
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -98,6 +98,10 @@ pub struct DiscoveryDocument {
     pub claims_supported: Vec<&'static str>,
     pub grant_types_supported: Vec<&'static str>,
     pub code_challenge_methods_supported: Vec<&'static str>,
+    #[serde(rename = "arkavo_access_token_format")]
+    pub arkavo_access_token_format: String,
+    #[serde(rename = "arkavo_cose_keys_uri")]
+    pub arkavo_cose_keys_uri: String,
 }
 
 /// OIDC claims issued in ID/access tokens.
@@ -526,6 +530,11 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         ],
         grant_types_supported: vec!["authorization_code", "client_credentials", "refresh_token"],
         code_challenge_methods_supported: vec!["S256"],
+        arkavo_access_token_format: "application/cwt".to_string(),
+        arkavo_cose_keys_uri: format!(
+            "{}/.well-known/cose-keys",
+            oidc.issuer.trim_end_matches('/')
+        ),
     };
     Json(doc)
 }
@@ -534,6 +543,44 @@ pub async fn jwks(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl IntoRespo
     Json(Jwks {
         keys: vec![oidc.jwk.clone()],
     })
+}
+
+/// Serve the signing key as a COSE_Key Set (RFC 9052 §7) in CBOR form.
+///
+/// CWT verifiers (OpenTDF tdf-rs, native arkavo apps) can fetch the P-256
+/// key in its native COSE format instead of converting from JWK.
+/// Same physical key as `/.well-known/jwks.json`; same `kid` (RFC 7638
+/// thumbprint bytes).
+pub async fn cose_keys(Extension(app_state): Extension<AppState>) -> impl IntoResponse {
+    let cose_key = crate::cwt::cose_key_from_p256_verifying_key(
+        &app_state.cwt_verifying_key,
+        &app_state.cwt_kid,
+    );
+
+    use coset::AsCborValue;
+    let key_value = match cose_key.to_cbor_value() {
+        Ok(v) => v,
+        Err(e) => {
+            error!("cose_keys: CoseKey -> CBOR conversion failed: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
+        }
+    };
+    let set = ciborium::value::Value::Array(vec![key_value]);
+
+    let mut bytes = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&set, &mut bytes) {
+        error!("cose_keys: CBOR serialization failed: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
+    }
+
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/cose-key-set+cbor"),
+            (http::header::CACHE_CONTROL, "public, max-age=600"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,7 +594,7 @@ pub struct AuthorizeQuery {
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     /// Identity-source hint. Currently supported: `apple` (with `id_token`),
-    /// `webauthn` (Arkavo JWT in `X-Auth-Token` header).
+    /// `webauthn` (Arkavo CWT in `X-Auth-Token` header).
     pub idp: Option<String>,
     /// Apple id_token, when `idp=apple`. Alternatively pass `X-Apple-Id-Token` header.
     pub id_token: Option<String>,
@@ -561,7 +608,7 @@ pub struct AuthorizeQuery {
 /// 1. `idp=apple` + `id_token` (or `X-Apple-Id-Token` header): validates the
 ///    Apple-issued id_token, maps to an Arkavo account, and issues an
 ///    authorization code.
-/// 2. `X-Auth-Token` header with a valid Arkavo JWT (from WebAuthn flow):
+/// 2. `X-Auth-Token` header with a valid Arkavo CWT (from WebAuthn flow):
 ///    upgrades the WebAuthn session into an OIDC authorization code.
 ///
 /// If no upstream credential is presented, returns 401 with a JSON body
@@ -845,7 +892,6 @@ async fn handle_authorization_code_grant(
 
     let now = Utc::now().timestamp();
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
-    let at_exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
 
     let id_claims = OidcClaims {
         iss: oidc.issuer.clone(),
@@ -861,10 +907,6 @@ async fn handle_authorization_code_grant(
         arkavo_roles: record.user.roles.clone(),
         arkavo_entitlements: record.user.entitlements.clone(),
     };
-    let mut access_claims = id_claims.clone();
-    access_claims.exp = at_exp;
-    access_claims.nonce = None;
-
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
 
@@ -879,15 +921,37 @@ async fn handle_authorization_code_grant(
             );
         }
     };
-    let access_token = match encode(&header, &access_claims, &app_state.encoding_key) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to encode access_token: {}", e);
-            return oidc_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to issue access_token",
-            );
+    let access_token = {
+        let extras = AccessTokenExtras {
+            idp: record.user.idp.clone(),
+            email: record.user.email.clone(),
+            email_verified: record.user.email_verified,
+            arkavo_account_id: Some(record.user.arkavo_account_id.clone()),
+            arkavo_roles: Some(record.user.roles.clone()),
+            arkavo_entitlements: Some(record.user.entitlements.clone()),
+        };
+        match mint_access_token(
+            &app_state,
+            &record.user.subject,
+            &record.client_id,
+            Some(extras),
+            // TODO: thread cnf through. The WebAuthn passkey's COSE_Key is in
+            // DynamoDB at this point, not on the request. Storing it on the
+            // AuthorizationCodeRecord at /authorize time (or looking it up via
+            // sub here) would let us bind the access token to the credential.
+            // Deferred from JWT->CWT migration; access token is currently
+            // unbound for WebAuthn flow, same security posture as today's JWT.
+            None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to mint access_token CWT: {}", e);
+                return oidc_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to issue access_token",
+                );
+            }
         }
     };
 
@@ -1023,15 +1087,31 @@ async fn handle_client_credentials_grant(
             );
         }
     };
-    let access_token = match encode(&header, &id_claims, &app_state.encoding_key) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to encode access_token: {}", e);
-            return oidc_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to issue access_token",
-            );
+    let access_token = {
+        let extras = AccessTokenExtras {
+            idp: id_claims.idp.clone(),
+            email: id_claims.email.clone(),
+            email_verified: id_claims.email_verified,
+            arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
+            arkavo_roles: Some(id_claims.arkavo_roles.clone()),
+            arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
+        };
+        match mint_access_token(
+            &app_state,
+            &client_subject,
+            &client.client_id,
+            Some(extras),
+            None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to mint access_token CWT: {}", e);
+                return oidc_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to issue access_token",
+                );
+            }
         }
     };
 
@@ -1166,7 +1246,6 @@ async fn handle_refresh_token_grant(
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
-    let at_exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
 
     let id_claims = OidcClaims {
         iss: oidc.issuer.clone(),
@@ -1182,9 +1261,6 @@ async fn handle_refresh_token_grant(
         arkavo_roles: roles,
         arkavo_entitlements: entitlements,
     };
-    let mut access_claims = id_claims.clone();
-    access_claims.exp = at_exp;
-
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
 
@@ -1199,15 +1275,31 @@ async fn handle_refresh_token_grant(
             );
         }
     };
-    let access_token = match encode(&header, &access_claims, &app_state.encoding_key) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Failed to encode access_token: {}", e);
-            return oidc_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to issue access_token",
-            );
+    let access_token = {
+        let extras = AccessTokenExtras {
+            idp: id_claims.idp.clone(),
+            email: id_claims.email.clone(),
+            email_verified: id_claims.email_verified,
+            arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
+            arkavo_roles: Some(id_claims.arkavo_roles.clone()),
+            arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
+        };
+        match mint_access_token(
+            &app_state,
+            &record.subject,
+            &record.client_id,
+            Some(extras),
+            None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to mint access_token CWT: {}", e);
+                return oidc_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to issue access_token",
+                );
+            }
         }
     };
 
@@ -1296,14 +1388,29 @@ pub async fn userinfo(
         }
     };
 
-    let mut validation = Validation::new(Algorithm::ES256);
-    validation.set_issuer(&[oidc.issuer.as_str()]);
-    // The aud claim is the client_id; we don't know it here, so disable that check.
-    validation.validate_aud = false;
-    let data = match decode::<OidcClaims>(&token, &app_state.decoding_key, &validation) {
-        Ok(d) => d,
+    // Access tokens are now CWT (COSE_Sign1). Decode from base64url and verify.
+    let raw = match crate::cwt::decode_from_header(&token) {
+        Ok(b) => b,
         Err(e) => {
-            debug!("UserInfo token decode failed: {}", e);
+            debug!("UserInfo token base64url decode failed: {}", e);
+            return oidc_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "Access token is invalid or expired",
+            );
+        }
+    };
+    let opts = crate::cwt::VerifyOptions {
+        expected_iss: Some(oidc.issuer.as_str()),
+        // aud is the client_id; we don't know it here, so skip the check.
+        expected_aud: None,
+        now: chrono::Utc::now().timestamp(),
+        skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+    };
+    let claims = match crate::cwt::verify(&raw, &app_state.cwt_verifying_key, &opts) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("UserInfo CWT verification failed: {}", e);
             return oidc_error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
@@ -1312,15 +1419,26 @@ pub async fn userinfo(
         }
     };
 
-    let claims = data.claims;
+    let sub = claims.sub.clone();
+    let email = claims.custom.email.clone();
+    let email_verified = claims.custom.email_verified;
+    let idp = claims.custom.idp.clone().unwrap_or_default();
+    let arkavo_account_id = claims.custom.arkavo_account_id.clone().unwrap_or_default();
+    let arkavo_roles = claims.custom.arkavo_roles.clone().unwrap_or_default();
+    let arkavo_entitlements = claims
+        .custom
+        .arkavo_entitlements
+        .clone()
+        .unwrap_or_default();
+
     Json(UserInfoResponse {
-        sub: &claims.sub,
-        email: claims.email.as_deref(),
-        email_verified: claims.email_verified,
-        idp: &claims.idp,
-        arkavo_account_id: &claims.arkavo_account_id,
-        arkavo_roles: &claims.arkavo_roles,
-        arkavo_entitlements: &claims.arkavo_entitlements,
+        sub: &sub,
+        email: email.as_deref(),
+        email_verified,
+        idp: &idp,
+        arkavo_account_id: &arkavo_account_id,
+        arkavo_roles: &arkavo_roles,
+        arkavo_entitlements: &arkavo_entitlements,
     })
     .into_response()
 }
@@ -1404,36 +1522,38 @@ async fn resolve_user(
             .map_err(|e| AuthorizeError::Database(e.to_string()));
     }
 
-    // Otherwise expect an Arkavo JWT (from WebAuthn flow).
-    if let Some(arkavo_jwt) = headers.get("X-Auth-Token").and_then(|h| h.to_str().ok()) {
-        return resolve_from_arkavo_jwt(app_state, oidc, arkavo_jwt).await;
+    // Otherwise expect an Arkavo CWT (from WebAuthn flow).
+    if let Some(arkavo_cwt) = headers.get("X-Auth-Token").and_then(|h| h.to_str().ok()) {
+        return resolve_from_arkavo_jwt(app_state, oidc, arkavo_cwt).await;
     }
 
     Err(AuthorizeError::LoginRequired)
 }
 
-async fn resolve_from_arkavo_jwt(
+/// Validates an Arkavo CWT from the `X-Auth-Token` header and returns the
+/// authenticated user. Legacy JWT tokens are rejected with
+/// [`AuthorizeError::InvalidArkavoJwt`].
+///
+/// The function name retains the `_jwt` suffix for callsite compatibility but
+/// the token format is now CWT (COSE_Sign1, ES256). A future cleanup pass can
+/// rename it once all callers are updated.
+pub(crate) async fn resolve_from_arkavo_jwt(
     app_state: &AppState,
     _oidc: &OidcConfig,
     token: &str,
 ) -> Result<AuthenticatedUser, AuthorizeError> {
-    // The legacy Arkavo JWTs do not yet include OIDC claims. Decode without
-    // strict exp/nbf validation to stay consistent with start_authentication
-    // (see authn.rs for the security rationale).
-    let mut validation = Validation::new(Algorithm::ES256);
-    validation.validate_nbf = false;
-    validation.validate_exp = false;
-    validation.validate_aud = false;
-    let decoding_key: &DecodingKey = &app_state.decoding_key;
-
-    #[derive(Deserialize)]
-    struct LegacyClaims {
-        sub: String,
-    }
-    let data = decode::<LegacyClaims>(token, decoding_key, &validation)
+    let bytes = crate::cwt::decode_from_header(token)
+        .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
+    let opts = crate::cwt::VerifyOptions {
+        expected_iss: Some(&app_state.issuer),
+        expected_aud: Some("arkavo"),
+        now: chrono::Utc::now().timestamp(),
+        skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+    };
+    let claims = crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
-    let account_id = data.claims.sub;
+    let account_id = claims.sub;
     // Best-effort role/entitlement defaults. Future work: persist these on the user.
     Ok(AuthenticatedUser {
         subject: format!("arkavo:{}", account_id),
@@ -1523,6 +1643,61 @@ fn oidc_error_response(status: StatusCode, code: &str, description: &str) -> Res
         .into_response()
 }
 
+/// Additional claims attached to a minted OIDC access token.
+#[derive(Debug, Clone, Default)]
+pub struct AccessTokenExtras {
+    pub idp: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub arkavo_account_id: Option<String>,
+    pub arkavo_roles: Option<Vec<String>>,
+    pub arkavo_entitlements: Option<Vec<String>>,
+}
+
+impl AccessTokenExtras {
+    pub fn with_idp(mut self, idp: &str) -> Self {
+        self.idp = idp.into();
+        self
+    }
+}
+
+/// Mint an OIDC access token as a CWT (COSE_Sign1, ES256).
+///
+/// Returns a base64url-encoded CWT suitable for use as a Bearer token in the
+/// `access_token` field of an OAuth2 token response.
+pub fn mint_access_token(
+    app_state: &AppState,
+    sub: &str,
+    audience: &str,
+    extras: Option<AccessTokenExtras>,
+    cnf: Option<crate::cwt::Cnf>,
+) -> Result<String, crate::cwt::CwtError> {
+    let mut claims = crate::cwt::ArkavoClaims::oidc_access(&app_state.issuer, sub, audience, 1);
+
+    if let Some(e) = extras {
+        if !e.idp.is_empty() {
+            claims = claims.with_idp(&e.idp);
+        }
+        if let Some(email) = e.email {
+            claims = claims.with_email(&email, e.email_verified.unwrap_or(false));
+        }
+        if let Some(id) = e.arkavo_account_id {
+            claims = claims.with_arkavo_account_id(&id);
+        }
+        if let Some(roles) = e.arkavo_roles {
+            claims = claims.with_arkavo_roles(roles);
+        }
+        if let Some(ents) = e.arkavo_entitlements {
+            claims = claims.with_arkavo_entitlements(ents);
+        }
+    }
+    if let Some(c) = cnf {
+        claims = claims.with_cnf(c);
+    }
+    let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
+    Ok(crate::cwt::encode_for_header(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,7 +1769,10 @@ mod tests {
         let vars = env_vars(&[
             ("OIDC_CLIENT_OPENTDF_ID", "opentdf"),
             ("OIDC_CLIENT_OPENTDF_SECRET", "shh"),
-            ("OIDC_CLIENT_OPENTDF_REDIRECT_URIS", "https://a/cb,https://b/cb"),
+            (
+                "OIDC_CLIENT_OPENTDF_REDIRECT_URIS",
+                "https://a/cb,https://b/cb",
+            ),
             ("OIDC_CLIENT_NATIVEAPP_ID", "arkavo-ios"),
             ("OIDC_CLIENT_NATIVEAPP_REDIRECT_URIS", "arkavo://oauth/cb"),
             // Unrelated env var must be ignored.
@@ -1828,6 +2006,45 @@ mod tests {
                 .iter()
                 .any(|c| c == "arkavo_entitlements")
         );
+        // Extension fields for CWT-aware RPs
+        assert_eq!(v["arkavo_access_token_format"], "application/cwt");
+        let cose_uri = v["arkavo_cose_keys_uri"].as_str().expect("string");
+        assert!(
+            cose_uri.ends_with("/.well-known/cose-keys"),
+            "unexpected cose_uri: {}",
+            cose_uri
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_doc_includes_arkavo_extensions() {
+        let oidc = test_oidc_config();
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .layer(Extension(oidc));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        assert_eq!(body_json["arkavo_access_token_format"], "application/cwt");
+        let uri = body_json["arkavo_cose_keys_uri"]
+            .as_str()
+            .expect("arkavo_cose_keys_uri must be a string");
+        assert!(uri.ends_with("/.well-known/cose-keys"), "got {}", uri);
+        assert_eq!(uri, "https://identity.arkavo.net/.well-known/cose-keys");
     }
 
     #[tokio::test]
@@ -1858,6 +2075,38 @@ mod tests {
         assert_eq!(v["keys"][0]["alg"], "ES256");
         assert_eq!(v["keys"][0]["use"], "sig");
         assert_eq!(v["keys"][0]["kid"], oidc.jwk.kid);
+    }
+
+    #[tokio::test]
+    async fn cose_keys_endpoint_returns_single_key() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let resp = crate::oidc::cose_keys(axum::extract::Extension(app_state.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), 200);
+        let ct = resp.headers().get("content-type").unwrap();
+        assert_eq!(ct, "application/cose-key-set+cbor");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: ciborium::value::Value =
+            ciborium::de::from_reader(body.as_ref()).expect("valid CBOR");
+        let ciborium::value::Value::Array(arr) = value else {
+            panic!("not an array")
+        };
+        assert_eq!(arr.len(), 1);
     }
 
     #[test]
@@ -1897,6 +2146,24 @@ mod tests {
         let der = secret.to_pkcs8_der().unwrap();
         let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
 
+        let cwt_signing_key = p256::ecdsa::SigningKey::from(&secret);
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+        let cwt_kid: Vec<u8> = {
+            use base64::Engine;
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
         let app_state = AppState {
             webauthn: Arc::new(
                 webauthn_rs::WebauthnBuilder::new(
@@ -1919,6 +2186,10 @@ mod tests {
             signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new("https://identity.arkavo.net".to_string()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -1969,6 +2240,24 @@ mod tests {
         let der = secret.to_pkcs8_der().unwrap();
         let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
 
+        let cwt_signing_key = p256::ecdsa::SigningKey::from(&secret);
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+        let cwt_kid: Vec<u8> = {
+            use base64::Engine;
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
         let app_state = AppState {
             webauthn: Arc::new(
                 webauthn_rs::WebauthnBuilder::new(
@@ -1991,6 +2280,10 @@ mod tests {
             signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new("https://identity.arkavo.net".to_string()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2041,5 +2334,134 @@ mod tests {
 
         // Verification of rotation: original token must be gone
         assert!(refresh_store.take(token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn access_token_is_cwt_not_jwt() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let extras = crate::oidc::AccessTokenExtras::default().with_idp("arkavo");
+        let token = crate::oidc::mint_access_token(
+            &app_state,
+            "arkavo:test",
+            "opentdf",
+            Some(extras),
+            None,
+        )
+        .expect("mint");
+
+        // CWT bytes start as base64url-encoded CBOR-tag-61(COSE_Sign1).
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(claims.aud, crate::cwt::Audience::Single("opentdf".into()));
+        assert_eq!(claims.custom.idp.as_deref(), Some("arkavo"));
+    }
+
+    #[tokio::test]
+    async fn access_token_apple_omits_cnf() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let token = crate::oidc::mint_access_token(
+            &app_state,
+            "apple:abc",
+            "opentdf",
+            Some(crate::oidc::AccessTokenExtras::default().with_idp("apple")),
+            None,
+        )
+        .expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert!(claims.cnf.is_none());
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_rejects_legacy_jwt_x_auth_token() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        #[derive(serde::Serialize)]
+        struct LegacyClaims {
+            sub: String,
+            exp: usize,
+        }
+        let claims = LegacyClaims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        };
+        let jwt = jsonwebtoken::encode(&header, &claims, &app_state.encoding_key).unwrap();
+
+        let oidc = OidcConfig {
+            issuer: "https://identity.arkavo.net".into(),
+            signing_kid: "test".into(),
+            clients: std::collections::HashMap::new(),
+            jwk: test_jwk(),
+        };
+
+        let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &jwt).await;
+        assert!(result.is_err(), "legacy JWT should be rejected");
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_accepts_cwt_x_auth_token() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let token = crate::authn::mint_auth_token(&app_state, &user_id, None).expect("mint cwt");
+
+        let oidc = OidcConfig {
+            issuer: "https://identity.arkavo.net".into(),
+            signing_kid: "test".into(),
+            clients: std::collections::HashMap::new(),
+            jwk: test_jwk(),
+        };
+
+        let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
+        assert!(
+            result.is_ok(),
+            "CWT token should be accepted, got {:?}",
+            result.err()
+        );
     }
 }

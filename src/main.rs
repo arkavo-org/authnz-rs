@@ -40,12 +40,14 @@ use crate::device_check::{
 };
 use crate::oidc::{
     AuthorizationCodeStore, OidcConfig, RefreshTokenStore, authorize as oidc_authorize,
-    discovery as oidc_discovery, jwks as oidc_jwks, token as oidc_token, userinfo as oidc_userinfo,
+    cose_keys as oidc_cose_keys, discovery as oidc_discovery, jwks as oidc_jwks,
+    token as oidc_token, userinfo as oidc_userinfo,
 };
 
 mod apple_signin;
 mod authn;
 mod constants;
+mod cwt;
 mod db;
 mod device_check;
 mod oidc;
@@ -170,6 +172,16 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey<NistP256>>,
     pub encoding_key: Arc<EncodingKey>,
     pub decoding_key: Arc<DecodingKey>,
+    pub cwt_signing_key: Arc<p256::ecdsa::SigningKey>,
+    pub cwt_verifying_key: Arc<p256::ecdsa::VerifyingKey>,
+    /// RFC 7638 JWK thumbprint as raw 32-byte SHA-256 hash.
+    /// JWKS advertises the base64url-encoded form of the same bytes
+    /// (see oidc::ec_public_key_to_jwk), so CWT and JWT share the same kid.
+    pub cwt_kid: Arc<Vec<u8>>,
+    /// CWT/OIDC issuer string. Resolved once at startup from `OIDC_ISSUER`
+    /// (falling back to [`crate::constants::DEFAULT_OIDC_ISSUER`]) so mint
+    /// and verify always agree on a single value within a process.
+    pub issuer: Arc<String>,
 }
 
 #[tokio::main]
@@ -180,11 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_config()?;
 
     // Load and validate EC keys
-    let (signing_key, encoding_key, decoding_key) = load_ec_keys(
-        &settings.sign_key_path,
-        &settings.encoding_key_path,
-        &settings.decoding_key_path,
-    )?;
+    let (signing_key, encoding_key, decoding_key, cwt_signing_key, cwt_verifying_key, cwt_kid) =
+        load_ec_keys(
+            &settings.sign_key_path,
+            &settings.encoding_key_path,
+            &settings.decoding_key_path,
+        )?;
 
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
@@ -245,6 +258,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
 
+    // Resolve the issuer once so mint and verify in every handler agree on a
+    // single value (eliminates per-request env reads and runtime-mutation
+    // footguns).
+    let issuer = env::var("OIDC_ISSUER")
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -252,6 +271,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key: Arc::new(signing_key),
         encoding_key: Arc::new(encoding_key),
         decoding_key: Arc::new(decoding_key),
+        cwt_signing_key: Arc::new(cwt_signing_key),
+        cwt_verifying_key: Arc::new(cwt_verifying_key),
+        cwt_kid: Arc::new(cwt_kid),
+        issuer: Arc::new(issuer),
     };
 
     // Set up Redis Client using fred
@@ -306,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // OIDC discovery + JWKS (advertise this server as an OIDC provider)
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks.json", get(oidc_jwks))
+        .route("/.well-known/cose-keys", get(oidc_cose_keys))
         // OIDC endpoints
         .route("/oauth/authorize", get(oidc_authorize))
         .route("/oauth/token", post(oidc_token))
@@ -525,26 +549,90 @@ fn load_ec_keys(
     sign_key_path: &str,
     encoding_key_path: &str,
     decoding_key_path: &str,
-) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        SigningKey<NistP256>,
+        EncodingKey,
+        DecodingKey,
+        p256::ecdsa::SigningKey,
+        p256::ecdsa::VerifyingKey,
+        Vec<u8>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
 
     debug!("Loading EC encoding key from: {}", encoding_key_path);
-    let encoding_key =
-        EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?).map_err(|e| {
-            error!("Failed to create EncodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
+    let encoding_pem = std::fs::read(encoding_key_path)?;
+    let encoding_pem_str = std::str::from_utf8(&encoding_pem)
+        .map_err(|e| format!("Encoding key PEM is not valid UTF-8: {e}"))?;
+
+    let encoding_key = EncodingKey::from_ec_pem(&encoding_pem).map_err(|e| {
+        error!("Failed to create EncodingKey: {:?}", e);
+        LoadKeysError::InvalidKeyFormat
+    })?;
+
+    // Load the same EC key material as p256 type for CWT signing.
+    let cwt_signing_key = {
+        use p256::pkcs8::DecodePrivateKey;
+        p256::SecretKey::from_pkcs8_pem(encoding_pem_str)
+            .map_err(|e| format!("Failed to parse CWT signing key as PKCS8 PEM: {e}"))?
+            .into()
+    };
 
     debug!("Attempting to create DecodingKey from PEM contents");
-    let decoding_key =
-        DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?).map_err(|e| {
-            error!("Failed to create DecodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
+    let decoding_pem = std::fs::read(decoding_key_path)?;
+    let decoding_pem_str = std::str::from_utf8(&decoding_pem)
+        .map_err(|e| format!("Decoding key PEM is not valid UTF-8: {e}"))?;
+
+    let decoding_key = DecodingKey::from_ec_pem(&decoding_pem).map_err(|e| {
+        error!("Failed to create DecodingKey: {:?}", e);
+        LoadKeysError::InvalidKeyFormat
+    })?;
+
+    // Load the same EC key material as p256 type for CWT verification.
+    let cwt_verifying_key = {
+        use p256::pkcs8::DecodePublicKey;
+        let pk = p256::PublicKey::from_public_key_pem(decoding_pem_str)
+            .map_err(|e| format!("Failed to parse CWT verifying key as SPKI PEM: {e}"))?;
+        p256::ecdsa::VerifyingKey::from(pk)
+    };
+
+    // kid = RFC 7638 JWK thumbprint, raw 32-byte SHA-256 hash.
+    // JWKS advertises the base64url-encoded form of the same bytes
+    // (see src/oidc.rs::ec_public_key_to_jwk), so CWT and JWT advertise
+    // the same physical kid.
+    let cwt_kid = {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let encoded = cwt_verifying_key.to_encoded_point(false);
+        let x = encoded
+            .x()
+            .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
+        let y = encoded
+            .y()
+            .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let thumb_input = format!(
+            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+            b64.encode(x),
+            b64.encode(y)
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(thumb_input.as_bytes());
+        hasher.finalize().to_vec()
+    };
 
     debug!("Successfully loaded EC keys");
-    Ok((signing_key, encoding_key, decoding_key))
+    Ok((
+        signing_key,
+        encoding_key,
+        decoding_key,
+        cwt_signing_key,
+        cwt_verifying_key,
+        cwt_kid,
+    ))
 }
 
 fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {
@@ -949,5 +1037,85 @@ mod tests {
         assert!(!validate_oauth_state(""));
         assert!(!validate_oauth_state("invalid<script>state"));
         assert!(!validate_oauth_state(&"a".repeat(101)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Build an AppState suitable for unit tests. Uses a fixed scalar
+    /// so signatures are reproducible. Requires AWS env vars to be set
+    /// (fake values are fine) before calling, as DynamoDBStore::new is async.
+    pub async fn build_test_app_state() -> AppState {
+        use base64::Engine;
+        use p256::pkcs8::EncodePrivateKey;
+
+        // Use a fixed [0x42u8; 32] scalar so test signatures are stable.
+        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
+        let secret = p256::SecretKey::new(scalar);
+
+        // SigningKey for attestation envelope.
+        let signing_key: ecdsa::SigningKey<p256::NistP256> = (&secret).into();
+
+        // JWT EncodingKey from the PKCS8 DER form.
+        let pkcs8_der = secret.to_pkcs8_der().expect("encode pkcs8");
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(pkcs8_der.as_bytes());
+
+        // Decoding key — use a placeholder (tests using JWT decoding should use their own key).
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(&[]);
+
+        // CWT keys (same scalar).
+        let cwt_signing_key: p256::ecdsa::SigningKey = (&secret).into();
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+
+        // CWT kid: RFC 7638 thumbprint (raw 32 bytes).
+        let cwt_kid: Vec<u8> = {
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
+        let webauthn = Arc::new(
+            webauthn_rs::WebauthnBuilder::new(
+                "identity.arkavo.net",
+                &url::Url::parse("https://identity.arkavo.net").unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap(),
+        );
+
+        let db_store = Arc::new(
+            crate::db::DynamoDBStore::new(
+                "credentials".to_string(),
+                "handles".to_string(),
+                "device_bindings".to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        AppState {
+            webauthn,
+            db_store,
+            signing_key: Arc::new(signing_key),
+            encoding_key: Arc::new(encoding_key),
+            decoding_key: Arc::new(decoding_key),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
+        }
     }
 }
