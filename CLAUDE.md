@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WebAuthn-based authentication and authorization service built with Rust, Axum, and DynamoDB. The system provides passwordless authentication using FIDO2/WebAuthn passkeys, JWT token generation, and decentralized identity (DID) support.
+WebAuthn-based authentication and authorization service built with Rust, Axum, and DynamoDB. The system provides passwordless authentication using FIDO2/WebAuthn passkeys, **CWT (COSE_Sign1, ES256) tokens for Arkavo-issued credentials, JWT for OIDC `id_token`**, and decentralized identity (DID) support.
 
 **Protocol Support**: HTTP/1.1, HTTP/2 with TLS 1.3 (HTTP/3 infrastructure ready but disabled due to dependency issues)
 
@@ -98,10 +98,10 @@ For complete production deployment instructions, see [docs/DEPLOYMENT_GUIDE.md](
 # Generate signing key for attestation envelope
 openssl ecparam -genkey -name prime256v1 -noout -out signkey.pem
 
-# Generate JWT encoding key (PKCS8 format)
+# Generate CWT/JWT encoding key (PKCS8 format)
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out encodekey.pem
 
-# Extract public key for JWT decoding
+# Extract public key for CWT/JWT decoding
 openssl ec -in encodekey.pem -pubout -out decodekey.pem
 ```
 
@@ -156,14 +156,14 @@ aws dynamodb create-table \
 - Axum router with WebAuthn endpoints
 - Session management (10-minute timeout, in-memory store)
 - OAuth callback handling for multiple providers (Patreon, Twitch, Discord, Reddit)
-- Loads EC keys for JWT signing/verification and attestation envelope creation
+- Loads EC keys for CWT/JWT signing/verification and attestation envelope creation
 - WebAuthn RP origin: `https://identity.arkavo.net` (main.rs:84-85)
 
 **authn.rs** - WebAuthn authentication flow
 - `start_register`: Initiates passkey registration with DID validation
-- `finish_register`: Completes registration, stores credential, issues JWT
+- `finish_register`: Completes registration, stores credential, issues CWT
 - `start_authentication`: Initiates passkey authentication
-- `finish_authentication`: Verifies authentication, issues JWT
+- `finish_authentication`: Verifies authentication, issues CWT
 - Account token generation with 99-year registration tokens (~5148 weeks)
 - Authentication tokens expire in 1 hour
 - Uses attestation envelope with ECDSA signature for registration response
@@ -181,7 +181,7 @@ aws dynamodb create-table \
 - `/.well-known/openid-configuration`: Discovery document
 - `/.well-known/jwks.json`: JWKS (advertises the EC P-256 signing key as a JWK)
 - `/oauth/authorize`: Authorization endpoint (code flow with PKCE)
-- `/oauth/token`: Token endpoint (issues ID + access tokens, ES256-signed)
+- `/oauth/token`: Token endpoint (issues access_token CWT + id_token JWT, both ES256-signed)
 - `/oauth/userinfo`: UserInfo endpoint
 - Issues OpenTDF-compatible claims: `iss`, `sub` (e.g. `apple:APPLE_SUB` or
   `arkavo:UUID`), `aud`, `email`, `email_verified`, `idp`,
@@ -189,7 +189,7 @@ aws dynamodb create-table \
 - Authorization codes stored in an in-memory `AuthorizationCodeStore` (10-min
   lifetime, single-use). For multi-instance deployments swap for a shared store.
 - Confidential clients use `client_secret`; public clients must use PKCE (S256).
-- Upstream authentication: WebAuthn-issued Arkavo JWT (via `X-Auth-Token`) or
+- Upstream authentication: WebAuthn-issued Arkavo CWT (via `X-Auth-Token`) or
   Apple id_token (via `idp=apple` + `id_token` query/`X-Apple-Id-Token` header).
 
 **apple_signin.rs** - Sign in with Apple integration
@@ -221,8 +221,8 @@ aws dynamodb create-table \
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
 - `finish_attestation`: Validates attestation object, stores device binding
-- `generate_assertion_challenge`: Issues challenge for existing devices (requires JWT)
-- `finish_assertion`: Verifies assertion, enforces counter increment, issues JWT
+- `generate_assertion_challenge`: Issues challenge for existing devices (requires CWT)
+- `finish_assertion`: Verifies assertion, enforces counter increment, issues CWT
 - CBOR attestation object parsing ("apple-appattest" format)
 - Certificate chain validation to Apple's root CA
 - Nonce calculation: SHA256(authData || SHA256(clientData))
@@ -239,16 +239,16 @@ aws dynamodb create-table \
    - Client completes WebAuthn ceremony
    - Server verifies registration via `/register` POST
    - Stores credential in DynamoDB
-   - Returns attestation envelope (signed with ECDSA) + JWT in X-Auth-Token header
+   - Returns attestation envelope (signed with ECDSA) + CWT in X-Auth-Token header (COSE_Sign1, ES256)
 
 2. **Authentication Flow**:
-   - Client sends JWT in X-Auth-Token header to `/authenticate/:username`
-   - Server decodes JWT (with exp/nbf validation disabled - see Security Notes)
-   - Retrieves credentials from DB or falls back to JWT payload
+   - Client sends CWT in X-Auth-Token header to `/authenticate/:username`
+   - Server decodes inbound CWT (exp/iat enforced with ±60s skew)
+   - Retrieves credentials from DB (authoritative — no token-embedded fallback)
    - Generates WebAuthn challenge, stores auth state in session
    - Client completes WebAuthn ceremony
    - Server verifies authentication via `/authenticate` POST
-   - Issues new JWT with 1-hour expiration
+   - Issues new CWT with 1-hour expiration
 
 3. **OAuth Integration**:
    - Callback endpoint: `/oauth/:client/:provider`
@@ -259,7 +259,7 @@ aws dynamodb create-table \
 5. **OIDC Provider Flow (for OpenTDF and other RPs)**:
    - Relying party (RP) redirects user-agent to `/oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=openid&state=...&nonce=...`
    - User-agent must already be authenticated via an upstream source:
-     - WebAuthn: present a valid Arkavo JWT via `X-Auth-Token` header
+     - WebAuthn: present a valid Arkavo CWT via `X-Auth-Token` header
      - Apple: pass `idp=apple` + Apple `id_token` (validated against Apple
        JWKS). The OIDC `nonce` query parameter is **required** for
        `idp=apple` and doubles as the Apple nonce — the client must use the
@@ -268,8 +268,8 @@ aws dynamodb create-table \
    - Server resolves/provisions the Arkavo account, mints a single-use
      authorization code, redirects back to `redirect_uri` with `code` + `state`
    - RP exchanges code at `/oauth/token` (HTTP Basic or form auth; PKCE for
-     public clients). Server returns `access_token` + `id_token` (both ES256,
-     1h lifetime) with OpenTDF-compatible claims
+     public clients). Server returns `access_token` (CWT, ES256) + `id_token`
+     (JWT, ES256) (both 1h lifetime) with OpenTDF-compatible claims
    - RP can call `/oauth/userinfo` with `Authorization: Bearer <access_token>`
 
 4. **Apple DeviceCheck/App Attest Flow**:
@@ -288,8 +288,8 @@ aws dynamodb create-table \
        - rpIdHash matches expected App ID
      - Server stores device binding: device_id, public_key, counter=0, user_id
    - **Ongoing Assertions**:
-     - Client requests assertion challenge: `GET /device-check/assert-challenge/:username` (requires JWT)
-     - Server issues fresh challenge, validates JWT token
+     - Client requests assertion challenge: `GET /device-check/assert-challenge/:username` (requires CWT)
+     - Server issues fresh challenge, validates CWT token
      - Client signs challenge with device key
      - Client POSTs assertion to `/device-check/assert`
      - Server validates:
@@ -297,16 +297,23 @@ aws dynamodb create-table \
        - Counter has incremented (counter > stored_counter)
        - Challenge matches expected hash
        - Signature is valid (TODO: implement signature verification)
-     - Server updates counter, issues new JWT (1-hour expiration)
+     - Server updates counter, issues new CWT (aud `arkavo:devicecheck`)
 
 ### Security Architecture
 
-**JWT Token Strategy**:
-- **Registration tokens**: Very long-lived (~99 years via 5148 weeks)
-- **Authentication tokens**: Short-lived (1 hour)
-- **Validation**: exp/nbf checks disabled on purpose
-  - Security relies on WebAuthn ceremony validation, not token expiration
-  - Tokens are cryptographically signed with ES256 (ECDSA with P-256)
+**Token Strategy**:
+- **Arkavo-issued tokens** (registration, auth, DeviceCheck assertion, OIDC access_token):
+  - **Format**: CWT (CBOR Web Token, RFC 8392) using COSE_Sign1 + ES256.
+  - **Inbound JWT is rejected** on all Arkavo authentication paths (hard cutover — no dual-format support).
+  - **Validation**: exp/iat enforced with ±60s skew. Algorithm restricted to ES256.
+- **OIDC `id_token`**: JWT (ES256). Required by OIDC Core spec.
+- **Apple `id_token`** (inbound): JWT validation against Apple's JWKS.
+- **Key advertisement**:
+  - `/.well-known/jwks.json` — JWKS for `id_token` verifiers (OIDC RPs).
+  - `/.well-known/cose-keys` — COSE_Key Set for CWT verifiers (OpenTDF, native).
+  - Same `kid` (RFC 7638 thumbprint) in both formats — JWKS advertises the base64url-encoded form; COSE_Key uses raw 32-byte hash.
+- **Discovery doc** (`/.well-known/openid-configuration`) advertises `arkavo_access_token_format: "application/cwt"` and `arkavo_cose_keys_uri` for CWT-aware RPs.
+- **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key or App Attest key where available. Not verifier-enforced in this release.
 
 **WebAuthn Protection**:
 - All authentication requires valid WebAuthn ceremony
@@ -319,9 +326,9 @@ aws dynamodb create-table \
   - `TLS_CERT_PATH`: X.509 certificate chain in PEM format (fullchain.pem)
   - `TLS_KEY_PATH`: Private key in PEM format (privkey.pem)
   - If omitted, server runs over unencrypted HTTP
-- **WebAuthn/JWT Keys** (required):
+- **WebAuthn/CWT Keys** (required):
   - Signing key: ECDSA P-256 for attestation envelope signatures
-  - Encoding/Decoding keys: ES256 for JWT generation and verification
+  - Encoding/Decoding keys: ES256 for CWT/JWT generation and verification
   - Keys loaded from PEM files specified in environment variables
 
 ### Session Management
@@ -343,14 +350,14 @@ The codebase uses thiserror for structured error handling:
 
 - Unit tests in respective modules:
   - `main.rs`: OAuth callback validation, provider parsing, input sanitization (9 tests)
-  - `authn.rs`: DID validation, handle validation, token expiration, error responses (5 tests)
+  - `authn.rs`: DID validation, handle validation, token expiration, error responses (8 tests)
   - `db.rs`: DID format, error conversions, JSON serialization, error messages (8 tests)
-  - `device_check.rs`: Challenge generation, authenticator data parsing, counter validation, error responses (6 tests)
+  - `device_check.rs`: Challenge generation, authenticator data parsing, counter validation, error responses (10 tests)
   - `oidc.rs`: JWK serialization/thumbprint, PKCE S256 verifier, authorization code
-    store lifecycle, discovery/JWKS endpoint shape, claim serialization (10 tests)
+    store lifecycle, discovery/JWKS endpoint shape, claim serialization (26 tests)
   - `apple_signin.rs`: id_token claim deserialization, error status mapping,
     username sanitization, hash stability (6 tests)
-- Integration test skeleton in tests/integration_test.rs
+  - `cwt.rs`: CWT encoder/decoder, mint/verify, cnf helpers, transport, and strictness (30 tests)
 - Test app routing with tower::ServiceExt::oneshot for request simulation
 - Mock requests use axum::body::Body::empty()
 - Critical test coverage focuses on:
@@ -404,7 +411,8 @@ When modifying token lifetimes, update these in authn.rs:
 4. Log operations with info!/error! macros
 
 ### Token generation pattern:
-- Use `encode(&header, &claims, &encoding_key)` with ES256 algorithm
+- Use `cwt::mint(claims, &encoding_key)` for Arkavo-issued tokens (CWT, COSE_Sign1, ES256)
+- Use `encode(&header, &claims, &encoding_key)` with ES256 for OIDC `id_token` (JWT only)
 - Include sub (user_id) and exp (expiration timestamp) in claims
 - Return tokens in X-Auth-Token header or JSON response body
 
@@ -438,6 +446,6 @@ When modifying token lifetimes, update these in authn.rs:
 
 ### Integration with NTDF
 The device binding can be used as the NPE (non-person entity) device/app proof key, enabling:
-- Device-bound JWT tokens (proof-of-possession similar to DPoP)
+- Device-bound CWT tokens (proof-of-possession via `cnf` claim, RFC 8747)
 - Hardware-backed attestation for NTDF authorization
 - Per-device, per-app cryptographic binding to user credentials

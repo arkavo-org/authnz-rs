@@ -1,7 +1,6 @@
 use crate::AppState;
 use crate::authn::WebauthnError::{
-    CorruptSession, InvalidSessionState, MissingToken, TokenCreationError, Unknown,
-    UserHasNoCredentials, UserNotFound,
+    CorruptSession, InvalidSessionState, MissingToken, Unknown, UserHasNoCredentials, UserNotFound,
 };
 use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
 use crate::db::DynamoDBError;
@@ -13,10 +12,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use chrono::Utc;
-use ecdsa::signature::{Signer, Verifier};
-use ecdsa::{Signature, VerifyingKey};
-use jsonwebtoken::{Algorithm, Header, TokenData, Validation, decode, encode};
+use ecdsa::Signature;
+use ecdsa::signature::Signer;
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -185,30 +182,21 @@ pub async fn finish_register(
                 }
             }
 
-            // Generate account token
-            let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
+            // Generate account token (CWT, ~99-year registration token)
             // SECURITY: Long-lived registration token (~99 years) is intentional.
             // Security relies on WebAuthn passkey validation, not token expiration.
             // The passkey ceremony provides replay protection and strong authentication.
-            let attestation_entity = AccountToken {
+            let cnf = crate::cwt::cnf_from_passkey(&passkey)?;
+
+            // Create envelope (signs over a minimal payload for legacy native clients)
+            let credential_id = Base64UrlSafeData::from(passkey.cred_id().to_vec());
+            let envelope_payload = EnvelopePayload {
                 user_unique_id: user_id,
                 credential_id,
-                passkey,
-                sub: user_id.to_string(),
-                exp: (Utc::now() + chrono::Duration::weeks(REGISTRATION_TOKEN_WEEKS)).timestamp()
-                    as usize,
             };
+            let envelope = AttestationEnvelope::new(envelope_payload, &app_state);
 
-            // Create envelope
-            let envelope = AttestationEnvelope::new(attestation_entity.clone(), &app_state);
-
-            // Generate JWT token
-            let header = Header::new(Algorithm::ES256);
-            let token =
-                encode(&header, &attestation_entity, &app_state.encoding_key).map_err(|err| {
-                    error!("Failed to create JWT token: {}", err);
-                    TokenCreationError(err)
-                })?;
+            let token = mint_registration_token(&app_state, &user_id, cnf)?;
 
             // Create response with token in header
             let mut response = Json(envelope).into_response();
@@ -243,30 +231,19 @@ pub async fn start_authentication(
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
-    // Get user from database or JWT
-    let mut token_data: Option<TokenData<AccountToken>> = None;
-    if let Some(jwt_header) = headers.get("X-Auth-Token") {
-        let jwt = jwt_header
+    // Verify inbound CWT account token from X-Auth-Token header (optional).
+    // If present, validate it; legacy JWT tokens will be rejected with a CWT error.
+    let inbound_user_id: Option<Uuid> = if let Some(token_header) = headers.get("X-Auth-Token") {
+        let token_str = token_header
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
+        let claims = verify_inbound_account_token(&app_state, token_str)?;
+        Some(Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::UserNotFound)?)
+    } else {
+        None
+    };
 
-        let decoding_key = (*app_state.decoding_key).clone();
-        let mut token_validation = Validation::new(Algorithm::ES256);
-        // SAFETY: JWT exp/nbf validation is intentionally disabled.
-        // Security model relies on WebAuthn ceremony validation, not token expiration.
-        // Long-lived registration tokens (~99 years) combined with WebAuthn provide
-        // replay protection via the passkey authentication ceremony and session management.
-        // Sessions expire after 10 minutes, providing time-based security boundaries.
-        token_validation.validate_nbf = false;
-        token_validation.validate_exp = false;
-        token_data = Some(
-            decode::<AccountToken>(jwt, &decoding_key, &token_validation).map_err(|err| {
-                WebauthnError::TokenDecodingError(format!("Error decoding token: {}", err))
-            })?,
-        );
-    }
-
-    // Try to get user from DB first, fallback to token data
+    // Look up user from DB (authoritative source).
     let user = match app_state
         .db_store
         .get_user_by_name(&username)
@@ -274,31 +251,19 @@ pub async fn start_authentication(
         .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
     {
         Some(user) => user,
-        None => {
-            if let Some(ref token_data) = token_data {
-                // Create temporary user from token data
-                crate::db::UserCredentials {
-                    user_id: token_data.claims.user_unique_id,
-                    username: username.clone(),
-                    credentials: vec![token_data.claims.passkey.clone()],
-                    did: String::new(), // Token doesn't contain DID
-                }
-            } else {
-                return Err(UserNotFound);
-            }
-        }
+        None => return Err(UserNotFound),
     };
 
-    // Credential retrieval strategy:
-    // 1. Prefer DB credentials (source of truth for registered users)
-    // 2. Fallback to JWT token passkey if user exists but has no stored credentials
-    // 3. Fail if neither is available (prevents invalid auth attempts)
-    let credentials = if user.credentials.is_empty() {
-        if let Some(token_data) = &token_data {
-            vec![token_data.claims.passkey.clone()]
-        } else {
-            return Err(UserHasNoCredentials);
+    // If a token was provided, ensure it belongs to this user.
+    if let Some(tid) = inbound_user_id {
+        if tid != user.user_id {
+            return Err(UserNotFound);
         }
+    }
+
+    // Credentials come exclusively from DB (authoritative).
+    let credentials = if user.credentials.is_empty() {
+        return Err(UserHasNoCredentials);
     } else {
         user.credentials.clone()
     };
@@ -344,53 +309,52 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            // Generate JWT token
-            let token = generate_jwt(user_unique_id, &app_state)?;
+            // Generate CWT auth token (1-hour, no cnf binding at this point;
+            // cnf binding is added in Task 15 once the passkey is retrieved from DB).
+            let token = mint_auth_token(&app_state, &user_unique_id, None)?;
             info!("Authentication successful for user: {}", user_unique_id);
-            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
+            Ok((StatusCode::OK, Json(AuthResponse { token })))
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
             Ok((
                 StatusCode::BAD_REQUEST,
                 Json(AuthResponse {
-                    jwt_token: String::new(),
+                    token: String::new(),
                 }),
             ))
         }
     }
 }
 
-// Existing helper functions and structs remain the same
 #[derive(Serialize)]
 struct AuthResponse {
-    jwt_token: String,
+    /// Arkavo-issued CWT (base64url-encoded COSE_Sign1 wrapped in CBOR tag 61).
+    /// Field name is format-agnostic so clients don't conflate it with a JWT.
+    token: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
-}
-
+/// Minimal envelope payload — identifies the user and registered credential
+/// but does NOT embed the full Passkey (DB is authoritative for credentials).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct AccountToken {
+struct EnvelopePayload {
     user_unique_id: Uuid,
     credential_id: Base64UrlSafeData,
-    passkey: Passkey,
-    sub: String,
-    exp: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AttestationEnvelope {
-    payload: AccountToken,
+    payload: EnvelopePayload,
     signature: Base64UrlSafeData,
 }
 
 impl AttestationEnvelope {
-    fn new(entity: AccountToken, app_state: &AppState) -> Self {
-        let payload_bytes = serde_json::to_vec(&entity).unwrap();
+    fn new(entity: EnvelopePayload, app_state: &AppState) -> Self {
+        // EnvelopePayload is `{ user_id: Uuid, public_key: Base64UrlSafeData }`,
+        // both of which serialize to JSON unconditionally — this only fails on
+        // OOM, which is unrecoverable anyway.
+        let payload_bytes =
+            serde_json::to_vec(&entity).expect("EnvelopePayload always serializes to JSON");
         let message = Sha256::digest(&payload_bytes);
         let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
 
@@ -399,22 +363,53 @@ impl AttestationEnvelope {
             signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
         }
     }
-
-    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
-        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
-        let message = Sha256::digest(&payload_bytes);
-        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
-        verifying_key.verify(&message, &signature).is_ok()
-    }
 }
 
-fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
+pub fn mint_auth_token(
+    app_state: &AppState,
+    user_id: &Uuid,
+    cnf: Option<crate::cwt::Cnf>,
+) -> Result<String, WebauthnError> {
+    let mut claims =
+        crate::cwt::ArkavoClaims::auth(&app_state.issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
+    if let Some(c) = cnf {
+        claims = claims.with_cnf(c);
+    }
+    let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
+    Ok(crate::cwt::encode_for_header(&bytes))
+}
+
+pub fn mint_registration_token(
+    app_state: &AppState,
+    user_id: &Uuid,
+    cnf: crate::cwt::Cnf,
+) -> Result<String, WebauthnError> {
+    let claims = crate::cwt::ArkavoClaims::registration(
+        &app_state.issuer,
+        &user_id.to_string(),
+        REGISTRATION_TOKEN_WEEKS,
+    )
+    .with_cnf(cnf);
+    let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
+    Ok(crate::cwt::encode_for_header(&bytes))
+}
+
+pub fn verify_inbound_account_token(
+    app_state: &AppState,
+    token: &str,
+) -> Result<crate::cwt::ArkavoClaims, WebauthnError> {
+    let bytes = crate::cwt::decode_from_header(token)?;
+    let opts = crate::cwt::VerifyOptions {
+        expected_iss: Some(&app_state.issuer),
+        expected_aud: Some("arkavo"),
+        now: chrono::Utc::now().timestamp(),
+        skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    let header = Header::new(Algorithm::ES256);
-    encode(&header, &claims, &app_state.encoding_key).map_err(TokenCreationError)
+    Ok(crate::cwt::verify(
+        &bytes,
+        &app_state.cwt_verifying_key,
+        &opts,
+    )?)
 }
 
 #[derive(Error, Debug)]
@@ -429,14 +424,10 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserializing Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
-    #[error("Token creation error")]
-    TokenCreationError(jsonwebtoken::errors::Error),
     #[error("Missing token")]
     MissingToken,
     #[error("Invalid token")]
     InvalidToken,
-    #[error("Token decoding failed: {0}")]
-    TokenDecodingError(String),
     #[error("DynamoDB operation failed: {0}")]
     DynamoDBOperationError(#[from] Box<crate::db::DynamoDBError>),
     #[error("Invalid username format")]
@@ -449,35 +440,73 @@ pub enum WebauthnError {
     SessionError(String),
     #[error("Invalid DID format: {0}")]
     InvalidDID(String),
+    #[error("CWT error: {0}")]
+    Cwt(#[from] crate::cwt::CwtError),
 }
 
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
-        let body = match self {
-            CorruptSession => "Corrupt Session".to_string(),
-            UserNotFound => "User Not Found".to_string(),
-            Unknown => "Unknown Error".to_string(),
-            UserHasNoCredentials => "User Has No Credentials".to_string(),
-            InvalidSessionState(_) => "Deserializing Session failed".to_string(),
-            TokenCreationError(err) => format!("Token creation failed: {}", err),
-            MissingToken => "Missing token".to_string(),
-            WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
-            WebauthnError::DynamoDBOperationError(err) => match *err {
-                DynamoDBError::TableNotExists(table) => {
-                    format!("Service setup incomplete: {} table not configured", table)
-                }
-                _ => format!("Database operation failed: {}", err),
-            },
-            WebauthnError::InvalidHandle => "Handle must start with the username".to_string(),
-            WebauthnError::UserCreationFailed(reason) => {
-                format!("Failed to create user: {}", reason)
-            }
-            WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
-            WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
-            WebauthnError::InvalidDID(err) => format!("Invalid DID format: {}", err),
+        let (status, body) = match self {
+            CorruptSession => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Corrupt Session".to_string(),
+            ),
+            UserNotFound => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "User Not Found".to_string(),
+            ),
+            Unknown => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unknown Error".to_string(),
+            ),
+            UserHasNoCredentials => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "User Has No Credentials".to_string(),
+            ),
+            InvalidSessionState(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Deserializing Session failed".to_string(),
+            ),
+            MissingToken => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing token".to_string(),
+            ),
+            WebauthnError::InvalidToken => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid token".to_string(),
+            ),
+            WebauthnError::DynamoDBOperationError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                match *err {
+                    DynamoDBError::TableNotExists(table) => {
+                        format!("Service setup incomplete: {} table not configured", table)
+                    }
+                    _ => format!("Database operation failed: {}", err),
+                },
+            ),
+            WebauthnError::InvalidHandle => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Handle must start with the username".to_string(),
+            ),
+            WebauthnError::UserCreationFailed(reason) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create user: {}", reason),
+            ),
+            WebauthnError::WebAuthnError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebAuthn operation failed: {}", err),
+            ),
+            WebauthnError::SessionError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Session operation failed: {}", err),
+            ),
+            WebauthnError::InvalidDID(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid DID format: {}", err),
+            ),
+            WebauthnError::Cwt(err) => (StatusCode::UNAUTHORIZED, format!("CWT error: {}", err)),
         };
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        (status, body).into_response()
     }
 }
 
@@ -535,5 +564,108 @@ mod tests {
             let response = error.into_response();
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn auth_token_is_cose_sign1() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).expect("decode header");
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
+        assert_eq!(
+            sign1.protected.header.alg,
+            Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256))
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_token_is_cose_sign1_with_cnf() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+
+        // Build a sample Cnf (cose_key + kid)
+        let scalar = p256::FieldBytes::from([0x77u8; 32]);
+        let secret = p256::SecretKey::from_bytes(&scalar).expect("scalar");
+        let vk: p256::ecdsa::VerifyingKey = *p256::ecdsa::SigningKey::from(&secret).verifying_key();
+        let cose_key = crate::cwt::cose_key_from_p256_verifying_key(&vk, b"cred-1");
+        let cnf = crate::cwt::Cnf {
+            cose_key,
+            kid: b"cred-1".to_vec(),
+        };
+
+        let token = mint_registration_token(&app_state, &user_id, cnf).expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        let payload = sign1.payload.unwrap();
+        let claims = crate::cwt::claims_from_cbor(&payload).unwrap();
+        assert!(claims.cnf.is_some());
+
+        // Registration tokens have very long exp (~99 years).
+        let now = chrono::Utc::now().timestamp();
+        let years_50 = 50 * 365 * 24 * 3600;
+        assert!(claims.exp - now > years_50);
+    }
+
+    #[tokio::test]
+    async fn inbound_legacy_jwt_rejected_in_start_authentication_decode() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+
+        // Construct a legacy JWT (will be rejected since we now require CWT).
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        #[derive(serde::Serialize)]
+        struct LegacyClaims {
+            sub: String,
+            exp: usize,
+        }
+        let claims = LegacyClaims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        };
+        let jwt = jsonwebtoken::encode(&header, &claims, &app_state.encoding_key).unwrap();
+
+        // The inbound parser should reject JWT-format tokens (not valid base64url COSE_Sign1).
+        let result = verify_inbound_account_token(&app_state, &jwt);
+        assert!(
+            matches!(result, Err(WebauthnError::Cwt(_))),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_cwt_accepted_in_start_authentication_decode() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let claims = verify_inbound_account_token(&app_state, &token).expect("verify");
+        assert_eq!(claims.sub, user_id.to_string());
     }
 }
