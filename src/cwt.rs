@@ -148,6 +148,19 @@ use ciborium::value::{Integer, Value};
 use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
 
+/// Convert a P-256 VerifyingKey into a COSE_Key (RFC 9052 §7).
+pub fn cose_key_from_p256_verifying_key(vk: &VerifyingKey, kid: &[u8]) -> coset::CoseKey {
+    use coset::iana;
+    let encoded = vk.to_encoded_point(false);
+    let x = encoded.x().expect("uncompressed P-256 point has x").to_vec();
+    let y = encoded.y().expect("uncompressed P-256 point has y").to_vec();
+
+    coset::CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x, y)
+        .algorithm(iana::Algorithm::ES256)
+        .key_id(kid.to_vec())
+        .build()
+}
+
 pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
     let payload = claims_to_cbor(claims)?;
 
@@ -844,5 +857,46 @@ mod tests {
             skew_secs: 60,
         };
         verify(&bytes, &vk, &opts).expect("verify");
+    }
+
+    fn sample_cose_key() -> coset::CoseKey {
+        let (_, vk) = test_keypair();
+        cose_key_from_p256_verifying_key(&vk, b"sample-kid")
+    }
+
+    #[test]
+    fn mint_with_cnf_roundtrips() {
+        let (sk, vk) = test_keypair();
+        let cose_key = sample_cose_key();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
+            .with_cnf(Cnf { cose_key: cose_key.clone(), kid: b"cred-id".to_vec() });
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let decoded = verify(&bytes, &vk, &opts).expect("verify");
+        let decoded_cnf = decoded.cnf.expect("cnf present");
+        assert_eq!(decoded_cnf.kid, b"cred-id".to_vec());
+        // CoseKey roundtrip: compare via CBOR serialization.
+        use coset::AsCborValue;
+        let a = decoded_cnf.cose_key.clone().to_cbor_value().unwrap();
+        let b = cose_key.clone().to_cbor_value().unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn without_cnf_omits_cnf_from_payload() {
+        let (sk, _vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
+            .with_cnf(Cnf { cose_key: sample_cose_key(), kid: b"x".to_vec() })
+            .without_cnf();
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let sign1 = coset::CoseSign1::from_slice(&bytes).unwrap();
+        let decoded = claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert!(decoded.cnf.is_none());
     }
 }
