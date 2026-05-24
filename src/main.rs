@@ -171,6 +171,12 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey<NistP256>>,
     pub encoding_key: Arc<EncodingKey>,
     pub decoding_key: Arc<DecodingKey>,
+    pub cwt_signing_key: Arc<p256::ecdsa::SigningKey>,
+    pub cwt_verifying_key: Arc<p256::ecdsa::VerifyingKey>,
+    /// RFC 7638 JWK thumbprint as raw 32-byte SHA-256 hash.
+    /// JWKS advertises the base64url-encoded form of the same bytes
+    /// (see oidc::ec_public_key_to_jwk), so CWT and JWT share the same kid.
+    pub cwt_kid: Arc<Vec<u8>>,
 }
 
 #[tokio::main]
@@ -181,11 +187,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_config()?;
 
     // Load and validate EC keys
-    let (signing_key, encoding_key, decoding_key) = load_ec_keys(
-        &settings.sign_key_path,
-        &settings.encoding_key_path,
-        &settings.decoding_key_path,
-    )?;
+    let (signing_key, encoding_key, decoding_key, cwt_signing_key, cwt_verifying_key, cwt_kid) =
+        load_ec_keys(
+            &settings.sign_key_path,
+            &settings.encoding_key_path,
+            &settings.decoding_key_path,
+        )?;
 
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
@@ -253,6 +260,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key: Arc::new(signing_key),
         encoding_key: Arc::new(encoding_key),
         decoding_key: Arc::new(decoding_key),
+        cwt_signing_key: Arc::new(cwt_signing_key),
+        cwt_verifying_key: Arc::new(cwt_verifying_key),
+        cwt_kid: Arc::new(cwt_kid),
     };
 
     // Set up Redis Client using fred
@@ -526,7 +536,17 @@ fn load_ec_keys(
     sign_key_path: &str,
     encoding_key_path: &str,
     decoding_key_path: &str,
-) -> Result<(SigningKey<NistP256>, EncodingKey, DecodingKey), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        SigningKey<NistP256>,
+        EncodingKey,
+        DecodingKey,
+        p256::ecdsa::SigningKey,
+        p256::ecdsa::VerifyingKey,
+        Vec<u8>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
 
@@ -544,8 +564,56 @@ fn load_ec_keys(
             LoadKeysError::InvalidKeyFormat
         })?;
 
+    // Load the same EC key material as p256 types for CWT signing/verification.
+    let cwt_signing_key = {
+        use p256::pkcs8::DecodePrivateKey;
+        let pem = std::fs::read_to_string(encoding_key_path)?;
+        p256::SecretKey::from_pkcs8_pem(&pem)
+            .map_err(|e| format!("Failed to parse CWT signing key as PKCS8 PEM: {e}"))?
+            .into()
+    };
+    let cwt_verifying_key = {
+        use p256::pkcs8::DecodePublicKey;
+        let pem = std::fs::read_to_string(decoding_key_path)?;
+        let pk = p256::PublicKey::from_public_key_pem(&pem)
+            .map_err(|e| format!("Failed to parse CWT verifying key as SPKI PEM: {e}"))?;
+        p256::ecdsa::VerifyingKey::from(pk)
+    };
+
+    // kid = RFC 7638 JWK thumbprint, raw 32-byte SHA-256 hash.
+    // JWKS advertises the base64url-encoded form of the same bytes
+    // (see src/oidc.rs::ec_public_key_to_jwk), so CWT and JWT advertise
+    // the same physical kid.
+    let cwt_kid = {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let encoded = cwt_verifying_key.to_encoded_point(false);
+        let x = encoded
+            .x()
+            .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
+        let y = encoded
+            .y()
+            .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let thumb_input = format!(
+            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+            b64.encode(x),
+            b64.encode(y)
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(thumb_input.as_bytes());
+        hasher.finalize().to_vec()
+    };
+
     debug!("Successfully loaded EC keys");
-    Ok((signing_key, encoding_key, decoding_key))
+    Ok((
+        signing_key,
+        encoding_key,
+        decoding_key,
+        cwt_signing_key,
+        cwt_verifying_key,
+        cwt_kid,
+    ))
 }
 
 fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {

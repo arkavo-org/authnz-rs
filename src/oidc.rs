@@ -1897,6 +1897,24 @@ mod tests {
         let der = secret.to_pkcs8_der().unwrap();
         let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
 
+        let cwt_signing_key = p256::ecdsa::SigningKey::from(&secret);
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+        let cwt_kid: Vec<u8> = {
+            use base64::Engine;
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
         let app_state = AppState {
             webauthn: Arc::new(
                 webauthn_rs::WebauthnBuilder::new(
@@ -1919,6 +1937,9 @@ mod tests {
             signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -1969,6 +1990,24 @@ mod tests {
         let der = secret.to_pkcs8_der().unwrap();
         let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
 
+        let cwt_signing_key = p256::ecdsa::SigningKey::from(&secret);
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+        let cwt_kid: Vec<u8> = {
+            use base64::Engine;
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
         let app_state = AppState {
             webauthn: Arc::new(
                 webauthn_rs::WebauthnBuilder::new(
@@ -1991,6 +2030,9 @@ mod tests {
             signing_key: Arc::new(p256::ecdsa::SigningKey::from(&secret)),
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
