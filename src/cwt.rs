@@ -225,7 +225,7 @@ pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u
     sign1.to_vec().map_err(|_| CwtError::Malformed)
 }
 
-fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
+pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
 
     entries.push((Value::Integer(1.into()), Value::Text(c.iss.clone())));
@@ -291,7 +291,7 @@ fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     Ok(bytes)
 }
 
-fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
+pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
     let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
