@@ -145,6 +145,28 @@ impl ArkavoClaims {
 }
 
 use ciborium::value::{Integer, Value};
+use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
+    let payload = claims_to_cbor(claims)?;
+
+    let protected = HeaderBuilder::new()
+        .algorithm(iana::Algorithm::ES256)
+        .key_id(kid.to_vec())
+        .build();
+
+    let sign1 = CoseSign1Builder::new()
+        .protected(protected)
+        .payload(payload)
+        .create_signature(b"", |to_sign| {
+            let sig: Signature = key.sign(to_sign);
+            sig.to_bytes().to_vec()
+        })
+        .build();
+
+    sign1.to_vec().map_err(|_| CwtError::Malformed)
+}
 
 fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
@@ -376,6 +398,42 @@ fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::rand_core::OsRng;
+
+    fn test_keypair() -> (SigningKey, p256::ecdsa::VerifyingKey) {
+        let sk = SigningKey::random(&mut OsRng);
+        let vk = *sk.verifying_key();
+        (sk, vk)
+    }
+
+    fn test_kid() -> Vec<u8> {
+        b"test-kid".to_vec()
+    }
+
+    #[test]
+    fn mint_produces_parseable_cose_sign1() {
+        let (sk, _vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
+        // Decode the COSE_Sign1 envelope.
+        let sign1 = coset::CoseSign1::from_slice(&bytes).expect("parse COSE_Sign1");
+        assert_eq!(sign1.protected.header.alg, Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)));
+        assert_eq!(sign1.protected.header.key_id, test_kid());
+        assert!(sign1.payload.is_some());
+    }
+
+    #[test]
+    fn mint_payload_contains_expected_claims() {
+        let (sk, _vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
+        let sign1 = coset::CoseSign1::from_slice(&bytes).unwrap();
+        let payload_bytes = sign1.payload.unwrap();
+        let decoded = claims_from_cbor(&payload_bytes).expect("decode payload");
+        assert_eq!(decoded.iss, "iss-1");
+        assert_eq!(decoded.sub, "sub-1");
+    }
 
     #[test]
     fn cwt_error_display() {
