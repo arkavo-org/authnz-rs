@@ -888,7 +888,19 @@ async fn handle_authorization_code_grant(
             arkavo_roles: Some(record.user.roles.clone()),
             arkavo_entitlements: Some(record.user.entitlements.clone()),
         };
-        match mint_access_token(&app_state, &record.user.subject, &record.client_id, Some(extras), None) {
+        match mint_access_token(
+            &app_state,
+            &record.user.subject,
+            &record.client_id,
+            Some(extras),
+            // TODO: thread cnf through. The WebAuthn passkey's COSE_Key is in
+            // DynamoDB at this point, not on the request. Storing it on the
+            // AuthorizationCodeRecord at /authorize time (or looking it up via
+            // sub here) would let us bind the access token to the credential.
+            // Deferred from JWT->CWT migration; access token is currently
+            // unbound for WebAuthn flow, same security posture as today's JWT.
+            None,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to mint access_token CWT: {}", e);
