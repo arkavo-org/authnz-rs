@@ -336,14 +336,6 @@ struct AuthResponse {
     jwt_token: String,
 }
 
-/// Minimal JWT claims struct retained for device_check.rs backward compatibility.
-/// TODO(Task 15): migrate device_check.rs to CWT and remove this.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
-}
-
 /// Minimal envelope payload — identifies the user and registered credential
 /// but does NOT embed the full Passkey (DB is authoritative for credentials).
 #[derive(Serialize, Deserialize, Clone, Debug)]
