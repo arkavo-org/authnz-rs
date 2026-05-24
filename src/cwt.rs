@@ -268,15 +268,19 @@ fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                         _ => Err(CwtError::Malformed),
                     })
                     .collect();
-                aud = Some(Audience::Multiple(parts?));
+                let parts = parts?;
+                if parts.is_empty() {
+                    return Err(CwtError::Malformed);
+                }
+                aud = Some(Audience::Multiple(parts));
             }
             (Value::Integer(i), Value::Integer(n)) if int_label(&i) == 4 => {
                 let v: i128 = n.into();
-                exp = Some(v as i64);
+                exp = Some(i64::try_from(v).map_err(|_| CwtError::Malformed)?);
             }
             (Value::Integer(i), Value::Integer(n)) if int_label(&i) == 6 => {
                 let v: i128 = n.into();
-                iat = Some(v as i64);
+                iat = Some(i64::try_from(v).map_err(|_| CwtError::Malformed)?);
             }
             (Value::Integer(i), Value::Bytes(b)) if int_label(&i) == 7 => {
                 if b.len() != 16 {
@@ -287,6 +291,22 @@ fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 cti = Some(arr);
             }
             (Value::Integer(i), Value::Map(map)) if int_label(&i) == 8 => {
+                // Reject duplicate keys inside the cnf sub-map.
+                {
+                    let mut seen_ints: Vec<i128> = Vec::new();
+                    for (k, _) in &map {
+                        match k {
+                            Value::Integer(j) => {
+                                let n: i128 = (*j).into();
+                                if seen_ints.contains(&n) {
+                                    return Err(CwtError::Malformed);
+                                }
+                                seen_ints.push(n);
+                            }
+                            _ => return Err(CwtError::Malformed),
+                        }
+                    }
+                }
                 let mut cose_key: Option<coset::CoseKey> = None;
                 let mut kid: Option<Vec<u8>> = None;
                 for (kk, vv) in map {
@@ -444,6 +464,54 @@ mod tests {
         // Hand-craft CBOR: map with two entries for key 1 (iss).
         // 0xa3 = map(3 entries); 0x01 = uint 1; 0x61, 'a' = tstr "a"; 0x01 = uint 1; 0x61, 'b' = tstr "b"; 0x02 = uint 2; 0x61, 'c' = tstr "c"
         let bytes = vec![0xa3, 0x01, 0x61, b'a', 0x01, 0x61, b'b', 0x02, 0x61, b'c'];
+        let result = claims_from_cbor(&bytes);
+        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+    }
+
+    #[test]
+    fn cbor_roundtrip_audience_multiple() {
+        let mut c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        c.aud = Audience::Multiple(vec!["a".into(), "b".into()]);
+        let bytes = claims_to_cbor(&c).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        match decoded.aud {
+            Audience::Multiple(v) => assert_eq!(v, vec!["a".to_string(), "b".to_string()]),
+            other => panic!("expected Multiple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cbor_decode_rejects_empty_audience_multiple() {
+        // Hand-craft a minimal claims map with aud = empty array.
+        // Map(6 entries): {1: "i", 2: "s", 3: [], 4: 0, 6: 0, 7: <16 zero bytes>}
+        let mut bytes = vec![
+            0xa6, // map(6)
+            0x01, 0x61, b'i',                     // 1: "i"
+            0x02, 0x61, b's',                     // 2: "s"
+            0x03, 0x80,                            // 3: []  (empty array)
+            0x04, 0x00,                            // 4: 0
+            0x06, 0x00,                            // 6: 0
+            0x07, 0x50,                            // 7: bstr(16) follows
+        ];
+        bytes.extend_from_slice(&[0u8; 16]);
+        let result = claims_from_cbor(&bytes);
+        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+    }
+
+    #[test]
+    fn cbor_decode_rejects_oversize_exp() {
+        // Hand-craft minimal map with exp = i64::MAX + 1 (which is 2^63).
+        // CBOR encoding of 2^63: uint major type (0x1b) + 8 bytes 0x80 00 00 00 00 00 00 00
+        let mut bytes = vec![
+            0xa6, // map(6)
+            0x01, 0x61, b'i',
+            0x02, 0x61, b's',
+            0x03, 0x61, b'a',                     // aud: "a"
+            0x04, 0x1b, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exp: 2^63
+            0x06, 0x00,                            // iat: 0
+            0x07, 0x50,                            // cti: 16 bytes
+        ];
+        bytes.extend_from_slice(&[0u8; 16]);
         let result = claims_from_cbor(&bytes);
         assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
     }
