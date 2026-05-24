@@ -419,7 +419,6 @@ pub fn verify(
     }
 
     // Verify signature.
-    let payload = sign1.payload.as_ref().ok_or(CwtError::Malformed)?.clone();
     sign1
         .verify_signature(b"", |sig_bytes, to_verify| {
             let sig = Signature::from_slice(sig_bytes).map_err(|_| ())?;
@@ -427,7 +426,9 @@ pub fn verify(
         })
         .map_err(|_| CwtError::InvalidSignature)?;
 
-    let claims = claims_from_cbor(&payload)?;
+    // Decode payload (borrowed from sign1, no clone).
+    let payload = sign1.payload.as_ref().ok_or(CwtError::Malformed)?;
+    let claims = claims_from_cbor(payload)?;
 
     // iss check.
     if let Some(want) = opts.expected_iss {
