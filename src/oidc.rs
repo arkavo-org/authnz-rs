@@ -536,6 +536,45 @@ pub async fn jwks(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl IntoRespo
     })
 }
 
+/// Serve the signing key as a COSE_Key Set (RFC 9052 §7) in CBOR form.
+///
+/// CWT verifiers (OpenTDF tdf-rs, native arkavo apps) can fetch the P-256
+/// key in its native COSE format instead of converting from JWK.
+/// Same physical key as `/.well-known/jwks.json`; same `kid` (RFC 7638
+/// thumbprint bytes).
+pub async fn cose_keys(Extension(app_state): Extension<AppState>) -> impl IntoResponse {
+    let cose_key = crate::cwt::cose_key_from_p256_verifying_key(
+        &app_state.cwt_verifying_key,
+        &app_state.cwt_kid,
+    );
+
+    use coset::AsCborValue;
+    let key_value = match cose_key.to_cbor_value() {
+        Ok(v) => v,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response()
+        }
+    };
+    let set = ciborium::value::Value::Array(vec![key_value]);
+
+    let mut bytes = Vec::new();
+    if ciborium::ser::into_writer(&set, &mut bytes).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
+    }
+
+    (
+        [
+            (
+                http::header::CONTENT_TYPE,
+                "application/cose-key-set+cbor",
+            ),
+            (http::header::CACHE_CONTROL, "public, max-age=600"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
     pub response_type: String,
@@ -1983,6 +2022,28 @@ mod tests {
         assert_eq!(v["keys"][0]["alg"], "ES256");
         assert_eq!(v["keys"][0]["use"], "sig");
         assert_eq!(v["keys"][0]["kid"], oidc.jwk.kid);
+    }
+
+    #[tokio::test]
+    async fn cose_keys_endpoint_returns_single_key() {
+        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
+        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
+        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let resp = crate::oidc::cose_keys(axum::extract::Extension(app_state.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(resp.status(), 200);
+        let ct = resp.headers().get("content-type").unwrap();
+        assert_eq!(ct, "application/cose-key-set+cbor");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: ciborium::value::Value =
+            ciborium::de::from_reader(body.as_ref()).expect("valid CBOR");
+        let ciborium::value::Value::Array(arr) = value else { panic!("not an array") };
+        assert_eq!(arr.len(), 1);
     }
 
     #[test]

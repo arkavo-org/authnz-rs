@@ -40,7 +40,8 @@ use crate::device_check::{
 };
 use crate::oidc::{
     AuthorizationCodeStore, OidcConfig, RefreshTokenStore, authorize as oidc_authorize,
-    discovery as oidc_discovery, jwks as oidc_jwks, token as oidc_token, userinfo as oidc_userinfo,
+    cose_keys as oidc_cose_keys, discovery as oidc_discovery, jwks as oidc_jwks,
+    token as oidc_token, userinfo as oidc_userinfo,
 };
 
 mod apple_signin;
@@ -317,6 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // OIDC discovery + JWKS (advertise this server as an OIDC provider)
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks.json", get(oidc_jwks))
+        .route("/.well-known/cose-keys", get(oidc_cose_keys))
         // OIDC endpoints
         .route("/oauth/authorize", get(oidc_authorize))
         .route("/oauth/token", post(oidc_token))
