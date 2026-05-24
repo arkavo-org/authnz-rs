@@ -44,6 +44,7 @@ use crate::oidc::{
 };
 
 mod apple_signin;
+mod cwt;
 mod authn;
 mod constants;
 mod db;
