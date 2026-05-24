@@ -14,7 +14,7 @@
 //! `arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`.
 //!
 //! Authentication during the authorize step is delegated to an upstream
-//! identity source (WebAuthn-issued Arkavo JWT, Apple Sign In, etc.).
+//! identity source (WebAuthn-issued Arkavo CWT, Apple Sign In, etc.).
 //! Operators MUST configure allowed clients/redirect URIs via environment
 //! variables (see [`OidcConfig`]).
 
@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use chrono::Utc;
 use fred::interfaces::{ClientLike, KeysInterface};
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, Header, encode};
 use log::{debug, error, info, warn};
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -547,7 +547,7 @@ pub struct AuthorizeQuery {
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     /// Identity-source hint. Currently supported: `apple` (with `id_token`),
-    /// `webauthn` (Arkavo JWT in `X-Auth-Token` header).
+    /// `webauthn` (Arkavo CWT in `X-Auth-Token` header).
     pub idp: Option<String>,
     /// Apple id_token, when `idp=apple`. Alternatively pass `X-Apple-Id-Token` header.
     pub id_token: Option<String>,
@@ -561,7 +561,7 @@ pub struct AuthorizeQuery {
 /// 1. `idp=apple` + `id_token` (or `X-Apple-Id-Token` header): validates the
 ///    Apple-issued id_token, maps to an Arkavo account, and issues an
 ///    authorization code.
-/// 2. `X-Auth-Token` header with a valid Arkavo JWT (from WebAuthn flow):
+/// 2. `X-Auth-Token` header with a valid Arkavo CWT (from WebAuthn flow):
 ///    upgrades the WebAuthn session into an OIDC authorization code.
 ///
 /// If no upstream credential is presented, returns 401 with a JSON body
@@ -1468,36 +1468,40 @@ async fn resolve_user(
             .map_err(|e| AuthorizeError::Database(e.to_string()));
     }
 
-    // Otherwise expect an Arkavo JWT (from WebAuthn flow).
-    if let Some(arkavo_jwt) = headers.get("X-Auth-Token").and_then(|h| h.to_str().ok()) {
-        return resolve_from_arkavo_jwt(app_state, oidc, arkavo_jwt).await;
+    // Otherwise expect an Arkavo CWT (from WebAuthn flow).
+    if let Some(arkavo_cwt) = headers.get("X-Auth-Token").and_then(|h| h.to_str().ok()) {
+        return resolve_from_arkavo_jwt(app_state, oidc, arkavo_cwt).await;
     }
 
     Err(AuthorizeError::LoginRequired)
 }
 
-async fn resolve_from_arkavo_jwt(
+/// Validates an Arkavo CWT from the `X-Auth-Token` header and returns the
+/// authenticated user. Legacy JWT tokens are rejected with
+/// [`AuthorizeError::InvalidArkavoJwt`].
+///
+/// The function name retains the `_jwt` suffix for callsite compatibility but
+/// the token format is now CWT (COSE_Sign1, ES256). A future cleanup pass can
+/// rename it once all callers are updated.
+pub(crate) async fn resolve_from_arkavo_jwt(
     app_state: &AppState,
     _oidc: &OidcConfig,
     token: &str,
 ) -> Result<AuthenticatedUser, AuthorizeError> {
-    // The legacy Arkavo JWTs do not yet include OIDC claims. Decode without
-    // strict exp/nbf validation to stay consistent with start_authentication
-    // (see authn.rs for the security rationale).
-    let mut validation = Validation::new(Algorithm::ES256);
-    validation.validate_nbf = false;
-    validation.validate_exp = false;
-    validation.validate_aud = false;
-    let decoding_key: &DecodingKey = &app_state.decoding_key;
-
-    #[derive(Deserialize)]
-    struct LegacyClaims {
-        sub: String,
-    }
-    let data = decode::<LegacyClaims>(token, decoding_key, &validation)
+    let bytes = crate::cwt::decode_from_header(token)
+        .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
+    let issuer = std::env::var("OIDC_ISSUER")
+        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+    let opts = crate::cwt::VerifyOptions {
+        expected_iss: Some(&issuer),
+        expected_aud: Some("arkavo"),
+        now: chrono::Utc::now().timestamp(),
+        skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+    };
+    let claims = crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
-    let account_id = data.claims.sub;
+    let account_id = claims.sub;
     // Best-effort role/entitlement defaults. Future work: persist these on the user.
     Ok(AuthenticatedUser {
         subject: format!("arkavo:{}", account_id),
@@ -2244,5 +2248,53 @@ mod tests {
         let sign1 = coset::CoseSign1::from_slice(&raw).unwrap();
         let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert!(claims.cnf.is_none());
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_rejects_legacy_jwt_x_auth_token() {
+        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
+        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
+        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        #[derive(serde::Serialize)]
+        struct LegacyClaims { sub: String, exp: usize }
+        let claims = LegacyClaims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        };
+        let jwt = jsonwebtoken::encode(&header, &claims, &app_state.encoding_key).unwrap();
+
+        let oidc = OidcConfig {
+            issuer: "https://identity.arkavo.net".into(),
+            signing_kid: "test".into(),
+            clients: std::collections::HashMap::new(),
+            jwk: test_jwk(),
+        };
+
+        let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &jwt).await;
+        assert!(result.is_err(), "legacy JWT should be rejected");
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_accepts_cwt_x_auth_token() {
+        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
+        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
+        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let token = crate::authn::mint_auth_token(&app_state, &user_id, None).expect("mint cwt");
+
+        let oidc = OidcConfig {
+            issuer: "https://identity.arkavo.net".into(),
+            signing_kid: "test".into(),
+            clients: std::collections::HashMap::new(),
+            jwk: test_jwk(),
+        };
+
+        let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
+        assert!(result.is_ok(), "CWT token should be accepted, got {:?}", result.err());
     }
 }
