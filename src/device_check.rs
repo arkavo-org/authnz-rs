@@ -567,7 +567,7 @@ pub fn mint_assertion_token(
     device_id: &[u8],
 ) -> Result<String, DeviceCheckError> {
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let cnf = crate::cwt::cnf_from_app_attest(device_public_key, device_id)?;
     let claims = crate::cwt::ArkavoClaims::devicecheck(
         &issuer,
@@ -589,7 +589,7 @@ pub fn verify_inbound_token(
 ) -> Result<crate::cwt::ArkavoClaims, DeviceCheckError> {
     let bytes = crate::cwt::decode_from_header(token)?;
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
         expected_iss: Some(&issuer),
         // The assertion challenge endpoint expects a standard Arkavo auth token,

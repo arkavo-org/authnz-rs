@@ -890,7 +890,6 @@ async fn handle_authorization_code_grant(
 
     let now = Utc::now().timestamp();
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
-    let at_exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
 
     let id_claims = OidcClaims {
         iss: oidc.issuer.clone(),
@@ -906,10 +905,6 @@ async fn handle_authorization_code_grant(
         arkavo_roles: record.user.roles.clone(),
         arkavo_entitlements: record.user.entitlements.clone(),
     };
-    let mut access_claims = id_claims.clone();
-    access_claims.exp = at_exp;
-    access_claims.nonce = None;
-
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
 
@@ -1243,7 +1238,6 @@ async fn handle_refresh_token_grant(
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
-    let at_exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
 
     let id_claims = OidcClaims {
         iss: oidc.issuer.clone(),
@@ -1259,9 +1253,6 @@ async fn handle_refresh_token_grant(
         arkavo_roles: roles,
         arkavo_entitlements: entitlements,
     };
-    let mut access_claims = id_claims.clone();
-    access_claims.exp = at_exp;
-
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
 
@@ -1278,12 +1269,12 @@ async fn handle_refresh_token_grant(
     };
     let access_token = {
         let extras = AccessTokenExtras {
-            idp: access_claims.idp.clone(),
-            email: access_claims.email.clone(),
-            email_verified: access_claims.email_verified,
-            arkavo_account_id: Some(access_claims.arkavo_account_id.clone()),
-            arkavo_roles: Some(access_claims.arkavo_roles.clone()),
-            arkavo_entitlements: Some(access_claims.arkavo_entitlements.clone()),
+            idp: id_claims.idp.clone(),
+            email: id_claims.email.clone(),
+            email_verified: id_claims.email_verified,
+            arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
+            arkavo_roles: Some(id_claims.arkavo_roles.clone()),
+            arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
         };
         match mint_access_token(&app_state, &record.subject, &record.client_id, Some(extras), None) {
             Ok(t) => t,
@@ -1536,7 +1527,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
     let bytes = crate::cwt::decode_from_header(token)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
         expected_iss: Some(&issuer),
         expected_aud: Some("arkavo"),

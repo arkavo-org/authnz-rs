@@ -553,31 +553,37 @@ fn load_ec_keys(
     let signing_key = load_single_ec_key(sign_key_path)?;
 
     debug!("Loading EC encoding key from: {}", encoding_key_path);
-    let encoding_key =
-        EncodingKey::from_ec_pem(&std::fs::read(encoding_key_path)?).map_err(|e| {
-            error!("Failed to create EncodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
+    let encoding_pem = std::fs::read(encoding_key_path)?;
+    let encoding_pem_str = std::str::from_utf8(&encoding_pem)
+        .map_err(|e| format!("Encoding key PEM is not valid UTF-8: {e}"))?;
 
-    debug!("Attempting to create DecodingKey from PEM contents");
-    let decoding_key =
-        DecodingKey::from_ec_pem(&std::fs::read(decoding_key_path)?).map_err(|e| {
-            error!("Failed to create DecodingKey: {:?}", e);
-            LoadKeysError::InvalidKeyFormat
-        })?;
+    let encoding_key = EncodingKey::from_ec_pem(&encoding_pem).map_err(|e| {
+        error!("Failed to create EncodingKey: {:?}", e);
+        LoadKeysError::InvalidKeyFormat
+    })?;
 
-    // Load the same EC key material as p256 types for CWT signing/verification.
+    // Load the same EC key material as p256 type for CWT signing.
     let cwt_signing_key = {
         use p256::pkcs8::DecodePrivateKey;
-        let pem = std::fs::read_to_string(encoding_key_path)?;
-        p256::SecretKey::from_pkcs8_pem(&pem)
+        p256::SecretKey::from_pkcs8_pem(encoding_pem_str)
             .map_err(|e| format!("Failed to parse CWT signing key as PKCS8 PEM: {e}"))?
             .into()
     };
+
+    debug!("Attempting to create DecodingKey from PEM contents");
+    let decoding_pem = std::fs::read(decoding_key_path)?;
+    let decoding_pem_str = std::str::from_utf8(&decoding_pem)
+        .map_err(|e| format!("Decoding key PEM is not valid UTF-8: {e}"))?;
+
+    let decoding_key = DecodingKey::from_ec_pem(&decoding_pem).map_err(|e| {
+        error!("Failed to create DecodingKey: {:?}", e);
+        LoadKeysError::InvalidKeyFormat
+    })?;
+
+    // Load the same EC key material as p256 type for CWT verification.
     let cwt_verifying_key = {
         use p256::pkcs8::DecodePublicKey;
-        let pem = std::fs::read_to_string(decoding_key_path)?;
-        let pk = p256::PublicKey::from_public_key_pem(&pem)
+        let pk = p256::PublicKey::from_public_key_pem(decoding_pem_str)
             .map_err(|e| format!("Failed to parse CWT verifying key as SPKI PEM: {e}"))?;
         p256::ecdsa::VerifyingKey::from(pk)
     };

@@ -376,7 +376,7 @@ pub fn mint_auth_token(
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let mut claims =
         crate::cwt::ArkavoClaims::auth(&issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
     if let Some(c) = cnf {
@@ -392,7 +392,7 @@ pub fn mint_registration_token(
     cnf: crate::cwt::Cnf,
 ) -> Result<String, WebauthnError> {
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let claims = crate::cwt::ArkavoClaims::registration(
         &issuer,
         &user_id.to_string(),
@@ -409,7 +409,7 @@ pub fn verify_inbound_account_token(
 ) -> Result<crate::cwt::ArkavoClaims, WebauthnError> {
     let bytes = crate::cwt::decode_from_header(token)?;
     let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
         expected_iss: Some(&issuer),
         expected_aud: Some("arkavo"),
