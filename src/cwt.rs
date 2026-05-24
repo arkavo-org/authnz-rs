@@ -753,4 +753,96 @@ mod tests {
         let result = verify(&bytes, &vk, &opts);
         assert!(matches!(result, Err(CwtError::UnsupportedAlg)), "got {:?}", result);
     }
+
+    #[test]
+    fn verify_rejects_expired() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            // now well past exp + skew
+            now: claims.exp + 120,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk, &opts);
+        assert!(matches!(result, Err(CwtError::Expired)), "got {:?}", result);
+    }
+
+    #[test]
+    fn verify_rejects_not_yet_valid() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            // now before iat by more than skew
+            now: claims.iat - 120,
+            skew_secs: 60,
+        };
+        let result = verify(&bytes, &vk, &opts);
+        assert!(matches!(result, Err(CwtError::NotYetValid)), "got {:?}", result);
+    }
+
+    #[test]
+    fn verify_accepts_within_skew_window() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+
+        // now is 30s before iat: within ±60 skew, accepted.
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat - 30,
+            skew_secs: 60,
+        };
+        verify(&bytes, &vk, &opts).expect("verify within skew");
+    }
+
+    #[test]
+    fn verify_rejects_iss_mismatch() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-other"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        assert!(matches!(verify(&bytes, &vk, &opts), Err(CwtError::IssuerMismatch)));
+    }
+
+    #[test]
+    fn verify_rejects_aud_mismatch() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: Some("other-audience"),
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        assert!(matches!(verify(&bytes, &vk, &opts), Err(CwtError::AudienceMismatch)));
+    }
+
+    #[test]
+    fn verify_accepts_aud_match_against_arkavo() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: Some("arkavo"),
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        verify(&bytes, &vk, &opts).expect("verify");
+    }
 }
