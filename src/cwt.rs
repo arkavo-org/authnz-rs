@@ -192,6 +192,19 @@ pub fn cnf_from_passkey(passkey: &webauthn_rs::prelude::Passkey) -> Result<Cnf, 
     Ok(Cnf { cose_key, kid })
 }
 
+/// Build a Cnf claim from a DeviceCheck/App Attest binding.
+///
+/// `public_key_bytes` is the device's P-256 public key in uncompressed
+/// SEC1 format (65 bytes: 0x04 || x || y), as stored in the
+/// `device_bindings` DynamoDB table. `device_id` is the App Attest
+/// key ID, used as the cnf.kid.
+pub fn cnf_from_app_attest(public_key_bytes: &[u8], device_id: &[u8]) -> Result<Cnf, CwtError> {
+    let vk = VerifyingKey::from_sec1_bytes(public_key_bytes)
+        .map_err(|_| CwtError::Malformed)?;
+    let cose_key = cose_key_from_p256_verifying_key(&vk, device_id);
+    Ok(Cnf { cose_key, kid: device_id.to_vec() })
+}
+
 pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
     let payload = claims_to_cbor(claims)?;
 
@@ -977,5 +990,22 @@ mod tests {
     #[test]
     fn decode_from_header_rejects_invalid_base64() {
         assert!(matches!(decode_from_header("!!!not-base64!!!"), Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn cnf_from_app_attest_constructs_cnf() {
+        // Mock device binding's public key as raw uncompressed P-256 (65 bytes: 0x04 || x || y).
+        let (_sk, vk) = test_keypair();
+        let public_key_bytes = vk.to_encoded_point(false).as_bytes().to_vec();
+        let device_id = b"app-attest-key-id".to_vec();
+
+        let cnf = cnf_from_app_attest(&public_key_bytes, &device_id).expect("build cnf");
+        assert_eq!(cnf.kid, device_id);
+    }
+
+    #[test]
+    fn cnf_from_app_attest_rejects_invalid_pubkey() {
+        let cnf = cnf_from_app_attest(&[0xde, 0xad, 0xbe, 0xef], b"id");
+        assert!(matches!(cnf, Err(CwtError::Malformed)));
     }
 }
