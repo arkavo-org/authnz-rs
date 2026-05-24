@@ -131,7 +131,9 @@ pub struct AttestationResponse {
 
 #[derive(Debug, Serialize)]
 pub struct AssertionResponse {
-    pub jwt_token: String,
+    /// Arkavo-issued CWT (base64url-encoded COSE_Sign1 wrapped in CBOR tag 61).
+    /// Field name is format-agnostic so clients don't conflate it with a JWT.
+    pub token: String,
 }
 
 // CBOR structures for App Attest
@@ -319,15 +321,27 @@ pub async fn generate_assertion_challenge(
 ) -> Result<impl IntoResponse, DeviceCheckError> {
     info!("Generating assertion challenge for user: {}", username);
 
-    // Verify CWT token
-    if let Some(token_header) = headers.get("X-Auth-Token") {
-        let token = token_header
-            .to_str()
-            .map_err(|_| DeviceCheckError::InvalidToken)?;
-
-        let _claims = verify_inbound_token(&app_state, token)?;
-    } else {
+    // Verify CWT token and bind it to the username in the path. The CWT's `sub`
+    // must resolve to the same user_id we look up by `username`; otherwise any
+    // holder of a valid Arkavo CWT could request assertion challenges (and burn
+    // session state) for arbitrary users.
+    let Some(token_header) = headers.get("X-Auth-Token") else {
         return Err(DeviceCheckError::MissingToken);
+    };
+    let token = token_header
+        .to_str()
+        .map_err(|_| DeviceCheckError::InvalidToken)?;
+    let claims = verify_inbound_token(&app_state, token)?;
+    let token_user_id = Uuid::parse_str(&claims.sub).map_err(|_| DeviceCheckError::UserNotFound)?;
+
+    let user = app_state
+        .db_store
+        .get_user_by_name(&username)
+        .await
+        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
+        .ok_or(DeviceCheckError::UserNotFound)?;
+    if token_user_id != user.user_id {
+        return Err(DeviceCheckError::UserNotFound);
     }
 
     // Generate challenge
@@ -430,7 +444,7 @@ pub async fn finish_assertion(
 
     info!("Assertion successful for key_id: {}", request.key_id);
 
-    Ok(Json(AssertionResponse { jwt_token: token }))
+    Ok(Json(AssertionResponse { token }))
 }
 
 // Helper functions
@@ -566,11 +580,9 @@ pub fn mint_assertion_token(
     device_public_key: &[u8],
     device_id: &[u8],
 ) -> Result<String, DeviceCheckError> {
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let cnf = crate::cwt::cnf_from_app_attest(device_public_key, device_id)?;
     let claims = crate::cwt::ArkavoClaims::devicecheck(
-        &issuer,
+        &app_state.issuer,
         &user_id.to_string(),
         AUTH_TOKEN_HOURS,
     )
@@ -588,17 +600,19 @@ pub fn verify_inbound_token(
     token: &str,
 ) -> Result<crate::cwt::ArkavoClaims, DeviceCheckError> {
     let bytes = crate::cwt::decode_from_header(token)?;
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
-        expected_iss: Some(&issuer),
+        expected_iss: Some(&app_state.issuer),
         // The assertion challenge endpoint expects a standard Arkavo auth token,
         // NOT a devicecheck assertion token (that would create a cycle).
         expected_aud: Some("arkavo"),
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    Ok(crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)?)
+    Ok(crate::cwt::verify(
+        &bytes,
+        &app_state.cwt_verifying_key,
+        &opts,
+    )?)
 }
 
 #[derive(Error, Debug)]
@@ -659,29 +673,49 @@ impl IntoResponse for DeviceCheckError {
     fn into_response(self) -> axum::response::Response {
         // CWT verification failures map to 401 Unauthorized; everything else is 400.
         let (status, body) = match self {
-            DeviceCheckError::Cwt(err) => (
-                StatusCode::UNAUTHORIZED,
-                format!("Unauthorized: {}", err),
+            DeviceCheckError::Cwt(err) => {
+                (StatusCode::UNAUTHORIZED, format!("Unauthorized: {}", err))
+            }
+            DeviceCheckError::CorruptSession => {
+                (StatusCode::BAD_REQUEST, "Corrupt Session".to_string())
+            }
+            DeviceCheckError::UserNotFound => {
+                (StatusCode::BAD_REQUEST, "User Not Found".to_string())
+            }
+            DeviceCheckError::DeviceNotFound => {
+                (StatusCode::BAD_REQUEST, "Device Not Found".to_string())
+            }
+            DeviceCheckError::InvalidSessionState(_) => (
+                StatusCode::BAD_REQUEST,
+                "Deserializing Session failed".to_string(),
             ),
-            DeviceCheckError::CorruptSession => (StatusCode::BAD_REQUEST, "Corrupt Session".to_string()),
-            DeviceCheckError::UserNotFound => (StatusCode::BAD_REQUEST, "User Not Found".to_string()),
-            DeviceCheckError::DeviceNotFound => (StatusCode::BAD_REQUEST, "Device Not Found".to_string()),
-            DeviceCheckError::InvalidSessionState(_) => (StatusCode::BAD_REQUEST, "Deserializing Session failed".to_string()),
-            DeviceCheckError::MissingToken => (StatusCode::UNAUTHORIZED, "Missing token".to_string()),
-            DeviceCheckError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
+            DeviceCheckError::MissingToken => {
+                (StatusCode::UNAUTHORIZED, "Missing token".to_string())
+            }
+            DeviceCheckError::InvalidToken => {
+                (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+            }
             DeviceCheckError::DynamoDBOperationError(err) => match *err {
                 DynamoDBError::TableNotExists(table) => (
                     StatusCode::BAD_REQUEST,
                     format!("Service setup incomplete: {} table not configured", table),
                 ),
-                _ => (StatusCode::BAD_REQUEST, format!("Database operation failed: {}", err)),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    format!("Database operation failed: {}", err),
+                ),
             },
-            DeviceCheckError::SessionError(err) => (StatusCode::BAD_REQUEST, format!("Session operation failed: {}", err)),
+            DeviceCheckError::SessionError(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("Session operation failed: {}", err),
+            ),
             DeviceCheckError::InvalidAttestationObject(err) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid attestation object: {}", err),
             ),
-            DeviceCheckError::InvalidFormat(err) => (StatusCode::BAD_REQUEST, format!("Invalid format: {}", err)),
+            DeviceCheckError::InvalidFormat(err) => {
+                (StatusCode::BAD_REQUEST, format!("Invalid format: {}", err))
+            }
             DeviceCheckError::InvalidCertificateChain(err) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid certificate chain: {}", err),
@@ -690,10 +724,20 @@ impl IntoResponse for DeviceCheckError {
                 StatusCode::BAD_REQUEST,
                 format!("Invalid authenticator data: {}", err),
             ),
-            DeviceCheckError::InvalidCounter(err) => (StatusCode::BAD_REQUEST, format!("Invalid counter: {}", err)),
-            DeviceCheckError::InvalidClientData(err) => (StatusCode::BAD_REQUEST, format!("Invalid client data: {}", err)),
-            DeviceCheckError::ChallengeMismatch => (StatusCode::BAD_REQUEST, "Challenge mismatch".to_string()),
-            DeviceCheckError::InvalidAssertion(err) => (StatusCode::BAD_REQUEST, format!("Invalid assertion: {}", err)),
+            DeviceCheckError::InvalidCounter(err) => {
+                (StatusCode::BAD_REQUEST, format!("Invalid counter: {}", err))
+            }
+            DeviceCheckError::InvalidClientData(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid client data: {}", err),
+            ),
+            DeviceCheckError::ChallengeMismatch => {
+                (StatusCode::BAD_REQUEST, "Challenge mismatch".to_string())
+            }
+            DeviceCheckError::InvalidAssertion(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid assertion: {}", err),
+            ),
         };
         (status, body).into_response()
     }
@@ -834,9 +878,15 @@ mod tests {
     #[tokio::test]
     async fn assertion_token_is_cose_sign1_with_devicecheck_aud() {
         use coset::CborSerializable;
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
@@ -848,27 +898,40 @@ mod tests {
         let vk: p256::ecdsa::VerifyingKey = *p256::ecdsa::SigningKey::from(&secret).verifying_key();
         let pubkey = vk.to_encoded_point(false).as_bytes().to_vec();
 
-        let token = crate::device_check::mint_assertion_token(
-            &app_state, &user_id, &pubkey, &device_id,
-        ).expect("mint");
+        let token =
+            crate::device_check::mint_assertion_token(&app_state, &user_id, &pubkey, &device_id)
+                .expect("mint");
 
         let raw = crate::cwt::decode_from_header(&token).unwrap();
-        let sign1 = coset::CoseSign1::from_slice(&raw).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
         let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
-        assert_eq!(claims.aud, crate::cwt::Audience::Single("arkavo:devicecheck".into()));
+        assert_eq!(
+            claims.aud,
+            crate::cwt::Audience::Single("arkavo:devicecheck".into())
+        );
         assert!(claims.cnf.is_some());
     }
 
     #[tokio::test]
     async fn inbound_jwt_rejected_at_assertion_challenge() {
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         #[derive(serde::Serialize)]
-        struct LegacyClaims { sub: String, exp: usize }
+        struct LegacyClaims {
+            sub: String,
+            exp: usize,
+        }
         let claims = LegacyClaims {
             sub: uuid::Uuid::new_v4().to_string(),
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,

@@ -12,8 +12,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use ecdsa::signature::{Signer, Verifier};
-use ecdsa::{Signature, VerifyingKey};
+use ecdsa::Signature;
+use ecdsa::signature::Signer;
 use log::{error, info};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
@@ -238,10 +238,7 @@ pub async fn start_authentication(
             .to_str()
             .map_err(|_| WebauthnError::InvalidToken)?;
         let claims = verify_inbound_account_token(&app_state, token_str)?;
-        Some(
-            Uuid::parse_str(&claims.sub)
-                .map_err(|_| WebauthnError::UserNotFound)?,
-        )
+        Some(Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::UserNotFound)?)
     } else {
         None
     };
@@ -316,24 +313,25 @@ pub async fn finish_authentication(
             // cnf binding is added in Task 15 once the passkey is retrieved from DB).
             let token = mint_auth_token(&app_state, &user_unique_id, None)?;
             info!("Authentication successful for user: {}", user_unique_id);
-            Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
+            Ok((StatusCode::OK, Json(AuthResponse { token })))
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
             Ok((
                 StatusCode::BAD_REQUEST,
                 Json(AuthResponse {
-                    jwt_token: String::new(),
+                    token: String::new(),
                 }),
             ))
         }
     }
 }
 
-// Existing helper functions and structs remain the same
 #[derive(Serialize)]
 struct AuthResponse {
-    jwt_token: String,
+    /// Arkavo-issued CWT (base64url-encoded COSE_Sign1 wrapped in CBOR tag 61).
+    /// Field name is format-agnostic so clients don't conflate it with a JWT.
+    token: String,
 }
 
 /// Minimal envelope payload — identifies the user and registered credential
@@ -352,7 +350,11 @@ struct AttestationEnvelope {
 
 impl AttestationEnvelope {
     fn new(entity: EnvelopePayload, app_state: &AppState) -> Self {
-        let payload_bytes = serde_json::to_vec(&entity).unwrap();
+        // EnvelopePayload is `{ user_id: Uuid, public_key: Base64UrlSafeData }`,
+        // both of which serialize to JSON unconditionally — this only fails on
+        // OOM, which is unrecoverable anyway.
+        let payload_bytes =
+            serde_json::to_vec(&entity).expect("EnvelopePayload always serializes to JSON");
         let message = Sha256::digest(&payload_bytes);
         let signature: Signature<NistP256> = app_state.signing_key.sign(&message);
 
@@ -361,13 +363,6 @@ impl AttestationEnvelope {
             signature: Base64UrlSafeData::from(signature.to_der().as_bytes().to_vec()),
         }
     }
-
-    fn _verify(&self, verifying_key: &VerifyingKey<NistP256>) -> bool {
-        let payload_bytes = serde_json::to_vec(&self.payload).unwrap();
-        let message = Sha256::digest(&payload_bytes);
-        let signature = Signature::from_der(self.signature.as_ref()).unwrap();
-        verifying_key.verify(&message, &signature).is_ok()
-    }
 }
 
 pub fn mint_auth_token(
@@ -375,10 +370,8 @@ pub fn mint_auth_token(
     user_id: &Uuid,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let mut claims =
-        crate::cwt::ArkavoClaims::auth(&issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
+        crate::cwt::ArkavoClaims::auth(&app_state.issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
     if let Some(c) = cnf {
         claims = claims.with_cnf(c);
     }
@@ -391,10 +384,8 @@ pub fn mint_registration_token(
     user_id: &Uuid,
     cnf: crate::cwt::Cnf,
 ) -> Result<String, WebauthnError> {
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let claims = crate::cwt::ArkavoClaims::registration(
-        &issuer,
+        &app_state.issuer,
         &user_id.to_string(),
         REGISTRATION_TOKEN_WEEKS,
     )
@@ -408,15 +399,17 @@ pub fn verify_inbound_account_token(
     token: &str,
 ) -> Result<crate::cwt::ArkavoClaims, WebauthnError> {
     let bytes = crate::cwt::decode_from_header(token)?;
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
-        expected_iss: Some(&issuer),
+        expected_iss: Some(&app_state.issuer),
         expected_aud: Some("arkavo"),
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    Ok(crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)?)
+    Ok(crate::cwt::verify(
+        &bytes,
+        &app_state.cwt_verifying_key,
+        &opts,
+    )?)
 }
 
 #[derive(Error, Debug)]
@@ -454,24 +447,63 @@ pub enum WebauthnError {
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
-            CorruptSession => (StatusCode::INTERNAL_SERVER_ERROR, "Corrupt Session".to_string()),
-            UserNotFound => (StatusCode::INTERNAL_SERVER_ERROR, "User Not Found".to_string()),
-            Unknown => (StatusCode::INTERNAL_SERVER_ERROR, "Unknown Error".to_string()),
-            UserHasNoCredentials => (StatusCode::INTERNAL_SERVER_ERROR, "User Has No Credentials".to_string()),
-            InvalidSessionState(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Deserializing Session failed".to_string()),
-            MissingToken => (StatusCode::INTERNAL_SERVER_ERROR, "Missing token".to_string()),
-            WebauthnError::InvalidToken => (StatusCode::INTERNAL_SERVER_ERROR, "Invalid token".to_string()),
-            WebauthnError::DynamoDBOperationError(err) => (StatusCode::INTERNAL_SERVER_ERROR, match *err {
-                DynamoDBError::TableNotExists(table) => {
-                    format!("Service setup incomplete: {} table not configured", table)
-                }
-                _ => format!("Database operation failed: {}", err),
-            }),
-            WebauthnError::InvalidHandle => (StatusCode::INTERNAL_SERVER_ERROR, "Handle must start with the username".to_string()),
-            WebauthnError::UserCreationFailed(reason) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create user: {}", reason)),
-            WebauthnError::WebAuthnError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("WebAuthn operation failed: {}", err)),
-            WebauthnError::SessionError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Session operation failed: {}", err)),
-            WebauthnError::InvalidDID(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid DID format: {}", err)),
+            CorruptSession => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Corrupt Session".to_string(),
+            ),
+            UserNotFound => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "User Not Found".to_string(),
+            ),
+            Unknown => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unknown Error".to_string(),
+            ),
+            UserHasNoCredentials => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "User Has No Credentials".to_string(),
+            ),
+            InvalidSessionState(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Deserializing Session failed".to_string(),
+            ),
+            MissingToken => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing token".to_string(),
+            ),
+            WebauthnError::InvalidToken => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid token".to_string(),
+            ),
+            WebauthnError::DynamoDBOperationError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                match *err {
+                    DynamoDBError::TableNotExists(table) => {
+                        format!("Service setup incomplete: {} table not configured", table)
+                    }
+                    _ => format!("Database operation failed: {}", err),
+                },
+            ),
+            WebauthnError::InvalidHandle => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Handle must start with the username".to_string(),
+            ),
+            WebauthnError::UserCreationFailed(reason) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create user: {}", reason),
+            ),
+            WebauthnError::WebAuthnError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebAuthn operation failed: {}", err),
+            ),
+            WebauthnError::SessionError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Session operation failed: {}", err),
+            ),
+            WebauthnError::InvalidDID(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid DID format: {}", err),
+            ),
             WebauthnError::Cwt(err) => (StatusCode::UNAUTHORIZED, format!("CWT error: {}", err)),
         };
         (status, body).into_response()
@@ -546,7 +578,8 @@ mod tests {
         let user_id = uuid::Uuid::new_v4();
         let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).expect("decode header");
-        let sign1 = coset::CoseSign1::from_slice(&raw).expect("parse COSE_Sign1");
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
         assert_eq!(
             sign1.protected.header.alg,
             Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256))
@@ -568,8 +601,7 @@ mod tests {
         // Build a sample Cnf (cose_key + kid)
         let scalar = p256::FieldBytes::from([0x77u8; 32]);
         let secret = p256::SecretKey::from_bytes(&scalar).expect("scalar");
-        let vk: p256::ecdsa::VerifyingKey =
-            *p256::ecdsa::SigningKey::from(&secret).verifying_key();
+        let vk: p256::ecdsa::VerifyingKey = *p256::ecdsa::SigningKey::from(&secret).verifying_key();
         let cose_key = crate::cwt::cose_key_from_p256_verifying_key(&vk, b"cred-1");
         let cnf = crate::cwt::Cnf {
             cose_key,
@@ -578,7 +610,8 @@ mod tests {
 
         let token = mint_registration_token(&app_state, &user_id, cnf).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).unwrap();
-        let sign1 = coset::CoseSign1::from_slice(&raw).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
         let payload = sign1.payload.unwrap();
         let claims = crate::cwt::claims_from_cbor(&payload).unwrap();
         assert!(claims.cnf.is_some());

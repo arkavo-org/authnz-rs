@@ -531,7 +531,10 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         grant_types_supported: vec!["authorization_code", "client_credentials", "refresh_token"],
         code_challenge_methods_supported: vec!["S256"],
         arkavo_access_token_format: "application/cwt".to_string(),
-        arkavo_cose_keys_uri: format!("{}/.well-known/cose-keys", oidc.issuer.trim_end_matches('/')),
+        arkavo_cose_keys_uri: format!(
+            "{}/.well-known/cose-keys",
+            oidc.issuer.trim_end_matches('/')
+        ),
     };
     Json(doc)
 }
@@ -557,23 +560,22 @@ pub async fn cose_keys(Extension(app_state): Extension<AppState>) -> impl IntoRe
     use coset::AsCborValue;
     let key_value = match cose_key.to_cbor_value() {
         Ok(v) => v,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response()
+        Err(e) => {
+            error!("cose_keys: CoseKey -> CBOR conversion failed: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
         }
     };
     let set = ciborium::value::Value::Array(vec![key_value]);
 
     let mut bytes = Vec::new();
-    if ciborium::ser::into_writer(&set, &mut bytes).is_err() {
+    if let Err(e) = ciborium::ser::into_writer(&set, &mut bytes) {
+        error!("cose_keys: CBOR serialization failed: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
     }
 
     (
         [
-            (
-                http::header::CONTENT_TYPE,
-                "application/cose-key-set+cbor",
-            ),
+            (http::header::CONTENT_TYPE, "application/cose-key-set+cbor"),
             (http::header::CACHE_CONTROL, "public, max-age=600"),
         ],
         bytes,
@@ -1094,7 +1096,13 @@ async fn handle_client_credentials_grant(
             arkavo_roles: Some(id_claims.arkavo_roles.clone()),
             arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
         };
-        match mint_access_token(&app_state, &client_subject, &client.client_id, Some(extras), None) {
+        match mint_access_token(
+            &app_state,
+            &client_subject,
+            &client.client_id,
+            Some(extras),
+            None,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to mint access_token CWT: {}", e);
@@ -1276,7 +1284,13 @@ async fn handle_refresh_token_grant(
             arkavo_roles: Some(id_claims.arkavo_roles.clone()),
             arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
         };
-        match mint_access_token(&app_state, &record.subject, &record.client_id, Some(extras), None) {
+        match mint_access_token(
+            &app_state,
+            &record.subject,
+            &record.client_id,
+            Some(extras),
+            None,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to mint access_token CWT: {}", e);
@@ -1411,7 +1425,11 @@ pub async fn userinfo(
     let idp = claims.custom.idp.clone().unwrap_or_default();
     let arkavo_account_id = claims.custom.arkavo_account_id.clone().unwrap_or_default();
     let arkavo_roles = claims.custom.arkavo_roles.clone().unwrap_or_default();
-    let arkavo_entitlements = claims.custom.arkavo_entitlements.clone().unwrap_or_default();
+    let arkavo_entitlements = claims
+        .custom
+        .arkavo_entitlements
+        .clone()
+        .unwrap_or_default();
 
     Json(UserInfoResponse {
         sub: &sub,
@@ -1526,10 +1544,8 @@ pub(crate) async fn resolve_from_arkavo_jwt(
 ) -> Result<AuthenticatedUser, AuthorizeError> {
     let bytes = crate::cwt::decode_from_header(token)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
     let opts = crate::cwt::VerifyOptions {
-        expected_iss: Some(&issuer),
+        expected_iss: Some(&app_state.issuer),
         expected_aud: Some("arkavo"),
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
@@ -1656,9 +1672,7 @@ pub fn mint_access_token(
     extras: Option<AccessTokenExtras>,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, crate::cwt::CwtError> {
-    let issuer = std::env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string());
-    let mut claims = crate::cwt::ArkavoClaims::oidc_access(&issuer, sub, audience, 1);
+    let mut claims = crate::cwt::ArkavoClaims::oidc_access(&app_state.issuer, sub, audience, 1);
 
     if let Some(e) = extras {
         if !e.idp.is_empty() {
@@ -1755,7 +1769,10 @@ mod tests {
         let vars = env_vars(&[
             ("OIDC_CLIENT_OPENTDF_ID", "opentdf"),
             ("OIDC_CLIENT_OPENTDF_SECRET", "shh"),
-            ("OIDC_CLIENT_OPENTDF_REDIRECT_URIS", "https://a/cb,https://b/cb"),
+            (
+                "OIDC_CLIENT_OPENTDF_REDIRECT_URIS",
+                "https://a/cb,https://b/cb",
+            ),
             ("OIDC_CLIENT_NATIVEAPP_ID", "arkavo-ios"),
             ("OIDC_CLIENT_NATIVEAPP_REDIRECT_URIS", "arkavo://oauth/cb"),
             // Unrelated env var must be ignored.
@@ -2026,15 +2043,8 @@ mod tests {
         let uri = body_json["arkavo_cose_keys_uri"]
             .as_str()
             .expect("arkavo_cose_keys_uri must be a string");
-        assert!(
-            uri.ends_with("/.well-known/cose-keys"),
-            "got {}",
-            uri
-        );
-        assert_eq!(
-            uri,
-            "https://identity.arkavo.net/.well-known/cose-keys"
-        );
+        assert!(uri.ends_with("/.well-known/cose-keys"), "got {}", uri);
+        assert_eq!(uri, "https://identity.arkavo.net/.well-known/cose-keys");
     }
 
     #[tokio::test]
@@ -2069,9 +2079,15 @@ mod tests {
 
     #[tokio::test]
     async fn cose_keys_endpoint_returns_single_key() {
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let resp = crate::oidc::cose_keys(axum::extract::Extension(app_state.clone()))
@@ -2082,10 +2098,14 @@ mod tests {
         let ct = resp.headers().get("content-type").unwrap();
         assert_eq!(ct, "application/cose-key-set+cbor");
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: ciborium::value::Value =
             ciborium::de::from_reader(body.as_ref()).expect("valid CBOR");
-        let ciborium::value::Value::Array(arr) = value else { panic!("not an array") };
+        let ciborium::value::Value::Array(arr) = value else {
+            panic!("not an array")
+        };
         assert_eq!(arr.len(), 1);
     }
 
@@ -2169,6 +2189,7 @@ mod tests {
             cwt_signing_key: Arc::new(cwt_signing_key),
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new("https://identity.arkavo.net".to_string()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2262,6 +2283,7 @@ mod tests {
             cwt_signing_key: Arc::new(cwt_signing_key),
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new("https://identity.arkavo.net".to_string()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2317,19 +2339,31 @@ mod tests {
     #[tokio::test]
     async fn access_token_is_cwt_not_jwt() {
         use coset::CborSerializable;
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let extras = crate::oidc::AccessTokenExtras::default().with_idp("arkavo");
         let token = crate::oidc::mint_access_token(
-            &app_state, "arkavo:test", "opentdf", Some(extras), None,
-        ).expect("mint");
+            &app_state,
+            "arkavo:test",
+            "opentdf",
+            Some(extras),
+            None,
+        )
+        .expect("mint");
 
-        // CWT bytes start as base64url-encoded CBOR; the COSE_Sign1 parses cleanly.
+        // CWT bytes start as base64url-encoded CBOR-tag-61(COSE_Sign1).
         let raw = crate::cwt::decode_from_header(&token).unwrap();
-        let sign1 = coset::CoseSign1::from_slice(&raw).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
         let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert_eq!(claims.aud, crate::cwt::Audience::Single("opentdf".into()));
         assert_eq!(claims.custom.idp.as_deref(), Some("arkavo"));
@@ -2338,32 +2372,51 @@ mod tests {
     #[tokio::test]
     async fn access_token_apple_omits_cnf() {
         use coset::CborSerializable;
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let token = crate::oidc::mint_access_token(
-            &app_state, "apple:abc", "opentdf",
+            &app_state,
+            "apple:abc",
+            "opentdf",
             Some(crate::oidc::AccessTokenExtras::default().with_idp("apple")),
             None,
-        ).expect("mint");
+        )
+        .expect("mint");
         let raw = crate::cwt::decode_from_header(&token).unwrap();
-        let sign1 = coset::CoseSign1::from_slice(&raw).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
         let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert!(claims.cnf.is_none());
     }
 
     #[tokio::test]
     async fn oidc_authorize_rejects_legacy_jwt_x_auth_token() {
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         #[derive(serde::Serialize)]
-        struct LegacyClaims { sub: String, exp: usize }
+        struct LegacyClaims {
+            sub: String,
+            exp: usize,
+        }
         let claims = LegacyClaims {
             sub: uuid::Uuid::new_v4().to_string(),
             exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
@@ -2383,9 +2436,15 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_authorize_accepts_cwt_x_auth_token() {
-        unsafe { std::env::set_var("AWS_REGION", "us-east-1"); }
-        unsafe { std::env::set_var("AWS_ACCESS_KEY_ID", "test"); }
-        unsafe { std::env::set_var("AWS_SECRET_ACCESS_KEY", "test"); }
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        }
+        unsafe {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
@@ -2399,6 +2458,10 @@ mod tests {
         };
 
         let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
-        assert!(result.is_ok(), "CWT token should be accepted, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "CWT token should be accepted, got {:?}",
+            result.err()
+        );
     }
 }

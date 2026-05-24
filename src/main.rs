@@ -45,9 +45,9 @@ use crate::oidc::{
 };
 
 mod apple_signin;
-mod cwt;
 mod authn;
 mod constants;
+mod cwt;
 mod db;
 mod device_check;
 mod oidc;
@@ -178,6 +178,10 @@ pub struct AppState {
     /// JWKS advertises the base64url-encoded form of the same bytes
     /// (see oidc::ec_public_key_to_jwk), so CWT and JWT share the same kid.
     pub cwt_kid: Arc<Vec<u8>>,
+    /// CWT/OIDC issuer string. Resolved once at startup from `OIDC_ISSUER`
+    /// (falling back to [`crate::constants::DEFAULT_OIDC_ISSUER`]) so mint
+    /// and verify always agree on a single value within a process.
+    pub issuer: Arc<String>,
 }
 
 #[tokio::main]
@@ -254,6 +258,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
 
+    // Resolve the issuer once so mint and verify in every handler agree on a
+    // single value (eliminates per-request env reads and runtime-mutation
+    // footguns).
+    let issuer = env::var("OIDC_ISSUER")
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -264,6 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwt_signing_key: Arc::new(cwt_signing_key),
         cwt_verifying_key: Arc::new(cwt_verifying_key),
         cwt_kid: Arc::new(cwt_kid),
+        issuer: Arc::new(issuer),
     };
 
     // Set up Redis Client using fred
@@ -1104,6 +1115,7 @@ pub(crate) mod test_helpers {
             cwt_signing_key: Arc::new(cwt_signing_key),
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
+            issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
         }
     }
 }

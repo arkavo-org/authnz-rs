@@ -71,11 +71,17 @@ fn random_cti() -> [u8; 16] {
 impl ArkavoClaims {
     fn base(iss: &str, sub: &str, aud: Audience, exp_secs: i64) -> Self {
         let iat = Utc::now().timestamp();
+        // Defensive: callers pass duration constants today, so this can only
+        // overflow on a programmer error (e.g. someone bumps a unit). Panic
+        // loudly rather than wrap silently and mint a token with an absurd exp.
+        let exp = iat
+            .checked_add(exp_secs)
+            .expect("ArkavoClaims::base: iat + exp_secs overflowed i64");
         Self {
             iss: iss.to_string(),
             sub: sub.to_string(),
             aud,
-            exp: iat + exp_secs,
+            exp,
             iat,
             cti: random_cti(),
             cnf: None,
@@ -83,8 +89,25 @@ impl ArkavoClaims {
         }
     }
 
+    fn hours_to_secs(hours: i64) -> i64 {
+        hours
+            .checked_mul(3600)
+            .expect("ArkavoClaims: hours * 3600 overflowed i64")
+    }
+
+    fn weeks_to_secs(weeks: i64) -> i64 {
+        weeks
+            .checked_mul(7 * 24 * 3600)
+            .expect("ArkavoClaims: weeks * 7*24*3600 overflowed i64")
+    }
+
     pub fn auth(iss: &str, sub: &str, hours: i64) -> Self {
-        Self::base(iss, sub, Audience::Single("arkavo".into()), hours * 3600)
+        Self::base(
+            iss,
+            sub,
+            Audience::Single("arkavo".into()),
+            Self::hours_to_secs(hours),
+        )
     }
 
     pub fn registration(iss: &str, sub: &str, weeks: i64) -> Self {
@@ -92,7 +115,7 @@ impl ArkavoClaims {
             iss,
             sub,
             Audience::Single("arkavo".into()),
-            weeks * 7 * 24 * 3600,
+            Self::weeks_to_secs(weeks),
         )
     }
 
@@ -101,12 +124,17 @@ impl ArkavoClaims {
             iss,
             sub,
             Audience::Single("arkavo:devicecheck".into()),
-            hours * 3600,
+            Self::hours_to_secs(hours),
         )
     }
 
     pub fn oidc_access(iss: &str, sub: &str, audience: &str, hours: i64) -> Self {
-        Self::base(iss, sub, Audience::Single(audience.into()), hours * 3600)
+        Self::base(
+            iss,
+            sub,
+            Audience::Single(audience.into()),
+            Self::hours_to_secs(hours),
+        )
     }
 
     pub fn with_cnf(mut self, cnf: Cnf) -> Self {
@@ -148,15 +176,20 @@ impl ArkavoClaims {
 
 use base64::Engine;
 use ciborium::value::{Integer, Value};
-use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
+use coset::{AsCborValue, CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
 
 /// Convert a P-256 VerifyingKey into a COSE_Key (RFC 9052 §7).
 pub fn cose_key_from_p256_verifying_key(vk: &VerifyingKey, kid: &[u8]) -> coset::CoseKey {
-    use coset::iana;
     let encoded = vk.to_encoded_point(false);
-    let x = encoded.x().expect("uncompressed P-256 point has x").to_vec();
-    let y = encoded.y().expect("uncompressed P-256 point has y").to_vec();
+    let x = encoded
+        .x()
+        .expect("uncompressed P-256 point has x")
+        .to_vec();
+    let y = encoded
+        .y()
+        .expect("uncompressed P-256 point has y")
+        .to_vec();
 
     coset::CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x, y)
         .algorithm(iana::Algorithm::ES256)
@@ -199,10 +232,25 @@ pub fn cnf_from_passkey(passkey: &webauthn_rs::prelude::Passkey) -> Result<Cnf, 
 /// `device_bindings` DynamoDB table. `device_id` is the App Attest
 /// key ID, used as the cnf.kid.
 pub fn cnf_from_app_attest(public_key_bytes: &[u8], device_id: &[u8]) -> Result<Cnf, CwtError> {
-    let vk = VerifyingKey::from_sec1_bytes(public_key_bytes)
-        .map_err(|_| CwtError::Malformed)?;
+    let vk = VerifyingKey::from_sec1_bytes(public_key_bytes).map_err(|_| CwtError::Malformed)?;
     let cose_key = cose_key_from_p256_verifying_key(&vk, device_id);
-    Ok(Cnf { cose_key, kid: device_id.to_vec() })
+    Ok(Cnf {
+        cose_key,
+        kid: device_id.to_vec(),
+    })
+}
+
+/// CBOR encoding of tag #6.61 (CWT, RFC 8392 §6):
+/// major type 6, additional info 24, uint8 = 61.
+pub(crate) const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
+
+/// Strip the CWT CBOR tag #6.61 prefix. Strict: input MUST start with the
+/// tag. Untagged COSE_Sign1 is rejected so a downstream verifier cannot be
+/// tricked by feeding raw COSE_Sign1 to a CWT consumer.
+pub(crate) fn strip_cwt_tag(bytes: &[u8]) -> Result<&[u8], CwtError> {
+    bytes
+        .strip_prefix(&CWT_TAG_PREFIX[..])
+        .ok_or(CwtError::Malformed)
 }
 
 pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
@@ -222,7 +270,14 @@ pub fn mint(claims: &ArkavoClaims, key: &SigningKey, kid: &[u8]) -> Result<Vec<u
         })
         .build();
 
-    sign1.to_vec().map_err(|_| CwtError::Malformed)
+    let inner = sign1.to_vec().map_err(|_| CwtError::Malformed)?;
+    // Wrap in CBOR tag #6.61 (CWT) per RFC 8392 §6 so strict CWT verifiers
+    // (HSM-backed validators, opentdf tdf-rs) can disambiguate the message
+    // from a generic COSE_Sign1.
+    let mut out = Vec::with_capacity(CWT_TAG_PREFIX.len() + inner.len());
+    out.extend_from_slice(&CWT_TAG_PREFIX);
+    out.extend_from_slice(&inner);
+    Ok(out)
 }
 
 pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
@@ -235,6 +290,12 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
         match &c.aud {
             Audience::Single(s) => Value::Text(s.clone()),
             Audience::Multiple(v) => {
+                // Decoder rejects an empty multi-audience array; reject the
+                // same shape on the way out so a misuse can't produce a token
+                // the verifier (or any RFC 8392 verifier) refuses.
+                if v.is_empty() {
+                    return Err(CwtError::Malformed);
+                }
                 Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect())
             }
         },
@@ -245,8 +306,7 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
 
     if let Some(cnf) = &c.cnf {
         let mut cnf_entries: Vec<(Value, Value)> = Vec::new();
-        // Serialize CoseKey via coset's AsCborValue.
-        use coset::AsCborValue;
+        // Serialize CoseKey via coset's AsCborValue (imported at module level).
         let cose_key_value = cnf
             .cose_key
             .clone()
@@ -391,7 +451,6 @@ pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 for (kk, vv) in map {
                     match (kk, vv) {
                         (Value::Integer(j), val) if int_label(&j) == 1 => {
-                            use coset::AsCborValue;
                             cose_key = Some(
                                 coset::CoseKey::from_cbor_value(val)
                                     .map_err(|_| CwtError::Malformed)?,
@@ -467,7 +526,10 @@ pub fn verify(
     key: &VerifyingKey,
     opts: &VerifyOptions,
 ) -> Result<ArkavoClaims, CwtError> {
-    let sign1 = coset::CoseSign1::from_slice(bytes).map_err(|_| CwtError::Malformed)?;
+    // RFC 8392 §6: strict require the CWT CBOR tag #6.61 around the
+    // COSE_Sign1. Untagged input is rejected.
+    let inner = strip_cwt_tag(bytes)?;
+    let sign1 = coset::CoseSign1::from_slice(inner).map_err(|_| CwtError::Malformed)?;
 
     // Strictness: alg MUST be ES256 in the PROTECTED header.
     match sign1.protected.header.alg {
@@ -503,6 +565,12 @@ pub fn verify(
         if !matches_aud {
             return Err(CwtError::AudienceMismatch);
         }
+    }
+
+    // Reject internally-inconsistent lifetimes (a well-formed issuer never mints
+    // exp < iat; rejecting closes a class of token-forgery / clock-skew shenanigans).
+    if claims.iat > claims.exp {
+        return Err(CwtError::Malformed);
     }
 
     // exp / iat with ±skew.
@@ -547,9 +615,13 @@ mod tests {
         let (sk, _vk) = test_keypair();
         let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
-        // Decode the COSE_Sign1 envelope.
-        let sign1 = coset::CoseSign1::from_slice(&bytes).expect("parse COSE_Sign1");
-        assert_eq!(sign1.protected.header.alg, Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)));
+        // Strip the CWT tag and decode the COSE_Sign1 envelope.
+        let inner = strip_cwt_tag(&bytes).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
+        assert_eq!(
+            sign1.protected.header.alg,
+            Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256))
+        );
         assert_eq!(sign1.protected.header.key_id, test_kid());
         assert!(sign1.payload.is_some());
     }
@@ -559,7 +631,7 @@ mod tests {
         let (sk, _vk) = test_keypair();
         let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
-        let sign1 = coset::CoseSign1::from_slice(&bytes).unwrap();
+        let sign1 = coset::CoseSign1::from_slice(strip_cwt_tag(&bytes).unwrap()).unwrap();
         let payload_bytes = sign1.payload.unwrap();
         let decoded = claims_from_cbor(&payload_bytes).expect("decode payload");
         assert_eq!(decoded.iss, "iss-1");
@@ -568,7 +640,10 @@ mod tests {
 
     #[test]
     fn cwt_error_display() {
-        assert_eq!(CwtError::Malformed.to_string(), "malformed COSE_Sign1 or CBOR");
+        assert_eq!(
+            CwtError::Malformed.to_string(),
+            "malformed COSE_Sign1 or CBOR"
+        );
         assert_eq!(
             CwtError::UnsupportedAlg.to_string(),
             "unsupported algorithm (only ES256 is accepted)"
@@ -654,7 +729,11 @@ mod tests {
         // 0xa3 = map(3 entries); 0x01 = uint 1; 0x61, 'a' = tstr "a"; 0x01 = uint 1; 0x61, 'b' = tstr "b"; 0x02 = uint 2; 0x61, 'c' = tstr "c"
         let bytes = vec![0xa3, 0x01, 0x61, b'a', 0x01, 0x61, b'b', 0x02, 0x61, b'c'];
         let result = claims_from_cbor(&bytes);
-        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -675,16 +754,20 @@ mod tests {
         // Map(6 entries): {1: "i", 2: "s", 3: [], 4: 0, 6: 0, 7: <16 zero bytes>}
         let mut bytes = vec![
             0xa6, // map(6)
-            0x01, 0x61, b'i',                     // 1: "i"
-            0x02, 0x61, b's',                     // 2: "s"
-            0x03, 0x80,                            // 3: []  (empty array)
-            0x04, 0x00,                            // 4: 0
-            0x06, 0x00,                            // 6: 0
-            0x07, 0x50,                            // 7: bstr(16) follows
+            0x01, 0x61, b'i', // 1: "i"
+            0x02, 0x61, b's', // 2: "s"
+            0x03, 0x80, // 3: []  (empty array)
+            0x04, 0x00, // 4: 0
+            0x06, 0x00, // 6: 0
+            0x07, 0x50, // 7: bstr(16) follows
         ];
         bytes.extend_from_slice(&[0u8; 16]);
         let result = claims_from_cbor(&bytes);
-        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -693,16 +776,18 @@ mod tests {
         // CBOR encoding of 2^63: uint major type (0x1b) + 8 bytes 0x80 00 00 00 00 00 00 00
         let mut bytes = vec![
             0xa6, // map(6)
-            0x01, 0x61, b'i',
-            0x02, 0x61, b's',
-            0x03, 0x61, b'a',                     // aud: "a"
+            0x01, 0x61, b'i', 0x02, 0x61, b's', 0x03, 0x61, b'a', // aud: "a"
             0x04, 0x1b, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exp: 2^63
-            0x06, 0x00,                            // iat: 0
-            0x07, 0x50,                            // cti: 16 bytes
+            0x06, 0x00, // iat: 0
+            0x07, 0x50, // cti: 16 bytes
         ];
         bytes.extend_from_slice(&[0u8; 16]);
         let result = claims_from_cbor(&bytes);
-        assert!(matches!(result, Err(CwtError::Malformed)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -719,6 +804,37 @@ mod tests {
         };
         let decoded = verify(&bytes, &vk, &opts).expect("verify");
         assert_eq!(decoded.sub, "sub-1");
+    }
+
+    #[test]
+    fn mint_emits_cwt_cbor_tag_61() {
+        let (sk, _vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
+        // RFC 8392 §6: tag 61 encodes as [0xD8, 0x3D] (major-6 + uint8(61)).
+        assert_eq!(&bytes[..2], &[0xD8, 0x3D]);
+    }
+
+    #[test]
+    fn verify_rejects_untagged_cose_sign1() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let tagged = mint(&claims, &sk, &test_kid()).unwrap();
+        // Strip the tag -> bare COSE_Sign1; verifier must reject.
+        let untagged = &tagged[CWT_TAG_PREFIX.len()..];
+
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        let result = verify(untagged, &vk, &opts);
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -754,7 +870,10 @@ mod tests {
             skew_secs: 60,
         };
         let result = verify(&bytes, &vk, &opts);
-        assert!(matches!(result, Err(CwtError::InvalidSignature) | Err(CwtError::Malformed)));
+        assert!(matches!(
+            result,
+            Err(CwtError::InvalidSignature) | Err(CwtError::Malformed)
+        ));
     }
 
     #[test]
@@ -778,7 +897,8 @@ mod tests {
                 sig.to_bytes().to_vec()
             })
             .build();
-        let bytes = sign1.to_vec().unwrap();
+        let mut bytes = CWT_TAG_PREFIX.to_vec();
+        bytes.extend_from_slice(&sign1.to_vec().unwrap());
 
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -787,7 +907,11 @@ mod tests {
             skew_secs: 60,
         };
         let result = verify(&bytes, &vk, &opts);
-        assert!(matches!(result, Err(CwtError::UnsupportedAlg)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::UnsupportedAlg)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -797,9 +921,7 @@ mod tests {
         let payload = claims_to_cbor(&claims).unwrap();
         let (sk, vk) = test_keypair();
 
-        let protected = coset::HeaderBuilder::new()
-            .key_id(test_kid())
-            .build();
+        let protected = coset::HeaderBuilder::new().key_id(test_kid()).build();
 
         let sign1 = coset::CoseSign1Builder::new()
             .protected(protected)
@@ -809,7 +931,8 @@ mod tests {
                 sig.to_bytes().to_vec()
             })
             .build();
-        let bytes = sign1.to_vec().unwrap();
+        let mut bytes = CWT_TAG_PREFIX.to_vec();
+        bytes.extend_from_slice(&sign1.to_vec().unwrap());
 
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -818,7 +941,11 @@ mod tests {
             skew_secs: 60,
         };
         let result = verify(&bytes, &vk, &opts);
-        assert!(matches!(result, Err(CwtError::UnsupportedAlg)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::UnsupportedAlg)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -852,7 +979,11 @@ mod tests {
             skew_secs: 60,
         };
         let result = verify(&bytes, &vk, &opts);
-        assert!(matches!(result, Err(CwtError::NotYetValid)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(CwtError::NotYetValid)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -882,7 +1013,10 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        assert!(matches!(verify(&bytes, &vk, &opts), Err(CwtError::IssuerMismatch)));
+        assert!(matches!(
+            verify(&bytes, &vk, &opts),
+            Err(CwtError::IssuerMismatch)
+        ));
     }
 
     #[test]
@@ -896,7 +1030,10 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        assert!(matches!(verify(&bytes, &vk, &opts), Err(CwtError::AudienceMismatch)));
+        assert!(matches!(
+            verify(&bytes, &vk, &opts),
+            Err(CwtError::AudienceMismatch)
+        ));
     }
 
     #[test]
@@ -926,7 +1063,10 @@ mod tests {
         // tests in later tasks.
         let cred_id: Vec<u8> = b"test-credential-id".to_vec();
         let cose_key = sample_cose_key();
-        let cnf = Cnf { cose_key, kid: cred_id.clone() };
+        let cnf = Cnf {
+            cose_key,
+            kid: cred_id.clone(),
+        };
         assert_eq!(cnf.kid, cred_id);
     }
 
@@ -934,8 +1074,10 @@ mod tests {
     fn mint_with_cnf_roundtrips() {
         let (sk, vk) = test_keypair();
         let cose_key = sample_cose_key();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
-            .with_cnf(Cnf { cose_key: cose_key.clone(), kid: b"cred-id".to_vec() });
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1).with_cnf(Cnf {
+            cose_key: cose_key.clone(),
+            kid: b"cred-id".to_vec(),
+        });
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -958,10 +1100,13 @@ mod tests {
     fn without_cnf_omits_cnf_from_payload() {
         let (sk, _vk) = test_keypair();
         let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
-            .with_cnf(Cnf { cose_key: sample_cose_key(), kid: b"x".to_vec() })
+            .with_cnf(Cnf {
+                cose_key: sample_cose_key(),
+                kid: b"x".to_vec(),
+            })
             .without_cnf();
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
-        let sign1 = coset::CoseSign1::from_slice(&bytes).unwrap();
+        let sign1 = coset::CoseSign1::from_slice(strip_cwt_tag(&bytes).unwrap()).unwrap();
         let decoded = claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert!(decoded.cnf.is_none());
     }
@@ -989,7 +1134,10 @@ mod tests {
 
     #[test]
     fn decode_from_header_rejects_invalid_base64() {
-        assert!(matches!(decode_from_header("!!!not-base64!!!"), Err(CwtError::Malformed)));
+        assert!(matches!(
+            decode_from_header("!!!not-base64!!!"),
+            Err(CwtError::Malformed)
+        ));
     }
 
     #[test]
