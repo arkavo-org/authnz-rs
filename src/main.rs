@@ -1020,3 +1020,82 @@ mod tests {
         assert!(!validate_oauth_state(&"a".repeat(101)));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Build an AppState suitable for unit tests. Uses a fixed scalar
+    /// so signatures are reproducible. Requires AWS env vars to be set
+    /// (fake values are fine) before calling, as DynamoDBStore::new is async.
+    pub async fn build_test_app_state() -> AppState {
+        use base64::Engine;
+        use p256::pkcs8::EncodePrivateKey;
+
+        // Use a fixed [0x42u8; 32] scalar so test signatures are stable.
+        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
+        let secret = p256::SecretKey::new(scalar);
+
+        // SigningKey for attestation envelope.
+        let signing_key: ecdsa::SigningKey<p256::NistP256> = (&secret).into();
+
+        // JWT EncodingKey from the PKCS8 DER form.
+        let pkcs8_der = secret.to_pkcs8_der().expect("encode pkcs8");
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(pkcs8_der.as_bytes());
+
+        // Decoding key — use a placeholder (tests using JWT decoding should use their own key).
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(&[]);
+
+        // CWT keys (same scalar).
+        let cwt_signing_key: p256::ecdsa::SigningKey = (&secret).into();
+        let cwt_verifying_key = *cwt_signing_key.verifying_key();
+
+        // CWT kid: RFC 7638 thumbprint (raw 32 bytes).
+        let cwt_kid: Vec<u8> = {
+            let encoded = cwt_verifying_key.to_encoded_point(false);
+            let x = encoded.x().unwrap();
+            let y = encoded.y().unwrap();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let thumb_input = format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                b64.encode(x),
+                b64.encode(y)
+            );
+            let mut hasher = Sha256::new();
+            hasher.update(thumb_input.as_bytes());
+            hasher.finalize().to_vec()
+        };
+
+        let webauthn = Arc::new(
+            webauthn_rs::WebauthnBuilder::new(
+                "identity.arkavo.net",
+                &url::Url::parse("https://identity.arkavo.net").unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap(),
+        );
+
+        let db_store = Arc::new(
+            crate::db::DynamoDBStore::new(
+                "credentials".to_string(),
+                "handles".to_string(),
+                "device_bindings".to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        AppState {
+            webauthn,
+            db_store,
+            signing_key: Arc::new(signing_key),
+            encoding_key: Arc::new(encoding_key),
+            decoding_key: Arc::new(decoding_key),
+            cwt_signing_key: Arc::new(cwt_signing_key),
+            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_kid: Arc::new(cwt_kid),
+        }
+    }
+}

@@ -344,8 +344,9 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            // Generate JWT token
-            let token = generate_jwt(user_unique_id, &app_state)?;
+            // Generate CWT auth token (1-hour, no cnf binding at this point;
+            // cnf binding is added in Task 15 once the passkey is retrieved from DB).
+            let token = mint_auth_token(&app_state, &user_unique_id, None)?;
             info!("Authentication successful for user: {}", user_unique_id);
             Ok((StatusCode::OK, Json(AuthResponse { jwt_token: token })))
         }
@@ -408,13 +409,20 @@ impl AttestationEnvelope {
     }
 }
 
-fn generate_jwt(user_id: Uuid, app_state: &AppState) -> Result<String, WebauthnError> {
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(AUTH_TOKEN_HOURS)).timestamp() as usize,
-    };
-    let header = Header::new(Algorithm::ES256);
-    encode(&header, &claims, &app_state.encoding_key).map_err(TokenCreationError)
+pub fn mint_auth_token(
+    app_state: &AppState,
+    user_id: &Uuid,
+    cnf: Option<crate::cwt::Cnf>,
+) -> Result<String, WebauthnError> {
+    let issuer = std::env::var("OIDC_ISSUER")
+        .unwrap_or_else(|_| "https://identity.arkavo.net".to_string());
+    let mut claims =
+        crate::cwt::ArkavoClaims::auth(&issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
+    if let Some(c) = cnf {
+        claims = claims.with_cnf(c);
+    }
+    let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
+    Ok(crate::cwt::encode_for_header(&bytes))
 }
 
 #[derive(Error, Debug)]
@@ -449,35 +457,36 @@ pub enum WebauthnError {
     SessionError(String),
     #[error("Invalid DID format: {0}")]
     InvalidDID(String),
+    #[error("CWT error: {0}")]
+    Cwt(#[from] crate::cwt::CwtError),
 }
 
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
-        let body = match self {
-            CorruptSession => "Corrupt Session".to_string(),
-            UserNotFound => "User Not Found".to_string(),
-            Unknown => "Unknown Error".to_string(),
-            UserHasNoCredentials => "User Has No Credentials".to_string(),
-            InvalidSessionState(_) => "Deserializing Session failed".to_string(),
-            TokenCreationError(err) => format!("Token creation failed: {}", err),
-            MissingToken => "Missing token".to_string(),
-            WebauthnError::InvalidToken => "Invalid token".to_string(),
-            WebauthnError::TokenDecodingError(err) => format!("Token decoding error: {}", err),
-            WebauthnError::DynamoDBOperationError(err) => match *err {
+        let (status, body) = match self {
+            CorruptSession => (StatusCode::INTERNAL_SERVER_ERROR, "Corrupt Session".to_string()),
+            UserNotFound => (StatusCode::INTERNAL_SERVER_ERROR, "User Not Found".to_string()),
+            Unknown => (StatusCode::INTERNAL_SERVER_ERROR, "Unknown Error".to_string()),
+            UserHasNoCredentials => (StatusCode::INTERNAL_SERVER_ERROR, "User Has No Credentials".to_string()),
+            InvalidSessionState(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Deserializing Session failed".to_string()),
+            TokenCreationError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Token creation failed: {}", err)),
+            MissingToken => (StatusCode::INTERNAL_SERVER_ERROR, "Missing token".to_string()),
+            WebauthnError::InvalidToken => (StatusCode::INTERNAL_SERVER_ERROR, "Invalid token".to_string()),
+            WebauthnError::TokenDecodingError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Token decoding error: {}", err)),
+            WebauthnError::DynamoDBOperationError(err) => (StatusCode::INTERNAL_SERVER_ERROR, match *err {
                 DynamoDBError::TableNotExists(table) => {
                     format!("Service setup incomplete: {} table not configured", table)
                 }
                 _ => format!("Database operation failed: {}", err),
-            },
-            WebauthnError::InvalidHandle => "Handle must start with the username".to_string(),
-            WebauthnError::UserCreationFailed(reason) => {
-                format!("Failed to create user: {}", reason)
-            }
-            WebauthnError::WebAuthnError(err) => format!("WebAuthn operation failed: {}", err),
-            WebauthnError::SessionError(err) => format!("Session operation failed: {}", err),
-            WebauthnError::InvalidDID(err) => format!("Invalid DID format: {}", err),
+            }),
+            WebauthnError::InvalidHandle => (StatusCode::INTERNAL_SERVER_ERROR, "Handle must start with the username".to_string()),
+            WebauthnError::UserCreationFailed(reason) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create user: {}", reason)),
+            WebauthnError::WebAuthnError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("WebAuthn operation failed: {}", err)),
+            WebauthnError::SessionError(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Session operation failed: {}", err)),
+            WebauthnError::InvalidDID(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid DID format: {}", err)),
+            WebauthnError::Cwt(err) => (StatusCode::UNAUTHORIZED, format!("CWT error: {}", err)),
         };
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        (status, body).into_response()
     }
 }
 
@@ -535,5 +544,24 @@ mod tests {
             let response = error.into_response();
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn auth_token_is_cose_sign1() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).expect("decode header");
+        let sign1 = coset::CoseSign1::from_slice(&raw).expect("parse COSE_Sign1");
+        assert_eq!(
+            sign1.protected.header.alg,
+            Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256))
+        );
     }
 }
