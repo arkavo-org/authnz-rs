@@ -104,9 +104,16 @@ impl DynamoDBStore {
         let link_pk = format!("{}#{}", provider, subject);
         let now = chrono::Utc::now().timestamp();
 
+        // Privacy: never log the full link_pk (it contains the pseudonymous
+        // IdP subject). The handler in apple_signin.rs deliberately logs only
+        // the first 8 chars of subject; mirror that here so the handler →
+        // db.rs log chain can still be correlated without disclosing the
+        // full sub.
+        let subject_log = log_subject_prefix(subject);
+
         info!(
-            "Linking identity. Table: {}, link_pk: {}, user_id: {}",
-            self.identity_links_table, link_pk, user_id
+            "Linking identity. Table: {}, provider: {}, subject_prefix: {}, user_id: {}",
+            self.identity_links_table, provider, subject_log, user_id
         );
 
         let result = self
@@ -127,14 +134,20 @@ impl DynamoDBStore {
 
         match result {
             Ok(_) => {
-                info!("Linked identity {} to user {}", link_pk, user_id);
+                info!(
+                    "Linked identity provider={} subject_prefix={} to user {}",
+                    provider, subject_log, user_id
+                );
                 Ok(())
             }
             Err(err) => match err {
                 SdkError::ServiceError(ref service_error) => {
                     let code = service_error.err().meta().code();
                     if code == Some("ConditionalCheckFailedException") {
-                        warn!("Identity {} already linked to a different user", link_pk);
+                        warn!(
+                            "Identity provider={} subject_prefix={} already linked to a different user",
+                            provider, subject_log
+                        );
                         return Err(DynamoDBError::LinkConflict);
                     }
                     if code == Some("ResourceNotFoundException") {
@@ -146,11 +159,17 @@ impl DynamoDBStore {
                             self.identity_links_table.clone(),
                         ));
                     }
-                    error!("Failed to write identity link {}: {:?}", link_pk, err);
+                    error!(
+                        "Failed to write identity link provider={} subject_prefix={}: {:?}",
+                        provider, subject_log, err
+                    );
                     Err(DynamoDBError::SdkError(err.to_string()))
                 }
                 _ => {
-                    error!("Unknown error writing identity link {}: {:?}", link_pk, err);
+                    error!(
+                        "Unknown error writing identity link provider={} subject_prefix={}: {:?}",
+                        provider, subject_log, err
+                    );
                     Err(DynamoDBError::SdkError(err.to_string()))
                 }
             },
@@ -760,6 +779,19 @@ impl DynamoDBStore {
     }
 }
 
+/// Privacy-preserving subject masker used by `link_identity` logs.
+///
+/// Returns the first 8 *characters* of an opaque IdP subject (Apple `sub`,
+/// future Google `sub`, etc.) so log lines can be correlated end-to-end
+/// without disclosing the full pseudonymous identifier. `char_indices` is
+/// used so multi-byte UTF-8 subjects do not panic on a mid-codepoint slice.
+fn log_subject_prefix(subject: &str) -> &str {
+    match subject.char_indices().nth(8) {
+        Some((byte_idx, _)) => &subject[..byte_idx],
+        None => subject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,5 +910,21 @@ mod tests {
     fn test_invalid_did_error() {
         let error = DynamoDBError::InvalidDID("DID must start with 'did:key:'".to_string());
         assert!(error.to_string().contains("did:key:"));
+    }
+
+    #[test]
+    fn test_log_subject_prefix_caps_at_eight_chars() {
+        assert_eq!(log_subject_prefix("001234.abcdef.ghijkl"), "001234.a");
+        assert_eq!(log_subject_prefix("short"), "short");
+        assert_eq!(log_subject_prefix(""), "");
+    }
+
+    #[test]
+    fn test_log_subject_prefix_handles_multibyte_utf8() {
+        // Regression guard: byte-slicing would panic mid-codepoint here.
+        let sub = "αβγδεζηθι";
+        let prefix = log_subject_prefix(sub);
+        assert_eq!(prefix, "αβγδεζηθ");
+        assert_eq!(prefix.chars().count(), 8);
     }
 }
