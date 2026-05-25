@@ -54,7 +54,7 @@ use crate::db::DynamoDBError;
 use crate::oidc::AuthenticatedUser;
 use axum::Json;
 use axum::extract::Extension;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
@@ -141,6 +141,14 @@ pub enum AppleSigninError {
     MissingClientId,
     #[error("session error: {0}")]
     SessionError(String),
+    #[error("Missing X-Auth-Token header")]
+    MissingAuth,
+    #[error("Invalid X-Auth-Token")]
+    InvalidAuth,
+    #[error("Apple identity already linked to a different account")]
+    LinkConflict,
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl IntoResponse for AppleSigninError {
@@ -149,10 +157,11 @@ impl IntoResponse for AppleSigninError {
             AppleSigninError::JwksFetch(_) | AppleSigninError::JwksParse(_) => {
                 StatusCode::BAD_GATEWAY
             }
-            AppleSigninError::MissingClientId | AppleSigninError::SessionError(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AppleSigninError::MissingClientId
+            | AppleSigninError::SessionError(_)
+            | AppleSigninError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppleSigninError::MissingSessionNonce => StatusCode::BAD_REQUEST,
+            AppleSigninError::LinkConflict => StatusCode::CONFLICT,
             _ => StatusCode::UNAUTHORIZED,
         };
         (status, self.to_string()).into_response()
@@ -560,6 +569,99 @@ pub async fn apple_idtoken_handler(
     .into_response()
 }
 
+/// Link an Apple identity to the currently-authenticated arkavo account.
+///
+/// Auth: requires a valid Arkavo CWT in the `X-Auth-Token` header. The CWT
+/// `sub` claim is the arkavo user_id that the Apple `sub` will be bound to.
+///
+/// Preamble: client must have called `GET /oauth/apple/nonce` on the same
+/// session. The id_token's `nonce` claim is matched against the session-stored
+/// nonce (verbatim or hex SHA-256, single-use, ≤ 10-minute TTL).
+///
+/// Minimum-PII posture: only the Apple `sub` is persisted, as a row in the
+/// `identity_links` table keyed by `apple#<sub>`. Email, name, private-relay
+/// address, and `real_user_status` claims are **deliberately discarded** even
+/// if Apple includes them — this endpoint treats Sign in with Apple as a pure
+/// authentication signal, not an identity source. Callers who want PII must
+/// request and store it on a separate code path.
+///
+/// Responses:
+///  - `200 OK`: identity successfully linked (or re-linked to the same user;
+///    the operation is idempotent on `(provider, subject) → user_id`).
+///  - `400 Bad Request`: no session nonce, or expired session nonce.
+///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, or Apple id_token
+///    validation failure (signature, iss, aud, nonce, exp, iat).
+///  - `409 Conflict`: this Apple `sub` is already linked to a *different*
+///    arkavo user. The conflicting user_id is **not** disclosed.
+///  - `500 Internal Server Error`: DynamoDB or configuration failure.
+pub async fn apple_link_handler(
+    Extension(app_state): Extension<AppState>,
+    Extension(cache): Extension<Arc<AppleJwksCache>>,
+    session: Session,
+    headers: HeaderMap,
+    Json(req): Json<AppleIdTokenRequest>,
+) -> Response {
+    // 1. Caller must be authenticated. The CWT's `sub` is the arkavo user_id
+    //    we'll bind the Apple identity to.
+    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // 2. Same nonce dance as the bootstrap endpoint — single-use consume,
+    //    bound to this session.
+    let raw_nonce = match consume_apple_nonce(&session).await {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+
+    // 3. Validate the Apple id_token. We only consume `sub` from the result;
+    //    any email/name claims that snuck through with non-empty scopes are
+    //    discarded below.
+    let claims = match verify_apple_id_token(&cache, &req.id_token, &raw_nonce).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // 4. Persist the link. The conditional put gives us per-subject uniqueness;
+    //    a 409 here means this Apple `sub` is already bound to a different
+    //    arkavo user — typically an account-hijack attempt or a user who has
+    //    already registered with us via the Apple-bootstrap path.
+    match app_state
+        .db_store
+        .link_identity(user_id, "apple", &claims.sub)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(crate::db::DynamoDBError::LinkConflict) => {
+            AppleSigninError::LinkConflict.into_response()
+        }
+        Err(e) => {
+            error!("Failed to link Apple identity: {}", e);
+            AppleSigninError::Internal(e.to_string()).into_response()
+        }
+    }
+}
+
+/// Extract the authenticated arkavo user_id from the inbound `X-Auth-Token`
+/// CWT header. Returns [`AppleSigninError::MissingAuth`] (HTTP 401) if the
+/// header is absent, [`AppleSigninError::InvalidAuth`] (HTTP 401) if the CWT
+/// fails to verify or its `sub` is not a valid UUID.
+fn extract_authenticated_user_id(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppleSigninError> {
+    let token_header = headers
+        .get("X-Auth-Token")
+        .ok_or(AppleSigninError::MissingAuth)?;
+    let token_str = token_header
+        .to_str()
+        .map_err(|_| AppleSigninError::InvalidAuth)?;
+    let claims = crate::authn::verify_inbound_account_token(app_state, token_str)
+        .map_err(|_| AppleSigninError::InvalidAuth)?;
+    Uuid::parse_str(&claims.sub).map_err(|_| AppleSigninError::InvalidAuth)
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct AppleCallbackForm {
@@ -701,6 +803,24 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::MissingAuth.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::InvalidAuth.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::LinkConflict.into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppleSigninError::Internal("boom".into())
+                .into_response()
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

@@ -38,6 +38,7 @@ export DECODING_KEY_PATH=/path/to/decodekey.pem
 export DYNAMODB_CREDENTIALS_TABLE=credentials
 export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
+export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 
 # Optional: Set port (defaults to 8080)
 export PORT=8080
@@ -85,6 +86,7 @@ export DECODING_KEY_PATH=/etc/authnz-rs/keys/decodekey.pem
 export DYNAMODB_CREDENTIALS_TABLE=credentials
 export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
+export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export AWS_REGION=us-east-1
 
 # Run the server
@@ -207,6 +209,12 @@ aws dynamodb create-table \
 - `POST /oauth/apple/idtoken`: Native flow — client must have called
   `/oauth/apple/nonce` first; server consumes session nonce (single-use) and
   validates the id_token against it
+- `POST /oauth/apple/link`: **Auth-required** link path. Caller presents a
+  valid Arkavo CWT via `X-Auth-Token`; server consumes the session nonce,
+  validates the Apple id_token, and writes `(user_id, "apple", sub)` to the
+  `identity_links` table. Idempotent on repeat; returns HTTP 409 if the same
+  Apple `sub` is already linked to a different arkavo user. **Minimum-PII**:
+  no email/name/relay claims are persisted, even if Apple sends them.
 - `POST /oauth/apple/callback`: **explicitly disabled** (HTTP 501). Apple web
   callback requires both code-exchange (signed client-secret JWT against
   Apple's token endpoint) *and* state-bound nonce verification. Until both
@@ -394,6 +402,22 @@ When modifying token lifetimes, update these in authn.rs:
   - app_id (String) - rpIdHash for App ID validation
   - created_at (Number) - Unix timestamp
   - updated_at (Number) - Unix timestamp (updated on each assertion)
+
+### identity_links table
+- **Primary Key**: link_pk (String) - Format: `<provider>#<subject>` (e.g. `apple#001234.abc...`)
+- **Attributes**:
+  - user_id (String/UUID) - The arkavo account bound to this third-party identity
+  - provider (String) - IdP name (`apple`, future: `google`, etc.)
+  - subject (String) - The IdP's stable subject identifier
+  - linked_at (Number) - Unix timestamp
+- **Uniqueness**: Conditional put on `link_pk` enforces per-(provider, subject) uniqueness.
+  Re-linking the same identity to the same user is idempotent; binding to a
+  different user returns `DynamoDBError::LinkConflict` (HTTP 409 upstream).
+- **PII**: Deliberately minimal. No email, display name, relay address, or
+  `real_user_status` is stored here, even if the IdP returns them.
+- **Future GSI** `user_id-index`: Add when an endpoint needs to enumerate
+  "which providers has this user linked?" — not required by the current
+  endpoint surface.
 
 ## Common Development Patterns
 

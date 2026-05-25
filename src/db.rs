@@ -40,6 +40,9 @@ pub enum DynamoDBError {
 
     #[error("Invalid DID format: {0}")]
     InvalidDID(String),
+
+    #[error("Identity already linked to a different user")]
+    LinkConflict,
 }
 
 impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
@@ -62,6 +65,7 @@ pub struct DynamoDBStore {
     credentials_table: String,
     handles_table: String,
     device_bindings_table: String,
+    identity_links_table: String,
 }
 
 impl DynamoDBStore {
@@ -69,6 +73,7 @@ impl DynamoDBStore {
         credentials_table: String,
         handles_table: String,
         device_bindings_table: String,
+        identity_links_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -78,7 +83,117 @@ impl DynamoDBStore {
             credentials_table,
             handles_table,
             device_bindings_table,
+            identity_links_table,
         })
+    }
+
+    /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
+    ///
+    /// Idempotent on (provider, subject): re-linking the same identity to the
+    /// same user succeeds silently; linking to a different user returns
+    /// [`DynamoDBError::LinkConflict`] (HTTP 409 upstream).
+    ///
+    /// Minimum-PII: only the join key is persisted. No email, display name,
+    /// relay address, or other identity metadata is stored here.
+    pub async fn link_identity(
+        &self,
+        user_id: Uuid,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), DynamoDBError> {
+        let link_pk = format!("{}#{}", provider, subject);
+        let now = chrono::Utc::now().timestamp();
+
+        info!(
+            "Linking identity. Table: {}, link_pk: {}, user_id: {}",
+            self.identity_links_table, link_pk, user_id
+        );
+
+        let result = self
+            .client
+            .put_item()
+            .table_name(&self.identity_links_table)
+            .item("link_pk", AttributeValue::S(link_pk.clone()))
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .item("provider", AttributeValue::S(provider.to_string()))
+            .item("subject", AttributeValue::S(subject.to_string()))
+            .item("linked_at", AttributeValue::N(now.to_string()))
+            // Allow idempotent re-link (same user) but reject linking to a
+            // different user — that's the cross-account hijack case.
+            .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
+            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!("Linked identity {} to user {}", link_pk, user_id);
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    let code = service_error.err().meta().code();
+                    if code == Some("ConditionalCheckFailedException") {
+                        warn!("Identity {} already linked to a different user", link_pk);
+                        return Err(DynamoDBError::LinkConflict);
+                    }
+                    if code == Some("ResourceNotFoundException") {
+                        error!("identity_links table does not exist");
+                        return Err(DynamoDBError::TableNotExists("identity_links".to_string()));
+                    }
+                    error!("Failed to write identity link {}: {:?}", link_pk, err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error writing identity link {}: {:?}", link_pk, err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Look up the arkavo user_id linked to a given (provider, subject) pair.
+    /// Returns `Ok(None)` if no link exists.
+    pub async fn find_user_by_link(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<Uuid>, DynamoDBError> {
+        let link_pk = format!("{}#{}", provider, subject);
+
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.identity_links_table)
+            .key("link_pk", AttributeValue::S(link_pk.clone()))
+            .send()
+            .await;
+
+        match result {
+            Ok(output) => {
+                let Some(item) = output.item else {
+                    return Ok(None);
+                };
+                let Some(AttributeValue::S(user_id_str)) = item.get("user_id") else {
+                    error!("identity_links row {} missing user_id attribute", link_pk);
+                    return Err(DynamoDBError::Internal(format!(
+                        "identity_links row {} missing user_id",
+                        link_pk
+                    )));
+                };
+                let user_id = Uuid::parse_str(user_id_str)?;
+                Ok(Some(user_id))
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        return Err(DynamoDBError::TableNotExists("identity_links".to_string()));
+                    }
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => Err(DynamoDBError::SdkError(err.to_string())),
+            },
+        }
     }
 
     pub async fn create_user(
@@ -774,12 +889,22 @@ mod tests {
             DynamoDBError::CredentialError("not found".to_string()),
             DynamoDBError::InvalidDID("bad format".to_string()),
             DynamoDBError::SdkError("aws error".to_string()),
+            DynamoDBError::LinkConflict,
         ];
 
         for error in errors {
             let msg = error.to_string();
             assert!(!msg.is_empty());
         }
+    }
+
+    #[test]
+    fn test_link_conflict_error() {
+        let error = DynamoDBError::LinkConflict;
+        assert_eq!(
+            error.to_string(),
+            "Identity already linked to a different user"
+        );
     }
 
     #[test]

@@ -30,7 +30,8 @@ use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 use crate::apple_signin::{
-    AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_nonce_handler,
+    AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_link_handler,
+    apple_nonce_handler,
 };
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
@@ -254,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_HANDLES_TABLE").unwrap_or_else(|_| "handles".to_string()),
         env::var("DYNAMODB_DEVICE_BINDINGS_TABLE")
             .unwrap_or_else(|_| "device_bindings".to_string()),
+        env::var("DYNAMODB_IDENTITY_LINKS_TABLE").unwrap_or_else(|_| "identity_links".to_string()),
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -337,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Sign in with Apple
         .route("/oauth/apple/nonce", get(apple_nonce_handler))
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
+        .route("/oauth/apple/link", post(apple_link_handler))
         .route("/oauth/apple/callback", post(apple_callback_handler))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
@@ -1101,6 +1104,7 @@ pub(crate) mod test_helpers {
                 "credentials".to_string(),
                 "handles".to_string(),
                 "device_bindings".to_string(),
+                "identity_links".to_string(),
             )
             .await
             .unwrap(),

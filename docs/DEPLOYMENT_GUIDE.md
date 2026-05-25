@@ -146,6 +146,7 @@ DECODING_KEY_PATH=/etc/authnz-rs/keys/decodekey.pem
 DYNAMODB_CREDENTIALS_TABLE=credentials
 DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
+DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 
 # AWS Region (if using AWS DynamoDB)
 AWS_REGION=us-east-1
@@ -153,6 +154,47 @@ AWS_REGION=us-east-1
 # Optional: DynamoDB Endpoint (for local development)
 # DYNAMODB_ENDPOINT=http://localhost:8000
 ```
+
+#### `identity_links` Table
+
+Required for the `POST /oauth/apple/link` endpoint (and any future third-party
+identity-linkage endpoint). Stores the mapping between an arkavo `user_id` and
+a third-party identity provider's `subject` claim.
+
+**Minimum-PII posture**: only the join key is persisted. No email, display
+name, private-relay address, or `real_user_status` is written here, even if
+the upstream IdP supplies it. Sign in with Apple is treated as an
+authentication signal, not an identity source.
+
+**Schema**
+
+| Attribute   | Type   | Purpose                                                     |
+|-------------|--------|-------------------------------------------------------------|
+| `link_pk`   | String | Primary key. Format: `<provider>#<subject>` (e.g. `apple#001234.abc…`). |
+| `user_id`   | String | UUID of the arkavo account the identity is bound to.        |
+| `provider`  | String | IdP name (`apple`, future: `google`, `github`, …).          |
+| `subject`   | String | The IdP's stable subject identifier (Apple's `sub` claim).  |
+| `linked_at` | Number | Unix timestamp of the link operation.                       |
+
+A conditional put on `link_pk` enforces uniqueness: re-linking the same
+identity to the same user is idempotent, but binding it to a different user
+returns HTTP `409 Conflict` (the conflicting `user_id` is not disclosed).
+
+**Provisioning**
+
+```bash
+aws dynamodb create-table \
+    --table-name identity_links \
+    --attribute-definitions AttributeName=link_pk,AttributeType=S \
+    --key-schema AttributeName=link_pk,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
+```
+
+**Future GSI** (not required for this release): a `user_id-index` on
+`user_id` will be needed when an authenticated user wants to enumerate all
+identities bound to their account ("which providers have I linked?"). Add it
+when that endpoint ships — no rows need backfilling, GSI population happens
+asynchronously on the existing data.
 
 ### Systemd Service Setup
 

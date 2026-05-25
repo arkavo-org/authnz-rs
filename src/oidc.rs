@@ -2179,6 +2179,7 @@ mod tests {
                     "credentials".to_string(),
                     "handles".to_string(),
                     "device_bindings".to_string(),
+                    "identity_links".to_string(),
                 )
                 .await
                 .unwrap(),
@@ -2273,6 +2274,7 @@ mod tests {
                     "credentials".to_string(),
                     "handles".to_string(),
                     "device_bindings".to_string(),
+                    "identity_links".to_string(),
                 )
                 .await
                 .unwrap(),
