@@ -54,7 +54,7 @@ use crate::db::DynamoDBError;
 use crate::oidc::AuthenticatedUser;
 use axum::Json;
 use axum::extract::Extension;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
@@ -141,6 +141,14 @@ pub enum AppleSigninError {
     MissingClientId,
     #[error("session error: {0}")]
     SessionError(String),
+    #[error("Missing X-Auth-Token header")]
+    MissingAuth,
+    #[error("Invalid X-Auth-Token")]
+    InvalidAuth,
+    #[error("Apple identity already linked to a different account")]
+    LinkConflict,
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl IntoResponse for AppleSigninError {
@@ -149,10 +157,11 @@ impl IntoResponse for AppleSigninError {
             AppleSigninError::JwksFetch(_) | AppleSigninError::JwksParse(_) => {
                 StatusCode::BAD_GATEWAY
             }
-            AppleSigninError::MissingClientId | AppleSigninError::SessionError(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AppleSigninError::MissingClientId
+            | AppleSigninError::SessionError(_)
+            | AppleSigninError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppleSigninError::MissingSessionNonce => StatusCode::BAD_REQUEST,
+            AppleSigninError::LinkConflict => StatusCode::CONFLICT,
             _ => StatusCode::UNAUTHORIZED,
         };
         (status, self.to_string()).into_response()
@@ -560,6 +569,160 @@ pub async fn apple_idtoken_handler(
     .into_response()
 }
 
+/// Link an Apple identity to the currently-authenticated arkavo account.
+///
+/// Auth: requires a valid Arkavo CWT in the `X-Auth-Token` header. The CWT
+/// `sub` claim is the arkavo user_id that the Apple `sub` will be bound to.
+///
+/// Preamble: client must have called `GET /oauth/apple/nonce` on the same
+/// session. The id_token's `nonce` claim is matched against the session-stored
+/// nonce (verbatim or hex SHA-256, single-use, ≤ 10-minute TTL).
+///
+/// Minimum-PII posture: only the Apple `sub` is persisted, as a row in the
+/// `identity_links` table keyed by `apple#<sub>`. Email, name, private-relay
+/// address, and `real_user_status` claims are **deliberately discarded** even
+/// if Apple includes them — this endpoint treats Sign in with Apple as a pure
+/// authentication signal, not an identity source. Callers who want PII must
+/// request and store it on a separate code path.
+///
+/// Responses:
+///  - `200 OK`: identity successfully linked (or re-linked to the same user;
+///    the operation is idempotent on `(provider, subject) → user_id`).
+///  - `400 Bad Request`: no session nonce, or expired session nonce.
+///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, or Apple id_token
+///    validation failure (signature, iss, aud, nonce, exp, iat).
+///  - `409 Conflict`: this Apple `sub` is already linked to a *different*
+///    arkavo user. The conflicting user_id is **not** disclosed.
+///  - `500 Internal Server Error`: DynamoDB or configuration failure.
+pub async fn apple_link_handler(
+    Extension(app_state): Extension<AppState>,
+    Extension(cache): Extension<Arc<AppleJwksCache>>,
+    session: Session,
+    headers: HeaderMap,
+    Json(req): Json<AppleIdTokenRequest>,
+) -> Response {
+    let client_ip = client_ip_from_headers(&headers);
+
+    // 1. Caller must be authenticated. The CWT's `sub` is the arkavo user_id
+    //    we'll bind the Apple identity to.
+    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // 2. Same nonce dance as the bootstrap endpoint — single-use consume,
+    //    bound to this session.
+    let raw_nonce = match consume_apple_nonce(&session).await {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+
+    // 3. Validate the Apple id_token. We only consume `sub` from the result;
+    //    any email/name claims that snuck through with non-empty scopes are
+    //    discarded below.
+    let claims = match verify_apple_id_token(&cache, &req.id_token, &raw_nonce).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    // 4. Persist the link. The conditional put gives us per-subject uniqueness;
+    //    a 409 here means this Apple `sub` is already bound to a different
+    //    arkavo user — typically an account-hijack attempt or a user who has
+    //    already registered with us via the Apple-bootstrap path.
+    let sub_prefix = subject_prefix(&claims.sub);
+    match app_state
+        .db_store
+        .link_identity(user_id, "apple", &claims.sub)
+        .await
+    {
+        Ok(()) => {
+            // Audit trail: subject_prefix (not full sub) is enough to triangulate
+            // with the DDB row during incident response without leaking the
+            // pseudonymous identifier into logs.
+            info!(
+                "audit identity_link outcome=linked user_id={} provider=apple subject_prefix={} client_ip={}",
+                user_id, sub_prefix, client_ip
+            );
+            StatusCode::OK.into_response()
+        }
+        Err(crate::db::DynamoDBError::LinkConflict) => {
+            warn!(
+                "audit identity_link outcome=conflict user_id={} provider=apple subject_prefix={} client_ip={}",
+                user_id, sub_prefix, client_ip
+            );
+            AppleSigninError::LinkConflict.into_response()
+        }
+        Err(e) => {
+            // Log the detailed error server-side, but return an opaque body —
+            // raw AWS SDK strings (region, request id, table name) must not
+            // reach the client.
+            error!("Failed to link Apple identity: {}", e);
+            AppleSigninError::Internal("identity_link_write_failed".to_string()).into_response()
+        }
+    }
+}
+
+/// First 8 *characters* of an opaque subject. Enough to correlate with a
+/// DynamoDB row during incident response, narrow enough not to leak the full
+/// pseudonymous identifier into logs.
+///
+/// Uses `char_indices` rather than byte-slicing so a future IdP whose subject
+/// contains multi-byte UTF-8 (some OIDC providers stuff email into `sub`) does
+/// not panic on a mid-codepoint boundary.
+fn subject_prefix(sub: &str) -> &str {
+    match sub.char_indices().nth(8) {
+        Some((byte_idx, _)) => &sub[..byte_idx],
+        None => sub,
+    }
+}
+
+/// Extract the originating client IP for audit logs.
+///
+/// Behind HAProxy / nginx we expect `X-Forwarded-For`; first comma-separated
+/// value is the original client. Falls back to `"unknown"` when no proxy
+/// header is present (e.g. local dev hitting the server directly). We do
+/// **not** trust this for any security decision — it's a hint for log
+/// correlation only.
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Extract the authenticated arkavo user_id from the inbound `X-Auth-Token`
+/// CWT header. Returns [`AppleSigninError::MissingAuth`] (HTTP 401) if the
+/// header is absent, [`AppleSigninError::InvalidAuth`] (HTTP 401) if the CWT
+/// fails to verify or its `sub` is not a valid UUID.
+///
+/// The HTTP response intentionally collapses every CWT failure into the same
+/// opaque `InvalidAuth` so an attacker cannot distinguish "wrong issuer" from
+/// "expired" from "bad signature". The specific reason is logged at `warn!`
+/// for the operator's audit trail.
+fn extract_authenticated_user_id(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppleSigninError> {
+    let token_header = headers
+        .get("X-Auth-Token")
+        .ok_or(AppleSigninError::MissingAuth)?;
+    let token_str = token_header.to_str().map_err(|e| {
+        warn!("X-Auth-Token rejected: header is not valid ASCII ({})", e);
+        AppleSigninError::InvalidAuth
+    })?;
+    let claims = crate::authn::verify_inbound_account_token(app_state, token_str).map_err(|e| {
+        warn!("X-Auth-Token rejected: CWT verification failed ({})", e);
+        AppleSigninError::InvalidAuth
+    })?;
+    Uuid::parse_str(&claims.sub).map_err(|e| {
+        warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
+        AppleSigninError::InvalidAuth
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct AppleCallbackForm {
@@ -701,6 +864,24 @@ mod tests {
                 .into_response()
                 .status(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::MissingAuth.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::InvalidAuth.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppleSigninError::LinkConflict.into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppleSigninError::Internal("boom".into())
+                .into_response()
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 
@@ -905,5 +1086,85 @@ mod tests {
         let v2: AppleNonceResponse = serde_json::from_slice(&body2).unwrap();
         // Two separate session-less requests must not return the same nonce.
         assert_ne!(v1.nonce, v2.nonce);
+    }
+
+    #[tokio::test]
+    async fn test_consume_apple_nonce_is_single_use() {
+        // Regression guard: the replay-prevention story for /oauth/apple/link
+        // and /oauth/apple/idtoken depends on the session-stored nonce being
+        // cleared on first read, regardless of whether downstream validation
+        // (id_token signature, audience, DDB put) succeeds. If this invariant
+        // breaks, an attacker who captures one valid (nonce, id_token) pair
+        // could replay it indefinitely.
+        use tower_sessions::cookie::time::Duration as SessionDuration;
+        use tower_sessions::{Expiry, MemoryStore, Session};
+
+        let store = Arc::new(MemoryStore::default());
+        let session = Session::new(
+            None,
+            store,
+            Some(Expiry::OnInactivity(SessionDuration::seconds(600))),
+        );
+
+        let issued = issue_apple_nonce(&session).await.expect("issue ok");
+        assert!(!issued.is_empty());
+
+        // First consume returns the nonce we issued.
+        let first = consume_apple_nonce(&session)
+            .await
+            .expect("first consume ok");
+        assert_eq!(first, issued);
+
+        // Second consume must fail with MissingSessionNonce (HTTP 400). If
+        // this ever returns Ok(...), the nonce is being replayed.
+        let second = consume_apple_nonce(&session).await;
+        assert!(
+            matches!(second, Err(AppleSigninError::MissingSessionNonce)),
+            "expected MissingSessionNonce on replay, got {:?}",
+            second
+        );
+    }
+
+    #[test]
+    fn test_subject_prefix_caps_at_eight() {
+        assert_eq!(subject_prefix("001234.abcdef.ghijkl"), "001234.a");
+        assert_eq!(subject_prefix("short"), "short");
+        assert_eq!(subject_prefix(""), "");
+    }
+
+    #[test]
+    fn test_subject_prefix_handles_multibyte_utf8() {
+        // Regression guard: byte-slicing would panic mid-codepoint here.
+        // "αβγδεζηθι" — each greek letter is 2 bytes in UTF-8. First 8
+        // characters = 16 bytes.
+        let sub = "αβγδεζηθι";
+        let prefix = subject_prefix(sub);
+        assert_eq!(prefix, "αβγδεζηθ");
+        assert_eq!(prefix.chars().count(), 8);
+    }
+
+    #[test]
+    fn test_client_ip_uses_first_xff_value() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7, 10.0.0.1, 10.0.0.2"),
+        );
+        assert_eq!(client_ip_from_headers(&headers), "203.0.113.7");
+    }
+
+    #[test]
+    fn test_client_ip_falls_back_to_unknown() {
+        let headers = HeaderMap::new();
+        assert_eq!(client_ip_from_headers(&headers), "unknown");
+    }
+
+    #[test]
+    fn test_client_ip_ignores_empty_xff() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static(""));
+        assert_eq!(client_ip_from_headers(&headers), "unknown");
     }
 }
