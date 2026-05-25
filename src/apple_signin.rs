@@ -653,18 +653,27 @@ pub async fn apple_link_handler(
             AppleSigninError::LinkConflict.into_response()
         }
         Err(e) => {
+            // Log the detailed error server-side, but return an opaque body —
+            // raw AWS SDK strings (region, request id, table name) must not
+            // reach the client.
             error!("Failed to link Apple identity: {}", e);
-            AppleSigninError::Internal(e.to_string()).into_response()
+            AppleSigninError::Internal("identity_link_write_failed".to_string()).into_response()
         }
     }
 }
 
-/// First 8 chars of an opaque subject. Enough to correlate with a DynamoDB row
-/// during incident response, narrow enough not to leak the full pseudonymous
-/// identifier into logs.
+/// First 8 *characters* of an opaque subject. Enough to correlate with a
+/// DynamoDB row during incident response, narrow enough not to leak the full
+/// pseudonymous identifier into logs.
+///
+/// Uses `char_indices` rather than byte-slicing so a future IdP whose subject
+/// contains multi-byte UTF-8 (some OIDC providers stuff email into `sub`) does
+/// not panic on a mid-codepoint boundary.
 fn subject_prefix(sub: &str) -> &str {
-    let take = sub.len().min(8);
-    &sub[..take]
+    match sub.char_indices().nth(8) {
+        Some((byte_idx, _)) => &sub[..byte_idx],
+        None => sub,
+    }
 }
 
 /// Extract the originating client IP for audit logs.
@@ -688,6 +697,11 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
 /// CWT header. Returns [`AppleSigninError::MissingAuth`] (HTTP 401) if the
 /// header is absent, [`AppleSigninError::InvalidAuth`] (HTTP 401) if the CWT
 /// fails to verify or its `sub` is not a valid UUID.
+///
+/// The HTTP response intentionally collapses every CWT failure into the same
+/// opaque `InvalidAuth` so an attacker cannot distinguish "wrong issuer" from
+/// "expired" from "bad signature". The specific reason is logged at `warn!`
+/// for the operator's audit trail.
 fn extract_authenticated_user_id(
     app_state: &AppState,
     headers: &HeaderMap,
@@ -695,12 +709,18 @@ fn extract_authenticated_user_id(
     let token_header = headers
         .get("X-Auth-Token")
         .ok_or(AppleSigninError::MissingAuth)?;
-    let token_str = token_header
-        .to_str()
-        .map_err(|_| AppleSigninError::InvalidAuth)?;
-    let claims = crate::authn::verify_inbound_account_token(app_state, token_str)
-        .map_err(|_| AppleSigninError::InvalidAuth)?;
-    Uuid::parse_str(&claims.sub).map_err(|_| AppleSigninError::InvalidAuth)
+    let token_str = token_header.to_str().map_err(|e| {
+        warn!("X-Auth-Token rejected: header is not valid ASCII ({})", e);
+        AppleSigninError::InvalidAuth
+    })?;
+    let claims = crate::authn::verify_inbound_account_token(app_state, token_str).map_err(|e| {
+        warn!("X-Auth-Token rejected: CWT verification failed ({})", e);
+        AppleSigninError::InvalidAuth
+    })?;
+    Uuid::parse_str(&claims.sub).map_err(|e| {
+        warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
+        AppleSigninError::InvalidAuth
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1110,6 +1130,17 @@ mod tests {
         assert_eq!(subject_prefix("001234.abcdef.ghijkl"), "001234.a");
         assert_eq!(subject_prefix("short"), "short");
         assert_eq!(subject_prefix(""), "");
+    }
+
+    #[test]
+    fn test_subject_prefix_handles_multibyte_utf8() {
+        // Regression guard: byte-slicing would panic mid-codepoint here.
+        // "αβγδεζηθι" — each greek letter is 2 bytes in UTF-8. First 8
+        // characters = 16 bytes.
+        let sub = "αβγδεζηθι";
+        let prefix = subject_prefix(sub);
+        assert_eq!(prefix, "αβγδεζηθ");
+        assert_eq!(prefix.chars().count(), 8);
     }
 
     #[test]

@@ -196,6 +196,15 @@ identities bound to their account ("which providers have I linked?"). Add it
 when that endpoint ships — no rows need backfilling, GSI population happens
 asynchronously on the existing data.
 
+**Audit log → X-Forwarded-For trust**: `/oauth/apple/link` records the
+originating client IP in its audit log by reading `X-Forwarded-For`. The
+deployment **must** put a reverse proxy (HAProxy, nginx) in front of
+authnz-rs that strips any client-supplied `X-Forwarded-For` header and
+prepends the real peer address. If clients can reach authnz-rs directly,
+they can forge this header and poison the audit log. The audit value is
+not used for any authorization decision — it is operator-correlation
+only — but log integrity still matters for incident response.
+
 ### Systemd Service Setup
 
 Create a systemd service file for automatic startup and management:

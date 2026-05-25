@@ -138,8 +138,13 @@ impl DynamoDBStore {
                         return Err(DynamoDBError::LinkConflict);
                     }
                     if code == Some("ResourceNotFoundException") {
-                        error!("identity_links table does not exist");
-                        return Err(DynamoDBError::TableNotExists("identity_links".to_string()));
+                        error!(
+                            "identity_links table {} does not exist",
+                            self.identity_links_table
+                        );
+                        return Err(DynamoDBError::TableNotExists(
+                            self.identity_links_table.clone(),
+                        ));
                     }
                     error!("Failed to write identity link {}: {:?}", link_pk, err);
                     Err(DynamoDBError::SdkError(err.to_string()))
@@ -148,50 +153,6 @@ impl DynamoDBStore {
                     error!("Unknown error writing identity link {}: {:?}", link_pk, err);
                     Err(DynamoDBError::SdkError(err.to_string()))
                 }
-            },
-        }
-    }
-
-    /// Look up the arkavo user_id linked to a given (provider, subject) pair.
-    /// Returns `Ok(None)` if no link exists.
-    pub async fn find_user_by_link(
-        &self,
-        provider: &str,
-        subject: &str,
-    ) -> Result<Option<Uuid>, DynamoDBError> {
-        let link_pk = format!("{}#{}", provider, subject);
-
-        let result = self
-            .client
-            .get_item()
-            .table_name(&self.identity_links_table)
-            .key("link_pk", AttributeValue::S(link_pk.clone()))
-            .send()
-            .await;
-
-        match result {
-            Ok(output) => {
-                let Some(item) = output.item else {
-                    return Ok(None);
-                };
-                let Some(AttributeValue::S(user_id_str)) = item.get("user_id") else {
-                    error!("identity_links row {} missing user_id attribute", link_pk);
-                    return Err(DynamoDBError::Internal(format!(
-                        "identity_links row {} missing user_id",
-                        link_pk
-                    )));
-                };
-                let user_id = Uuid::parse_str(user_id_str)?;
-                Ok(Some(user_id))
-            }
-            Err(err) => match err {
-                SdkError::ServiceError(ref service_error) => {
-                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
-                        return Err(DynamoDBError::TableNotExists("identity_links".to_string()));
-                    }
-                    Err(DynamoDBError::SdkError(err.to_string()))
-                }
-                _ => Err(DynamoDBError::SdkError(err.to_string())),
             },
         }
     }
