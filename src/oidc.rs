@@ -1655,6 +1655,7 @@ pub struct AccessTokenExtras {
 }
 
 impl AccessTokenExtras {
+    #[cfg(test)]
     pub fn with_idp(mut self, idp: &str) -> Self {
         self.idp = idp.into();
         self
@@ -2179,6 +2180,7 @@ mod tests {
                     "credentials".to_string(),
                     "handles".to_string(),
                     "device_bindings".to_string(),
+                    "identity_links".to_string(),
                 )
                 .await
                 .unwrap(),
@@ -2273,6 +2275,7 @@ mod tests {
                     "credentials".to_string(),
                     "handles".to_string(),
                     "device_bindings".to_string(),
+                    "identity_links".to_string(),
                 )
                 .await
                 .unwrap(),

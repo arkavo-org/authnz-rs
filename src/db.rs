@@ -40,6 +40,9 @@ pub enum DynamoDBError {
 
     #[error("Invalid DID format: {0}")]
     InvalidDID(String),
+
+    #[error("Identity already linked to a different user")]
+    LinkConflict,
 }
 
 impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
@@ -62,6 +65,7 @@ pub struct DynamoDBStore {
     credentials_table: String,
     handles_table: String,
     device_bindings_table: String,
+    identity_links_table: String,
 }
 
 impl DynamoDBStore {
@@ -69,6 +73,7 @@ impl DynamoDBStore {
         credentials_table: String,
         handles_table: String,
         device_bindings_table: String,
+        identity_links_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -78,7 +83,97 @@ impl DynamoDBStore {
             credentials_table,
             handles_table,
             device_bindings_table,
+            identity_links_table,
         })
+    }
+
+    /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
+    ///
+    /// Idempotent on (provider, subject): re-linking the same identity to the
+    /// same user succeeds silently; linking to a different user returns
+    /// [`DynamoDBError::LinkConflict`] (HTTP 409 upstream).
+    ///
+    /// Minimum-PII: only the join key is persisted. No email, display name,
+    /// relay address, or other identity metadata is stored here.
+    pub async fn link_identity(
+        &self,
+        user_id: Uuid,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), DynamoDBError> {
+        let link_pk = format!("{}#{}", provider, subject);
+        let now = chrono::Utc::now().timestamp();
+
+        // Privacy: never log the full link_pk (it contains the pseudonymous
+        // IdP subject). The handler in apple_signin.rs deliberately logs only
+        // the first 8 chars of subject; mirror that here so the handler →
+        // db.rs log chain can still be correlated without disclosing the
+        // full sub.
+        let subject_log = log_subject_prefix(subject);
+
+        info!(
+            "Linking identity. Table: {}, provider: {}, subject_prefix: {}, user_id: {}",
+            self.identity_links_table, provider, subject_log, user_id
+        );
+
+        let result = self
+            .client
+            .put_item()
+            .table_name(&self.identity_links_table)
+            .item("link_pk", AttributeValue::S(link_pk.clone()))
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .item("provider", AttributeValue::S(provider.to_string()))
+            .item("subject", AttributeValue::S(subject.to_string()))
+            .item("linked_at", AttributeValue::N(now.to_string()))
+            // Allow idempotent re-link (same user) but reject linking to a
+            // different user — that's the cross-account hijack case.
+            .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
+            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!(
+                    "Linked identity provider={} subject_prefix={} to user {}",
+                    provider, subject_log, user_id
+                );
+                Ok(())
+            }
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    let code = service_error.err().meta().code();
+                    if code == Some("ConditionalCheckFailedException") {
+                        warn!(
+                            "Identity provider={} subject_prefix={} already linked to a different user",
+                            provider, subject_log
+                        );
+                        return Err(DynamoDBError::LinkConflict);
+                    }
+                    if code == Some("ResourceNotFoundException") {
+                        error!(
+                            "identity_links table {} does not exist",
+                            self.identity_links_table
+                        );
+                        return Err(DynamoDBError::TableNotExists(
+                            self.identity_links_table.clone(),
+                        ));
+                    }
+                    error!(
+                        "Failed to write identity link provider={} subject_prefix={}: {:?}",
+                        provider, subject_log, err
+                    );
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!(
+                        "Unknown error writing identity link provider={} subject_prefix={}: {:?}",
+                        provider, subject_log, err
+                    );
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
     }
 
     pub async fn create_user(
@@ -684,6 +779,19 @@ impl DynamoDBStore {
     }
 }
 
+/// Privacy-preserving subject masker used by `link_identity` logs.
+///
+/// Returns the first 8 *characters* of an opaque IdP subject (Apple `sub`,
+/// future Google `sub`, etc.) so log lines can be correlated end-to-end
+/// without disclosing the full pseudonymous identifier. `char_indices` is
+/// used so multi-byte UTF-8 subjects do not panic on a mid-codepoint slice.
+fn log_subject_prefix(subject: &str) -> &str {
+    match subject.char_indices().nth(8) {
+        Some((byte_idx, _)) => &subject[..byte_idx],
+        None => subject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,12 +882,22 @@ mod tests {
             DynamoDBError::CredentialError("not found".to_string()),
             DynamoDBError::InvalidDID("bad format".to_string()),
             DynamoDBError::SdkError("aws error".to_string()),
+            DynamoDBError::LinkConflict,
         ];
 
         for error in errors {
             let msg = error.to_string();
             assert!(!msg.is_empty());
         }
+    }
+
+    #[test]
+    fn test_link_conflict_error() {
+        let error = DynamoDBError::LinkConflict;
+        assert_eq!(
+            error.to_string(),
+            "Identity already linked to a different user"
+        );
     }
 
     #[test]
@@ -792,5 +910,21 @@ mod tests {
     fn test_invalid_did_error() {
         let error = DynamoDBError::InvalidDID("DID must start with 'did:key:'".to_string());
         assert!(error.to_string().contains("did:key:"));
+    }
+
+    #[test]
+    fn test_log_subject_prefix_caps_at_eight_chars() {
+        assert_eq!(log_subject_prefix("001234.abcdef.ghijkl"), "001234.a");
+        assert_eq!(log_subject_prefix("short"), "short");
+        assert_eq!(log_subject_prefix(""), "");
+    }
+
+    #[test]
+    fn test_log_subject_prefix_handles_multibyte_utf8() {
+        // Regression guard: byte-slicing would panic mid-codepoint here.
+        let sub = "αβγδεζηθι";
+        let prefix = log_subject_prefix(sub);
+        assert_eq!(prefix, "αβγδεζηθ");
+        assert_eq!(prefix.chars().count(), 8);
     }
 }
