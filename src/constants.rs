@@ -37,3 +37,31 @@ pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
 /// OIDC refresh token lifetime in seconds (30 days)
 pub const REFRESH_TOKEN_LIFETIME_SECONDS: i64 = 2592000;
+
+/// Patreon OAuth2 authorize endpoint.
+///
+/// Surfaced in documentation only — the Arkavo client opens this URL itself
+/// during the consent step (authnz-rs only sees the resulting `code`).
+#[allow(dead_code)]
+pub const PATREON_AUTHORIZE_URL: &str = "https://www.patreon.com/oauth2/authorize";
+
+/// Patreon OAuth2 token endpoint
+pub const PATREON_TOKEN_URL: &str = "https://www.patreon.com/api/oauth2/token";
+
+/// Patreon API v2 identity endpoint (used to discover the linked Patreon user's
+/// id and — for creators — their owned campaign).
+pub const PATREON_IDENTITY_URL: &str = "https://www.patreon.com/api/oauth2/v2/identity";
+
+/// Patreon API v2 campaign members endpoint (templated with `{campaign_id}`).
+/// Used by membership materialization to read a creator's campaign roster
+/// and resolve a consumer's `patron_status`/tiers.
+pub const PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE: &str =
+    "https://www.patreon.com/api/oauth2/v2/campaigns/{campaign_id}/members";
+
+/// Patreon membership-materialization cache TTL in seconds (5 minutes).
+///
+/// Short enough that revocations propagate quickly, long enough that we don't
+/// hammer Patreon on every token mint. The plan calls for ~5 min;
+/// `verified_at`/`expires_at` are recorded in the cached materialization so a
+/// stale cache after Patreon goes down can be detected and rejected.
+pub const PATREON_CACHE_TTL_SECONDS: i64 = 300;
