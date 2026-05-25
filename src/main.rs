@@ -189,6 +189,13 @@ pub struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
+    // rustls 0.23 is linked against both `aws-lc-rs` and `ring`, so it cannot
+    // auto-pick a crypto provider and `ServerConfig::builder()` panics unless
+    // a provider is installed first.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     // Load configuration
     let settings = load_config()?;
 

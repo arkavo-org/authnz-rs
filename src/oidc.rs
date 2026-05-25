@@ -1655,6 +1655,7 @@ pub struct AccessTokenExtras {
 }
 
 impl AccessTokenExtras {
+    #[cfg(test)]
     pub fn with_idp(mut self, idp: &str) -> Self {
         self.idp = idp.into();
         self

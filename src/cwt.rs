@@ -142,6 +142,7 @@ impl ArkavoClaims {
         self
     }
 
+    #[cfg(test)]
     pub fn without_cnf(mut self) -> Self {
         self.cnf = None;
         self
