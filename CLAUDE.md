@@ -320,7 +320,7 @@ aws dynamodb create-table \
   - `/.well-known/jwks.json` — JWKS for `id_token` verifiers (OIDC RPs).
   - `/.well-known/cose-keys` — COSE_Key Set for CWT verifiers (OpenTDF, native).
   - Same `kid` (RFC 7638 thumbprint) in both formats — JWKS advertises the base64url-encoded form; COSE_Key uses raw 32-byte hash.
-- **Discovery doc** (`/.well-known/openid-configuration`) advertises `arkavo_access_token_format: "application/cwt"` and `arkavo_cose_keys_uri` for CWT-aware RPs.
+- **Discovery doc** (`/.well-known/openid-configuration`) advertises `access_token_format: "application/cwt"` and `cose_keys_uri` for CWT-aware RPs.
 - **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key or App Attest key where available. Not verifier-enforced in this release.
 
 **WebAuthn Protection**:
