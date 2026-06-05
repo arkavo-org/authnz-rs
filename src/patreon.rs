@@ -319,6 +319,10 @@ pub enum PatreonError {
     InvalidRedirectUri,
     #[error("role must be \"creator\" or \"consumer\"")]
     InvalidRole,
+    #[error("role=creator but no Patreon campaign is owned by this account")]
+    NoCampaign,
+    #[error("Patreon rejected the authorization code (expired, replayed, or invalid)")]
+    InvalidGrant,
     #[error("missing or invalid X-Auth-Token")]
     MissingAuth,
     #[error("Patreon API error: {0}")]
@@ -340,7 +344,10 @@ impl IntoResponse for PatreonError {
     fn into_response(self) -> Response {
         let status = match &self {
             PatreonError::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
-            PatreonError::InvalidRedirectUri | PatreonError::InvalidRole => StatusCode::BAD_REQUEST,
+            PatreonError::InvalidRedirectUri
+            | PatreonError::InvalidRole
+            | PatreonError::NoCampaign
+            | PatreonError::InvalidGrant => StatusCode::BAD_REQUEST,
             PatreonError::MissingAuth => StatusCode::UNAUTHORIZED,
             PatreonError::Api(_) => StatusCode::BAD_GATEWAY,
             PatreonError::LinkConflict => StatusCode::CONFLICT,
@@ -349,7 +356,32 @@ impl IntoResponse for PatreonError {
             | PatreonError::Db(_)
             | PatreonError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, self.to_string()).into_response()
+        // Only expose safe, pre-defined messages to clients. The `Api`, `Kms`,
+        // `Crypto`, and `Db` variants embed raw upstream diagnostics (KMS ARNs,
+        // DynamoDB internals, Patreon response bodies) — those stay in the
+        // server logs (already emitted via error!/warn! at the call sites) and
+        // must never reach the wire.
+        let body: &str = match &self {
+            PatreonError::NotConfigured => "Patreon integration is not configured",
+            PatreonError::InvalidRedirectUri => "redirect_uri is not in the allow list",
+            PatreonError::InvalidRole => "role must be \"creator\" or \"consumer\"",
+            PatreonError::NoCampaign => {
+                "role=creator but no Patreon campaign is owned by this account"
+            }
+            PatreonError::InvalidGrant => {
+                "Patreon rejected the authorization code (expired, replayed, or invalid)"
+            }
+            PatreonError::MissingAuth => "missing or invalid X-Auth-Token",
+            PatreonError::LinkConflict => {
+                "Patreon identity already linked to a different arkavo user"
+            }
+            PatreonError::Api(_) => "upstream Patreon request failed",
+            PatreonError::Kms(_) | PatreonError::Crypto(_) | PatreonError::Db(_) => {
+                "internal error"
+            }
+            PatreonError::Internal(_) => "internal error",
+        };
+        (status, body.to_string()).into_response()
     }
 }
 
@@ -464,6 +496,16 @@ pub async fn patreon_link_handler(
             return e.into_response();
         }
     };
+
+    // role is client-asserted; refuse to persist a creator link with no owned
+    // campaign (it would materialize empty entitlements forever).
+    if let Err(e) = validate_creator_campaign(&role, &campaign_id) {
+        warn!(
+            "Patreon link rejected: role=creator but no campaign for subject_prefix={}",
+            subject_prefix(&patreon_user_id)
+        );
+        return e.into_response();
+    }
 
     // 3. Persist the link. identity_links first (uniqueness check), then
     //    patreon_tokens. Order matters: identity_links is the per-Patreon-
@@ -604,6 +646,22 @@ struct PatreonTokenResponse {
     pub token_type: String,
 }
 
+/// Classify a non-success Patreon token-endpoint response. Client errors (4xx)
+/// mean the *caller's* `code`/`redirect_uri` was bad → surface a 400. Server
+/// errors / unexpected statuses are Patreon's fault → 502 with diagnostics for
+/// the logs only.
+fn token_exchange_error(status: reqwest::StatusCode, body: &str) -> PatreonError {
+    if status.is_client_error() {
+        PatreonError::InvalidGrant
+    } else {
+        PatreonError::Api(format!(
+            "token endpoint returned {}: {}",
+            status,
+            truncate(body, 256)
+        ))
+    }
+}
+
 async fn exchange_code_for_tokens(
     http: &reqwest::Client,
     oauth: &PatreonOAuthConfig,
@@ -626,22 +684,20 @@ async fn exchange_code_for_tokens(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(PatreonError::Api(format!(
-            "token endpoint returned {}: {}",
-            status,
-            truncate(&body, 256)
-        )));
+        return Err(token_exchange_error(status, &body));
     }
     resp.json::<PatreonTokenResponse>()
         .await
         .map_err(|e| PatreonError::Api(format!("token JSON parse: {}", e)))
 }
 
-/// Refresh a Patreon access token using its refresh token. Wired through to
-/// `materialize_from_link` in a follow-up change so a stale access token
-/// triggers refresh-and-persist on the access_token mint path; today the
-/// mint path just serves an empty membership snapshot when Patreon returns
-/// 401. The helper itself is correct, the integration is the deferred piece.
+/// Refresh a Patreon access token using its refresh token. To be wired into
+/// `materialize_from_link` in a follow-up so a stale/revoked access token
+/// triggers refresh-and-persist on the access_token mint path. Until then the
+/// mint path fails closed: a 401 (or any fetch error) propagates and the
+/// `arkavo_patreon` claim is omitted entirely — so an expired access token
+/// silently drops the user's entitlements until they re-link. The helper
+/// itself is correct; only the 401-triggered integration is deferred.
 #[allow(dead_code)]
 async fn refresh_access_token(
     http: &reqwest::Client,
@@ -674,6 +730,17 @@ async fn refresh_access_token(
         .map_err(|e| PatreonError::Api(format!("refresh JSON parse: {}", e)))
 }
 
+/// Build the `/identity` URL. Creators add the `campaign` relationship so we
+/// can discover the owned campaign id; consumers need none of it. We never
+/// request the `email` field — minimum-PII, and it's never read.
+fn identity_url(is_creator: bool) -> String {
+    if is_creator {
+        format!("{}?include=campaign", PATREON_IDENTITY_URL)
+    } else {
+        PATREON_IDENTITY_URL.to_string()
+    }
+}
+
 /// Fetch the current user's Patreon identity, returning
 /// `(patreon_user_id, Option<campaign_id>)`. Campaign discovery only runs
 /// for creators (and only the first campaign is captured — multi-campaign
@@ -683,12 +750,7 @@ async fn fetch_identity(
     access_token: &str,
     is_creator: bool,
 ) -> Result<(String, Option<String>), PatreonError> {
-    let mut url = String::from(PATREON_IDENTITY_URL);
-    if is_creator {
-        // The `campaign` relationship is creator-only — for consumers it's
-        // empty and the extra include is harmless but wasteful.
-        url.push_str("?include=campaign&fields%5Buser%5D=email");
-    }
+    let url = identity_url(is_creator);
     let resp = http
         .get(&url)
         .bearer_auth(access_token)
@@ -740,6 +802,16 @@ fn find_campaign_id(body: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Guard against persisting a contradictory creator link. `role` is asserted
+/// by the client; if it claims `creator` but Patreon reports no owned campaign,
+/// the row would materialize empty entitlements forever — reject up front.
+fn validate_creator_campaign(role: &str, campaign_id: &Option<String>) -> Result<(), PatreonError> {
+    if role == "creator" && campaign_id.is_none() {
+        return Err(PatreonError::NoCampaign);
+    }
+    Ok(())
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -752,6 +824,12 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // --------- Membership materialization (used by OIDC access_token mint) ---------
+
+/// Hard cap on the in-memory fallback map (used only while Redis is down).
+/// Bounds memory if Redis stays unreachable under sustained load; once the cap
+/// is hit, new users simply re-materialize on each mint instead of being
+/// cached. Redis remains the unbounded-by-TTL primary store.
+const MAX_LOCAL_CACHE_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 pub struct MembershipCache {
@@ -815,7 +893,14 @@ impl MembershipCache {
             }
         } else {
             let mut map = self.local.lock().unwrap();
-            map.insert(key, (snap.clone(), snap.cache_expires_at));
+            // Reclaim expired entries first, then enforce the cap. We still
+            // refresh an existing key even at capacity (it's not net growth);
+            // only brand-new keys are dropped once full.
+            let now = Utc::now().timestamp();
+            map.retain(|_, (_, exp)| *exp > now);
+            if map.len() < MAX_LOCAL_CACHE_ENTRIES || map.contains_key(&key) {
+                map.insert(key, (snap.clone(), snap.cache_expires_at));
+            }
         }
     }
 
@@ -977,17 +1062,14 @@ async fn materialize_from_link(
             }
         }
         _ => {
-            // Consumer: query Patreon for memberships.
-            let memberships = match fetch_consumer_memberships(&state.http, &access_token).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(
-                        "Patreon consumer membership fetch failed: {} — embedding empty list",
-                        e
-                    );
-                    Vec::new()
-                }
-            };
+            // Consumer: query Patreon for memberships. A fetch *failure* must
+            // propagate — the caller (materialize_for_user) fails closed by
+            // omitting the claim entirely and NOT caching. Swallowing the error
+            // into an empty list would cache a false "no entitlement" for the
+            // full TTL on any transient Patreon blip or token expiry. A genuine
+            // HTTP 200 with no memberships still yields Ok(vec![]) here and is
+            // cached as a real (empty) snapshot.
+            let memberships = fetch_consumer_memberships(&state.http, &access_token).await?;
             ArkavoPatreon {
                 role: "consumer".into(),
                 patreon_user_id: link.patreon_user_id.clone(),
@@ -1226,6 +1308,39 @@ mod tests {
     }
 
     #[test]
+    fn identity_url_creator_includes_campaign_but_not_email() {
+        // Minimum-PII: we only need data.id + campaign relationship; never
+        // request the user's email from Patreon.
+        let url = identity_url(true);
+        assert!(url.contains("include=campaign"), "creator url: {url}");
+        assert!(
+            !url.to_lowercase().contains("email"),
+            "creator url must not request email: {url}"
+        );
+    }
+
+    #[test]
+    fn identity_url_consumer_has_no_query() {
+        assert_eq!(identity_url(false), PATREON_IDENTITY_URL);
+    }
+
+    #[test]
+    fn token_exchange_client_error_maps_to_invalid_grant() {
+        // A bad/expired/replayed auth code is the *client's* fault — surface a
+        // 400, not a 502 that implies Patreon is down.
+        let err = token_exchange_error(reqwest::StatusCode::BAD_REQUEST, "invalid_grant");
+        assert!(matches!(err, PatreonError::InvalidGrant));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn token_exchange_server_error_maps_to_bad_gateway() {
+        let err = token_exchange_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert!(matches!(err, PatreonError::Api(_)));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
     fn truncate_respects_char_boundaries() {
         let s = "αβγδ"; // 4 chars, 8 bytes
         assert_eq!(truncate(s, 100), s);
@@ -1265,6 +1380,40 @@ mod tests {
             PatreonError::Kms("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[tokio::test]
+    async fn into_response_redacts_server_side_error_details() {
+        use axum::body::to_bytes;
+        // Server-side (5xx) variants must never echo raw upstream diagnostics
+        // (KMS ARNs, DynamoDB internals, Patreon bodies) to the client.
+        let cases = [
+            PatreonError::Kms("arn:aws:kms:us-east-1:123456789012:key/SECRET-KMS-DETAIL".into()),
+            PatreonError::Crypto("SECRET-KMS-DETAIL nonce internals".into()),
+            PatreonError::Db("SECRET-KMS-DETAIL table scan".into()),
+            PatreonError::Internal("SECRET-KMS-DETAIL stack".into()),
+        ];
+        for err in cases {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("SECRET-KMS-DETAIL"),
+                "5xx body leaked internal detail: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn into_response_keeps_safe_client_facing_messages() {
+        use axum::body::to_bytes;
+        // 4xx variants carry no sensitive data and may keep their descriptive
+        // body so the caller can correct the request.
+        let resp = PatreonError::InvalidRole.into_response();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("creator"), "client-facing 4xx body: {text}");
     }
 
     #[tokio::test]
@@ -1330,6 +1479,94 @@ mod tests {
         assert!(cache.get(user_id).await.is_none(), "invalidate clears");
     }
 
+    /// reqwest client whose DNS for the Patreon host resolves to a dead local
+    /// port, so any outbound Patreon call fails fast and offline.
+    fn unreachable_patreon_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .resolve(
+                "www.patreon.com",
+                "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+            )
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    async fn consumer_link_with_token(sealer: &TokenSealer, token: &[u8]) -> PatreonLink {
+        let access = sealer.seal(token).await.expect("seal access");
+        let refresh = seal_under_existing_dek(sealer, &access.wrapped_dek, b"refresh")
+            .await
+            .expect("seal refresh");
+        let now = Utc::now().timestamp();
+        PatreonLink {
+            user_id: Uuid::new_v4(),
+            role: "consumer".into(),
+            patreon_user_id: "p-1".into(),
+            campaign_id: None,
+            scopes: String::new(),
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            token_expires_at: now + 3600,
+            linked_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_fetch_failure_propagates_does_not_yield_empty_snapshot() {
+        // Fail-closed contract: when Patreon is unreachable, materialization
+        // must return Err (so materialize_for_user omits the claim and does NOT
+        // cache), NOT Ok with an empty membership list that would be cached for
+        // the full TTL and read downstream as "no entitlement".
+        let sealer = TokenSealer::Plaintext;
+        let link = consumer_link_with_token(&sealer, b"access-token").await;
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let state = PatreonState {
+            oauth: Some(PatreonOAuthConfig {
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                redirect_uris: vec!["https://x/cb".into()],
+            }),
+            sealer: Some(sealer),
+            http: unreachable_patreon_http(),
+            cache: MembershipCache::new(redis),
+        };
+        let result = materialize_from_link(&state, &link).await;
+        assert!(
+            result.is_err(),
+            "unreachable Patreon must propagate an error, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_cache_fallback_is_bounded() {
+        // Redis disconnected → local fallback. Inserting more distinct,
+        // non-expired users than the cap must not grow the map past the cap.
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let cache = MembershipCache::new(redis);
+        let now = Utc::now().timestamp();
+        let snap = ArkavoPatreon {
+            role: "consumer".into(),
+            patreon_user_id: "p".into(),
+            campaign_id: None,
+            memberships: vec![],
+            verified_at: now,
+            cache_expires_at: now + 3600, // not expired, so retain can't reclaim
+        };
+        for _ in 0..(MAX_LOCAL_CACHE_ENTRIES + 25) {
+            cache.put(Uuid::new_v4(), &snap).await;
+        }
+        let len = cache.local.lock().unwrap().len();
+        assert!(
+            len <= MAX_LOCAL_CACHE_ENTRIES,
+            "local cache grew to {len}, exceeding cap {MAX_LOCAL_CACHE_ENTRIES}"
+        );
+    }
+
     #[tokio::test]
     async fn membership_cache_drops_expired_entries() {
         let redis =
@@ -1354,6 +1591,29 @@ mod tests {
         assert_eq!(subject_prefix("0123456789abc"), "01234567");
         assert_eq!(subject_prefix("short"), "short");
         assert_eq!(subject_prefix(""), "");
+    }
+
+    #[test]
+    fn creator_without_campaign_is_rejected() {
+        // A creator link with no discoverable campaign would persist a
+        // contradictory row (role=creator, campaign_id=None) that materializes
+        // empty entitlements forever. Reject it at link time instead.
+        assert!(matches!(
+            validate_creator_campaign("creator", &None),
+            Err(PatreonError::NoCampaign)
+        ));
+        // Creator with a campaign is fine.
+        assert!(validate_creator_campaign("creator", &Some("camp-1".into())).is_ok());
+        // Consumers never require a campaign.
+        assert!(validate_creator_campaign("consumer", &None).is_ok());
+    }
+
+    #[test]
+    fn no_campaign_error_maps_to_400() {
+        assert_eq!(
+            PatreonError::NoCampaign.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
