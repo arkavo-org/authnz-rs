@@ -60,6 +60,12 @@ use tokio::sync::RwLock;
 /// a `kid` miss force-refreshes regardless, so an hour is comfortable.
 const ENTRA_JWKS_CACHE_TTL_SECONDS: i64 = 3600;
 
+/// Total timeout for a JWKS fetch. The fetch runs inline on the unauthenticated
+/// `/oauth/authorize` path (any `idp=entra` token can trigger a cold or
+/// `kid`-miss refresh), so a bounded timeout is required to keep a slow or
+/// blackholed `login.microsoftonline.com` from pinning an inbound task.
+const ENTRA_JWKS_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Claims published by Entra in v2.0 `id_token`s.
 ///
 /// Requires the app registration to use `accessTokenAcceptedVersion: 2` so the
@@ -205,6 +211,10 @@ fn parse_audiences(raw: Option<String>) -> Vec<String> {
 pub struct EntraJwksCache {
     inner: RwLock<CacheState>,
     cfg: EntraConfig,
+    /// Reused HTTP client carrying an explicit total timeout (see
+    /// [`ENTRA_JWKS_HTTP_TIMEOUT_SECS`]). Reused so the connection pool survives
+    /// across refreshes rather than reconnecting on every cold fetch.
+    http_client: reqwest::Client,
 }
 
 struct CacheState {
@@ -225,12 +235,17 @@ impl EntraJwksCache {
     }
 
     pub fn with_config(cfg: EntraConfig) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(ENTRA_JWKS_HTTP_TIMEOUT_SECS))
+            .build()
+            .expect("build reqwest client for Entra JWKS");
         Self {
             inner: RwLock::new(CacheState {
                 keys: Vec::new(),
                 fetched_at: 0,
             }),
             cfg,
+            http_client,
         }
     }
 
@@ -243,7 +258,10 @@ impl EntraJwksCache {
             }
         }
 
-        let response = reqwest::get(&self.cfg.jwks_url)
+        let response = self
+            .http_client
+            .get(&self.cfg.jwks_url)
+            .send()
             .await
             .map_err(|e| EntraSigninError::JwksFetch(e.to_string()))?;
         if !response.status().is_success() {
@@ -394,6 +412,12 @@ fn check_nonce(
     Ok(())
 }
 
+/// Constant-time byte comparison **for equal-length inputs**. The early
+/// length-mismatch return leaks the length of `b` (the expected nonce / its
+/// 64-char hex hash) via timing. That is acceptable here: the nonce is the
+/// client-supplied, single-use OIDC `nonce`, not a long-lived secret, so its
+/// length is not sensitive. A vetted crate (`subtle`) would be required if a
+/// stronger guarantee were ever needed.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -418,6 +442,12 @@ pub async fn map_entra_user(
     let username = format!("entra-{}", sanitize_for_username(&claims.oid));
     let did = format!("did:key:entra-{}", &sha256_hex(&claims.oid)[..32]);
 
+    // NOTE: read-then-create is not atomic — two concurrent *first* logins for
+    // the same `oid` can both observe `None` and provision duplicate accounts.
+    // This is inherited from the shared `create_user` path (WebAuthn + Apple
+    // have the same shape); making provisioning idempotent (conditional put on
+    // `username`, re-read on conflict) is a db-layer follow-up tracked in #34,
+    // not specific to Entra.
     let user = match app_state.db_store.get_user_by_name(&username).await? {
         Some(existing) => existing,
         None => {
