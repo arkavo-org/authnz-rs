@@ -24,6 +24,7 @@ use crate::constants::{
     ACCESS_TOKEN_LIFETIME_SECONDS, AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER,
     ID_TOKEN_LIFETIME_SECONDS,
 };
+use crate::entra_signin;
 use axum::Json;
 use axum::extract::{Extension, Form, Query};
 use axum::http::{HeaderMap, StatusCode};
@@ -620,6 +621,7 @@ pub async fn authorize(
     Extension(app_state): Extension<AppState>,
     Extension(oidc): Extension<Arc<OidcConfig>>,
     Extension(apple): Extension<Arc<apple_signin::AppleJwksCache>>,
+    Extension(entra): Extension<Arc<entra_signin::EntraJwksCache>>,
     Extension(code_store): Extension<AuthorizationCodeStore>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeQuery>,
@@ -676,7 +678,7 @@ pub async fn authorize(
     }
 
     // Resolve the authenticated user from one of the supported upstream sources.
-    let user = match resolve_user(&app_state, &oidc, &apple, &headers, &params).await {
+    let user = match resolve_user(&app_state, &oidc, &apple, &entra, &headers, &params).await {
         Ok(user) => user,
         Err(e) => return e.into_response(),
     };
@@ -1460,6 +1462,15 @@ pub enum AuthorizeError {
     AppleNonceRequired,
     #[error("apple_signin error: {0}")]
     AppleSigninError(#[from] apple_signin::AppleSigninError),
+    #[error("invalid Entra id_token: {0}")]
+    InvalidEntraIdToken(String),
+    #[error(
+        "idp=entra requires the OIDC `nonce` query parameter (used as the Entra nonce). \
+         No nonce was supplied — refusing to validate Entra id_token."
+    )]
+    EntraNonceRequired,
+    #[error("entra_signin error: {0}")]
+    EntraSigninError(#[from] entra_signin::EntraSigninError),
     #[error("database error: {0}")]
     Database(String),
 }
@@ -1468,11 +1479,15 @@ impl IntoResponse for AuthorizeError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
             AuthorizeError::LoginRequired => (StatusCode::UNAUTHORIZED, "login_required"),
-            AuthorizeError::InvalidArkavoJwt(_) | AuthorizeError::InvalidAppleIdToken(_) => {
+            AuthorizeError::InvalidArkavoJwt(_)
+            | AuthorizeError::InvalidAppleIdToken(_)
+            | AuthorizeError::InvalidEntraIdToken(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
+            AuthorizeError::AppleNonceRequired | AuthorizeError::EntraNonceRequired => {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            }
+            AuthorizeError::AppleSigninError(_) | AuthorizeError::EntraSigninError(_) => {
                 (StatusCode::UNAUTHORIZED, "invalid_token")
             }
-            AuthorizeError::AppleNonceRequired => (StatusCode::BAD_REQUEST, "invalid_request"),
-            AuthorizeError::AppleSigninError(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
             AuthorizeError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
         oidc_error_response(status, code, &self.to_string())
@@ -1483,9 +1498,39 @@ async fn resolve_user(
     app_state: &AppState,
     oidc: &OidcConfig,
     apple: &apple_signin::AppleJwksCache,
+    entra: &entra_signin::EntraJwksCache,
     headers: &HeaderMap,
     params: &AuthorizeQuery,
 ) -> Result<AuthenticatedUser, AuthorizeError> {
+    // Entra (Microsoft 365) is checked first: an Entra client may present its
+    // id_token via the generic `id_token` param, which would otherwise be
+    // claimed by the Apple branch below. Dispatch is by explicit `idp=entra` or
+    // the dedicated `X-Entra-Id-Token` header.
+    if params.idp.as_deref() == Some("entra") || headers.get("X-Entra-Id-Token").is_some() {
+        let token = headers
+            .get("X-Entra-Id-Token")
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+            .or_else(|| params.id_token.clone())
+            .ok_or_else(|| {
+                AuthorizeError::InvalidEntraIdToken("id_token is required for idp=entra".into())
+            })?;
+
+        // As with Apple, the OIDC `nonce` query parameter doubles as the Entra
+        // nonce: the client uses the same value when invoking Entra, Entra
+        // echoes it in the id_token, and we verify the match. Refusing to
+        // validate without a nonce is the mandatory anti-replay binding.
+        let nonce = params
+            .nonce
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .ok_or(AuthorizeError::EntraNonceRequired)?;
+
+        let entra_claims = entra_signin::verify_entra_id_token(entra, &token, nonce).await?;
+        return entra_signin::map_entra_user(app_state, &entra_claims)
+            .await
+            .map_err(|e| AuthorizeError::Database(e.to_string()));
+    }
+
     // Prefer explicit idp hint.
     if params.idp.as_deref() == Some("apple")
         || params.id_token.is_some()

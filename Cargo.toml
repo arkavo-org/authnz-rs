@@ -55,3 +55,10 @@ hex = "=0.4.3"           # Hex encoding for hashes
 [features]
 default = []
 http3 = ["h3", "h3-quinn", "quinn"]
+
+[dev-dependencies]
+# Generate an ephemeral RSA keypair at test time so no private key is ever
+# committed (see entra_signin network tests). Already in the lock graph via
+# jsonwebtoken's rust_crypto feature, so this adds no new downloads.
+rsa = "0.9"
+rand = "0.8"

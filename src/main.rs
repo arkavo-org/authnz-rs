@@ -39,6 +39,7 @@ use crate::db::DynamoDBStore;
 use crate::device_check::{
     finish_assertion, finish_attestation, generate_assertion_challenge, generate_challenge,
 };
+use crate::entra_signin::EntraJwksCache;
 use crate::oidc::{
     AuthorizationCodeStore, OidcConfig, RefreshTokenStore, authorize as oidc_authorize,
     cose_keys as oidc_cose_keys, discovery as oidc_discovery, jwks as oidc_jwks,
@@ -51,6 +52,7 @@ mod constants;
 mod cwt;
 mod db;
 mod device_check;
+mod entra_signin;
 mod oidc;
 
 // HTTP/3 server function (feature-gated)
@@ -316,6 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
     let oidc_refresh_store = RefreshTokenStore::new(redis_client);
     let apple_jwks_cache = Arc::new(AppleJwksCache::new());
+    // Entra (Microsoft 365) upstream federation. Reads ENTRA_TENANT_ID /
+    // ENTRA_CLIENT_ID from the environment; unconfigured deployments simply
+    // reject `idp=entra` at verification time (EntraSigninError::NotConfigured).
+    let entra_jwks_cache = Arc::new(EntraJwksCache::new());
 
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
@@ -367,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(oidc_code_store))
         .layer(Extension(oidc_refresh_store))
         .layer(Extension(apple_jwks_cache))
+        .layer(Extension(entra_jwks_cache))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
         .fallback(handler_fallback);
