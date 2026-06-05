@@ -286,6 +286,11 @@ pub struct PatreonState {
     pub sealer: Option<TokenSealer>,
     pub http: reqwest::Client,
     pub cache: MembershipCache,
+    /// Patreon OAuth2 token endpoint. Defaults to the production constant;
+    /// overridable so tests (and staging) can point at a local/sandbox server.
+    pub token_url: String,
+    /// Patreon API v2 identity endpoint (base, without query). See `token_url`.
+    pub identity_url: String,
 }
 
 impl PatreonState {
@@ -303,6 +308,8 @@ impl PatreonState {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             cache: MembershipCache::new(redis),
+            token_url: PATREON_TOKEN_URL.to_string(),
+            identity_url: PATREON_IDENTITY_URL.to_string(),
         }
     }
 
@@ -327,6 +334,8 @@ pub enum PatreonError {
     MissingAuth,
     #[error("Patreon API error: {0}")]
     Api(String),
+    #[error("Patreon rejected the access token (expired or revoked)")]
+    Unauthorized,
     #[error("KMS error: {0}")]
     Kms(String),
     #[error("Crypto error: {0}")]
@@ -349,7 +358,11 @@ impl IntoResponse for PatreonError {
             | PatreonError::NoCampaign
             | PatreonError::InvalidGrant => StatusCode::BAD_REQUEST,
             PatreonError::MissingAuth => StatusCode::UNAUTHORIZED,
-            PatreonError::Api(_) => StatusCode::BAD_GATEWAY,
+            // A Patreon-side 401 is an upstream/token problem, not a problem
+            // with the *caller's* request to us → surface as BAD_GATEWAY. In
+            // the materialization path this is caught and triggers a refresh
+            // before it can become a response.
+            PatreonError::Api(_) | PatreonError::Unauthorized => StatusCode::BAD_GATEWAY,
             PatreonError::LinkConflict => StatusCode::CONFLICT,
             PatreonError::Kms(_)
             | PatreonError::Crypto(_)
@@ -376,6 +389,7 @@ impl IntoResponse for PatreonError {
                 "Patreon identity already linked to a different arkavo user"
             }
             PatreonError::Api(_) => "upstream Patreon request failed",
+            PatreonError::Unauthorized => "Patreon rejected the access token",
             PatreonError::Kms(_) | PatreonError::Crypto(_) | PatreonError::Db(_) => {
                 "internal error"
             }
@@ -473,20 +487,28 @@ pub async fn patreon_link_handler(
     }
 
     // 1. Exchange the code for tokens.
-    let tokens =
-        match exchange_code_for_tokens(&state.http, oauth, &req.code, &req.redirect_uri).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Patreon code exchange failed: {}", e);
-                return e.into_response();
-            }
-        };
+    let tokens = match exchange_code_for_tokens(
+        &state.http,
+        oauth,
+        &req.code,
+        &req.redirect_uri,
+        &state.token_url,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Patreon code exchange failed: {}", e);
+            return e.into_response();
+        }
+    };
 
     // 2. Discover patreon_user_id (+ campaign_id for creators).
     let (patreon_user_id, campaign_id) = match fetch_identity(
         &state.http,
         &tokens.access_token,
         role.as_str() == "creator",
+        &state.identity_url,
     )
     .await
     {
@@ -662,11 +684,55 @@ fn token_exchange_error(status: reqwest::StatusCode, body: &str) -> PatreonError
     }
 }
 
+/// Build the updated [`PatreonLink`] after a successful token refresh. Keeps
+/// the immutable identity fields (user, Patreon user/campaign, role,
+/// `linked_at`) and swaps in the freshly-sealed access/refresh ciphertexts,
+/// new scopes, and recomputed expiry. Patreon rotates the refresh token on
+/// every refresh, so both ciphertexts are replaced.
+fn merge_refreshed_link(
+    old: &PatreonLink,
+    new_tokens: &PatreonTokenResponse,
+    sealed_access: SealedToken,
+    sealed_refresh: SealedToken,
+    now: i64,
+) -> PatreonLink {
+    PatreonLink {
+        user_id: old.user_id,
+        role: old.role.clone(),
+        patreon_user_id: old.patreon_user_id.clone(),
+        campaign_id: old.campaign_id.clone(),
+        scopes: new_tokens.scope.clone(),
+        access_token_ct: sealed_access.ciphertext,
+        access_token_nonce: sealed_access.nonce,
+        refresh_token_ct: sealed_refresh.ciphertext,
+        refresh_token_nonce: sealed_refresh.nonce,
+        wrapped_dek: sealed_access.wrapped_dek,
+        token_expires_at: now + new_tokens.expires_in,
+        linked_at: old.linked_at,
+    }
+}
+
+/// Classify a non-success Patreon `/identity` (or membership) response. A 401
+/// means our stored access token is stale/revoked and the caller may refresh;
+/// everything else is an opaque upstream failure.
+fn identity_fetch_error(status: reqwest::StatusCode, body: &str) -> PatreonError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        PatreonError::Unauthorized
+    } else {
+        PatreonError::Api(format!(
+            "identity endpoint returned {}: {}",
+            status,
+            truncate(body, 256)
+        ))
+    }
+}
+
 async fn exchange_code_for_tokens(
     http: &reqwest::Client,
     oauth: &PatreonOAuthConfig,
     code: &str,
     redirect_uri: &str,
+    token_url: &str,
 ) -> Result<PatreonTokenResponse, PatreonError> {
     let form = [
         ("code", code),
@@ -676,7 +742,7 @@ async fn exchange_code_for_tokens(
         ("redirect_uri", redirect_uri),
     ];
     let resp = http
-        .post(PATREON_TOKEN_URL)
+        .post(token_url)
         .form(&form)
         .send()
         .await
@@ -691,18 +757,14 @@ async fn exchange_code_for_tokens(
         .map_err(|e| PatreonError::Api(format!("token JSON parse: {}", e)))
 }
 
-/// Refresh a Patreon access token using its refresh token. To be wired into
-/// `materialize_from_link` in a follow-up so a stale/revoked access token
-/// triggers refresh-and-persist on the access_token mint path. Until then the
-/// mint path fails closed: a 401 (or any fetch error) propagates and the
-/// `arkavo_patreon` claim is omitted entirely — so an expired access token
-/// silently drops the user's entitlements until they re-link. The helper
-/// itself is correct; only the 401-triggered integration is deferred.
-#[allow(dead_code)]
+/// Refresh a Patreon access token using its refresh token. Wired into
+/// `materialize_from_link`: a consumer membership fetch that returns 401
+/// triggers refresh-and-retry, and the caller persists the rotated tokens.
 async fn refresh_access_token(
     http: &reqwest::Client,
     oauth: &PatreonOAuthConfig,
     refresh_token: &str,
+    token_url: &str,
 ) -> Result<PatreonTokenResponse, PatreonError> {
     let form = [
         ("grant_type", "refresh_token"),
@@ -711,7 +773,7 @@ async fn refresh_access_token(
         ("client_secret", oauth.client_secret.as_str()),
     ];
     let resp = http
-        .post(PATREON_TOKEN_URL)
+        .post(token_url)
         .form(&form)
         .send()
         .await
@@ -730,14 +792,14 @@ async fn refresh_access_token(
         .map_err(|e| PatreonError::Api(format!("refresh JSON parse: {}", e)))
 }
 
-/// Build the `/identity` URL. Creators add the `campaign` relationship so we
-/// can discover the owned campaign id; consumers need none of it. We never
-/// request the `email` field — minimum-PII, and it's never read.
-fn identity_url(is_creator: bool) -> String {
+/// Build the `/identity` URL from a base. Creators add the `campaign`
+/// relationship so we can discover the owned campaign id; consumers need none
+/// of it. We never request the `email` field — minimum-PII, never read.
+fn build_identity_url(base: &str, is_creator: bool) -> String {
     if is_creator {
-        format!("{}?include=campaign", PATREON_IDENTITY_URL)
+        format!("{}?include=campaign", base)
     } else {
-        PATREON_IDENTITY_URL.to_string()
+        base.to_string()
     }
 }
 
@@ -749,8 +811,9 @@ async fn fetch_identity(
     http: &reqwest::Client,
     access_token: &str,
     is_creator: bool,
+    identity_url: &str,
 ) -> Result<(String, Option<String>), PatreonError> {
-    let url = identity_url(is_creator);
+    let url = build_identity_url(identity_url, is_creator);
     let resp = http
         .get(&url)
         .bearer_auth(access_token)
@@ -760,11 +823,7 @@ async fn fetch_identity(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(PatreonError::Api(format!(
-            "identity endpoint returned {}: {}",
-            status,
-            truncate(&body, 256)
-        )));
+        return Err(identity_fetch_error(status, &body));
     }
     let body: serde_json::Value = resp
         .json()
@@ -1005,8 +1064,8 @@ pub async fn materialize_for_user(
         }
     };
 
-    let snap = match materialize_from_link(state, &link).await {
-        Ok(snap) => snap,
+    let (snap, refreshed) = match materialize_from_link(state, &link).await {
+        Ok(v) => v,
         Err(e) => {
             warn!(
                 "Patreon materialization failed for user {}: {} — failing closed (no claim)",
@@ -1015,16 +1074,33 @@ pub async fn materialize_for_user(
             return None;
         }
     };
+
+    // If the access token was refreshed during materialization, persist the
+    // rotated tokens. Best-effort: a persist failure doesn't fail the mint (we
+    // already have the memberships) — the next mint simply refreshes again.
+    if let Some(new_link) = refreshed {
+        match app_state.db_store.put_patreon_link(&new_link).await {
+            Ok(()) => debug!("Persisted refreshed Patreon tokens for user {}", user_id),
+            Err(e) => warn!(
+                "Failed to persist refreshed Patreon tokens for user {}: {} — will refresh again next mint",
+                user_id, e
+            ),
+        }
+    }
+
     state.cache.put(user_id, &snap).await;
     Some(snap)
 }
 
+/// Produce the membership snapshot for a link. The returned `Option<PatreonLink>`
+/// is `Some` iff a token refresh happened and the caller should persist the
+/// rotated tokens. Any unrecoverable failure propagates — the caller fails
+/// closed (omits the claim, doesn't cache).
 async fn materialize_from_link(
     state: &PatreonState,
     link: &PatreonLink,
-) -> Result<ArkavoPatreon, PatreonError> {
+) -> Result<(ArkavoPatreon, Option<PatreonLink>), PatreonError> {
     let sealer = state.sealer.as_ref().ok_or(PatreonError::NotConfigured)?;
-    let oauth = state.oauth.as_ref().ok_or(PatreonError::NotConfigured)?;
 
     let access_plain = sealer
         .open(&SealedToken {
@@ -1036,51 +1112,109 @@ async fn materialize_from_link(
     let access_token = String::from_utf8(access_plain)
         .map_err(|_| PatreonError::Crypto("access token not UTF-8 after decrypt".into()))?;
 
-    // Fast path: token still valid by our recorded expiry. Patreon may have
-    // revoked the token server-side anyway, in which case the membership
-    // call below returns 401 and we'd want to refresh — but we don't refresh
-    // pre-emptively here to keep this read path cheap. A future iteration
-    // can add the 401-triggered refresh + persist cycle.
     let now = Utc::now().timestamp();
-    let _stale = now >= link.token_expires_at;
-    let _ = oauth; // refresh-on-401 path not yet implemented; see comment above.
 
-    let snap = match link.role.as_str() {
+    match link.role.as_str() {
         "creator" => {
             // For creators, the snapshot is informational — the relevant
-            // membership data is the consumer's, not the creator's. Embed
-            // the campaign id so RPs can look up "which creator does this
-            // user own".
-            let memberships = Vec::new();
-            ArkavoPatreon {
+            // membership data is the consumer's, not the creator's. Embed the
+            // campaign id so RPs can look up "which creator does this user own".
+            // No Patreon call is made, so no refresh is possible or needed.
+            let snap = ArkavoPatreon {
                 role: "creator".into(),
                 patreon_user_id: link.patreon_user_id.clone(),
                 campaign_id: link.campaign_id.clone(),
-                memberships,
+                memberships: Vec::new(),
                 verified_at: now,
                 cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
-            }
+            };
+            Ok((snap, None))
         }
         _ => {
-            // Consumer: query Patreon for memberships. A fetch *failure* must
-            // propagate — the caller (materialize_for_user) fails closed by
-            // omitting the claim entirely and NOT caching. Swallowing the error
-            // into an empty list would cache a false "no entitlement" for the
-            // full TTL on any transient Patreon blip or token expiry. A genuine
-            // HTTP 200 with no memberships still yields Ok(vec![]) here and is
-            // cached as a real (empty) snapshot.
-            let memberships = fetch_consumer_memberships(&state.http, &access_token).await?;
-            ArkavoPatreon {
+            // Consumer: query Patreon for memberships, refreshing the access
+            // token once on a 401. A genuine HTTP 200 with no memberships
+            // yields an empty list (cached as a real snapshot); any
+            // unrecoverable failure propagates so the caller fails closed.
+            let (memberships, refreshed) =
+                fetch_memberships_with_refresh(state, link, &access_token).await?;
+            let snap = ArkavoPatreon {
                 role: "consumer".into(),
                 patreon_user_id: link.patreon_user_id.clone(),
                 campaign_id: None,
                 memberships,
                 verified_at: now,
                 cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
-            }
+            };
+            Ok((snap, refreshed))
         }
-    };
-    Ok(snap)
+    }
+}
+
+/// Fetch consumer memberships, transparently refreshing the access token once
+/// if Patreon returns 401 (token expired/revoked). On refresh, returns the
+/// rotated [`PatreonLink`] so the caller can persist it; the retry fetch is
+/// authoritative (a second 401 propagates rather than looping).
+///
+/// Concurrency note: two simultaneous mints for the same user can both refresh.
+/// Patreon rotates the refresh token on use, so the slower refresh may fail (it
+/// reused an already-consumed refresh token) — that mint just fails closed for
+/// that request, and persistence is last-writer-wins. Acceptable for the read
+/// path; fully serializing refreshes (distributed lock / conditional update) is
+/// intentionally out of scope here.
+async fn fetch_memberships_with_refresh(
+    state: &PatreonState,
+    link: &PatreonLink,
+    access_token: &str,
+) -> Result<(Vec<ArkavoPatreonMembership>, Option<PatreonLink>), PatreonError> {
+    match fetch_consumer_memberships(&state.http, access_token, &state.identity_url).await {
+        Ok(m) => Ok((m, None)),
+        Err(PatreonError::Unauthorized) => {
+            let sealer = state.sealer.as_ref().ok_or(PatreonError::NotConfigured)?;
+            let oauth = state.oauth.as_ref().ok_or(PatreonError::NotConfigured)?;
+            info!(
+                "Patreon access token rejected (401) for patreon_user_id_prefix={}; refreshing",
+                subject_prefix(&link.patreon_user_id)
+            );
+
+            let refresh_plain = sealer
+                .open(&SealedToken {
+                    wrapped_dek: link.wrapped_dek.clone(),
+                    nonce: link.refresh_token_nonce.clone(),
+                    ciphertext: link.refresh_token_ct.clone(),
+                })
+                .await?;
+            let refresh_token = String::from_utf8(refresh_plain).map_err(|_| {
+                PatreonError::Crypto("refresh token not UTF-8 after decrypt".into())
+            })?;
+
+            let new_tokens =
+                refresh_access_token(&state.http, oauth, &refresh_token, &state.token_url).await?;
+
+            // Re-seal both rotated tokens under a fresh per-row DEK (distinct
+            // GCM nonces; one wrapped DEK per row).
+            let sealed_access = sealer.seal(new_tokens.access_token.as_bytes()).await?;
+            let sealed_refresh = seal_under_existing_dek(
+                sealer,
+                &sealed_access.wrapped_dek,
+                new_tokens.refresh_token.as_bytes(),
+            )
+            .await?;
+            let now = Utc::now().timestamp();
+            let refreshed_link =
+                merge_refreshed_link(link, &new_tokens, sealed_access, sealed_refresh, now);
+
+            // Retry once with the new access token. A failure here propagates
+            // (fail-closed) rather than triggering a second refresh.
+            let memberships = fetch_consumer_memberships(
+                &state.http,
+                &new_tokens.access_token,
+                &state.identity_url,
+            )
+            .await?;
+            Ok((memberships, Some(refreshed_link)))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Pull the consumer's memberships from Patreon's `/identity` endpoint.
@@ -1090,11 +1224,12 @@ async fn materialize_from_link(
 async fn fetch_consumer_memberships(
     http: &reqwest::Client,
     access_token: &str,
+    identity_url: &str,
 ) -> Result<Vec<ArkavoPatreonMembership>, PatreonError> {
     let url = format!(
         "{}?include=memberships,memberships.currently_entitled_tiers,memberships.campaign\
         &fields%5Bmember%5D=patron_status",
-        PATREON_IDENTITY_URL
+        identity_url
     );
     let resp = http
         .get(&url)
@@ -1105,11 +1240,7 @@ async fn fetch_consumer_memberships(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(PatreonError::Api(format!(
-            "identity endpoint returned {}: {}",
-            status,
-            truncate(&body, 256)
-        )));
+        return Err(identity_fetch_error(status, &body));
     }
     let body: serde_json::Value = resp
         .json()
@@ -1311,7 +1442,7 @@ mod tests {
     fn identity_url_creator_includes_campaign_but_not_email() {
         // Minimum-PII: we only need data.id + campaign relationship; never
         // request the user's email from Patreon.
-        let url = identity_url(true);
+        let url = build_identity_url(PATREON_IDENTITY_URL, true);
         assert!(url.contains("include=campaign"), "creator url: {url}");
         assert!(
             !url.to_lowercase().contains("email"),
@@ -1321,7 +1452,24 @@ mod tests {
 
     #[test]
     fn identity_url_consumer_has_no_query() {
-        assert_eq!(identity_url(false), PATREON_IDENTITY_URL);
+        assert_eq!(
+            build_identity_url(PATREON_IDENTITY_URL, false),
+            PATREON_IDENTITY_URL
+        );
+    }
+
+    #[test]
+    fn identity_fetch_401_classifies_as_unauthorized() {
+        // A 401 on a membership/identity fetch means our access token is
+        // stale/revoked → caller can trigger a refresh. Other failures stay Api.
+        assert!(matches!(
+            identity_fetch_error(reqwest::StatusCode::UNAUTHORIZED, "expired"),
+            PatreonError::Unauthorized
+        ));
+        assert!(matches!(
+            identity_fetch_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+            PatreonError::Api(_)
+        ));
     }
 
     #[test]
@@ -1515,6 +1663,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_refreshed_link_preserves_identity_and_updates_tokens() {
+        let sealer = TokenSealer::Plaintext;
+        let old = consumer_link_with_token(&sealer, b"old-access").await;
+        let new_tokens = PatreonTokenResponse {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            expires_in: 2_592_000,
+            scope: "identity campaigns.members".into(),
+            token_type: "Bearer".into(),
+        };
+        let sealed_access = sealer
+            .seal(new_tokens.access_token.as_bytes())
+            .await
+            .unwrap();
+        let sealed_refresh = seal_under_existing_dek(
+            &sealer,
+            &sealed_access.wrapped_dek,
+            new_tokens.refresh_token.as_bytes(),
+        )
+        .await
+        .unwrap();
+        let now = 1_000_000;
+        let merged = merge_refreshed_link(&old, &new_tokens, sealed_access, sealed_refresh, now);
+
+        // Identity, role, and link timestamp are preserved.
+        assert_eq!(merged.user_id, old.user_id);
+        assert_eq!(merged.patreon_user_id, old.patreon_user_id);
+        assert_eq!(merged.role, old.role);
+        assert_eq!(merged.campaign_id, old.campaign_id);
+        assert_eq!(merged.linked_at, old.linked_at);
+        // Token material + expiry + scopes are refreshed.
+        assert_eq!(merged.scopes, "identity campaigns.members");
+        assert_eq!(merged.token_expires_at, now + 2_592_000);
+        let opened_access = sealer
+            .open(&SealedToken {
+                wrapped_dek: merged.wrapped_dek.clone(),
+                nonce: merged.access_token_nonce.clone(),
+                ciphertext: merged.access_token_ct.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(opened_access, b"new-access");
+        let opened_refresh = sealer
+            .open(&SealedToken {
+                wrapped_dek: merged.wrapped_dek.clone(),
+                nonce: merged.refresh_token_nonce.clone(),
+                ciphertext: merged.refresh_token_ct.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(opened_refresh, b"new-refresh");
+    }
+
+    #[tokio::test]
     async fn consumer_fetch_failure_propagates_does_not_yield_empty_snapshot() {
         // Fail-closed contract: when Patreon is unreachable, materialization
         // must return Err (so materialize_for_user omits the claim and does NOT
@@ -1533,12 +1735,114 @@ mod tests {
             sealer: Some(sealer),
             http: unreachable_patreon_http(),
             cache: MembershipCache::new(redis),
+            token_url: PATREON_TOKEN_URL.to_string(),
+            identity_url: PATREON_IDENTITY_URL.to_string(),
         };
         let result = materialize_from_link(&state, &link).await;
         assert!(
             result.is_err(),
             "unreachable Patreon must propagate an error, got: {result:?}"
         );
+    }
+
+    /// Minimal localhost Patreon stand-in. Dispatches on method + bearer token:
+    /// - POST (token endpoint)            → 200, rotated tokens (new-access/new-refresh)
+    /// - GET  with `Bearer old-access`    → 401 (token expired)
+    /// - GET  with `Bearer new-access`    → 200, one active membership
+    ///
+    /// Returns `(token_url, identity_url)` pointing at the spawned server.
+    async fn spawn_patreon_mock() -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    // Small localhost requests arrive whole in one read; the
+                    // request line + headers are all we dispatch on.
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_post = req.starts_with("POST");
+                    let has_old = req.contains("Bearer old-access");
+
+                    let (status_line, body) = if is_post {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":2592000,"scope":"identity","token_type":"Bearer"}"#.to_string(),
+                        )
+                    } else if has_old {
+                        ("HTTP/1.1 401 Unauthorized", String::new())
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"data":{"id":"p-1"},"included":[{"type":"member","id":"m1","attributes":{"patron_status":"active_patron"},"relationships":{"campaign":{"data":{"id":"camp-1"}},"currently_entitled_tiers":{"data":[{"id":"tier-gold"}]}}}]}"#.to_string(),
+                        )
+                    };
+                    let resp = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        (format!("{base}/token"), format!("{base}/v2/identity"))
+    }
+
+    #[tokio::test]
+    async fn consumer_membership_refreshes_on_401_and_retries() {
+        // End-to-end: stale access token → 401 → refresh → retry → memberships.
+        let (token_url, identity_url) = spawn_patreon_mock().await;
+        let sealer = TokenSealer::Plaintext;
+        let link = consumer_link_with_token(&sealer, b"old-access").await;
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let state = PatreonState {
+            oauth: Some(PatreonOAuthConfig {
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                redirect_uris: vec!["https://x/cb".into()],
+            }),
+            sealer: Some(sealer.clone()),
+            http: reqwest::Client::new(),
+            cache: MembershipCache::new(redis),
+            token_url,
+            identity_url,
+        };
+
+        let (snap, refreshed) = materialize_from_link(&state, &link)
+            .await
+            .expect("materialization should succeed after refresh");
+
+        // The retried fetch (with new-access) returned the active membership.
+        assert_eq!(snap.memberships.len(), 1, "expected one membership");
+        assert_eq!(
+            snap.memberships[0].patron_status.as_deref(),
+            Some("active_patron")
+        );
+        assert_eq!(snap.memberships[0].tier_ids, vec!["tier-gold"]);
+
+        // A refresh occurred, so a rotated link is handed back for persistence,
+        // and its access ciphertext decrypts to the new token.
+        let new_link = refreshed.expect("a refresh should have produced a new link");
+        assert_eq!(new_link.user_id, link.user_id);
+        assert_eq!(new_link.patreon_user_id, link.patreon_user_id);
+        let opened = sealer
+            .open(&SealedToken {
+                wrapped_dek: new_link.wrapped_dek.clone(),
+                nonce: new_link.access_token_nonce.clone(),
+                ciphertext: new_link.access_token_ct.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(opened, b"new-access");
     }
 
     #[tokio::test]
