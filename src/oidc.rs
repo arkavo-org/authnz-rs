@@ -1729,6 +1729,17 @@ pub fn mint_access_token(
 ) -> Result<String, crate::cwt::CwtError> {
     let mut claims = crate::cwt::ArkavoClaims::oidc_access(&app_state.issuer, sub, audience, 1);
 
+    // RFC 8707-style shared resource audience: a resource server validating
+    // one fixed audience (the OpenTDF platform CWT verifier) must accept
+    // tokens minted for any RP, so the configured platform audience rides
+    // along with the per-client one.
+    if let Some(platform_aud) = app_state.platform_audience.as_ref()
+        && platform_aud != audience
+    {
+        claims.aud =
+            crate::cwt::Audience::Multiple(vec![audience.to_string(), platform_aud.clone()]);
+    }
+
     if let Some(e) = extras {
         if !e.idp.is_empty() {
             claims = claims.with_idp(&e.idp);
@@ -2257,6 +2268,7 @@ mod tests {
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
+            platform_audience: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2353,6 +2365,7 @@ mod tests {
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
+            platform_audience: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2443,6 +2456,53 @@ mod tests {
         let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
         assert_eq!(claims.aud, crate::cwt::Audience::Single("opentdf".into()));
         assert_eq!(claims.custom.idp.as_deref(), Some("arkavo"));
+    }
+
+    #[tokio::test]
+    async fn access_token_carries_platform_audience_when_configured() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
+        let mut app_state = crate::test_helpers::build_test_app_state().await;
+        app_state.platform_audience =
+            std::sync::Arc::new(Some("https://platform.arkavo.net".to_string()));
+
+        let token =
+            crate::oidc::mint_access_token(&app_state, "arkavo:test", "opentdf", None, None)
+                .expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claims.aud,
+            crate::cwt::Audience::Multiple(vec![
+                "opentdf".to_string(),
+                "https://platform.arkavo.net".to_string()
+            ])
+        );
+
+        // When the client IS the platform audience, no duplicate aud entry.
+        let token = crate::oidc::mint_access_token(
+            &app_state,
+            "arkavo:test",
+            "https://platform.arkavo.net",
+            None,
+            None,
+        )
+        .expect("mint");
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claims.aud,
+            crate::cwt::Audience::Single("https://platform.arkavo.net".into())
+        );
     }
 
     #[tokio::test]
