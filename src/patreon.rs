@@ -1477,8 +1477,17 @@ pub(crate) fn parse_memberships_from_identity(
             .and_then(|a| a.get("title"))
             .and_then(|v| v.as_str())
         {
-            let slug = slugify_tier(title);
-            if !slug.is_empty() {
+            // Every tier with a (non-blank) title gets a non-empty, stable
+            // slug. Latin titles slugify to the creator's vocabulary; a
+            // title that is all non-ASCII (e.g. Japanese/emoji) slugifies to
+            // empty, so fall back to the numeric tier id — deterministic and
+            // unique, so international creators' tiers are still gateable.
+            // The Creator app applies the same fallback at tag time.
+            if !title.trim().is_empty() {
+                let mut slug = slugify_tier(title);
+                if slug.is_empty() {
+                    slug = format!("tier-{id}");
+                }
                 tier_slug_by_id.insert(id, slug);
             }
         }
@@ -1516,10 +1525,17 @@ pub(crate) fn parse_memberships_from_identity(
             })
             .unwrap_or_default();
         let tier_ids: Vec<String> = entitled_ids.iter().map(|s| s.to_string()).collect();
-        let tier_slugs: Vec<String> = entitled_ids
-            .iter()
-            .filter_map(|id| tier_slug_by_id.get(id).cloned())
-            .collect();
+        // Deduplicate: slugify is not injective (two distinct titles can
+        // collapse to one slug), so the slug set may be smaller than
+        // tier_ids — they are an independent set, not a parallel array.
+        let mut tier_slugs: Vec<String> = Vec::new();
+        for id in &entitled_ids {
+            if let Some(slug) = tier_slug_by_id.get(id)
+                && !tier_slugs.contains(slug)
+            {
+                tier_slugs.push(slug.clone());
+            }
+        }
         out.push(ArkavoPatreonMembership {
             campaign_id,
             patron_status,
@@ -1644,6 +1660,53 @@ mod tests {
             let slug = slugify_tier(raw);
             assert!(!slug.contains('_') && !slug.contains(' '), "{slug}");
         }
+    }
+
+    #[test]
+    fn parse_memberships_non_ascii_tier_falls_back_to_id() {
+        // A title that slugifies to empty (all non-ASCII) still yields a
+        // stable, unique slug from the tier id — international creators'
+        // tiers stay gateable.
+        let body = json!({
+            "included": [
+                {
+                    "type": "member", "id": "m1",
+                    "attributes": {"patron_status": "active_patron"},
+                    "relationships": {
+                        "campaign": {"data": {"id": "c1", "type": "campaign"}},
+                        "currently_entitled_tiers": {"data": [{"id": "55", "type": "tier"}]}
+                    }
+                },
+                {"type": "tier", "id": "55", "attributes": {"title": "ゴールド"}}
+            ]
+        });
+        let parsed = parse_memberships_from_identity(&body);
+        assert_eq!(parsed[0].tier_slugs, vec!["tier-55"]);
+    }
+
+    #[test]
+    fn parse_memberships_dedupes_colliding_slugs() {
+        // Two distinct titles that collapse to the same slug yield ONE slug.
+        let body = json!({
+            "included": [
+                {
+                    "type": "member", "id": "m1",
+                    "attributes": {"patron_status": "active_patron"},
+                    "relationships": {
+                        "campaign": {"data": {"id": "c1", "type": "campaign"}},
+                        "currently_entitled_tiers": {"data": [
+                            {"id": "t1", "type": "tier"},
+                            {"id": "t2", "type": "tier"}
+                        ]}
+                    }
+                },
+                {"type": "tier", "id": "t1", "attributes": {"title": "Gold!"}},
+                {"type": "tier", "id": "t2", "attributes": {"title": "Gold?"}}
+            ]
+        });
+        let parsed = parse_memberships_from_identity(&body);
+        assert_eq!(parsed[0].tier_ids, vec!["t1", "t2"]);
+        assert_eq!(parsed[0].tier_slugs, vec!["gold"]); // deduped
     }
 
     #[test]

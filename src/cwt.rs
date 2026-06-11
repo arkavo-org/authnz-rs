@@ -97,8 +97,9 @@ pub struct ArkavoPatreonMembership {
     /// Slugified tier titles (lowercase, hyphenated) the user is entitled
     /// to within this campaign — the creator's own tier vocabulary. Feeds
     /// the platform's campaign-qualified entitlements
-    /// (`campaign-tier/value/<campaign_id>_<slug>`). Parallel to `tier_ids`
-    /// but human-meaningful; empty until materialized.
+    /// (`campaign-tier/value/<campaign_id>_<slug>`). An independent,
+    /// deduplicated SET — NOT parallel to `tier_ids` (slugify is not
+    /// injective and titleless tiers are dropped). Empty until materialized.
     pub tier_slugs: Vec<String>,
 }
 
