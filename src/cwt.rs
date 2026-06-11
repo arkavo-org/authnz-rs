@@ -50,6 +50,50 @@ pub struct CustomClaims {
     pub arkavo_account_id: Option<String>,
     pub arkavo_roles: Option<Vec<String>>,
     pub arkavo_entitlements: Option<Vec<String>>,
+    /// Materialized Patreon membership snapshot. Populated by the OIDC token
+    /// endpoint at mint time from the user's linked Patreon account. Verifiers
+    /// (KAS, downstream RPs) read this directly off the access_token CWT —
+    /// per the architecture statement, "Patreon proves membership, authnz-rs
+    /// materializes entitlement", and the materialization lives in the token.
+    pub arkavo_patreon: Option<ArkavoPatreon>,
+}
+
+/// Materialized Patreon membership for embedding in a CWT access token.
+///
+/// One snapshot per minted token. `verified_at` is the wall-clock second when
+/// the Patreon API was queried (or the cache was warmed); `cache_expires_at`
+/// is the latest second the cached snapshot may be reused without re-querying
+/// Patreon. Downstream consumers should treat any value where
+/// `cache_expires_at < now` as stale and re-mint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkavoPatreon {
+    /// `creator` or `consumer`. Determines how the membership list is
+    /// interpreted: a creator owns `campaign_id`; a consumer is enrolled in
+    /// zero or more campaigns.
+    pub role: String,
+    /// Patreon user id (the `data.id` returned by `/api/oauth2/v2/identity`).
+    pub patreon_user_id: String,
+    /// Creator-only: the Patreon campaign id discovered at link time. None
+    /// for consumers (their memberships are listed in `memberships`).
+    pub campaign_id: Option<String>,
+    /// Consumer memberships. Empty for creators.
+    pub memberships: Vec<ArkavoPatreonMembership>,
+    /// Unix timestamp when this snapshot was materialized.
+    pub verified_at: i64,
+    /// Unix timestamp after which the snapshot is stale.
+    pub cache_expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkavoPatreonMembership {
+    pub campaign_id: String,
+    /// Patreon's `patron_status` string. `active_patron`, `declined_patron`,
+    /// `former_patron`, or absent (then `None`). Only `active_patron` should
+    /// be treated as conferring entitlement by downstream policy.
+    pub patron_status: Option<String>,
+    /// Patreon tier IDs the user is currently entitled to. Empty list means
+    /// the user is a free follower (no paid tier).
+    pub tier_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +215,11 @@ impl ArkavoClaims {
 
     pub fn with_arkavo_entitlements(mut self, ents: Vec<String>) -> Self {
         self.custom.arkavo_entitlements = Some(ents);
+        self
+    }
+
+    pub fn with_arkavo_patreon(mut self, p: ArkavoPatreon) -> Self {
+        self.custom.arkavo_patreon = Some(p);
         self
     }
 }
@@ -345,11 +394,136 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
             Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect()),
         ));
     }
+    if let Some(p) = &c.custom.arkavo_patreon {
+        entries.push((Value::Text("arkavo_patreon".into()), patreon_to_cbor(p)));
+    }
 
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&Value::Map(entries), &mut bytes)
         .map_err(|_| CwtError::Malformed)?;
     Ok(bytes)
+}
+
+fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    entries.push((Value::Text("role".into()), Value::Text(p.role.clone())));
+    entries.push((
+        Value::Text("patreon_user_id".into()),
+        Value::Text(p.patreon_user_id.clone()),
+    ));
+    if let Some(cid) = &p.campaign_id {
+        entries.push((Value::Text("campaign_id".into()), Value::Text(cid.clone())));
+    }
+    if !p.memberships.is_empty() {
+        let arr: Vec<Value> = p
+            .memberships
+            .iter()
+            .map(|m| {
+                let mut m_entries: Vec<(Value, Value)> = Vec::new();
+                m_entries.push((
+                    Value::Text("campaign_id".into()),
+                    Value::Text(m.campaign_id.clone()),
+                ));
+                if let Some(status) = &m.patron_status {
+                    m_entries.push((
+                        Value::Text("patron_status".into()),
+                        Value::Text(status.clone()),
+                    ));
+                }
+                m_entries.push((
+                    Value::Text("tier_ids".into()),
+                    Value::Array(m.tier_ids.iter().map(|t| Value::Text(t.clone())).collect()),
+                ));
+                Value::Map(m_entries)
+            })
+            .collect();
+        entries.push((Value::Text("memberships".into()), Value::Array(arr)));
+    }
+    entries.push((
+        Value::Text("verified_at".into()),
+        Value::Integer(p.verified_at.into()),
+    ));
+    entries.push((
+        Value::Text("cache_expires_at".into()),
+        Value::Integer(p.cache_expires_at.into()),
+    ));
+    Value::Map(entries)
+}
+
+fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
+    let Value::Map(entries) = v else {
+        return Err(CwtError::Malformed);
+    };
+    let mut role: Option<String> = None;
+    let mut patreon_user_id: Option<String> = None;
+    let mut campaign_id: Option<String> = None;
+    let mut memberships: Vec<ArkavoPatreonMembership> = Vec::new();
+    let mut verified_at: Option<i64> = None;
+    let mut cache_expires_at: Option<i64> = None;
+
+    for (k, vv) in entries {
+        let key = match k {
+            Value::Text(s) => s,
+            _ => return Err(CwtError::Malformed),
+        };
+        match (key.as_str(), vv) {
+            ("role", Value::Text(s)) => role = Some(s),
+            ("patreon_user_id", Value::Text(s)) => patreon_user_id = Some(s),
+            ("campaign_id", Value::Text(s)) => campaign_id = Some(s),
+            ("memberships", Value::Array(arr)) => {
+                for item in arr {
+                    let Value::Map(m_entries) = item else {
+                        return Err(CwtError::Malformed);
+                    };
+                    let mut m_campaign_id: Option<String> = None;
+                    let mut m_status: Option<String> = None;
+                    let mut m_tiers: Vec<String> = Vec::new();
+                    for (mk, mv) in m_entries {
+                        let mkey = match mk {
+                            Value::Text(s) => s,
+                            _ => return Err(CwtError::Malformed),
+                        };
+                        match (mkey.as_str(), mv) {
+                            ("campaign_id", Value::Text(s)) => m_campaign_id = Some(s),
+                            ("patron_status", Value::Text(s)) => m_status = Some(s),
+                            ("tier_ids", Value::Array(a)) => {
+                                m_tiers = a
+                                    .into_iter()
+                                    .map(|t| match t {
+                                        Value::Text(s) => Ok(s),
+                                        _ => Err(CwtError::Malformed),
+                                    })
+                                    .collect::<Result<_, _>>()?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    memberships.push(ArkavoPatreonMembership {
+                        campaign_id: m_campaign_id.ok_or(CwtError::Malformed)?,
+                        patron_status: m_status,
+                        tier_ids: m_tiers,
+                    });
+                }
+            }
+            ("verified_at", Value::Integer(n)) => {
+                let v: i128 = n.into();
+                verified_at = Some(i64::try_from(v).map_err(|_| CwtError::Malformed)?);
+            }
+            ("cache_expires_at", Value::Integer(n)) => {
+                let v: i128 = n.into();
+                cache_expires_at = Some(i64::try_from(v).map_err(|_| CwtError::Malformed)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(ArkavoPatreon {
+        role: role.ok_or(CwtError::Malformed)?,
+        patreon_user_id: patreon_user_id.ok_or(CwtError::Malformed)?,
+        campaign_id,
+        memberships,
+        verified_at: verified_at.ok_or(CwtError::Malformed)?,
+        cache_expires_at: cache_expires_at.ok_or(CwtError::Malformed)?,
+    })
 }
 
 pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
@@ -495,6 +669,9 @@ pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     })
                     .collect();
                 custom.arkavo_entitlements = Some(parts?);
+            }
+            (Value::Text(s), v) if s == "arkavo_patreon" => {
+                custom.arkavo_patreon = Some(patreon_from_cbor(v)?);
             }
             _ => {} // Ignore unknown claims (forward-compat).
         }
@@ -701,6 +878,51 @@ mod tests {
         assert_eq!(decoded.iat, c.iat);
         assert_eq!(decoded.cti, c.cti);
         assert!(decoded.cnf.is_none());
+    }
+
+    #[test]
+    fn cbor_roundtrip_arkavo_patreon_consumer_claim() {
+        let snap = ArkavoPatreon {
+            role: "consumer".into(),
+            patreon_user_id: "patreon-user-42".into(),
+            campaign_id: None,
+            memberships: vec![
+                ArkavoPatreonMembership {
+                    campaign_id: "camp-1".into(),
+                    patron_status: Some("active_patron".into()),
+                    tier_ids: vec!["tier-gold".into(), "tier-vip".into()],
+                },
+                ArkavoPatreonMembership {
+                    campaign_id: "camp-2".into(),
+                    patron_status: Some("former_patron".into()),
+                    tier_ids: vec![],
+                },
+            ],
+            verified_at: 1_700_000_000,
+            cache_expires_at: 1_700_000_300,
+        };
+        let mut c = ArkavoClaims::oidc_access("iss-1", "arkavo:abc", "opentdf", 1);
+        c = c.with_arkavo_patreon(snap.clone());
+        let bytes = claims_to_cbor(&c).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.custom.arkavo_patreon, Some(snap));
+    }
+
+    #[test]
+    fn cbor_roundtrip_arkavo_patreon_creator_claim() {
+        let snap = ArkavoPatreon {
+            role: "creator".into(),
+            patreon_user_id: "patreon-user-7".into(),
+            campaign_id: Some("camp-9".into()),
+            memberships: vec![],
+            verified_at: 1_700_000_000,
+            cache_expires_at: 1_700_000_300,
+        };
+        let mut c = ArkavoClaims::oidc_access("iss-1", "arkavo:creator", "opentdf", 1);
+        c = c.with_arkavo_patreon(snap.clone());
+        let bytes = claims_to_cbor(&c).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.custom.arkavo_patreon, Some(snap));
     }
 
     #[test]

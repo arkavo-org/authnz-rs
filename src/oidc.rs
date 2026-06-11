@@ -745,6 +745,7 @@ pub async fn token(
     Extension(oidc): Extension<Arc<OidcConfig>>,
     Extension(code_store): Extension<AuthorizationCodeStore>,
     Extension(refresh_store): Extension<RefreshTokenStore>,
+    Extension(patreon): Extension<crate::patreon::PatreonState>,
     headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Response {
@@ -755,6 +756,7 @@ pub async fn token(
                 oidc,
                 code_store,
                 refresh_store,
+                patreon,
                 headers,
                 form,
             )
@@ -764,7 +766,7 @@ pub async fn token(
             handle_client_credentials_grant(app_state, oidc, headers, form).await
         }
         "refresh_token" => {
-            handle_refresh_token_grant(app_state, oidc, refresh_store, headers, form).await
+            handle_refresh_token_grant(app_state, oidc, refresh_store, patreon, headers, form).await
         }
         _ => oidc_error_response(
             StatusCode::BAD_REQUEST,
@@ -779,6 +781,7 @@ async fn handle_authorization_code_grant(
     oidc: Arc<OidcConfig>,
     code_store: AuthorizationCodeStore,
     refresh_store: RefreshTokenStore,
+    patreon: crate::patreon::PatreonState,
     headers: HeaderMap,
     form: TokenForm,
 ) -> Response {
@@ -919,6 +922,14 @@ async fn handle_authorization_code_grant(
             );
         }
     };
+    // Materialize Patreon membership (if linked) for embedding in the
+    // access_token CWT. Per the architecture statement: "Patreon proves
+    // membership, authnz-rs materializes entitlement." Fails closed — the
+    // helper returns None on any Patreon-side error so the resulting token
+    // simply omits the `arkavo_patreon` claim and downstream policy treats
+    // that as "no entitlement".
+    let arkavo_patreon = resolve_arkavo_patreon(&app_state, &patreon, &record.user).await;
+
     let access_token = {
         let extras = AccessTokenExtras {
             idp: record.user.idp.clone(),
@@ -927,6 +938,7 @@ async fn handle_authorization_code_grant(
             arkavo_account_id: Some(record.user.arkavo_account_id.clone()),
             arkavo_roles: Some(record.user.roles.clone()),
             arkavo_entitlements: Some(record.user.entitlements.clone()),
+            arkavo_patreon,
         };
         match mint_access_token(
             &app_state,
@@ -1093,6 +1105,8 @@ async fn handle_client_credentials_grant(
             arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
             arkavo_roles: Some(id_claims.arkavo_roles.clone()),
             arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
+            // Service accounts (client_credentials) have no Patreon link.
+            arkavo_patreon: None,
         };
         match mint_access_token(
             &app_state,
@@ -1142,6 +1156,7 @@ async fn handle_refresh_token_grant(
     app_state: AppState,
     oidc: Arc<OidcConfig>,
     refresh_store: RefreshTokenStore,
+    patreon: crate::patreon::PatreonState,
     headers: HeaderMap,
     form: TokenForm,
 ) -> Response {
@@ -1273,6 +1288,16 @@ async fn handle_refresh_token_grant(
             );
         }
     };
+    // Re-materialize Patreon membership on refresh so a downgrade/cancel
+    // since the original code exchange propagates within the 5-min cache TTL.
+    // Only the user-flow subjects (not service-account `client:...`) carry a
+    // resolvable arkavo user_id; the parse_uuid_from_subject helper returns
+    // None for service accounts so we skip the lookup cleanly.
+    let arkavo_patreon = match parse_uuid_from_subject(&record.subject) {
+        Some(user_id) => crate::patreon::materialize_for_user(&app_state, &patreon, user_id).await,
+        None => None,
+    };
+
     let access_token = {
         let extras = AccessTokenExtras {
             idp: id_claims.idp.clone(),
@@ -1281,6 +1306,7 @@ async fn handle_refresh_token_grant(
             arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
             arkavo_roles: Some(id_claims.arkavo_roles.clone()),
             arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
+            arkavo_patreon,
         };
         match mint_access_token(
             &app_state,
@@ -1607,6 +1633,30 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
     constant_time_eq(&expected, challenge)
 }
 
+/// Pull the arkavo `user_id` UUID off an [`AuthenticatedUser`] and run the
+/// Patreon materialization. We prefer `arkavo_account_id` (always set for
+/// user flows) but fall back to parsing the `arkavo:` subject so this stays
+/// resilient to refactors of `AuthenticatedUser`. Service-account subjects
+/// (`client:...`) don't have a Patreon link by construction — return None.
+async fn resolve_arkavo_patreon(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    user: &AuthenticatedUser,
+) -> Option<crate::cwt::ArkavoPatreon> {
+    let user_id = Uuid::parse_str(&user.arkavo_account_id)
+        .ok()
+        .or_else(|| parse_uuid_from_subject(&user.subject))?;
+    crate::patreon::materialize_for_user(app_state, patreon, user_id).await
+}
+
+/// Strip the `arkavo:` prefix (if present) and parse the remainder as a
+/// UUID. Returns None for service-account subjects (`client:<id>`) and any
+/// other subject format we don't recognize.
+fn parse_uuid_from_subject(subject: &str) -> Option<Uuid> {
+    let raw = subject.strip_prefix("arkavo:").unwrap_or(subject);
+    Uuid::parse_str(raw).ok()
+}
+
 fn generate_authz_code() -> String {
     // 256 bits of randomness, base64url-encoded. UUID v4 supplies 122 bits;
     // combine two for ~244 bits and append a nanosecond-based salt to make
@@ -1650,6 +1700,12 @@ pub struct AccessTokenExtras {
     pub arkavo_account_id: Option<String>,
     pub arkavo_roles: Option<Vec<String>>,
     pub arkavo_entitlements: Option<Vec<String>>,
+    /// Materialized Patreon membership snapshot. Set by the OIDC token
+    /// endpoint before calling [`mint_access_token`] when the authenticated
+    /// user has a Patreon link; embedded into the CWT `arkavo_patreon` claim.
+    /// `None` when the user is unlinked, Patreon support is disabled, or
+    /// materialization failed (fail-closed posture per the plan).
+    pub arkavo_patreon: Option<crate::cwt::ArkavoPatreon>,
 }
 
 impl AccessTokenExtras {
@@ -1688,6 +1744,9 @@ pub fn mint_access_token(
         }
         if let Some(ents) = e.arkavo_entitlements {
             claims = claims.with_arkavo_entitlements(ents);
+        }
+        if let Some(p) = e.arkavo_patreon {
+            claims = claims.with_arkavo_patreon(p);
         }
     }
     if let Some(c) = cnf {
@@ -1867,6 +1926,13 @@ mod tests {
     fn test_redis() -> fred::clients::RedisClient {
         let config = fred::types::RedisConfig::default();
         fred::clients::RedisClient::new(config, None, None, None)
+    }
+
+    /// Patreon disabled by default — tests that don't exercise Patreon
+    /// linking get a no-op state so `mint_access_token` simply doesn't emit
+    /// the `arkavo_patreon` claim.
+    fn test_patreon_state() -> crate::patreon::PatreonState {
+        crate::patreon::PatreonState::new(None, None, test_redis())
     }
 
     #[tokio::test]
@@ -2179,6 +2245,7 @@ mod tests {
                     "handles".to_string(),
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
+                    "patreon_tokens".to_string(),
                 )
                 .await
                 .unwrap(),
@@ -2274,6 +2341,7 @@ mod tests {
                     "handles".to_string(),
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
+                    "patreon_tokens".to_string(),
                 )
                 .await
                 .unwrap(),
@@ -2321,8 +2389,15 @@ mod tests {
         };
 
         let headers = HeaderMap::new();
-        let resp =
-            handle_refresh_token_grant(app_state, oidc, refresh_store.clone(), headers, form).await;
+        let resp = handle_refresh_token_grant(
+            app_state,
+            oidc,
+            refresh_store.clone(),
+            test_patreon_state(),
+            headers,
+            form,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
