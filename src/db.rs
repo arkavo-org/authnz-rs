@@ -66,6 +66,7 @@ pub struct DynamoDBStore {
     handles_table: String,
     device_bindings_table: String,
     identity_links_table: String,
+    patreon_tokens_table: String,
 }
 
 impl DynamoDBStore {
@@ -74,6 +75,7 @@ impl DynamoDBStore {
         handles_table: String,
         device_bindings_table: String,
         identity_links_table: String,
+        patreon_tokens_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -84,7 +86,124 @@ impl DynamoDBStore {
             handles_table,
             device_bindings_table,
             identity_links_table,
+            patreon_tokens_table,
         })
+    }
+
+    /// Persist (or replace) the Patreon token bundle for a user.
+    ///
+    /// This is keyed by the arkavo `user_id` — one Patreon link per user, per
+    /// role. Re-linking overwrites the previous row (a user can re-authorize
+    /// to refresh consent or change role from consumer to creator). The
+    /// per-(provider, patreon_user_id) uniqueness invariant is enforced
+    /// separately via [`link_identity`] on the `identity_links` table, which
+    /// mirrors the Apple linking pattern.
+    pub async fn put_patreon_link(
+        &self,
+        link: &crate::patreon::PatreonLink,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Persisting Patreon link. Table: {}, user_id: {}, role: {}",
+            self.patreon_tokens_table, link.user_id, link.role
+        );
+
+        let mut item_builder = self
+            .client
+            .put_item()
+            .table_name(&self.patreon_tokens_table)
+            .item("user_id", AttributeValue::S(link.user_id.to_string()))
+            .item("role", AttributeValue::S(link.role.clone()))
+            .item(
+                "patreon_user_id",
+                AttributeValue::S(link.patreon_user_id.clone()),
+            )
+            .item("scopes", AttributeValue::S(link.scopes.clone()))
+            .item(
+                "access_token_ct",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    link.access_token_ct.clone(),
+                )),
+            )
+            .item(
+                "access_token_nonce",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    link.access_token_nonce.clone(),
+                )),
+            )
+            .item(
+                "refresh_token_ct",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    link.refresh_token_ct.clone(),
+                )),
+            )
+            .item(
+                "refresh_token_nonce",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    link.refresh_token_nonce.clone(),
+                )),
+            )
+            .item(
+                "wrapped_dek",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+                    link.wrapped_dek.clone(),
+                )),
+            )
+            .item(
+                "token_expires_at",
+                AttributeValue::N(link.token_expires_at.to_string()),
+            )
+            .item("linked_at", AttributeValue::N(link.linked_at.to_string()));
+        if let Some(cid) = &link.campaign_id {
+            item_builder = item_builder.item("campaign_id", AttributeValue::S(cid.clone()));
+        }
+
+        match item_builder.send().await {
+            Ok(_) => Ok(()),
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!(
+                            "patreon_tokens table {} does not exist",
+                            self.patreon_tokens_table
+                        );
+                        return Err(DynamoDBError::TableNotExists(
+                            self.patreon_tokens_table.clone(),
+                        ));
+                    }
+                    error!("Failed to write to patreon_tokens table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error writing to patreon_tokens table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Read the Patreon token bundle for a user, if any.
+    ///
+    /// Returns `Ok(None)` when the user has not linked Patreon.
+    pub async fn get_patreon_link(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<crate::patreon::PatreonLink>, DynamoDBError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.patreon_tokens_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to read patreon_tokens for {}: {:?}", user_id, err);
+                DynamoDBError::SdkError(err.to_string())
+            })?;
+
+        let Some(item) = result.item else {
+            return Ok(None);
+        };
+        item_to_patreon_link(&item).map(Some)
     }
 
     /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
@@ -777,6 +896,73 @@ impl DynamoDBStore {
             updated_at,
         })
     }
+}
+
+fn item_to_patreon_link(
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> Result<crate::patreon::PatreonLink, DynamoDBError> {
+    fn read_string(
+        item: &std::collections::HashMap<String, AttributeValue>,
+        key: &str,
+    ) -> Result<String, DynamoDBError> {
+        item.get(key)
+            .ok_or_else(|| DynamoDBError::Internal(format!("Missing patreon field {}", key)))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal(format!("Invalid patreon field {}", key)))
+            .map(|s| s.to_string())
+    }
+    fn read_bytes(
+        item: &std::collections::HashMap<String, AttributeValue>,
+        key: &str,
+    ) -> Result<Vec<u8>, DynamoDBError> {
+        item.get(key)
+            .ok_or_else(|| DynamoDBError::Internal(format!("Missing patreon field {}", key)))?
+            .as_b()
+            .map_err(|_| DynamoDBError::Internal(format!("Invalid patreon field {}", key)))
+            .map(|b| b.as_ref().to_vec())
+    }
+    fn read_i64(
+        item: &std::collections::HashMap<String, AttributeValue>,
+        key: &str,
+    ) -> Result<i64, DynamoDBError> {
+        item.get(key)
+            .ok_or_else(|| DynamoDBError::Internal(format!("Missing patreon field {}", key)))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal(format!("Invalid patreon field {}", key)))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal(format!("Unparseable number for {}", key)))
+    }
+
+    let user_id = Uuid::parse_str(&read_string(item, "user_id")?)?;
+    let role = read_string(item, "role")?;
+    let patreon_user_id = read_string(item, "patreon_user_id")?;
+    let scopes = read_string(item, "scopes")?;
+    let access_token_ct = read_bytes(item, "access_token_ct")?;
+    let access_token_nonce = read_bytes(item, "access_token_nonce")?;
+    let refresh_token_ct = read_bytes(item, "refresh_token_ct")?;
+    let refresh_token_nonce = read_bytes(item, "refresh_token_nonce")?;
+    let wrapped_dek = read_bytes(item, "wrapped_dek")?;
+    let token_expires_at = read_i64(item, "token_expires_at")?;
+    let linked_at = read_i64(item, "linked_at")?;
+    let campaign_id = item
+        .get("campaign_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+
+    Ok(crate::patreon::PatreonLink {
+        user_id,
+        role,
+        patreon_user_id,
+        campaign_id,
+        scopes,
+        access_token_ct,
+        access_token_nonce,
+        refresh_token_ct,
+        refresh_token_nonce,
+        wrapped_dek,
+        token_expires_at,
+        linked_at,
+    })
 }
 
 /// Privacy-preserving subject masker used by `link_identity` logs.

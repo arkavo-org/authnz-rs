@@ -39,6 +39,7 @@ export DYNAMODB_CREDENTIALS_TABLE=credentials
 export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
+export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 
 # Optional: Set port (defaults to 8080)
 export PORT=8080
@@ -62,6 +63,14 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # Optional: Sign in with Apple. Accepts a comma-separated list so the same
 # AuthNZ instance can serve an iOS bundle id + web Service ID.
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
+
+# Optional: Patreon linking + membership materialization. Set all four to
+# enable; leave any unset to disable the Patreon code paths silently
+# (POST /oauth/patreon/link returns HTTP 503 NotConfigured).
+export PATREON_CLIENT_ID=<patreon-oauth-client-id>
+export PATREON_CLIENT_SECRET=<patreon-oauth-client-secret>
+export PATREON_REDIRECT_URIS=https://identity.arkavo.net/oauth/patreon/cb,arkavo://oauth/patreon
+export PATREON_KMS_KEY_ID=alias/arkavo-patreon-token-key
 
 # Run the server
 cargo run
@@ -87,6 +96,7 @@ export DYNAMODB_CREDENTIALS_TABLE=credentials
 export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
+export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export AWS_REGION=us-east-1
 
 # Run the server
@@ -145,6 +155,14 @@ aws dynamodb create-table \
     --table-name device_bindings \
     --attribute-definitions AttributeName=device_id,AttributeType=S \
     --key-schema AttributeName=device_id,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
+
+# Create patreon_tokens table (KMS-encrypted Patreon access/refresh tokens)
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name patreon_tokens \
+    --attribute-definitions AttributeName=user_id,AttributeType=S \
+    --key-schema AttributeName=user_id,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST
 ```
 
@@ -225,6 +243,47 @@ aws dynamodb create-table \
   is the canonical join key — email is optional metadata and never used to
   locate accounts (private-relay rotation safe).
 - Requires `APPLE_CLIENT_ID` to be set (one or more comma-separated values).
+
+**patreon.rs** - Patreon identity linking + membership materialization
+- Mirrors the Apple linking contract: minimum-PII row in `identity_links`
+  (`patreon#<patreon_user_id> → arkavo_user_id`, conditional put for
+  cross-account uniqueness) plus encrypted token bundle in
+  `patreon_tokens`.
+- `POST /oauth/patreon/link`: **Auth-required** link path (the *only* new
+  endpoint surface for Patreon — there is deliberately no `/me/patreon`,
+  `/entitlements/...`, or status endpoint). Body:
+  `{ "code": "<oauth-code>", "redirect_uri": "<one of PATREON_REDIRECT_URIS>",
+  "role": "creator"|"consumer" }`. Behaviour:
+    1. Verifies the inbound `X-Auth-Token` CWT (`sub` is the arkavo user_id).
+    2. Exchanges `code` at `https://www.patreon.com/api/oauth2/token`.
+    3. Fetches `/api/oauth2/v2/identity` to discover the Patreon `user.id`
+       (and, for creators, the owned `campaign.id`).
+    4. Conditional put on `identity_links` for per-Patreon-account
+       uniqueness — HTTP 409 if the Patreon account is already linked to a
+       *different* arkavo user; idempotent re-link to the same user.
+    5. Persists the encrypted token bundle (access + refresh) in
+       `patreon_tokens` keyed by arkavo `user_id`.
+    6. Invalidates the membership materialization cache for the user.
+- **Token sealing**: AES-256-GCM under a per-row 256-bit DEK; the DEK is
+  KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
+  GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
+- **Membership materialization**: surfaced *only* on the OIDC access_token
+  CWT as the `arkavo_patreon` claim. The OIDC token endpoint
+  (`handle_authorization_code_grant` and `handle_refresh_token_grant`) calls
+  [`materialize_for_user`] before minting; for consumers this queries
+  Patreon's `/identity?include=memberships,...` and builds an
+  `ArkavoPatreon { role, patreon_user_id, campaign_id?, memberships,
+  verified_at, cache_expires_at }` snapshot; for creators it just embeds the
+  stored `campaign_id`. Results are cached in Redis (with in-memory
+  fallback) for `PATREON_CACHE_TTL_SECONDS` (5 min).
+- **Fail-closed**: when Patreon is unreachable, the link is absent, or the
+  cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
+  claim entirely — downstream KAS / policy enforcers must treat absence of
+  the claim as "no entitlement".
+- Patreon support is **optional**: if any of `PATREON_CLIENT_ID`,
+  `PATREON_CLIENT_SECRET`, `PATREON_REDIRECT_URIS`, or `PATREON_KMS_KEY_ID`
+  is unset, every Patreon code path is silently disabled and the link
+  endpoint returns HTTP 503 NotConfigured.
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
@@ -404,10 +463,10 @@ When modifying token lifetimes, update these in authn.rs:
   - updated_at (Number) - Unix timestamp (updated on each assertion)
 
 ### identity_links table
-- **Primary Key**: link_pk (String) - Format: `<provider>#<subject>` (e.g. `apple#001234.abc...`)
+- **Primary Key**: link_pk (String) - Format: `<provider>#<subject>` (e.g. `apple#001234.abc...`, `patreon#12345`)
 - **Attributes**:
   - user_id (String/UUID) - The arkavo account bound to this third-party identity
-  - provider (String) - IdP name (`apple`, future: `google`, etc.)
+  - provider (String) - IdP name (`apple`, `patreon`, future: `google`, etc.)
   - subject (String) - The IdP's stable subject identifier
   - linked_at (Number) - Unix timestamp
 - **Uniqueness**: Conditional put on `link_pk` enforces per-(provider, subject) uniqueness.
@@ -418,6 +477,37 @@ When modifying token lifetimes, update these in authn.rs:
 - **Future GSI** `user_id-index`: Add when an endpoint needs to enumerate
   "which providers has this user linked?" — not required by the current
   endpoint surface.
+
+### patreon_tokens table
+- **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link
+  overwrites in place.
+- **Attributes**:
+  - role (String) - `creator` or `consumer`
+  - patreon_user_id (String) - Patreon's stable `data.id` from `/identity`;
+    duplicated here so the materialization read path doesn't need a second
+    lookup against `identity_links`
+  - campaign_id (String, optional) - Creator only; the Patreon `campaign.id`
+    discovered at link time
+  - scopes (String) - Space-separated OAuth scopes granted on the token
+  - access_token_ct (Binary) - AES-256-GCM ciphertext of the Patreon access
+    token under the row's DEK
+  - access_token_nonce (Binary) - 12-byte GCM nonce for access_token_ct
+  - refresh_token_ct (Binary) - AES-256-GCM ciphertext of the Patreon
+    refresh token under the same DEK
+  - refresh_token_nonce (Binary) - 12-byte GCM nonce for refresh_token_ct
+    (always distinct from access_token_nonce — never reuse key+nonce)
+  - wrapped_dek (Binary) - KMS-wrapped 256-bit DEK; decrypt with
+    `kms:Decrypt` on `PATREON_KMS_KEY_ID`
+  - token_expires_at (Number) - Unix timestamp the Patreon access token
+    expires at (per Patreon's `expires_in`)
+  - linked_at (Number) - Unix timestamp of original link
+- **Encryption**: Envelope. A DynamoDB-only compromise yields ciphertext
+  blobs but no plaintext tokens — recovery additionally requires
+  `kms:Decrypt` on the configured key.
+- **No GSI**: per-Patreon-account uniqueness is enforced via the
+  `identity_links` row (`patreon#<patreon_user_id>`), not via a secondary
+  index here. The forward `user_id → patreon` lookup uses the table's
+  primary key directly.
 
 ## Common Development Patterns
 

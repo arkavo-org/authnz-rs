@@ -44,6 +44,7 @@ use crate::oidc::{
     cose_keys as oidc_cose_keys, discovery as oidc_discovery, jwks as oidc_jwks,
     token as oidc_token, userinfo as oidc_userinfo,
 };
+use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
 
 mod apple_signin;
 mod authn;
@@ -52,6 +53,7 @@ mod cwt;
 mod db;
 mod device_check;
 mod oidc;
+mod patreon;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -263,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_DEVICE_BINDINGS_TABLE")
             .unwrap_or_else(|_| "device_bindings".to_string()),
         env::var("DYNAMODB_IDENTITY_LINKS_TABLE").unwrap_or_else(|_| "identity_links".to_string()),
+        env::var("DYNAMODB_PATREON_TOKENS_TABLE").unwrap_or_else(|_| "patreon_tokens".to_string()),
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -314,8 +317,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to load OIDC configuration: {}", e))?,
     );
     let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
-    let oidc_refresh_store = RefreshTokenStore::new(redis_client);
+    let oidc_refresh_store = RefreshTokenStore::new(redis_client.clone());
     let apple_jwks_cache = Arc::new(AppleJwksCache::new());
+
+    // Patreon support is optional; if PATREON_CLIENT_ID isn't set, every
+    // Patreon code path (link handler + access_token enrichment) is silently
+    // disabled. This lets non-Patreon deployments run without forced config.
+    let patreon_oauth = PatreonOAuthConfig::from_env();
+    let patreon_sealer = build_kms_sealer().await;
+    if patreon_oauth.is_some() && patreon_sealer.is_none() {
+        log::warn!(
+            "PATREON_CLIENT_ID is set but PATREON_KMS_KEY_ID is not — \
+             /oauth/patreon/link will reject with 503 (NotConfigured)"
+        );
+    }
+    let patreon_state = PatreonState::new(patreon_oauth, patreon_sealer, redis_client);
 
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
@@ -348,6 +364,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
         .route("/oauth/apple/link", post(apple_link_handler))
         .route("/oauth/apple/callback", post(apple_callback_handler))
+        // Patreon linking (mirrors /oauth/apple/link — same auth-required,
+        // identity_links-write contract). Membership + tier are surfaced
+        // only on the resulting OIDC access_token CWT; there is deliberately
+        // no /me/patreon or /entitlements endpoint surface.
+        .route("/oauth/patreon/link", post(patreon_link_handler))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
@@ -367,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(oidc_code_store))
         .layer(Extension(oidc_refresh_store))
         .layer(Extension(apple_jwks_cache))
+        .layer(Extension(patreon_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
         .fallback(handler_fallback);
@@ -1112,6 +1134,7 @@ pub(crate) mod test_helpers {
                 "handles".to_string(),
                 "device_bindings".to_string(),
                 "identity_links".to_string(),
+                "patreon_tokens".to_string(),
             )
             .await
             .unwrap(),
