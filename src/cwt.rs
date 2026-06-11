@@ -94,6 +94,12 @@ pub struct ArkavoPatreonMembership {
     /// Patreon tier IDs the user is currently entitled to. Empty list means
     /// the user is a free follower (no paid tier).
     pub tier_ids: Vec<String>,
+    /// Slugified tier titles (lowercase, hyphenated) the user is entitled
+    /// to within this campaign — the creator's own tier vocabulary. Feeds
+    /// the platform's campaign-qualified entitlements
+    /// (`campaign-tier/value/<campaign_id>_<slug>`). Parallel to `tier_ids`
+    /// but human-meaningful; empty until materialized.
+    pub tier_slugs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +440,17 @@ fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
                     Value::Text("tier_ids".into()),
                     Value::Array(m.tier_ids.iter().map(|t| Value::Text(t.clone())).collect()),
                 ));
+                if !m.tier_slugs.is_empty() {
+                    m_entries.push((
+                        Value::Text("tier_slugs".into()),
+                        Value::Array(
+                            m.tier_slugs
+                                .iter()
+                                .map(|t| Value::Text(t.clone()))
+                                .collect(),
+                        ),
+                    ));
+                }
                 Value::Map(m_entries)
             })
             .collect();
@@ -478,6 +495,7 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                     let mut m_campaign_id: Option<String> = None;
                     let mut m_status: Option<String> = None;
                     let mut m_tiers: Vec<String> = Vec::new();
+                    let mut m_slugs: Vec<String> = Vec::new();
                     for (mk, mv) in m_entries {
                         let mkey = match mk {
                             Value::Text(s) => s,
@@ -495,6 +513,15 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                                     })
                                     .collect::<Result<_, _>>()?;
                             }
+                            ("tier_slugs", Value::Array(a)) => {
+                                m_slugs = a
+                                    .into_iter()
+                                    .map(|t| match t {
+                                        Value::Text(s) => Ok(s),
+                                        _ => Err(CwtError::Malformed),
+                                    })
+                                    .collect::<Result<_, _>>()?;
+                            }
                             _ => {}
                         }
                     }
@@ -502,6 +529,7 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                         campaign_id: m_campaign_id.ok_or(CwtError::Malformed)?,
                         patron_status: m_status,
                         tier_ids: m_tiers,
+                        tier_slugs: m_slugs,
                     });
                 }
             }
@@ -891,11 +919,13 @@ mod tests {
                     campaign_id: "camp-1".into(),
                     patron_status: Some("active_patron".into()),
                     tier_ids: vec!["tier-gold".into(), "tier-vip".into()],
+                    tier_slugs: vec!["gold".into(), "vip".into()],
                 },
                 ArkavoPatreonMembership {
                     campaign_id: "camp-2".into(),
                     patron_status: Some("former_patron".into()),
                     tier_ids: vec![],
+                    tier_slugs: vec![],
                 },
             ],
             verified_at: 1_700_000_000,
