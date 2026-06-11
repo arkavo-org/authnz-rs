@@ -185,6 +185,13 @@ pub struct AppState {
     /// (falling back to [`crate::constants::DEFAULT_OIDC_ISSUER`]) so mint
     /// and verify always agree on a single value within a process.
     pub issuer: Arc<String>,
+    /// Optional shared audience appended to every OIDC access token
+    /// (`OIDC_PLATFORM_AUDIENCE`, e.g. "https://platform.arkavo.net").
+    /// Access tokens normally carry `aud = client_id`, but a resource server
+    /// validating one fixed audience (the OpenTDF platform's CWT verifier)
+    /// must accept tokens minted for any RP — RFC 8707-style. None ⇒
+    /// single-audience tokens, unchanged.
+    pub platform_audience: Arc<Option<String>>,
 }
 
 #[tokio::main]
@@ -287,6 +294,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwt_verifying_key: Arc::new(cwt_verifying_key),
         cwt_kid: Arc::new(cwt_kid),
         issuer: Arc::new(issuer),
+        platform_audience: Arc::new(
+            env::var("OIDC_PLATFORM_AUDIENCE")
+                .ok()
+                .filter(|v| !v.is_empty()),
+        ),
     };
 
     // Set up Redis Client using fred
@@ -1150,6 +1162,7 @@ pub(crate) mod test_helpers {
             cwt_verifying_key: Arc::new(cwt_verifying_key),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
+            platform_audience: Arc::new(None),
         }
     }
 }

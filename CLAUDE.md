@@ -60,6 +60,12 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
 # export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
 
+# Optional: shared resource audience appended to every OIDC access token
+# (RFC 8707-style). Set this to the OpenTDF platform's configured audience so
+# tokens minted for any RP (apps, service accounts) pass the platform's
+# single-audience CWT verification. Unset = single-audience tokens.
+export OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net
+
 # Optional: Sign in with Apple. Accepts a comma-separated list so the same
 # AuthNZ instance can serve an iOS bundle id + web Service ID.
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
