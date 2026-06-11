@@ -1126,6 +1126,8 @@ struct SerializableMembership {
     campaign_id: String,
     patron_status: Option<String>,
     tier_ids: Vec<String>,
+    #[serde(default)]
+    tier_slugs: Vec<String>,
 }
 
 impl From<&ArkavoPatreon> for SerializableMaterialized {
@@ -1141,6 +1143,7 @@ impl From<&ArkavoPatreon> for SerializableMaterialized {
                     campaign_id: m.campaign_id.clone(),
                     patron_status: m.patron_status.clone(),
                     tier_ids: m.tier_ids.clone(),
+                    tier_slugs: m.tier_slugs.clone(),
                 })
                 .collect(),
             verified_at: p.verified_at,
@@ -1162,6 +1165,7 @@ impl From<SerializableMaterialized> for ArkavoPatreon {
                     campaign_id: m.campaign_id,
                     patron_status: m.patron_status,
                     tier_ids: m.tier_ids,
+                    tier_slugs: m.tier_slugs,
                 })
                 .collect(),
             verified_at: s.verified_at,
@@ -1422,7 +1426,7 @@ async fn fetch_consumer_memberships(
 ) -> Result<Vec<ArkavoPatreonMembership>, PatreonError> {
     let url = format!(
         "{}?include=memberships,memberships.currently_entitled_tiers,memberships.campaign\
-        &fields%5Bmember%5D=patron_status",
+        &fields%5Bmember%5D=patron_status&fields%5Btier%5D=title",
         identity_url
     );
     let resp = http
@@ -1457,6 +1461,38 @@ pub(crate) fn parse_memberships_from_identity(
         return Vec::new();
     };
 
+    // First pass: index tier id -> slugified title so each membership can
+    // surface the creator's own tier vocabulary, not just opaque ids.
+    let mut tier_slug_by_id: std::collections::HashMap<&str, String> =
+        std::collections::HashMap::new();
+    for entry in included {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("tier") {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(title) = entry
+            .get("attributes")
+            .and_then(|a| a.get("title"))
+            .and_then(|v| v.as_str())
+        {
+            // Every tier with a (non-blank) title gets a non-empty, stable
+            // slug. Latin titles slugify to the creator's vocabulary; a
+            // title that is all non-ASCII (e.g. Japanese/emoji) slugifies to
+            // empty, so fall back to the numeric tier id — deterministic and
+            // unique, so international creators' tiers are still gateable.
+            // The Creator app applies the same fallback at tag time.
+            if !title.trim().is_empty() {
+                let mut slug = slugify_tier(title);
+                if slug.is_empty() {
+                    slug = format!("tier-{id}");
+                }
+                tier_slug_by_id.insert(id, slug);
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for entry in included {
         if entry.get("type").and_then(|v| v.as_str()) != Some("member") {
@@ -1477,27 +1513,59 @@ pub(crate) fn parse_memberships_from_identity(
             .and_then(|a| a.get("patron_status"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let tier_ids: Vec<String> = entry
+        let entitled_ids: Vec<&str> = entry
             .get("relationships")
             .and_then(|r| r.get("currently_entitled_tiers"))
             .and_then(|t| t.get("data"))
             .and_then(|d| d.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|t| t.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .filter_map(|t| t.get("id").and_then(|v| v.as_str()))
                     .collect()
             })
             .unwrap_or_default();
+        let tier_ids: Vec<String> = entitled_ids.iter().map(|s| s.to_string()).collect();
+        // Deduplicate: slugify is not injective (two distinct titles can
+        // collapse to one slug), so the slug set may be smaller than
+        // tier_ids — they are an independent set, not a parallel array.
+        let mut tier_slugs: Vec<String> = Vec::new();
+        for id in &entitled_ids {
+            if let Some(slug) = tier_slug_by_id.get(id)
+                && !tier_slugs.contains(slug)
+            {
+                tier_slugs.push(slug.clone());
+            }
+        }
         out.push(ArkavoPatreonMembership {
             campaign_id,
             patron_status,
             tier_ids,
+            tier_slugs,
         });
     }
     out
 }
 
 // --------- Helpers (copied from apple_signin to avoid cross-module coupling) ---------
+
+/// Slugify a Patreon tier title to the campaign-qualified entitlement form
+/// the platform expects: lowercase ASCII alphanumerics, runs of other
+/// characters collapsed to a single '-', trimmed. Notably produces no '_'
+/// (the platform's <campaign_id>_<tier_slug> separator) and no spaces.
+pub(crate) fn slugify_tier(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_dash = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
 
 fn subject_prefix(sub: &str) -> &str {
     match sub.char_indices().nth(8) {
@@ -1562,7 +1630,9 @@ mod tests {
                             ]
                         }
                     }
-                }
+                },
+                {"type": "tier", "id": "tier-1", "attributes": {"title": "Gold Tier"}},
+                {"type": "tier", "id": "tier-2", "attributes": {"title": "VIP+ Access!"}}
             ]
         });
         let parsed = parse_memberships_from_identity(&body);
@@ -1570,6 +1640,93 @@ mod tests {
         assert_eq!(parsed[0].campaign_id, "camp-gold");
         assert_eq!(parsed[0].patron_status.as_deref(), Some("active_patron"));
         assert_eq!(parsed[0].tier_ids, vec!["tier-1", "tier-2"]);
+        // Tier titles are slugified into the creator's vocabulary, in the
+        // same order as the entitled tiers.
+        assert_eq!(parsed[0].tier_slugs, vec!["gold-tier", "vip-access"]);
+    }
+
+    #[test]
+    fn slugify_tier_normalizes_to_entitlement_form() {
+        assert_eq!(slugify_tier("Gold Tier"), "gold-tier");
+        assert_eq!(slugify_tier("VIP+ Access!"), "vip-access");
+        assert_eq!(slugify_tier("  Early   Birds  "), "early-birds");
+        assert_eq!(
+            slugify_tier("Tier_With_Underscores"),
+            "tier-with-underscores"
+        );
+        assert_eq!(slugify_tier("!!!"), "");
+        // Never contains the platform separator or spaces.
+        for raw in ["a_b", "A B C", "x__y"] {
+            let slug = slugify_tier(raw);
+            assert!(!slug.contains('_') && !slug.contains(' '), "{slug}");
+        }
+    }
+
+    #[test]
+    fn parse_memberships_non_ascii_tier_falls_back_to_id() {
+        // A title that slugifies to empty (all non-ASCII) still yields a
+        // stable, unique slug from the tier id — international creators'
+        // tiers stay gateable.
+        let body = json!({
+            "included": [
+                {
+                    "type": "member", "id": "m1",
+                    "attributes": {"patron_status": "active_patron"},
+                    "relationships": {
+                        "campaign": {"data": {"id": "c1", "type": "campaign"}},
+                        "currently_entitled_tiers": {"data": [{"id": "55", "type": "tier"}]}
+                    }
+                },
+                {"type": "tier", "id": "55", "attributes": {"title": "ゴールド"}}
+            ]
+        });
+        let parsed = parse_memberships_from_identity(&body);
+        assert_eq!(parsed[0].tier_slugs, vec!["tier-55"]);
+    }
+
+    #[test]
+    fn parse_memberships_dedupes_colliding_slugs() {
+        // Two distinct titles that collapse to the same slug yield ONE slug.
+        let body = json!({
+            "included": [
+                {
+                    "type": "member", "id": "m1",
+                    "attributes": {"patron_status": "active_patron"},
+                    "relationships": {
+                        "campaign": {"data": {"id": "c1", "type": "campaign"}},
+                        "currently_entitled_tiers": {"data": [
+                            {"id": "t1", "type": "tier"},
+                            {"id": "t2", "type": "tier"}
+                        ]}
+                    }
+                },
+                {"type": "tier", "id": "t1", "attributes": {"title": "Gold!"}},
+                {"type": "tier", "id": "t2", "attributes": {"title": "Gold?"}}
+            ]
+        });
+        let parsed = parse_memberships_from_identity(&body);
+        assert_eq!(parsed[0].tier_ids, vec!["t1", "t2"]);
+        assert_eq!(parsed[0].tier_slugs, vec!["gold"]); // deduped
+    }
+
+    #[test]
+    fn parse_memberships_tier_without_title_yields_no_slug() {
+        let body = json!({
+            "included": [
+                {
+                    "type": "member", "id": "m1",
+                    "attributes": {"patron_status": "active_patron"},
+                    "relationships": {
+                        "campaign": {"data": {"id": "c1", "type": "campaign"}},
+                        "currently_entitled_tiers": {"data": [{"id": "t1", "type": "tier"}]}
+                    }
+                }
+                // no tier resource in `included` (legacy / missing fields[tier])
+            ]
+        });
+        let parsed = parse_memberships_from_identity(&body);
+        assert_eq!(parsed[0].tier_ids, vec!["t1"]);
+        assert!(parsed[0].tier_slugs.is_empty());
     }
 
     #[test]
@@ -1830,6 +1987,7 @@ mod tests {
                 campaign_id: "camp-1".into(),
                 patron_status: Some("active_patron".into()),
                 tier_ids: vec!["tier-1".into()],
+                tier_slugs: vec!["tier-1".into()],
             }],
             verified_at: now,
             cache_expires_at: now + 300,
