@@ -83,52 +83,180 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Patreon OAuth client configuration. Loaded once at startup from env vars.
+/// One registered Patreon OAuth client (Patreon issues one client per app,
+/// so multi-app deployments carry several).
+#[derive(Debug, Clone)]
+pub struct PatreonClient {
+    pub client_id: String,
+    pub client_secret: String,
+    /// Allow-list of permitted redirect URIs for *this* client. Must contain
+    /// whatever the app used at `https://www.patreon.com/oauth2/authorize`.
+    pub redirect_uris: Vec<String>,
+}
+
+/// Patreon OAuth configuration. Loaded once at startup from env vars.
 ///
 /// Empty/missing config disables every Patreon code path silently — link
 /// handler returns 503, membership materialization is skipped. This lets
 /// non-Patreon deployments run without forcing operators to set Patreon
 /// credentials.
+///
+/// Two env forms, combinable (mirrors the `OIDC_CLIENT_<TAG>_*` pattern):
+///
+/// ```text
+///   # Legacy single client:
+///   PATREON_CLIENT_ID / PATREON_CLIENT_SECRET / PATREON_REDIRECT_URIS
+///
+///   # Tagged clients (one Patreon client per app):
+///   PATREON_CLIENT_<TAG>_ID            = the Patreon client id
+///   PATREON_CLIENT_<TAG>_SECRET        = the Patreon client secret
+///   PATREON_CLIENT_<TAG>_REDIRECT_URIS = comma-separated redirect URIs
+/// ```
+///
+/// The link request's `redirect_uri` selects which client's credentials are
+/// used for the code exchange, so a redirect URI may belong to only one
+/// client. Any malformed tag, duplicate client_id, or redirect URI claimed
+/// by two clients disables Patreon entirely (loud warn, fail-closed) rather
+/// than guessing which credentials to use.
 #[derive(Debug, Clone)]
 pub struct PatreonOAuthConfig {
-    pub client_id: String,
-    pub client_secret: String,
-    /// Allow-list of permitted redirect URIs. Must contain whatever the
-    /// client used at `https://www.patreon.com/oauth2/authorize`. Comma-
-    /// separated in `PATREON_REDIRECT_URIS`.
-    pub redirect_uris: Vec<String>,
+    pub clients: Vec<PatreonClient>,
 }
 
 impl PatreonOAuthConfig {
     pub fn from_env() -> Option<Self> {
-        let client_id = env::var("PATREON_CLIENT_ID")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let client_secret = env::var("PATREON_CLIENT_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let redirect_uris: Vec<String> = env::var("PATREON_REDIRECT_URIS")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
+        Self::from_env_vars(env::vars())
+    }
+
+    /// Parse from a `(key, value)` iterator (testable without process env).
+    fn from_env_vars<I>(vars: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let env_map: std::collections::HashMap<String, String> =
+            vars.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+        let mut clients: Vec<PatreonClient> = Vec::new();
+
+        // Legacy untagged trio. (`PATREON_CLIENT_ID` cannot collide with the
+        // tag scan below: its post-prefix remainder `ID` has no `_ID` suffix.)
+        if let Some(client_id) = env_map.get("PATREON_CLIENT_ID") {
+            let Some(client_secret) = env_map.get("PATREON_CLIENT_SECRET") else {
+                warn!(
+                    "PATREON_CLIENT_ID is set but PATREON_CLIENT_SECRET is missing — Patreon disabled"
+                );
+                return None;
+            };
+            let redirect_uris = split_uris(env_map.get("PATREON_REDIRECT_URIS"));
+            if redirect_uris.is_empty() {
+                warn!(
+                    "PATREON_CLIENT_ID is set but PATREON_REDIRECT_URIS is empty — \
+                     /oauth/patreon/link would reject all callbacks; Patreon disabled"
+                );
+                return None;
+            }
+            clients.push(PatreonClient {
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                redirect_uris,
+            });
+        }
+
+        // Tagged clients: PATREON_CLIENT_<TAG>_ID anchors each registration.
+        let mut tags: Vec<String> = env_map
+            .keys()
+            .filter_map(|k| {
+                k.strip_prefix("PATREON_CLIENT_")
+                    .and_then(|rest| rest.strip_suffix("_ID"))
+                    .filter(|tag| !tag.is_empty())
+                    .map(|s| s.to_string())
             })
-            .unwrap_or_default();
-        if redirect_uris.is_empty() {
-            warn!(
-                "PATREON_CLIENT_ID is set but PATREON_REDIRECT_URIS is empty — \
-                 /oauth/patreon/link will reject all callbacks"
-            );
+            .collect();
+        tags.sort(); // deterministic order regardless of env iteration
+        for tag in tags {
+            let client_id = env_map[&format!("PATREON_CLIENT_{}_ID", tag)].clone();
+            let Some(client_secret) = env_map
+                .get(&format!("PATREON_CLIENT_{}_SECRET", tag))
+                .cloned()
+            else {
+                warn!(
+                    "PATREON_CLIENT_{}_ID is set but PATREON_CLIENT_{}_SECRET is missing — Patreon disabled",
+                    tag, tag
+                );
+                return None;
+            };
+            let redirect_uris =
+                split_uris(env_map.get(&format!("PATREON_CLIENT_{}_REDIRECT_URIS", tag)));
+            if redirect_uris.is_empty() {
+                warn!(
+                    "PATREON_CLIENT_{}_ID is set but PATREON_CLIENT_{}_REDIRECT_URIS is empty — Patreon disabled",
+                    tag, tag
+                );
+                return None;
+            }
+            clients.push(PatreonClient {
+                client_id,
+                client_secret,
+                redirect_uris,
+            });
+        }
+
+        if clients.is_empty() {
             return None;
         }
-        Some(Self {
-            client_id,
-            client_secret,
-            redirect_uris,
-        })
+
+        // Reject ambiguity rather than guessing: duplicate client_ids and
+        // redirect URIs shared across clients both make credential selection
+        // ill-defined.
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_uris = std::collections::HashSet::new();
+        for c in &clients {
+            if !seen_ids.insert(c.client_id.clone()) {
+                warn!(
+                    "Duplicate Patreon client_id configured under multiple tags — Patreon disabled"
+                );
+                return None;
+            }
+            for u in &c.redirect_uris {
+                if !seen_uris.insert(u.clone()) {
+                    warn!(
+                        "Patreon redirect URI {} is claimed by more than one client — Patreon disabled",
+                        u
+                    );
+                    return None;
+                }
+            }
+        }
+
+        Some(Self { clients })
     }
+
+    /// The client registered for this redirect URI, if any. Used by the link
+    /// endpoint to pick which credentials perform the code exchange.
+    pub fn client_for_redirect(&self, redirect_uri: &str) -> Option<&PatreonClient> {
+        self.clients
+            .iter()
+            .find(|c| c.redirect_uris.iter().any(|u| u == redirect_uri))
+    }
+
+    /// The client that issued a stored token bundle (refresh needs the same
+    /// client's secret). Rows written before multi-client support carry no
+    /// client_id; tolerate that only while a single client is configured.
+    pub fn client_by_id(&self, client_id: &str) -> Option<&PatreonClient> {
+        if client_id.is_empty() && self.clients.len() == 1 {
+            return self.clients.first();
+        }
+        self.clients.iter().find(|c| c.client_id == client_id)
+    }
+}
+
+fn split_uris(raw: Option<&String>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// KMS envelope sealer for Patreon access/refresh tokens.
@@ -410,6 +538,10 @@ pub struct PatreonLink {
     pub user_id: Uuid,
     /// `creator` or `consumer`.
     pub role: String,
+    /// The Patreon client_id whose code exchange produced this token bundle.
+    /// Refresh must present the same client's secret. Empty on rows written
+    /// before multi-client support.
+    pub client_id: String,
     pub patreon_user_id: String,
     pub campaign_id: Option<String>,
     pub scopes: String,
@@ -482,14 +614,16 @@ pub async fn patreon_link_handler(
         _ => return PatreonError::InvalidRole.into_response(),
     };
 
-    if !oauth.redirect_uris.iter().any(|u| u == &req.redirect_uri) {
+    // The redirect_uri selects which registered Patreon client's credentials
+    // perform the exchange (Patreon issues one client per app).
+    let Some(client) = oauth.client_for_redirect(&req.redirect_uri) else {
         return PatreonError::InvalidRedirectUri.into_response();
-    }
+    };
 
     // 1. Exchange the code for tokens.
     let tokens = match exchange_code_for_tokens(
         &state.http,
-        oauth,
+        client,
         &req.code,
         &req.redirect_uri,
         &state.token_url,
@@ -579,6 +713,7 @@ pub async fn patreon_link_handler(
     let link = PatreonLink {
         user_id,
         role: role.clone(),
+        client_id: client.client_id.clone(),
         patreon_user_id: patreon_user_id.clone(),
         campaign_id: campaign_id.clone(),
         scopes: tokens.scope.clone(),
@@ -700,6 +835,7 @@ fn merge_refreshed_link(
     PatreonLink {
         user_id: old.user_id,
         role: old.role.clone(),
+        client_id: old.client_id.clone(),
         patreon_user_id: old.patreon_user_id.clone(),
         campaign_id: old.campaign_id.clone(),
         scopes: new_tokens.scope.clone(),
@@ -730,7 +866,7 @@ fn identity_fetch_error(status: reqwest::StatusCode, body: &str) -> PatreonError
 
 async fn exchange_code_for_tokens(
     http: &reqwest::Client,
-    oauth: &PatreonOAuthConfig,
+    client: &PatreonClient,
     code: &str,
     redirect_uri: &str,
     token_url: &str,
@@ -738,8 +874,8 @@ async fn exchange_code_for_tokens(
     let form = [
         ("code", code),
         ("grant_type", "authorization_code"),
-        ("client_id", oauth.client_id.as_str()),
-        ("client_secret", oauth.client_secret.as_str()),
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
         ("redirect_uri", redirect_uri),
     ];
     let resp = http
@@ -763,15 +899,15 @@ async fn exchange_code_for_tokens(
 /// triggers refresh-and-retry, and the caller persists the rotated tokens.
 async fn refresh_access_token(
     http: &reqwest::Client,
-    oauth: &PatreonOAuthConfig,
+    client: &PatreonClient,
     refresh_token: &str,
     token_url: &str,
 ) -> Result<PatreonTokenResponse, PatreonError> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", oauth.client_id.as_str()),
-        ("client_secret", oauth.client_secret.as_str()),
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
     ];
     let resp = http
         .post(token_url)
@@ -1210,6 +1346,17 @@ async fn fetch_memberships_with_refresh(
         Err(PatreonError::Unauthorized) => {
             let sealer = state.sealer.as_ref().ok_or(PatreonError::NotConfigured)?;
             let oauth = state.oauth.as_ref().ok_or(PatreonError::NotConfigured)?;
+            // Refresh must use the same client that minted the bundle —
+            // Patreon rejects a refresh token presented with another
+            // client's credentials. Unknown client_id (e.g. the operator
+            // dropped a client from env) fails closed: claim omitted.
+            let Some(client) = oauth.client_by_id(&link.client_id) else {
+                warn!(
+                    "Patreon link for patreon_user_id_prefix={} was issued by client_id no longer configured; cannot refresh",
+                    subject_prefix(&link.patreon_user_id)
+                );
+                return Err(PatreonError::NotConfigured.into());
+            };
             info!(
                 "Patreon access token rejected (401) for patreon_user_id_prefix={}; refreshing",
                 subject_prefix(&link.patreon_user_id)
@@ -1227,7 +1374,7 @@ async fn fetch_memberships_with_refresh(
             })?;
 
             let new_tokens =
-                refresh_access_token(&state.http, oauth, &refresh_token, &state.token_url).await?;
+                refresh_access_token(&state.http, client, &refresh_token, &state.token_url).await?;
 
             // Re-seal both rotated tokens under a fresh per-row DEK (distinct
             // GCM nonces; one wrapped DEK per row).
@@ -1716,6 +1863,7 @@ mod tests {
         PatreonLink {
             user_id: Uuid::new_v4(),
             role: "consumer".into(),
+            client_id: "c".into(),
             patreon_user_id: "p-1".into(),
             campaign_id: None,
             scopes: String::new(),
@@ -1795,9 +1943,11 @@ mod tests {
             fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
         let state = PatreonState {
             oauth: Some(PatreonOAuthConfig {
-                client_id: "c".into(),
-                client_secret: "s".into(),
-                redirect_uris: vec!["https://x/cb".into()],
+                clients: vec![PatreonClient {
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    redirect_uris: vec!["https://x/cb".into()],
+                }],
             }),
             sealer: Some(sealer),
             http: unreachable_patreon_http(),
@@ -1876,9 +2026,11 @@ mod tests {
             fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
         let state = PatreonState {
             oauth: Some(PatreonOAuthConfig {
-                client_id: "c".into(),
-                client_secret: "s".into(),
-                redirect_uris: vec!["https://x/cb".into()],
+                clients: vec![PatreonClient {
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    redirect_uris: vec!["https://x/cb".into()],
+                }],
             }),
             sealer: Some(sealer.clone()),
             http: reqwest::Client::new(),
@@ -1928,9 +2080,11 @@ mod tests {
             fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
         let state = PatreonState {
             oauth: Some(PatreonOAuthConfig {
-                client_id: "c".into(),
-                client_secret: "s".into(),
-                redirect_uris: vec!["https://x/cb".into()],
+                clients: vec![PatreonClient {
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    redirect_uris: vec!["https://x/cb".into()],
+                }],
             }),
             sealer: Some(sealer.clone()),
             http: reqwest::Client::new(),
@@ -2049,32 +2203,139 @@ mod tests {
         assert_eq!(req.role, "consumer");
     }
 
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn patreon_oauth_config_requires_redirect_uris() {
-        // Force env to a clean state for the duration of this test.
-        unsafe {
-            std::env::set_var("PATREON_CLIENT_ID", "test-client");
-            std::env::set_var("PATREON_CLIENT_SECRET", "test-secret");
-            std::env::remove_var("PATREON_REDIRECT_URIS");
-        }
-        assert!(PatreonOAuthConfig::from_env().is_none());
-
-        unsafe {
-            std::env::set_var("PATREON_REDIRECT_URIS", "https://a/cb, https://b/cb");
-        }
-        let cfg = PatreonOAuthConfig::from_env().expect("config builds");
-        assert_eq!(cfg.client_id, "test-client");
-        assert_eq!(cfg.client_secret, "test-secret");
-        assert_eq!(
-            cfg.redirect_uris,
-            vec!["https://a/cb".to_string(), "https://b/cb".to_string()]
+        assert!(
+            PatreonOAuthConfig::from_env_vars(env(&[
+                ("PATREON_CLIENT_ID", "test-client"),
+                ("PATREON_CLIENT_SECRET", "test-secret"),
+            ]))
+            .is_none()
         );
 
-        // Cleanup so other tests aren't affected.
-        unsafe {
-            std::env::remove_var("PATREON_CLIENT_ID");
-            std::env::remove_var("PATREON_CLIENT_SECRET");
-            std::env::remove_var("PATREON_REDIRECT_URIS");
-        }
+        let cfg = PatreonOAuthConfig::from_env_vars(env(&[
+            ("PATREON_CLIENT_ID", "test-client"),
+            ("PATREON_CLIENT_SECRET", "test-secret"),
+            ("PATREON_REDIRECT_URIS", "https://a/cb, https://b/cb"),
+        ]))
+        .expect("config builds");
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.clients[0].client_id, "test-client");
+        assert_eq!(cfg.clients[0].client_secret, "test-secret");
+        assert_eq!(
+            cfg.clients[0].redirect_uris,
+            vec!["https://a/cb".to_string(), "https://b/cb".to_string()]
+        );
+    }
+
+    #[test]
+    fn patreon_oauth_config_parses_tagged_clients() {
+        let cfg = PatreonOAuthConfig::from_env_vars(env(&[
+            ("PATREON_CLIENT_ARKAVO_ID", "id-arkavo"),
+            ("PATREON_CLIENT_ARKAVO_SECRET", "sec-arkavo"),
+            (
+                "PATREON_CLIENT_ARKAVO_REDIRECT_URIS",
+                "https://identity.arkavo.net/oauth/arkavo/patreon",
+            ),
+            ("PATREON_CLIENT_CREATOR_ID", "id-creator"),
+            ("PATREON_CLIENT_CREATOR_SECRET", "sec-creator"),
+            (
+                "PATREON_CLIENT_CREATOR_REDIRECT_URIS",
+                "https://identity.arkavo.net/oauth/arkavocreator/patreon, https://webauthn.arkavo.net/oauth/arkavocreator/patreon",
+            ),
+        ]))
+        .expect("config builds");
+        assert_eq!(cfg.clients.len(), 2);
+
+        // redirect_uri → the client registered for it.
+        let by_redirect = cfg
+            .client_for_redirect("https://webauthn.arkavo.net/oauth/arkavocreator/patreon")
+            .expect("creator client");
+        assert_eq!(by_redirect.client_id, "id-creator");
+        assert!(cfg.client_for_redirect("https://evil.example/cb").is_none());
+
+        // client_id → stored-bundle lookup for refresh.
+        assert_eq!(
+            cfg.client_by_id("id-arkavo").expect("arkavo").client_secret,
+            "sec-arkavo"
+        );
+        assert!(cfg.client_by_id("unknown").is_none());
+        // Empty client_id (pre-multi-client row) is ambiguous with 2 clients.
+        assert!(cfg.client_by_id("").is_none());
+    }
+
+    #[test]
+    fn patreon_oauth_config_combines_legacy_and_tagged() {
+        let cfg = PatreonOAuthConfig::from_env_vars(env(&[
+            ("PATREON_CLIENT_ID", "legacy-id"),
+            ("PATREON_CLIENT_SECRET", "legacy-sec"),
+            ("PATREON_REDIRECT_URIS", "https://legacy/cb"),
+            ("PATREON_CLIENT_ARKAVO_ID", "id-arkavo"),
+            ("PATREON_CLIENT_ARKAVO_SECRET", "sec-arkavo"),
+            ("PATREON_CLIENT_ARKAVO_REDIRECT_URIS", "https://arkavo/cb"),
+        ]))
+        .expect("config builds");
+        assert_eq!(cfg.clients.len(), 2);
+        assert_eq!(
+            cfg.client_for_redirect("https://legacy/cb")
+                .expect("legacy")
+                .client_id,
+            "legacy-id"
+        );
+    }
+
+    #[test]
+    fn patreon_oauth_config_single_client_tolerates_empty_client_id() {
+        let cfg = PatreonOAuthConfig::from_env_vars(env(&[
+            ("PATREON_CLIENT_ID", "only-id"),
+            ("PATREON_CLIENT_SECRET", "only-sec"),
+            ("PATREON_REDIRECT_URIS", "https://only/cb"),
+        ]))
+        .expect("config builds");
+        // Rows written before multi-client support carry client_id="".
+        assert_eq!(cfg.client_by_id("").expect("fallback").client_id, "only-id");
+    }
+
+    #[test]
+    fn patreon_oauth_config_rejects_ambiguity() {
+        // Same redirect URI claimed by two clients → disabled.
+        assert!(
+            PatreonOAuthConfig::from_env_vars(env(&[
+                ("PATREON_CLIENT_A_ID", "id-a"),
+                ("PATREON_CLIENT_A_SECRET", "sec-a"),
+                ("PATREON_CLIENT_A_REDIRECT_URIS", "https://shared/cb"),
+                ("PATREON_CLIENT_B_ID", "id-b"),
+                ("PATREON_CLIENT_B_SECRET", "sec-b"),
+                ("PATREON_CLIENT_B_REDIRECT_URIS", "https://shared/cb"),
+            ]))
+            .is_none()
+        );
+        // Duplicate client_id across tags → disabled.
+        assert!(
+            PatreonOAuthConfig::from_env_vars(env(&[
+                ("PATREON_CLIENT_A_ID", "same"),
+                ("PATREON_CLIENT_A_SECRET", "sec-a"),
+                ("PATREON_CLIENT_A_REDIRECT_URIS", "https://a/cb"),
+                ("PATREON_CLIENT_B_ID", "same"),
+                ("PATREON_CLIENT_B_SECRET", "sec-b"),
+                ("PATREON_CLIENT_B_REDIRECT_URIS", "https://b/cb"),
+            ]))
+            .is_none()
+        );
+        // Tag missing its secret → disabled (not silently skipped).
+        assert!(
+            PatreonOAuthConfig::from_env_vars(env(&[
+                ("PATREON_CLIENT_A_ID", "id-a"),
+                ("PATREON_CLIENT_A_REDIRECT_URIS", "https://a/cb"),
+            ]))
+            .is_none()
+        );
     }
 }

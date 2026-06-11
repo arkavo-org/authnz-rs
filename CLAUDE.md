@@ -64,12 +64,22 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # AuthNZ instance can serve an iOS bundle id + web Service ID.
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
 
-# Optional: Patreon linking + membership materialization. Set all four to
-# enable; leave any unset to disable the Patreon code paths silently
-# (POST /oauth/patreon/link returns HTTP 503 NotConfigured).
-export PATREON_CLIENT_ID=<patreon-oauth-client-id>
-export PATREON_CLIENT_SECRET=<patreon-oauth-client-secret>
-export PATREON_REDIRECT_URIS=https://identity.arkavo.net/oauth/patreon/cb,arkavo://oauth/patreon
+# Optional: Patreon linking + membership materialization. Patreon issues one
+# OAuth client per app, so clients are registered with tagged env vars
+# (mirroring OIDC_CLIENT_<TAG>_*). Each client needs _ID, _SECRET, and
+# _REDIRECT_URIS; the link request's redirect_uri selects which client's
+# credentials perform the code exchange, so a redirect URI may belong to only
+# one client. The legacy untagged trio (PATREON_CLIENT_ID/_SECRET/
+# PATREON_REDIRECT_URIS) still registers a single client and may be combined
+# with tagged ones. Any malformed/ambiguous registration, or a missing
+# PATREON_KMS_KEY_ID, disables all Patreon code paths (POST
+# /oauth/patreon/link returns HTTP 503 NotConfigured).
+export PATREON_CLIENT_ARKAVO_ID=<patreon-oauth-client-id>
+export PATREON_CLIENT_ARKAVO_SECRET=<patreon-oauth-client-secret>
+export PATREON_CLIENT_ARKAVO_REDIRECT_URIS=https://identity.arkavo.net/oauth/arkavo/patreon
+# export PATREON_CLIENT_ARKAVOCREATOR_ID=...
+# export PATREON_CLIENT_ARKAVOCREATOR_SECRET=...
+# export PATREON_CLIENT_ARKAVOCREATOR_REDIRECT_URIS=https://identity.arkavo.net/oauth/arkavocreator/patreon
 export PATREON_KMS_KEY_ID=alias/arkavo-patreon-token-key
 
 # Run the server
@@ -252,10 +262,14 @@ aws dynamodb create-table \
 - `POST /oauth/patreon/link`: **Auth-required** link path (the *only* new
   endpoint surface for Patreon — there is deliberately no `/me/patreon`,
   `/entitlements/...`, or status endpoint). Body:
-  `{ "code": "<oauth-code>", "redirect_uri": "<one of PATREON_REDIRECT_URIS>",
+  `{ "code": "<oauth-code>", "redirect_uri": "<a registered redirect URI>",
   "role": "creator"|"consumer" }`. Behaviour:
     1. Verifies the inbound `X-Auth-Token` CWT (`sub` is the arkavo user_id).
-    2. Exchanges `code` at `https://www.patreon.com/api/oauth2/token`.
+    2. Resolves the registered Patreon client by `redirect_uri` (Patreon
+       issues one client per app) and exchanges `code` at
+       `https://www.patreon.com/api/oauth2/token` with that client's
+       credentials. The issuing `client_id` is persisted with the token
+       bundle so refresh uses the same client's secret.
     3. Fetches `/api/oauth2/v2/identity` to discover the Patreon `user.id`
        (and, for creators, the owned `campaign.id`).
     4. Conditional put on `identity_links` for per-Patreon-account
@@ -280,10 +294,15 @@ aws dynamodb create-table \
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of
   the claim as "no entitlement".
-- Patreon support is **optional**: if any of `PATREON_CLIENT_ID`,
-  `PATREON_CLIENT_SECRET`, `PATREON_REDIRECT_URIS`, or `PATREON_KMS_KEY_ID`
-  is unset, every Patreon code path is silently disabled and the link
-  endpoint returns HTTP 503 NotConfigured.
+- Patreon support is **optional**: with no Patreon clients registered (via
+  `PATREON_CLIENT_<TAG>_ID/_SECRET/_REDIRECT_URIS` tagged vars or the legacy
+  `PATREON_CLIENT_ID`/`PATREON_CLIENT_SECRET`/`PATREON_REDIRECT_URIS` trio),
+  or with `PATREON_KMS_KEY_ID` unset, every Patreon code path is silently
+  disabled and the link endpoint returns HTTP 503 NotConfigured. Malformed
+  or ambiguous registrations (a tag missing `_SECRET`/`_REDIRECT_URIS`,
+  duplicate client_id, a redirect URI claimed by two clients) also disable
+  Patreon entirely — loud warn, fail-closed — rather than guessing which
+  credentials to use.
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
@@ -483,6 +502,10 @@ When modifying token lifetimes, update these in authn.rs:
   overwrites in place.
 - **Attributes**:
   - role (String) - `creator` or `consumer`
+  - client_id (String) - The Patreon OAuth client that performed the code
+    exchange; refresh must present the same client's secret. Empty on rows
+    written before multi-client support (tolerated only while exactly one
+    client is configured).
   - patreon_user_id (String) - Patreon's stable `data.id` from `/identity`;
     duplicated here so the materialization read path doesn't need a second
     lookup against `identity_links`

@@ -113,6 +113,7 @@ impl DynamoDBStore {
             .table_name(&self.patreon_tokens_table)
             .item("user_id", AttributeValue::S(link.user_id.to_string()))
             .item("role", AttributeValue::S(link.role.clone()))
+            .item("client_id", AttributeValue::S(link.client_id.clone()))
             .item(
                 "patreon_user_id",
                 AttributeValue::S(link.patreon_user_id.clone()),
@@ -935,6 +936,14 @@ fn item_to_patreon_link(
 
     let user_id = Uuid::parse_str(&read_string(item, "user_id")?)?;
     let role = read_string(item, "role")?;
+    // Rows written before multi-client support have no client_id; an empty
+    // string defers to PatreonOAuthConfig::client_by_id's single-client
+    // fallback rather than failing the read.
+    let client_id = item
+        .get("client_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     let patreon_user_id = read_string(item, "patreon_user_id")?;
     let scopes = read_string(item, "scopes")?;
     let access_token_ct = read_bytes(item, "access_token_ct")?;
@@ -952,6 +961,7 @@ fn item_to_patreon_link(
     Ok(crate::patreon::PatreonLink {
         user_id,
         role,
+        client_id,
         patreon_user_id,
         campaign_id,
         scopes,
