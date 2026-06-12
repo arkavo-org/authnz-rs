@@ -49,7 +49,9 @@
 //! do not break identity continuity.
 
 use crate::AppState;
-use crate::constants::{APPLE_ISSUER, APPLE_JWKS_CACHE_TTL_SECONDS, APPLE_JWKS_URL};
+use crate::constants::{
+    APPLE_ISSUER, APPLE_JWKS_CACHE_TTL_SECONDS, APPLE_JWKS_HTTP_TIMEOUT_SECS, APPLE_JWKS_URL,
+};
 use crate::db::DynamoDBError;
 use crate::oidc::AuthenticatedUser;
 use axum::Json;
@@ -177,6 +179,10 @@ impl IntoResponse for AppleSigninError {
 pub struct AppleJwksCache {
     inner: RwLock<CacheState>,
     client_ids: Vec<String>,
+    /// Reused HTTP client with a bounded total timeout. Built once so the
+    /// connection pool survives cache refreshes, and so a stalled
+    /// `appleid.apple.com` can't hang the `/oauth/apple/*` / `idp=apple` paths.
+    client: reqwest::Client,
 }
 
 struct CacheState {
@@ -195,12 +201,24 @@ impl AppleJwksCache {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let timeout_secs = env::var("APPLE_JWKS_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(APPLE_JWKS_HTTP_TIMEOUT_SECS);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            // A failure here means the TLS backend can't initialize, which is a
+            // fatal startup condition — fail loudly rather than run unbounded.
+            .expect("failed to build Apple JWKS HTTP client");
         Self {
             inner: RwLock::new(CacheState {
                 keys: Vec::new(),
                 fetched_at: 0,
             }),
             client_ids,
+            client,
         }
     }
 
@@ -218,22 +236,10 @@ impl AppleJwksCache {
             }
         }
 
-        let response = reqwest::get(APPLE_JWKS_URL)
-            .await
-            .map_err(|e| AppleSigninError::JwksFetch(e.to_string()))?;
-        if !response.status().is_success() {
-            return Err(AppleSigninError::JwksFetch(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        let body: AppleJwksResponse = response
-            .json()
-            .await
-            .map_err(|e| AppleSigninError::JwksParse(e.to_string()))?;
+        let keys = fetch_jwks(&self.client, APPLE_JWKS_URL).await?;
 
         let mut state = self.inner.write().await;
-        state.keys = body.keys;
+        state.keys = keys;
         state.fetched_at = now;
         Ok(state.keys.clone())
     }
@@ -254,6 +260,28 @@ impl Default for AppleJwksCache {
 #[derive(Debug, Deserialize)]
 struct AppleJwksResponse {
     keys: Vec<Jwk>,
+}
+
+/// Fetch and parse a JWKS document with the provided (timeout-bounded) client.
+/// Extracted from [`AppleJwksCache::get_keys`] so the timeout behaviour is
+/// unit-testable against a slow server without reaching Apple.
+async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Vec<Jwk>, AppleSigninError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AppleSigninError::JwksFetch(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(AppleSigninError::JwksFetch(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let body: AppleJwksResponse = response
+        .json()
+        .await
+        .map_err(|e| AppleSigninError::JwksParse(e.to_string()))?;
+    Ok(body.keys)
 }
 
 /// Verify an Apple-issued id_token against the configured Apple client IDs,
@@ -1166,5 +1194,40 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static(""));
         assert_eq!(client_ip_from_headers(&headers), "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_fetch_times_out_against_a_stalled_server() {
+        // A listener that accepts connections but never responds, simulating a
+        // blackholed appleid.apple.com. fetch_jwks must fail fast via its client
+        // timeout rather than hang the (attacker-triggerable) caller.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Hold accepted connections open without ever responding.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/auth/keys");
+
+        let start = std::time::Instant::now();
+        let result = fetch_jwks(&client, &url).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(AppleSigninError::JwksFetch(_))),
+            "stalled fetch should surface as JwksFetch, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "fetch should fail fast via timeout ({elapsed:?}), not hang"
+        );
     }
 }
