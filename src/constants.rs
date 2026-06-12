@@ -29,6 +29,13 @@ pub const AUTHORIZATION_CODE_LIFETIME_SECONDS: i64 = 600;
 /// Apple JWKS cache TTL in seconds (1 hour). Apple rotates keys infrequently.
 pub const APPLE_JWKS_CACHE_TTL_SECONDS: i64 = 3600;
 
+/// Total HTTP timeout (seconds) for fetching Apple's JWKS. Bounds the
+/// unauthenticated `/oauth/apple/*` and `idp=apple` paths so a stalled or
+/// blackholed `appleid.apple.com` cannot hang inbound requests (a `kid`-miss
+/// force-refresh makes the fetch attacker-triggerable). Override with the
+/// `APPLE_JWKS_HTTP_TIMEOUT_SECS` env var.
+pub const APPLE_JWKS_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Apple JWKS URL
 pub const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 
