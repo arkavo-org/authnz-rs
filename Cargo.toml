@@ -1,6 +1,6 @@
 [package]
 name = "authnz-rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "BSD-2"
 rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
@@ -20,8 +20,8 @@ rustls-pemfile = "2.2"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 # HTTP/3 support (optional - enable with "http3" feature)
-h3 = { version = "0.0.6", optional = true }
-h3-quinn = { version = "0.0.8", optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
 quinn = { version = "0.11", optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 tower = { version = "0.5", features = ["full"] }
