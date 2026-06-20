@@ -193,10 +193,11 @@ pub struct AppState {
     /// must accept tokens minted for any RP — RFC 8707-style. None ⇒
     /// single-audience tokens, unchanged.
     pub platform_audience: Arc<Option<String>>,
-    /// did:webvh log/update-key signer (AWS KMS). `None` when `WEBVH_KMS_KEY_ID`
-    /// is unset — the passport DID document is still built and served as a
-    /// legacy did:web view, but no signed `did.jsonl` log is emitted.
-    pub webvh_signer: Arc<Option<webvh::KmsSigner>>,
+    /// did:webvh Ed25519 update-signing key (crate `Secret` JSON), loaded from
+    /// `WEBVH_SIGN_KEY_PATH`. `None` when unset — the passport DID document is
+    /// still built and served as a legacy did:web view, but no signed
+    /// `did.jsonl` log is emitted.
+    pub webvh_sign_key: Arc<Option<String>>,
 }
 
 #[tokio::main]
@@ -288,8 +289,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let issuer = env::var("OIDC_ISSUER")
         .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
 
-    // did:webvh update-key signer (fail-closed: None when WEBVH_KMS_KEY_ID unset)
-    let webvh_signer = webvh::KmsSigner::from_env().await;
+    // did:webvh Ed25519 update-signing key (fail-open: None when WEBVH_SIGN_KEY_PATH unset)
+    let webvh_sign_key = webvh::load_sign_key();
 
     // Create the app state
     let app_state = AppState {
@@ -307,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .filter(|v| !v.is_empty()),
         ),
-        webvh_signer: Arc::new(webvh_signer),
+        webvh_sign_key: Arc::new(webvh_sign_key),
     };
 
     // Set up Redis Client using fred
@@ -1180,7 +1181,7 @@ pub(crate) mod test_helpers {
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
             platform_audience: Arc::new(None),
-            webvh_signer: Arc::new(None),
+            webvh_sign_key: Arc::new(None),
         }
     }
 }
