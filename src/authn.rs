@@ -198,6 +198,11 @@ pub async fn finish_register(
 
             let token = mint_registration_token(&app_state, &user_id, cnf)?;
 
+            // did:webvh passport: build (and, with the `webvh` feature + a KMS
+            // signer, sign + persist) the DID log for this passkey. Non-fatal —
+            // a webvh failure must never break WebAuthn registration.
+            crate::webvh::on_passkey_registered(&app_state, &user_id, &username, &passkey).await;
+
             // Create response with token in header
             let mut response = Json(envelope).into_response();
             match HeaderValue::from_str(&token) {
@@ -313,6 +318,7 @@ pub async fn finish_authentication(
             // cnf binding is added in Task 15 once the passkey is retrieved from DB).
             let token = mint_auth_token(&app_state, &user_unique_id, None)?;
             info!("Authentication successful for user: {}", user_unique_id);
+
             Ok((StatusCode::OK, Json(AuthResponse { token })))
         }
         Err(e) => {

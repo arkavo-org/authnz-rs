@@ -207,6 +207,22 @@ impl DynamoDBStore {
         item_to_patreon_link(&item).map(Some)
     }
 
+    /// Write a `handle -> did` row into the shared `handles` (prod-handles)
+    /// store. Used by webvh provisioning to publish the canonical `did:webvh`.
+    /// The handle is lowercased to match ATProto normalisation and the
+    /// resolveHandle Lambda's lowercased read key.
+    pub async fn put_handle(&self, handle: &str, did: &str) -> Result<(), DynamoDBError> {
+        self.client
+            .put_item()
+            .table_name(&self.handles_table)
+            .item("handle", AttributeValue::S(handle.to_lowercase()))
+            .item("did", AttributeValue::S(did.to_string()))
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
     ///
     /// Idempotent on (provider, subject): re-linking the same identity to the
@@ -355,88 +371,13 @@ impl DynamoDBStore {
             },
         }
 
-        // Now try to create handle record - if it fails due to missing table, return success anyway
-        match self
-            .client
-            .put_item()
-            .table_name(&self.handles_table)
-            .item(
-                "handle",
-                AttributeValue::S(format!("{}.arkavo.social", username)),
-            )
-            .item("did", AttributeValue::S(user.did.clone()))
-            .send()
-            .await
-        {
-            Ok(_) => {
-                info!("Created handle record");
-            }
-            Err(err) => {
-                match err {
-                    SdkError::ServiceError(ref service_error) => {
-                        if service_error.err().meta().code() == Some("ResourceNotFoundException") {
-                            // If handles table doesn't exist, log warning but don't fail the registration
-                            warn!(
-                                "Handles table does not exist - handle will need to be created later"
-                            );
-                        } else {
-                            error!("Failed to write to handles table: {:?}", err);
-                            // Attempt to rollback credentials entry
-                            warn!(
-                                "Attempting to rollback credentials entry for user: {}",
-                                user.user_id
-                            );
-                            if let Err(rollback_err) = self
-                                .client
-                                .delete_item()
-                                .table_name(&self.credentials_table)
-                                .key("user_id", AttributeValue::S(user.user_id.to_string()))
-                                .send()
-                                .await
-                            {
-                                error!(
-                                    "CRITICAL: Failed to rollback credentials for user {}: {:?}. Manual cleanup required.",
-                                    user.user_id, rollback_err
-                                );
-                            } else {
-                                info!(
-                                    "Successfully rolled back credentials entry for user: {}",
-                                    user.user_id
-                                );
-                            }
-                            return Err(DynamoDBError::SdkError(err.to_string()));
-                        }
-                    }
-                    _ => {
-                        error!("Unknown error writing to handles table: {:?}", err);
-                        // Attempt to rollback credentials entry
-                        warn!(
-                            "Attempting to rollback credentials entry for user: {}",
-                            user.user_id
-                        );
-                        if let Err(rollback_err) = self
-                            .client
-                            .delete_item()
-                            .table_name(&self.credentials_table)
-                            .key("user_id", AttributeValue::S(user.user_id.to_string()))
-                            .send()
-                            .await
-                        {
-                            error!(
-                                "CRITICAL: Failed to rollback credentials for user {}: {:?}. Manual cleanup required.",
-                                user.user_id, rollback_err
-                            );
-                        } else {
-                            info!(
-                                "Successfully rolled back credentials entry for user: {}",
-                                user.user_id
-                            );
-                        }
-                        return Err(DynamoDBError::SdkError(err.to_string()));
-                    }
-                }
-            }
-        }
+        // NOTE: the handle record is intentionally NOT written here anymore.
+        // It used to write `{username}.arkavo.social -> did:key:...`, which is
+        // invalid for ATProto consumption and polluted the shared `handles`
+        // (prod-handles) store the resolveHandle Lambda serves. The handle is
+        // now written as `<handle> -> did:webvh:...` (lowercased) by the webvh
+        // provisioning at registration. See [`put_handle`] and src/webvh.rs
+        // (`on_passkey_registered`).
 
         Ok(user)
     }
@@ -487,6 +428,27 @@ impl DynamoDBStore {
         } else {
             info!("No items returned for username: {}", username);
             Ok(None)
+        }
+    }
+
+    /// Fetch a user by primary key (`user_id`). General accessor; intended for
+    /// webvh backfill-on-login (provisioning a did:webvh for users who
+    /// registered before it existed) — a tracked follow-up.
+    pub async fn get_user_by_id(
+        &self,
+        user_id: &Uuid,
+    ) -> Result<Option<UserCredentials>, DynamoDBError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        match result.item {
+            Some(item) => self.item_to_user_credentials(&item).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -666,6 +628,41 @@ impl DynamoDBStore {
             credentials,
             did,
         })
+    }
+
+    /// Persist the did:webvh append-only log (`did.jsonl`) for a user, as a
+    /// `webvh_log` attribute on the credentials row. (A future iteration may
+    /// move the log to its own table; the credentials-row attribute is the
+    /// current home for the resolution endpoint.)
+    pub async fn put_webvh_log(&self, user_id: &Uuid, log: &str) -> Result<(), DynamoDBError> {
+        self.client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .update_expression("SET webvh_log = :log")
+            .expression_attribute_values(":log", AttributeValue::S(log.to_string()))
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read a user's persisted did:webvh log, if any.
+    pub async fn get_webvh_log(&self, user_id: &Uuid) -> Result<Option<String>, DynamoDBError> {
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .projection_expression("webvh_log")
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        Ok(resp
+            .item()
+            .and_then(|i| i.get("webvh_log"))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string()))
     }
 
     // Device binding methods for App Attest

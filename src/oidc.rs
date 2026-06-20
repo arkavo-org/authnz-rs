@@ -2269,6 +2269,7 @@ mod tests {
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
+            webvh_signer: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2366,6 +2367,7 @@ mod tests {
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
+            webvh_signer: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
