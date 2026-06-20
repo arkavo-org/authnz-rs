@@ -1,0 +1,29 @@
+# Standalone manual HTTP/3 smoke-test client for authnz-rs.
+#
+# This is intentionally an isolated crate (note the empty `[workspace]` table,
+# which stops Cargo from treating it as a member of the parent `authnz-rs`
+# package). It is NOT compiled or run by `cargo test` / `cargo build` in the
+# parent — `tests/*.rs` files are, but `tests/<subdir>/` projects are not.
+#
+# It exists because there is no `curl --http3` on the dev machines, so the
+# HTTP/3 acceptance gate for issue #15 / PR #45 is driven with this client.
+# See README.md for usage.
+[package]
+name = "h3-smoke-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Empty workspace table: isolate this crate from the parent so `cargo` commands
+# run in the repo root never descend into or build it.
+[workspace]
+
+[dependencies]
+# Pinned to the same HTTP/3 stack the server uses (Cargo.toml `http3` feature).
+tokio = { version = "1", features = ["full"] }
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls = { version = "0.23", features = ["ring"] }
+bytes = "1"
+http = "1"

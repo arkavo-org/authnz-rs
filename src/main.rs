@@ -24,6 +24,8 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tower::ServiceBuilder;
+#[cfg(feature = "http3")]
+use tower::ServiceExt; // Router::oneshot in the HTTP/3 → Axum bridge
 use tower_sessions::cookie::SameSite;
 use tower_sessions::cookie::time::Duration;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
@@ -82,7 +84,13 @@ async fn run_h3_server(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
-    server_config.max_early_data_size = 0xffffffff;
+    // Disable QUIC/TLS 1.3 0-RTT (early data). 0-RTT data is replayable by a
+    // network attacker (RFC 9001 §9.2, RFC 8470), and this service's endpoints
+    // are overwhelmingly non-idempotent (token exchange, registration,
+    // authentication, identity linking) with no per-request replay protection.
+    // The only cost is one extra round trip on session resumption; correctness
+    // and replay safety win for an auth/OIDC server. (0 = disabled per rustls.)
+    server_config.max_early_data_size = 0;
     server_config.alpn_protocols = vec![b"h3".to_vec()];
 
     // Create Quinn server config
@@ -95,10 +103,10 @@ async fn run_h3_server(
 
     // Bind UDP socket
     let socket = std::net::UdpSocket::bind(addr)?;
-    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+    let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(quinn_server_config),
-        socket.try_into()?,
+        socket,
         Arc::new(quinn::TokioRuntime),
     )?;
 
@@ -129,17 +137,29 @@ async fn handle_h3_connection(
 
     loop {
         match h3_conn.accept().await {
-            Ok(Some((req, stream))) => {
+            // h3 0.0.8: accept() yields a RequestResolver; resolve_request()
+            // awaits the headers and produces the (Request, RequestStream) pair.
+            Ok(Some(resolver)) => {
                 let app = app.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_h3_request(req, stream, app).await {
-                        eprintln!("HTTP/3 request error: {}", e);
+                    match resolver.resolve_request().await {
+                        Ok((req, stream)) => {
+                            if let Err(e) = handle_h3_request(req, stream, app).await {
+                                eprintln!("HTTP/3 request error: {}", e);
+                            }
+                        }
+                        Err(e) => eprintln!("HTTP/3 request resolve error: {}", e),
                     }
                 });
             }
             Ok(None) => break,
             Err(e) => {
-                eprintln!("HTTP/3 accept error: {}", e);
+                // accept() returns Err when the connection ends — a client
+                // disconnecting (graceful close, ApplicationClose, timeout) is
+                // routine and terminal, not an operator-actionable error. Record
+                // it at debug instead of spamming stderr on every closed
+                // connection.
+                debug!("HTTP/3 connection accept loop ended: {}", e);
                 break;
             }
         }
@@ -151,19 +171,91 @@ async fn handle_h3_connection(
 #[cfg(feature = "http3")]
 async fn handle_h3_request(
     req: http::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<h3_quinn::RecvStream>, bytes::Bytes>,
+    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
     app: Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Convert H3 request to Axum request
-    let (parts, _) = req.into_parts();
-    let body = axum::body::Body::empty(); // TODO: Handle request body if needed
-    let axum_req = http::Request::from_parts(parts, body);
+    use bytes::Buf;
 
-    // Call the router (this is simplified - production would need proper integration)
-    // For now, just return a basic response
-    let response = http::Response::builder().status(200).body(()).unwrap();
+    // 1. Collect the H3 request body into an axum Body (bounded — auth/OIDC
+    //    payloads are tiny; refuse anything larger rather than buffering
+    //    unbounded memory from an untrusted peer).
+    const MAX_H3_BODY: usize = 2 * 1024 * 1024; // 2 MiB
+    let mut body_bytes: Vec<u8> = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await? {
+        let remaining = chunk.remaining();
+        if body_bytes.len() + remaining > MAX_H3_BODY {
+            let resp = http::Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(())
+                .unwrap();
+            stream.send_response(resp).await?;
+            stream.finish().await?;
+            return Ok(());
+        }
+        body_bytes.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
+    }
 
-    stream.send_response(response).await?;
+    // A response to HEAD must carry the same headers as the GET-equivalent
+    // (including Content-Length) but no message body. The TCP path gets this for
+    // free from hyper; on H3 we serve the response ourselves, so capture the
+    // method now and suppress the body frame below.
+    let is_head = req.method() == Method::HEAD;
+
+    // The QUIC stream frames the body, so the bytes we actually buffered are
+    // authoritative. Normalize Content-Length so the router never sees a
+    // client-supplied value that disagrees with the real body length.
+    let (mut parts, _) = req.into_parts();
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    if !body_bytes.is_empty() {
+        parts.headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from(body_bytes.len() as u64),
+        );
+    }
+    let axum_req = http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+
+    // 2. Drive the Axum router as a tower::Service (its error type is Infallible).
+    let response = app
+        .oneshot(axum_req)
+        .await
+        .map_err(|e| format!("router error: {e}"))?;
+
+    // 3. Send status + headers, then forward the response body frame by frame
+    //    (no full-body buffering — keeps memory bounded and preserves streaming
+    //    for any future chunked response). A HEAD response carries the headers
+    //    but no body.
+    let (mut resp_parts, mut resp_body) = response.into_parts();
+
+    // hyper synthesizes Content-Length from the body size at the wire layer on
+    // the TCP path; that layer is bypassed here, so replicate it — advertise
+    // Content-Length when the body length is exactly known and not already set.
+    // This gives H3 clients (including HEAD probes, where the body is suppressed
+    // below) the same Content-Length they would see over HTTP/2. Streaming bodies
+    // of unknown size are left without it, exactly as on the TCP path.
+    if !resp_parts.headers.contains_key(http::header::CONTENT_LENGTH)
+        && let Some(len) = http_body::Body::size_hint(&resp_body).exact()
+        && let Ok(value) = http::HeaderValue::from_str(&len.to_string())
+    {
+        resp_parts
+            .headers
+            .insert(http::header::CONTENT_LENGTH, value);
+    }
+
+    stream
+        .send_response(http::Response::from_parts(resp_parts, ()))
+        .await?;
+
+    if !is_head {
+        use http_body_util::BodyExt;
+        while let Some(frame) = resp_body.frame().await {
+            // Forward data frames; trailers (rare on these routes) are skipped.
+            if let Ok(data) = frame?.into_data() {
+                if !data.is_empty() {
+                    stream.send_data(data).await?;
+                }
+            }
+        }
+    }
     stream.finish().await?;
 
     Ok(())
@@ -423,6 +515,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(apple_app_site_association))
         .fallback(handler_fallback);
 
+    // The H3 server serves the base router (without the Alt-Svc layer added
+    // below), so HTTP/3 responses don't redundantly advertise h3 to themselves —
+    // Alt-Svc is only meaningful to upgrade a TCP (HTTP/1.1/2) client to H3.
+    #[cfg(feature = "http3")]
+    let h3_app_base = app.clone();
+
+    // Advertise HTTP/3 via Alt-Svc on the TCP (HTTP/1.1 + HTTP/2) responses, but
+    // only when H3 is actually serving: the feature is compiled in, the runtime
+    // toggle is on, and TLS is enabled (H3 is only spawned in the TLS branch).
+    // This is a no-op for the default build, keeping the non-http3 path
+    // byte-for-byte unchanged.
+    let advertise_h3 = cfg!(feature = "http3")
+        && settings.tls_enabled
+        && env::var("ENABLE_HTTP3").unwrap_or_else(|_| "true".to_string()) == "true";
+    let app = if advertise_h3 {
+        let alt_svc = alt_svc_header_value(settings.port);
+        app.layer(axum::middleware::from_fn(
+            move |req: Request, next: axum::middleware::Next| {
+                let alt_svc = alt_svc.clone();
+                async move {
+                    let mut res = next.run(req).await;
+                    res.headers_mut().insert(http::header::ALT_SVC, alt_svc);
+                    res
+                }
+            },
+        ))
+    } else {
+        app
+    };
+
     let addr = format!("{}:{}", settings.bind_address, settings.port);
     println!("Listening on: {} (HTTP/1.1, HTTP/2, HTTP/3)", addr);
 
@@ -433,16 +555,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "http3")]
         if env::var("ENABLE_HTTP3").unwrap_or_else(|_| "true".to_string()) == "true" {
             let h3_addr = format!("{}:{}", settings.bind_address, settings.port);
-            let h3_app = app.clone();
+            let h3_app = h3_app_base;
             let h3_cert_path = settings.tls_cert_path.clone();
             let h3_key_path = settings.tls_key_path.clone();
 
+            let log_addr = h3_addr.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_h3_server(&h3_addr, h3_app, &h3_cert_path, &h3_key_path).await {
                     eprintln!("HTTP/3 server error: {}", e);
                 }
             });
-            println!("HTTP/3 (QUIC) enabled on UDP {}", h3_addr);
+            println!("HTTP/3 (QUIC) enabled on UDP {}", log_addr);
         }
 
         #[cfg(not(feature = "http3"))]
@@ -519,6 +642,13 @@ async fn health_get() -> &'static str {
 
 async fn health_head() -> StatusCode {
     StatusCode::OK
+}
+
+/// Build the `Alt-Svc` header value advertising HTTP/3 availability on `port`.
+/// `ma` (max-age, seconds) is advisory; 86400s = 24h is a conservative default.
+fn alt_svc_header_value(port: u16) -> http::HeaderValue {
+    http::HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", port))
+        .expect("alt-svc header value is always valid ASCII")
 }
 
 // Fallback handler - properly handle HEAD requests without body
@@ -930,6 +1060,18 @@ mod tests {
     // Helper function to create test app
     fn create_test_app() -> Router {
         Router::new().route("/oauth/:client/:provider", get(handle_oauth_callback))
+    }
+
+    #[test]
+    fn alt_svc_header_advertises_h3_on_port() {
+        assert_eq!(
+            alt_svc_header_value(443).to_str().unwrap(),
+            "h3=\":443\"; ma=86400"
+        );
+        assert_eq!(
+            alt_svc_header_value(8443).to_str().unwrap(),
+            "h3=\":8443\"; ma=86400"
+        );
     }
 
     #[tokio::test]

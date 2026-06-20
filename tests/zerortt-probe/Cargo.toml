@@ -1,0 +1,19 @@
+# Standalone manual probe for whether the HTTP/3 server offers TLS 1.3 0-RTT
+# (early data). 0-RTT data is replayable, so it is deliberately disabled on the
+# server (src/main.rs: max_early_data_size = 0); this tool is how that is
+# verified end-to-end.
+#
+# Isolated crate (empty `[workspace]` table) — NOT built or run by the parent
+# `cargo build` / `cargo test`. See README.md.
+[package]
+name = "zerortt-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
