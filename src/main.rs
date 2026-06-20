@@ -84,7 +84,13 @@ async fn run_h3_server(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
-    server_config.max_early_data_size = 0xffffffff;
+    // Disable QUIC/TLS 1.3 0-RTT (early data). 0-RTT data is replayable by a
+    // network attacker (RFC 9001 §9.2, RFC 8470), and this service's endpoints
+    // are overwhelmingly non-idempotent (token exchange, registration,
+    // authentication, identity linking) with no per-request replay protection.
+    // The only cost is one extra round trip on session resumption; correctness
+    // and replay safety win for an auth/OIDC server. (0 = disabled per rustls.)
+    server_config.max_early_data_size = 0;
     server_config.alpn_protocols = vec![b"h3".to_vec()];
 
     // Create Quinn server config
