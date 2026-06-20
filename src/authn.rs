@@ -31,6 +31,27 @@ pub struct RegisterParams {
     pub did: String,
 }
 
+/// ATProto-handle-safe username validation. The username becomes the leftmost
+/// label of the `<username>.arkavo.social` handle and flows into the derived
+/// did:web id, the `at://` URI, and the prod-handles key — so it must be a valid
+/// DNS label: 1–63 ASCII alphanumerics and internal hyphens, no leading/trailing
+/// hyphen. Blocks `.`, `:`, `/`, `#`, whitespace, control, and non-ASCII — the
+/// separators that would otherwise corrupt those identifiers. (Case is
+/// normalized to lowercase when the handle row is written.)
+fn is_valid_username(username: &str) -> bool {
+    let len = username.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    let bytes = username.as_bytes();
+    if bytes[0] == b'-' || bytes[len - 1] == b'-' {
+        return false;
+    }
+    username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -39,6 +60,15 @@ pub async fn start_register(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start register for user: {}", username);
+
+    // Hardening: constrain the username to an ATProto-handle-safe DNS label
+    // before it flows into the derived did:web id, `at://` handle, and the
+    // prod-handles key.
+    if !is_valid_username(&username) {
+        return Err(WebauthnError::InvalidUsername(
+            "must be 1-63 chars of [a-zA-Z0-9-] with no leading/trailing hyphen".to_string(),
+        ));
+    }
 
     // Validate DID format
     if !params.did.starts_with("did:key:") {
@@ -472,6 +502,8 @@ pub enum WebauthnError {
     Cwt(#[from] crate::cwt::CwtError),
     #[error("account exists; adding a passkey requires authentication")]
     AccountExistsAuthRequired,
+    #[error("invalid username: {0}")]
+    InvalidUsername(String),
 }
 
 impl IntoResponse for WebauthnError {
@@ -539,6 +571,10 @@ impl IntoResponse for WebauthnError {
                 StatusCode::UNAUTHORIZED,
                 "Account exists; authenticate (X-Auth-Token) to add a passkey".to_string(),
             ),
+            WebauthnError::InvalidUsername(msg) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid username: {}", msg),
+            ),
         };
         (status, body).into_response()
     }
@@ -547,6 +583,27 @@ impl IntoResponse for WebauthnError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn username_charset_allow_list() {
+        // Valid ATProto-handle-safe labels
+        assert!(is_valid_username("alice"));
+        assert!(is_valid_username("alice-bob"));
+        assert!(is_valid_username("a1b2c3"));
+        assert!(is_valid_username("apple-001234"));
+        // Rejects injection / structural hazards that would corrupt the
+        // derived did:web id, at:// URI, or handle key
+        assert!(!is_valid_username(""));
+        assert!(!is_valid_username("-alice"));
+        assert!(!is_valid_username("alice-"));
+        assert!(!is_valid_username("alice.bob")); // '.' label separator
+        assert!(!is_valid_username("a/b")); // path separator
+        assert!(!is_valid_username("a:b")); // did method separator
+        assert!(!is_valid_username("a#b"));
+        assert!(!is_valid_username("alice bob")); // whitespace
+        assert!(!is_valid_username("älice")); // non-ascii
+        assert!(!is_valid_username(&"a".repeat(64))); // too long
+    }
 
     #[test]
     fn test_did_validation_logic() {
