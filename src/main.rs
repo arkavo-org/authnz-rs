@@ -148,7 +148,12 @@ async fn handle_h3_connection(
             }
             Ok(None) => break,
             Err(e) => {
-                eprintln!("HTTP/3 accept error: {}", e);
+                // accept() returns Err when the connection ends — a client
+                // disconnecting (graceful close, ApplicationClose, timeout) is
+                // routine and terminal, not an operator-actionable error. Record
+                // it at debug instead of spamming stderr on every closed
+                // connection.
+                debug!("HTTP/3 connection accept loop ended: {}", e);
                 break;
             }
         }
