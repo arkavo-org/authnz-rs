@@ -3,7 +3,7 @@ name = "authnz-rs"
 version = "0.6.0"
 edition = "2024"
 license = "BSD-2"
-rust-version = "1.91.1"
+rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
 
 [profile.release]
 opt-level = 2  # Lower optimization level
@@ -33,7 +33,7 @@ serde_json = "1.0"
 env_logger = "0.11"
 pem = "3.0"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-ecdsa = { version = "0.16", features = ["signing", "std", "verifying"] }
+ecdsa = { version = "0.16", features = ["der", "signing", "std", "verifying"] }
 sha2 = "0.10"
 uuid = { version = "1.18", features = ["v4"] }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
@@ -54,6 +54,15 @@ base64 = "=0.22.1"       # Encoding/decoding for attestation data
 hex = "=0.4.3"           # Hex encoding for hashes
 aes-gcm = "0.10"         # AES-256-GCM for sealing Patreon tokens under KMS-wrapped DEK
 
+# did:webvh log engine (opt-in via the `webvh` feature) — DIF reference impl.
+# Heavy transitive tree, so gated to keep the default build lean. Needs the MSRV
+# bump to 1.95 (rust-version above). affinidi-data-integrity is pinned to the
+# version didwebvh-rs 0.5.5 uses (its Signer trait + DataIntegrityError type).
+didwebvh-rs = { version = "0.5.5", default-features = false, optional = true }
+affinidi-data-integrity = { version = "0.7.6", optional = true }
+
 [features]
 default = []
 http3 = ["h3", "h3-quinn", "quinn"]
+# did:webvh log engine (DIF didwebvh-rs). Heavy deps, so opt-in.
+webvh = ["dep:didwebvh-rs", "dep:affinidi-data-integrity"]

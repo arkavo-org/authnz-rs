@@ -31,13 +31,46 @@ pub struct RegisterParams {
     pub did: String,
 }
 
+/// ATProto-handle-safe username validation. The username becomes the leftmost
+/// label of the `<username>.arkavo.social` handle and flows into the derived
+/// did:web id, the `at://` URI, and the prod-handles key — so it must be a valid
+/// ATProto handle label: 1–63 chars of **lowercase** ASCII alphanumerics and
+/// internal hyphens, no leading/trailing hyphen. Lowercase-only matches ATProto
+/// (handles are case-insensitive, normalized to lowercase) and removes the
+/// `Alice` vs `alice` case-folding collision on the shared handle key. Blocks
+/// `.`, `:`, `/`, `#`, whitespace, uppercase, control, and non-ASCII.
+fn is_valid_username(username: &str) -> bool {
+    let len = username.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    let bytes = username.as_bytes();
+    if bytes[0] == b'-' || bytes[len - 1] == b'-' {
+        return false;
+    }
+    username
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
     Query(params): Query<RegisterParams>, // Add query params
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start register for user: {}", username);
+
+    // Hardening: constrain the username to an ATProto-handle-safe DNS label
+    // before it flows into the derived did:web id, `at://` handle, and the
+    // prod-handles key.
+    if !is_valid_username(&username) {
+        return Err(WebauthnError::InvalidUsername(
+            "must be 1-63 chars of [a-z0-9-] (lowercase) with no leading/trailing hyphen"
+                .to_string(),
+        ));
+    }
 
     // Validate DID format
     if !params.did.starts_with("did:key:") {
@@ -88,6 +121,27 @@ pub async fn start_register(
             }
         }
     };
+
+    // SECURITY: WebAuthn registration is unauthenticated, and start_register
+    // reuses an existing user record when the username already exists. Adding a
+    // passkey to an account that ALREADY has credentials therefore requires
+    // proof of control of that account (a valid CWT for this user_id) —
+    // otherwise an unauthenticated caller could graft their own passkey onto an
+    // existing user and (under webvh) repoint that user's handle -> DID. A user
+    // with zero credentials (initial registration, possibly retried) may still
+    // finish without a token.
+    if !user.credentials.is_empty() {
+        let token_str = headers
+            .get("X-Auth-Token")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(WebauthnError::AccountExistsAuthRequired)?;
+        let claims = verify_inbound_account_token(&app_state, token_str)?;
+        let tid =
+            Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
+        if tid != user.user_id {
+            return Err(WebauthnError::AccountExistsAuthRequired);
+        }
+    }
 
     // Clean up existing session state
     if let Err(err) = session.remove_value(SESSION_REG_STATE_KEY).await {
@@ -197,6 +251,11 @@ pub async fn finish_register(
             let envelope = AttestationEnvelope::new(envelope_payload, &app_state);
 
             let token = mint_registration_token(&app_state, &user_id, cnf)?;
+
+            // did:webvh passport: build (and, with the `webvh` feature + a KMS
+            // signer, sign + persist) the DID log for this passkey. Non-fatal —
+            // a webvh failure must never break WebAuthn registration.
+            crate::webvh::on_passkey_registered(&app_state, &user_id, &username, &passkey).await;
 
             // Create response with token in header
             let mut response = Json(envelope).into_response();
@@ -313,6 +372,7 @@ pub async fn finish_authentication(
             // cnf binding is added in Task 15 once the passkey is retrieved from DB).
             let token = mint_auth_token(&app_state, &user_unique_id, None)?;
             info!("Authentication successful for user: {}", user_unique_id);
+
             Ok((StatusCode::OK, Json(AuthResponse { token })))
         }
         Err(e) => {
@@ -442,6 +502,10 @@ pub enum WebauthnError {
     InvalidDID(String),
     #[error("CWT error: {0}")]
     Cwt(#[from] crate::cwt::CwtError),
+    #[error("account exists; adding a passkey requires authentication")]
+    AccountExistsAuthRequired,
+    #[error("invalid username: {0}")]
+    InvalidUsername(String),
 }
 
 impl IntoResponse for WebauthnError {
@@ -505,6 +569,14 @@ impl IntoResponse for WebauthnError {
                 format!("Invalid DID format: {}", err),
             ),
             WebauthnError::Cwt(err) => (StatusCode::UNAUTHORIZED, format!("CWT error: {}", err)),
+            WebauthnError::AccountExistsAuthRequired => (
+                StatusCode::UNAUTHORIZED,
+                "Account exists; authenticate (X-Auth-Token) to add a passkey".to_string(),
+            ),
+            WebauthnError::InvalidUsername(msg) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid username: {}", msg),
+            ),
         };
         (status, body).into_response()
     }
@@ -513,6 +585,29 @@ impl IntoResponse for WebauthnError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn username_charset_allow_list() {
+        // Valid ATProto-handle-safe labels
+        assert!(is_valid_username("alice"));
+        assert!(is_valid_username("alice-bob"));
+        assert!(is_valid_username("a1b2c3"));
+        assert!(is_valid_username("apple-001234"));
+        // Rejects injection / structural hazards that would corrupt the
+        // derived did:web id, at:// URI, or handle key
+        assert!(!is_valid_username(""));
+        assert!(!is_valid_username("-alice"));
+        assert!(!is_valid_username("alice-"));
+        assert!(!is_valid_username("alice.bob")); // '.' label separator
+        assert!(!is_valid_username("a/b")); // path separator
+        assert!(!is_valid_username("a:b")); // did method separator
+        assert!(!is_valid_username("a#b"));
+        assert!(!is_valid_username("alice bob")); // whitespace
+        assert!(!is_valid_username("älice")); // non-ascii
+        assert!(!is_valid_username("Alice")); // uppercase (ATProto handles are lowercase)
+        assert!(!is_valid_username("aliceBob")); // uppercase
+        assert!(!is_valid_username(&"a".repeat(64))); // too long
+    }
 
     #[test]
     fn test_did_validation_logic() {
