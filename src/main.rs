@@ -195,7 +195,17 @@ async fn handle_h3_request(
     // method now and suppress the body frame below.
     let is_head = req.method() == Method::HEAD;
 
-    let (parts, _) = req.into_parts();
+    // The QUIC stream frames the body, so the bytes we actually buffered are
+    // authoritative. Normalize Content-Length so the router never sees a
+    // client-supplied value that disagrees with the real body length.
+    let (mut parts, _) = req.into_parts();
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    if !body_bytes.is_empty() {
+        parts.headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from(body_bytes.len() as u64),
+        );
+    }
     let axum_req = http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
     // 2. Drive the Axum router as a tower::Service (its error type is Infallible).
@@ -204,15 +214,24 @@ async fn handle_h3_request(
         .await
         .map_err(|e| format!("router error: {e}"))?;
 
-    // 3. Stream status + headers + body back over the H3 stream.
-    let (resp_parts, resp_body) = response.into_parts();
-    let h3_response = http::Response::from_parts(resp_parts, ());
-    stream.send_response(h3_response).await?;
+    // 3. Send status + headers, then forward the response body frame by frame
+    //    (no full-body buffering — keeps memory bounded and preserves streaming
+    //    for any future chunked response). A HEAD response carries the headers
+    //    but no body.
+    let (resp_parts, mut resp_body) = response.into_parts();
+    stream
+        .send_response(http::Response::from_parts(resp_parts, ()))
+        .await?;
 
     if !is_head {
-        let body_bytes = axum::body::to_bytes(resp_body, usize::MAX).await?;
-        if !body_bytes.is_empty() {
-            stream.send_data(body_bytes).await?;
+        use http_body_util::BodyExt;
+        while let Some(frame) = resp_body.frame().await {
+            // Forward data frames; trailers (rare on these routes) are skipped.
+            if let Ok(data) = frame?.into_data() {
+                if !data.is_empty() {
+                    stream.send_data(data).await?;
+                }
+            }
         }
     }
     stream.finish().await?;
@@ -474,6 +493,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(apple_app_site_association))
         .fallback(handler_fallback);
 
+    // The H3 server serves the base router (without the Alt-Svc layer added
+    // below), so HTTP/3 responses don't redundantly advertise h3 to themselves —
+    // Alt-Svc is only meaningful to upgrade a TCP (HTTP/1.1/2) client to H3.
+    #[cfg(feature = "http3")]
+    let h3_app_base = app.clone();
+
     // Advertise HTTP/3 via Alt-Svc on the TCP (HTTP/1.1 + HTTP/2) responses, but
     // only when H3 is actually serving: the feature is compiled in, the runtime
     // toggle is on, and TLS is enabled (H3 is only spawned in the TLS branch).
@@ -508,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "http3")]
         if env::var("ENABLE_HTTP3").unwrap_or_else(|_| "true".to_string()) == "true" {
             let h3_addr = format!("{}:{}", settings.bind_address, settings.port);
-            let h3_app = app.clone();
+            let h3_app = h3_app_base;
             let h3_cert_path = settings.tls_cert_path.clone();
             let h3_key_path = settings.tls_key_path.clone();
 
