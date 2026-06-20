@@ -8,12 +8,11 @@
 //!
 //! ## The key architectural point this module encodes
 //!
-//! A WebAuthn passkey **cannot** be the did:webvh *log signer*. The crate's
-//! external `Signer` trait
-//! (`affinidi_data_integrity::signer::Signer`) signs arbitrary
-//! pre-canonicalised bytes and returns a raw signature; a passkey only ever
-//! signs `authenticatorData || SHA256(clientDataJSON)` via an interactive
-//! ceremony with a client-held key. So the two key roles are **decoupled**:
+//! A WebAuthn passkey **cannot** be the did:webvh *log signer*: the log proof is
+//! an Ed25519 `eddsa-jcs-2022` signature over canonicalised bytes, whereas a
+//! passkey only ever signs `authenticatorData || SHA256(clientDataJSON)` (P-256)
+//! via an interactive ceremony with a client-held key. So the two key roles are
+//! **decoupled**:
 //!
 //! * **Log / update authority** — a software **Ed25519** key (the DIF crate's
 //!   `Secret`), loaded from `WEBVH_SIGN_KEY_PATH`. did:webvh v1.0 mandates the
@@ -219,23 +218,40 @@ pub fn build_did_document(
 /// under the `webvh` feature). `None` (fail-open) when unset or unreadable — the
 /// DID document is still built/served, but no signed log is emitted.
 pub fn load_sign_key() -> Option<String> {
+    // WEBVH_SIGN_KEY_PATH unset = intentional disable (fail-open, quiet).
     let path = env::var("WEBVH_SIGN_KEY_PATH")
         .ok()
         .filter(|s| !s.is_empty())?;
-    match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => {
-            info!("webvh: update-signing key loaded from {path}");
-            Some(s)
-        }
+    // The path IS configured, so a broken key is a misconfiguration, not an
+    // intentional disable — log at error! so it stays visible even under
+    // ERROR-level filtering. (Fail-open: registration still succeeds; webvh
+    // signing is simply off until the key is fixed.)
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => s,
         Ok(_) => {
-            warn!("webvh: WEBVH_SIGN_KEY_PATH={path} is empty — webvh signing disabled");
-            None
+            error!("webvh: WEBVH_SIGN_KEY_PATH={path} is empty — webvh signing DISABLED");
+            return None;
         }
         Err(e) => {
-            warn!("webvh: cannot read WEBVH_SIGN_KEY_PATH={path}: {e} — webvh signing disabled");
-            None
+            error!("webvh: cannot read WEBVH_SIGN_KEY_PATH={path}: {e} — webvh signing DISABLED");
+            return None;
+        }
+    };
+    // The update key is the DID update authority; flag loudly if its file is
+    // readable by group/other (it should be chmod 600).
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            error!(
+                "webvh: update-key file {path} is group/other-accessible (mode {:o}) — chmod 600",
+                mode & 0o777
+            );
         }
     }
+    info!("webvh: update-signing key loaded from {path}");
+    Some(contents)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,15 +426,9 @@ pub async fn well_known_did_jsonl(
 // did:webvh log emission — opt-in (pulls the DIF crate)
 // ---------------------------------------------------------------------------
 //
-// Enable with `--features webvh` AFTER adding the optional deps in Cargo.toml:
-//   didwebvh-rs            = { version = "0.5", optional = true }
-//   affinidi-data-integrity = { version = "*",  optional = true }  # match didwebvh-rs
-// and expanding the feature to:
-//   webvh = ["dep:didwebvh-rs", "dep:affinidi-data-integrity"]
-//
-// Written against the published `didwebvh-rs` examples (examples/create.rs and
-// examples/custom_signer.rs). Field/variant names are from those examples; the
-// first `--features webvh` build is where any minor signature drift surfaces.
+// Behind the `webvh` cargo feature (= `["dep:didwebvh-rs"]`) so the heavy DIF
+// dependency tree stays out of the default build. The Ed25519 update key is the
+// crate's re-exported `Secret`; no other direct dep is required.
 #[cfg(feature = "webvh")]
 mod log_emit {
     use super::WebvhError;
@@ -469,10 +479,10 @@ mod log_emit {
 mod tests {
     use super::*;
 
-    /// Live diagnostic (ignored): drives `create_passport_log` against the real
-    /// KMS key to confirm did:webvh signing works end-to-end. Run with:
-    ///   WEBVH_KMS_KEY_ID=alias/arkavo-webvh-update-key \
-    ///     cargo test --features webvh webvh_live_create -- --ignored --nocapture
+    /// Live diagnostic (ignored): generates a fresh Ed25519 update key and drives
+    /// `create_did` to confirm did:webvh signing works end-to-end (no KMS, no
+    /// env, no network). Run with:
+    ///   cargo test --features webvh webvh_live_create -- --ignored --nocapture
     #[cfg(feature = "webvh")]
     #[tokio::test]
     #[ignore]
