@@ -189,6 +189,12 @@ async fn handle_h3_request(
         body_bytes.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
     }
 
+    // A response to HEAD must carry the same headers as the GET-equivalent
+    // (including Content-Length) but no message body. The TCP path gets this for
+    // free from hyper; on H3 we serve the response ourselves, so capture the
+    // method now and suppress the body frame below.
+    let is_head = req.method() == Method::HEAD;
+
     let (parts, _) = req.into_parts();
     let axum_req = http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
@@ -203,9 +209,11 @@ async fn handle_h3_request(
     let h3_response = http::Response::from_parts(resp_parts, ());
     stream.send_response(h3_response).await?;
 
-    let body_bytes = axum::body::to_bytes(resp_body, usize::MAX).await?;
-    if !body_bytes.is_empty() {
-        stream.send_data(body_bytes).await?;
+    if !is_head {
+        let body_bytes = axum::body::to_bytes(resp_body, usize::MAX).await?;
+        if !body_bytes.is_empty() {
+            stream.send_data(body_bytes).await?;
+        }
     }
     stream.finish().await?;
 
