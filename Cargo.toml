@@ -23,6 +23,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 quinn = { version = "0.11", optional = true }
+http-body = { version = "1", optional = true }         # response body size_hint for H3 Content-Length
 http-body-util = { version = "0.1", optional = true }  # frame-by-frame H3 response streaming
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 tower = { version = "0.5", features = ["full"] }
@@ -63,6 +64,6 @@ didwebvh-rs = { version = "0.5.5", default-features = false, optional = true }
 
 [features]
 default = []
-http3 = ["h3", "h3-quinn", "quinn", "http-body-util"]
+http3 = ["h3", "h3-quinn", "quinn", "http-body", "http-body-util"]
 # did:webvh log engine (DIF didwebvh-rs). Heavy deps, so opt-in.
 webvh = ["dep:didwebvh-rs"]

@@ -218,7 +218,23 @@ async fn handle_h3_request(
     //    (no full-body buffering — keeps memory bounded and preserves streaming
     //    for any future chunked response). A HEAD response carries the headers
     //    but no body.
-    let (resp_parts, mut resp_body) = response.into_parts();
+    let (mut resp_parts, mut resp_body) = response.into_parts();
+
+    // hyper synthesizes Content-Length from the body size at the wire layer on
+    // the TCP path; that layer is bypassed here, so replicate it — advertise
+    // Content-Length when the body length is exactly known and not already set.
+    // This gives H3 clients (including HEAD probes, where the body is suppressed
+    // below) the same Content-Length they would see over HTTP/2. Streaming bodies
+    // of unknown size are left without it, exactly as on the TCP path.
+    if !resp_parts.headers.contains_key(http::header::CONTENT_LENGTH)
+        && let Some(len) = http_body::Body::size_hint(&resp_body).exact()
+        && let Ok(value) = http::HeaderValue::from_str(&len.to_string())
+    {
+        resp_parts
+            .headers
+            .insert(http::header::CONTENT_LENGTH, value);
+    }
+
     stream
         .send_response(http::Response::from_parts(resp_parts, ()))
         .await?;
