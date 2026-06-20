@@ -15,9 +15,11 @@
 //! signs `authenticatorData || SHA256(clientDataJSON)` via an interactive
 //! ceremony with a client-held key. So the two key roles are **decoupled**:
 //!
-//! * **Log / update authority** — a server-custodied key in AWS KMS. This is
-//!   what implements `Signer` ([`KmsSigner`]) and signs `did.jsonl` entries.
-//!   (KMS is already in this codebase for Patreon token sealing.)
+//! * **Log / update authority** — a software **Ed25519** key (the DIF crate's
+//!   `Secret`), loaded from `WEBVH_SIGN_KEY_PATH`. did:webvh v1.0 mandates the
+//!   `eddsa-jcs-2022` cryptosuite (Ed25519), which AWS KMS cannot sign — so this
+//!   is a key file, the same posture as the CWT signing key
+//!   (`ENCODING_KEY_PATH`). It signs the `did.jsonl` data-integrity proofs.
 //! * **User authentication credential** — the WebAuthn passkey (P-256 COSE),
 //!   published *inside* the DID document as a `Multikey` `verificationMethod`
 //!   under `authentication`/`assertionMethod`. The webvh log makes the
@@ -28,23 +30,20 @@
 //! Everything except the actual `didwebvh-rs` calls is in the default build and
 //! unit-tested: the real `did:key` derivation from a passkey's P-256 COSE key
 //! (replacing the structurally-invalid `did:key:apple-<hex>` flagged in the
-//! review), the DID-document builder, the KMS signer plumbing, the DER→raw
-//! P-256 signature conversion, and the resolution endpoints.
+//! review), the DID-document builder, the Ed25519 key-file loader, and the
+//! resolution endpoints.
 //!
-//! The `impl Signer for KmsSigner` and the `create_did`/`update_did` calls that
-//! actually emit a signed `did.jsonl` are behind `#[cfg(feature = "webvh")]`
-//! (see [`log_emit`]) so the heavy DIF dependency tree stays opt-in for plain
-//! `cargo build`/CI; the production build (`production/build.sh`) enables
-//! `--features webvh`, making did:webvh canonical in prod.
+//! The `create_did` call that emits a signed `did.jsonl` (via the Ed25519
+//! `Secret`) is behind `#[cfg(feature = "webvh")]` (see [`log_emit`]) so the
+//! heavy DIF dependency tree stays opt-in for plain `cargo build`/CI; the
+//! production build (`production/build.sh`) enables `--features webvh`, making
+//! did:webvh canonical in prod.
 
-use aws_config::BehaviorVersion;
-use aws_sdk_kms::primitives::Blob;
-use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
 use axum::extract::{Extension, Path};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use log::{error, info, warn};
-use p256::ecdsa::{Signature, VerifyingKey};
+use p256::ecdsa::VerifyingKey;
 use serde_json::json;
 use std::env;
 use thiserror::Error;
@@ -61,10 +60,6 @@ pub enum WebvhError {
     UnsupportedKeyType,
     #[error("key format: {0}")]
     KeyFormat(String),
-    #[error("signature format: {0}")]
-    SigFormat(String),
-    #[error("KMS error: {0}")]
-    Kms(String),
     #[error("webvh log error: {0}")]
     Log(String),
 }
@@ -209,145 +204,38 @@ pub fn build_did_document(
 }
 
 // ---------------------------------------------------------------------------
-// KMS-backed external signer (the did:webvh log / update authority)
+// did:webvh log / update key (Ed25519 software key)
 // ---------------------------------------------------------------------------
+//
+// did:webvh v1.0 mandates the eddsa-jcs-2022 cryptosuite (Ed25519), and AWS KMS
+// cannot sign Ed25519 — so the log/update key is a software Ed25519 key loaded
+// from `WEBVH_SIGN_KEY_PATH` (the crate's `Secret` JSON form). Same
+// plaintext-key-file posture as the CWT signing key (`ENCODING_KEY_PATH`). The
+// passkey (P-256) is NOT this key — it is published as a verificationMethod in
+// the DID document; this key only signs the log's data-integrity proofs.
 
-/// External `Signer` for the did:webvh log, backed by an AWS KMS asymmetric
-/// `ECC_NIST_P256` key (`WEBVH_KMS_KEY_ID`). The private key never leaves KMS.
-///
-/// Cloneable (KMS client + strings) so it can be handed by value into
-/// `CreateDIDConfig::builder_generic().authorization_key(...)`.
-#[derive(Clone)]
-pub struct KmsSigner {
-    client: aws_sdk_kms::Client,
-    key_id: String,
-    /// `publicKeyMultibase` of the *update* key — goes in webvh `update_keys`.
-    update_key_multibase: String,
-    /// `did:key:z..#z..` self-reference for proof metadata
-    /// (`Signer::verification_method`).
-    verification_method: String,
-}
-
-impl std::fmt::Debug for KmsSigner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KmsSigner")
-            .field("key_id", &self.key_id)
-            .field("verification_method", &self.verification_method)
-            .finish()
-    }
-}
-
-impl KmsSigner {
-    /// Build from `WEBVH_KMS_KEY_ID`, mirroring [`crate::patreon::build_kms_sealer`].
-    /// `None` (Patreon-style fail-closed) when unset or the key can't be read.
-    pub async fn from_env() -> Option<Self> {
-        let key_id = env::var("WEBVH_KMS_KEY_ID")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-        let client = aws_sdk_kms::Client::new(&config);
-        match Self::new(client, key_id).await {
-            Ok(s) => {
-                info!(
-                    "webvh: KMS update-key signer ready ({})",
-                    s.verification_method
-                );
-                Some(s)
-            }
-            Err(e) => {
-                warn!("webvh: WEBVH_KMS_KEY_ID set but signer unavailable: {e}");
-                None
-            }
+/// Read the Ed25519 update-signing key (crate `Secret` JSON) from
+/// `WEBVH_SIGN_KEY_PATH`. Returns the raw file contents (parsed into a `Secret`
+/// under the `webvh` feature). `None` (fail-open) when unset or unreadable — the
+/// DID document is still built/served, but no signed log is emitted.
+pub fn load_sign_key() -> Option<String> {
+    let path = env::var("WEBVH_SIGN_KEY_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => {
+            info!("webvh: update-signing key loaded from {path}");
+            Some(s)
+        }
+        Ok(_) => {
+            warn!("webvh: WEBVH_SIGN_KEY_PATH={path} is empty — webvh signing disabled");
+            None
+        }
+        Err(e) => {
+            warn!("webvh: cannot read WEBVH_SIGN_KEY_PATH={path}: {e} — webvh signing disabled");
+            None
         }
     }
-
-    async fn new(client: aws_sdk_kms::Client, key_id: String) -> Result<Self, WebvhError> {
-        let resp = client
-            .get_public_key()
-            .key_id(&key_id)
-            .send()
-            .await
-            .map_err(|e| WebvhError::Kms(format!("GetPublicKey: {e}")))?;
-        let spki = resp
-            .public_key()
-            .ok_or_else(|| WebvhError::Kms("GetPublicKey returned no key".into()))?
-            .as_ref();
-        let multibase = spki_p256_to_multibase(spki)?;
-        let verification_method = format!("did:key:{multibase}#{multibase}");
-        Ok(Self {
-            client,
-            key_id,
-            update_key_multibase: multibase,
-            verification_method,
-        })
-    }
-
-    /// `publicKeyMultibase` of the update key (for webvh `update_keys`).
-    pub fn update_key_multibase(&self) -> &str {
-        &self.update_key_multibase
-    }
-
-    /// Sign with the KMS key, returning a raw 64-byte P-256 signature (r‖s),
-    /// the form data-integrity proofs expect (KMS returns ASN.1 DER).
-    ///
-    /// Contract: the affinidi-data-integrity `Signer` hands "pre-hashed,
-    /// pre-canonicalised" bytes — for the P-256 cryptosuite that is the 32-byte
-    /// SHA-256 digest. We require exactly 32 bytes and pass them to KMS as
-    /// `MessageType::Digest`. We deliberately do NOT branch on length to decide
-    /// whether to hash: the old heuristic could sign 32 bytes of non-digest
-    /// material as a digest, silently producing an unverifiable proof. A
-    /// non-32-byte input now fails loud instead. **Confirm end-to-end against a
-    /// live KMS key when first enabling the `webvh` feature** (see PR notes).
-    pub async fn sign_p256(&self, digest: &[u8]) -> Result<Vec<u8>, WebvhError> {
-        if digest.len() != 32 {
-            return Err(WebvhError::SigFormat(format!(
-                "expected a 32-byte pre-hashed digest, got {} bytes",
-                digest.len()
-            )));
-        }
-        let resp = self
-            .client
-            .sign()
-            .key_id(&self.key_id)
-            .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
-            .message_type(MessageType::Digest)
-            .message(Blob::new(digest.to_vec()))
-            .send()
-            .await
-            .map_err(|e| WebvhError::Kms(format!("Sign: {e}")))?;
-        let der = resp
-            .signature()
-            .ok_or_else(|| WebvhError::Kms("Sign returned no signature".into()))?
-            .as_ref();
-        der_p256_sig_to_raw(der)
-    }
-}
-
-/// KMS GetPublicKey returns SPKI DER. For `ECC_NIST_P256` the trailing 65 bytes
-/// are the uncompressed SEC1 point (`0x04 || x || y`); re-encode it as a P-256
-/// `did:key` multibase.
-fn spki_p256_to_multibase(spki: &[u8]) -> Result<String, WebvhError> {
-    if spki.len() < 65 {
-        return Err(WebvhError::KeyFormat("SPKI too short for P-256".into()));
-    }
-    let point = &spki[spki.len() - 65..];
-    if point[0] != 0x04 {
-        return Err(WebvhError::KeyFormat(
-            "expected uncompressed SEC1 point".into(),
-        ));
-    }
-    cose_p256_to_multibase(&point[1..33], &point[33..65])
-}
-
-/// Convert an ASN.1 DER P-256 ECDSA signature into raw `r‖s` (64 bytes).
-fn der_p256_sig_to_raw(der: &[u8]) -> Result<Vec<u8>, WebvhError> {
-    let sig = Signature::from_der(der).map_err(|e| WebvhError::SigFormat(e.to_string()))?;
-    // Normalize to low-S: KMS does not guarantee canonical (low-S) signatures,
-    // and strict data-integrity / JOSE P-256 verifiers reject high-S as
-    // non-canonical (signature-malleability check). normalize_s() returns
-    // Some(low_s) only when it had to flip; None means already low-S.
-    let sig = sig.normalize_s().unwrap_or(sig);
-    Ok(sig.to_bytes().to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +244,7 @@ fn der_p256_sig_to_raw(der: &[u8]) -> Result<Vec<u8>, WebvhError> {
 
 /// Called from `finish_register` after a passkey is stored. Builds the passport
 /// DID document from the freshly-registered passkey and — when the `webvh`
-/// feature is enabled and a [`KmsSigner`] is configured — signs the first
+/// feature is enabled and an Ed25519 update key is configured — signs the first
 /// `did.jsonl` log entry and persists it for resolution.
 ///
 /// Non-fatal: a webvh failure must never break WebAuthn registration.
@@ -384,8 +272,8 @@ pub async fn on_passkey_registered(
 
     #[cfg(feature = "webvh")]
     {
-        let Some(signer) = app_state.webvh_signer.as_ref().as_ref() else {
-            log::debug!("webvh: no signer configured (WEBVH_KMS_KEY_ID unset); doc not signed");
+        let Some(sign_key) = app_state.webvh_sign_key.as_ref().as_ref() else {
+            log::debug!("webvh: no signing key (WEBVH_SIGN_KEY_PATH unset); doc not signed");
             return;
         };
         // Idempotent: a user's did:webvh is minted once. Additional passkeys
@@ -405,7 +293,7 @@ pub async fn on_passkey_registered(
         }
         let address = format!("https://identity.arkavo.net/dids/{username}");
         let handle = format!("{}.arkavo.social", username.to_lowercase());
-        match log_emit::create_passport_log(signer.clone(), &address, did_document).await {
+        match log_emit::create_passport_log(sign_key, &address, did_document).await {
             Ok((did, log)) => {
                 // Persist the log FIRST and treat a persist failure as
                 // fatal-to-mint. Publishing handle -> did:webvh while the log
@@ -533,45 +421,31 @@ pub async fn well_known_did_jsonl(
 // first `--features webvh` build is where any minor signature drift surfaces.
 #[cfg(feature = "webvh")]
 mod log_emit {
-    use super::{KmsSigner, WebvhError};
-    use affinidi_data_integrity::DataIntegrityError;
+    use super::WebvhError;
     use didwebvh_rs::prelude::*;
     use std::sync::Arc;
 
-    #[async_trait]
-    impl Signer for KmsSigner {
-        fn key_type(&self) -> KeyType {
-            KeyType::P256
-        }
-        fn verification_method(&self) -> &str {
-            &self.verification_method
-        }
-        async fn sign(&self, data: &[u8]) -> Result<Vec<u8>, DataIntegrityError> {
-            self.sign_p256(data)
-                .await
-                .map_err(|e| DataIntegrityError::Signing(Box::new(e)))
-        }
-    }
-
     /// Create the first `did.jsonl` log entry for a passport DID, signed by the
-    /// KMS update key, with the passkey embedded as the authentication method.
+    /// Ed25519 update key (parsed from its crate-`Secret` JSON), with the passkey
+    /// embedded as the authentication verificationMethod. Returns `(did, log)`.
     pub async fn create_passport_log(
-        signer: KmsSigner,
+        sign_key_json: &str,
         address: &str,
         did_document: serde_json::Value,
     ) -> Result<(String, String), WebvhError> {
+        let secret: Secret = serde_json::from_str(sign_key_json)
+            .map_err(|e| WebvhError::Log(format!("parse update key: {e}")))?;
+        let update_mb = secret
+            .get_public_keymultibase()
+            .map_err(|e| WebvhError::Log(format!("update key multibase: {e:?}")))?;
         let parameters = Parameters {
-            update_keys: Some(Arc::new(vec![Multibase::new(
-                signer.update_key_multibase().to_string(),
-            )])),
+            update_keys: Some(Arc::new(vec![Multibase::new(update_mb)])),
             portable: Some(true), // passport must survive a server move
             ..Default::default()
         };
-        // W (witness signer) is unused here; pin it to the default `Secret` so
-        // the two-Signer-param generic resolves (A = our KmsSigner).
-        let config: CreateDIDConfig<KmsSigner, Secret> = CreateDIDConfig::builder_generic()
+        let config = CreateDIDConfig::builder()
             .address(address)
-            .authorization_key(signer)
+            .authorization_key(secret)
             .did_document(did_document)
             .parameters(parameters)
             .also_known_as_web(true)
@@ -594,6 +468,77 @@ mod log_emit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live diagnostic (ignored): drives `create_passport_log` against the real
+    /// KMS key to confirm did:webvh signing works end-to-end. Run with:
+    ///   WEBVH_KMS_KEY_ID=alias/arkavo-webvh-update-key \
+    ///     cargo test --features webvh webvh_live_create -- --ignored --nocapture
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    #[ignore]
+    async fn webvh_live_create() {
+        use didwebvh_rs::did_key::generate_did_key;
+        use didwebvh_rs::prelude::*;
+        use std::sync::Arc;
+
+        // Ed25519 update key (KMS can't sign Ed25519; did:webvh v1.0 mandates it).
+        let (_did, secret) = generate_did_key(KeyType::Ed25519).expect("gen ed25519");
+        let key_json = serde_json::to_string(&secret).expect("serialize Secret");
+        let gx = hex::decode("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+            .unwrap();
+        let gy = hex::decode("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+            .unwrap();
+        let mb = cose_p256_to_multibase(&gx, &gy).unwrap();
+        let doc = build_did_document("{DID}", &mb, &["at://diag.arkavo.social".to_string()]);
+        let params = Parameters {
+            update_keys: Some(Arc::new(vec![Multibase::new(
+                secret.get_public_keymultibase().unwrap(),
+            )])),
+            portable: Some(true),
+            ..Default::default()
+        };
+        let config = CreateDIDConfig::builder()
+            .address("https://identity.arkavo.net/dids/diag")
+            .authorization_key(secret)
+            .did_document(doc)
+            .parameters(params)
+            .also_known_as_web(true)
+            .also_known_as_scid(true)
+            .build()
+            .expect("build config");
+        match create_did(config).await {
+            Ok(result) => {
+                println!("DIAG OK did={}", result.did());
+                println!("DIAG KEY_JSON={key_json}");
+                println!(
+                    "DIAG LOG={}",
+                    serde_json::to_string(result.log_entry()).unwrap()
+                );
+            }
+            Err(e) => println!("DIAG ERR: {e:?}"),
+        }
+    }
+
+    /// One-time key generator (ignored). Writes a fresh Ed25519 update key
+    /// (crate `Secret` JSON) to `WEBVH_SIGN_KEY_PATH`, refusing to overwrite:
+    ///   WEBVH_SIGN_KEY_PATH=production/webvh-signkey.json \
+    ///     cargo test --features webvh webvh_generate_key -- --ignored --nocapture
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    #[ignore]
+    async fn webvh_generate_key() {
+        use didwebvh_rs::did_key::generate_did_key;
+        use didwebvh_rs::prelude::KeyType;
+        let path =
+            std::env::var("WEBVH_SIGN_KEY_PATH").expect("set WEBVH_SIGN_KEY_PATH to output file");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "refusing to overwrite existing key at {path}"
+        );
+        let (did_key, secret) = generate_did_key(KeyType::Ed25519).expect("gen ed25519");
+        std::fs::write(&path, serde_json::to_string(&secret).expect("serialize")).expect("write");
+        println!("WEBVH KEY GENERATED -> {path}\n  update key did:key = {did_key}");
+    }
 
     // Independent anchor for the base58btc alphabet/algorithm (canonical bs58
     // test vector), so the multicodec tests below aren't self-referential.
@@ -644,40 +589,6 @@ mod tests {
     #[test]
     fn rejects_wrong_length_coordinates() {
         assert!(cose_p256_to_multibase(&[0u8; 31], &[0u8; 32]).is_err());
-    }
-
-    #[test]
-    fn der_signature_to_raw_rs() {
-        // DER SEQUENCE { INTEGER 1, INTEGER 1 } → r=1, s=1.
-        let der = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
-        let raw = der_p256_sig_to_raw(&der).unwrap();
-        assert_eq!(raw.len(), 64);
-        let mut expected = vec![0u8; 64];
-        expected[31] = 1; // r
-        expected[63] = 1; // s
-        assert_eq!(raw, expected);
-    }
-
-    #[test]
-    fn spki_extraction_round_trips_did_key() {
-        // Build a synthetic P-256 SPKI: standard 26-byte header + uncompressed G.
-        let header = hex::decode("3059301306072a8648ce3d020106082a8648ce3d030107034200").unwrap();
-        let mut spki = header;
-        spki.push(0x04);
-        spki.extend_from_slice(&hex32(
-            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
-        ));
-        spki.extend_from_slice(&hex32(
-            "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
-        ));
-
-        let from_spki = spki_p256_to_multibase(&spki).unwrap();
-        let from_xy = cose_p256_to_multibase(
-            &hex32("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
-            &hex32("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
-        )
-        .unwrap();
-        assert_eq!(from_spki, from_xy);
     }
 
     #[test]
