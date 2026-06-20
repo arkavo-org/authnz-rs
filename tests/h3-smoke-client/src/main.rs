@@ -103,16 +103,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[client] connection closed: {:?}", err);
     };
 
+    // Optional method override via H3_METHOD (e.g. H3_METHOD=HEAD). Defaults to
+    // POST when a body is given, otherwise GET.
+    let method_override = std::env::var("H3_METHOD").ok();
+
     let request = async move {
-        let mut builder = if let Some(ref b) = post_body {
-            http::Request::builder()
-                .method("POST")
-                .uri(&uri)
+        let method = method_override
+            .clone()
+            .unwrap_or_else(|| if post_body.is_some() { "POST" } else { "GET" }.to_string());
+        let mut builder = http::Request::builder().method(method.as_str()).uri(&uri);
+        if let Some(ref b) = post_body {
+            builder = builder
                 .header("content-type", "application/x-www-form-urlencoded")
-                .header("content-length", b.len().to_string())
-        } else {
-            http::Request::builder().uri(&uri)
-        };
+                .header("content-length", b.len().to_string());
+        }
         if let Some(ref h) = extra_header {
             if let Some((name, value)) = h.split_once(':') {
                 builder = builder.header(name.trim(), value.trim());

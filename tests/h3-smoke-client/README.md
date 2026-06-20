@@ -34,6 +34,10 @@ h3-smoke-client <url> [body] [header]
 - `[header]` — optional extra request header, `"Name: Value"`
   (e.g. `"X-Auth-Token: <cwt>"`).
 
+The request method defaults to `POST` when a body is given, otherwise `GET`.
+Override it with the `H3_METHOD` env var, e.g. `H3_METHOD=HEAD` to confirm a
+HEAD response carries headers (incl. `Content-Length`) but no body.
+
 It prints the response status, headers, and body to stdout.
 
 ## Running the full gate
