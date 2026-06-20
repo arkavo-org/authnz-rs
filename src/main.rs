@@ -54,6 +54,7 @@ mod db;
 mod device_check;
 mod oidc;
 mod patreon;
+mod webvh;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -192,6 +193,10 @@ pub struct AppState {
     /// must accept tokens minted for any RP — RFC 8707-style. None ⇒
     /// single-audience tokens, unchanged.
     pub platform_audience: Arc<Option<String>>,
+    /// did:webvh log/update-key signer (AWS KMS). `None` when `WEBVH_KMS_KEY_ID`
+    /// is unset — the passport DID document is still built and served as a
+    /// legacy did:web view, but no signed `did.jsonl` log is emitted.
+    pub webvh_signer: Arc<Option<webvh::KmsSigner>>,
 }
 
 #[tokio::main]
@@ -283,6 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let issuer = env::var("OIDC_ISSUER")
         .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
 
+    // did:webvh update-key signer (fail-closed: None when WEBVH_KMS_KEY_ID unset)
+    let webvh_signer = webvh::KmsSigner::from_env().await;
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -299,6 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .filter(|v| !v.is_empty()),
         ),
+        webvh_signer: Arc::new(webvh_signer),
     };
 
     // Set up Redis Client using fred
@@ -395,6 +404,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(generate_assertion_challenge),
         )
         .route("/device-check/assert", post(finish_assertion))
+        // did:webvh passport resolution. did.json is a legacy did:web view
+        // (resolvable today); did.jsonl is the signed verifiable-history log
+        // (populated when the `webvh` feature signs one).
+        .route("/dids/:username/did.json", get(webvh::well_known_did_json))
+        .route(
+            "/dids/:username/did.jsonl",
+            get(webvh::well_known_did_jsonl),
+        )
         .layer(Extension(app_state))
         .layer(Extension(oidc_config))
         .layer(Extension(oidc_code_store))
@@ -1163,6 +1180,7 @@ pub(crate) mod test_helpers {
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
             platform_audience: Arc::new(None),
+            webvh_signer: Arc::new(None),
         }
     }
 }
