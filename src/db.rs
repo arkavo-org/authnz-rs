@@ -211,16 +211,47 @@ impl DynamoDBStore {
     /// store. Used by webvh provisioning to publish the canonical `did:webvh`.
     /// The handle is lowercased to match ATProto normalisation and the
     /// resolveHandle Lambda's lowercased read key.
-    pub async fn put_handle(&self, handle: &str, did: &str) -> Result<(), DynamoDBError> {
-        self.client
+    ///
+    /// SECURITY: the write is conditional on handle ownership — a handle row may
+    /// only be (re)written by its owning `user_id`. This is defense-in-depth
+    /// against handle/identity takeover (the shared store the resolveHandle
+    /// Lambda serves). Legacy rows that predate the `user_id` attribute are
+    /// claimable once, then bound. A cross-user attempt returns
+    /// [`DynamoDBError::LinkConflict`].
+    pub async fn put_handle(
+        &self,
+        handle: &str,
+        did: &str,
+        user_id: &Uuid,
+    ) -> Result<(), DynamoDBError> {
+        let result = self
+            .client
             .put_item()
             .table_name(&self.handles_table)
             .item("handle", AttributeValue::S(handle.to_lowercase()))
             .item("did", AttributeValue::S(did.to_string()))
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .condition_expression(
+                "attribute_not_exists(handle) OR attribute_not_exists(user_id) OR user_id = :uid",
+            )
+            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
             .send()
-            .await
-            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
-        Ok(())
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if let SdkError::ServiceError(ref se) = err {
+                    if se.err().meta().code() == Some("ConditionalCheckFailedException") {
+                        warn!(
+                            "put_handle: {} owned by another user — write refused",
+                            handle
+                        );
+                        return Err(DynamoDBError::LinkConflict);
+                    }
+                }
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
     }
 
     /// Link a third-party identity (e.g. Apple `sub`) to an existing user.

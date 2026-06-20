@@ -379,6 +379,21 @@ pub async fn on_passkey_registered(
             log::debug!("webvh: no signer configured (WEBVH_KMS_KEY_ID unset); doc not signed");
             return;
         };
+        // Idempotent: a user's did:webvh is minted once. Additional passkeys
+        // (device adds) must NOT re-mint a new DID or repoint the handle.
+        // (Reflecting a new key in the existing DID doc via update_did is a
+        // follow-up.)
+        match app_state.db_store.get_webvh_log(user_id).await {
+            Ok(Some(_)) => {
+                log::debug!("webvh: {username} already provisioned; skipping re-mint");
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("webvh: log read failed for {username}: {e}");
+                return;
+            }
+        }
         let address = format!("https://identity.arkavo.net/dids/{username}");
         let handle = format!("{username}.arkavo.social");
         match log_emit::create_passport_log(signer.clone(), &address, did_document).await {
@@ -389,7 +404,7 @@ pub async fn on_passkey_registered(
                 // Publish handle -> did:webvh into the shared handle store (the
                 // canonical sovereign mapping the resolveHandle Lambda serves) —
                 // replaces the old invalid did:key write.
-                if let Err(e) = app_state.db_store.put_handle(&handle, &did).await {
+                if let Err(e) = app_state.db_store.put_handle(&handle, &did, user_id).await {
                     warn!("webvh: failed to write handle {handle} -> {did}: {e}");
                 } else {
                     info!(

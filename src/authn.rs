@@ -36,6 +36,7 @@ pub async fn start_register(
     session: Session,
     Path(username): Path<String>,
     Query(params): Query<RegisterParams>, // Add query params
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start register for user: {}", username);
 
@@ -88,6 +89,27 @@ pub async fn start_register(
             }
         }
     };
+
+    // SECURITY: WebAuthn registration is unauthenticated, and start_register
+    // reuses an existing user record when the username already exists. Adding a
+    // passkey to an account that ALREADY has credentials therefore requires
+    // proof of control of that account (a valid CWT for this user_id) —
+    // otherwise an unauthenticated caller could graft their own passkey onto an
+    // existing user and (under webvh) repoint that user's handle -> DID. A user
+    // with zero credentials (initial registration, possibly retried) may still
+    // finish without a token.
+    if !user.credentials.is_empty() {
+        let token_str = headers
+            .get("X-Auth-Token")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(WebauthnError::AccountExistsAuthRequired)?;
+        let claims = verify_inbound_account_token(&app_state, token_str)?;
+        let tid =
+            Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
+        if tid != user.user_id {
+            return Err(WebauthnError::AccountExistsAuthRequired);
+        }
+    }
 
     // Clean up existing session state
     if let Err(err) = session.remove_value(SESSION_REG_STATE_KEY).await {
@@ -448,6 +470,8 @@ pub enum WebauthnError {
     InvalidDID(String),
     #[error("CWT error: {0}")]
     Cwt(#[from] crate::cwt::CwtError),
+    #[error("account exists; adding a passkey requires authentication")]
+    AccountExistsAuthRequired,
 }
 
 impl IntoResponse for WebauthnError {
@@ -511,6 +535,10 @@ impl IntoResponse for WebauthnError {
                 format!("Invalid DID format: {}", err),
             ),
             WebauthnError::Cwt(err) => (StatusCode::UNAUTHORIZED, format!("CWT error: {}", err)),
+            WebauthnError::AccountExistsAuthRequired => (
+                StatusCode::UNAUTHORIZED,
+                "Account exists; authenticate (X-Auth-Token) to add a passkey".to_string(),
+            ),
         };
         (status, body).into_response()
     }
