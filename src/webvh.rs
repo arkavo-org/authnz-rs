@@ -290,25 +290,28 @@ impl KmsSigner {
     /// Sign with the KMS key, returning a raw 64-byte P-256 signature (r‖s),
     /// the form data-integrity proofs expect (KMS returns ASN.1 DER).
     ///
-    /// `data` is the bytes the cryptosuite hands the signer. The crate documents
-    /// these as "pre-hashed, pre-canonicalised"; we treat a 32-byte input as the
-    /// SHA-256 digest and otherwise hash it ourselves, so both readings of
-    /// "pre-hashed" are handled. **Confirm against the chosen cryptosuite when
-    /// first enabling the `webvh` feature.**
-    pub async fn sign_p256(&self, data: &[u8]) -> Result<Vec<u8>, WebvhError> {
-        use sha2::{Digest, Sha256};
-        let digest = if data.len() == 32 {
-            data.to_vec()
-        } else {
-            Sha256::digest(data).to_vec()
-        };
+    /// Contract: the affinidi-data-integrity `Signer` hands "pre-hashed,
+    /// pre-canonicalised" bytes — for the P-256 cryptosuite that is the 32-byte
+    /// SHA-256 digest. We require exactly 32 bytes and pass them to KMS as
+    /// `MessageType::Digest`. We deliberately do NOT branch on length to decide
+    /// whether to hash: the old heuristic could sign 32 bytes of non-digest
+    /// material as a digest, silently producing an unverifiable proof. A
+    /// non-32-byte input now fails loud instead. **Confirm end-to-end against a
+    /// live KMS key when first enabling the `webvh` feature** (see PR notes).
+    pub async fn sign_p256(&self, digest: &[u8]) -> Result<Vec<u8>, WebvhError> {
+        if digest.len() != 32 {
+            return Err(WebvhError::SigFormat(format!(
+                "expected a 32-byte pre-hashed digest, got {} bytes",
+                digest.len()
+            )));
+        }
         let resp = self
             .client
             .sign()
             .key_id(&self.key_id)
             .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
             .message_type(MessageType::Digest)
-            .message(Blob::new(digest))
+            .message(Blob::new(digest.to_vec()))
             .send()
             .await
             .map_err(|e| WebvhError::Kms(format!("Sign: {e}")))?;
@@ -339,6 +342,11 @@ fn spki_p256_to_multibase(spki: &[u8]) -> Result<String, WebvhError> {
 /// Convert an ASN.1 DER P-256 ECDSA signature into raw `r‖s` (64 bytes).
 fn der_p256_sig_to_raw(der: &[u8]) -> Result<Vec<u8>, WebvhError> {
     let sig = Signature::from_der(der).map_err(|e| WebvhError::SigFormat(e.to_string()))?;
+    // Normalize to low-S: KMS does not guarantee canonical (low-S) signatures,
+    // and strict data-integrity / JOSE P-256 verifiers reject high-S as
+    // non-canonical (signature-malleability check). normalize_s() returns
+    // Some(low_s) only when it had to flip; None means already low-S.
+    let sig = sig.normalize_s().unwrap_or(sig);
     Ok(sig.to_bytes().to_vec())
 }
 
@@ -366,7 +374,8 @@ pub async fn on_passkey_registered(
         }
     };
     let did_key = passkey_to_did_key(passkey).unwrap_or_else(|_| format!("did:key:{multibase}"));
-    let also_known_as = vec![format!("at://{username}.arkavo.social")];
+    // ATProto handles are lowercase; keep alsoKnownAs / the handle key consistent.
+    let also_known_as = vec![format!("at://{}.arkavo.social", username.to_lowercase())];
     let did_document = build_did_document("{DID}", &multibase, &also_known_as);
     info!(
         "webvh: passport document ready for {username} (auth key {did_key}, aka {:?})",
@@ -395,11 +404,19 @@ pub async fn on_passkey_registered(
             }
         }
         let address = format!("https://identity.arkavo.net/dids/{username}");
-        let handle = format!("{username}.arkavo.social");
+        let handle = format!("{}.arkavo.social", username.to_lowercase());
         match log_emit::create_passport_log(signer.clone(), &address, did_document).await {
             Ok((did, log)) => {
+                // Persist the log FIRST and treat a persist failure as
+                // fatal-to-mint. Publishing handle -> did:webvh while the log
+                // failed to persist would (a) make did.jsonl 404 for that DID and
+                // (b) let a later re-mint (get_webvh_log == None) repoint the
+                // handle to a brand-new DID — breaking did:webvh's stability.
                 if let Err(e) = app_state.db_store.put_webvh_log(user_id, &log).await {
-                    warn!("webvh: signed log but failed to persist for {username}: {e}");
+                    warn!(
+                        "webvh: failed to persist log for {username}; NOT publishing handle: {e}"
+                    );
+                    return;
                 }
                 // Publish handle -> did:webvh into the shared handle store (the
                 // canonical sovereign mapping the resolveHandle Lambda serves) —
@@ -441,8 +458,11 @@ pub async fn well_known_did_json(
             match passkey_to_multibase(passkey) {
                 Ok(multibase) => {
                     // did:web id encodes the path segments after the host.
-                    let did_web = format!("did:web:identity.arkavo.net:dids:{username}");
-                    let aka = vec![format!("at://{username}.arkavo.social")];
+                    // Lowercase to stay consistent with the (lowercased) handle
+                    // key and the ATProto handle convention.
+                    let uname = username.to_lowercase();
+                    let did_web = format!("did:web:identity.arkavo.net:dids:{uname}");
+                    let aka = vec![format!("at://{uname}.arkavo.social")];
                     let doc = build_did_document(&did_web, &multibase, &aka);
                     (
                         StatusCode::OK,

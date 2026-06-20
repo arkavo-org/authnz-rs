@@ -34,10 +34,11 @@ pub struct RegisterParams {
 /// ATProto-handle-safe username validation. The username becomes the leftmost
 /// label of the `<username>.arkavo.social` handle and flows into the derived
 /// did:web id, the `at://` URI, and the prod-handles key — so it must be a valid
-/// DNS label: 1–63 ASCII alphanumerics and internal hyphens, no leading/trailing
-/// hyphen. Blocks `.`, `:`, `/`, `#`, whitespace, control, and non-ASCII — the
-/// separators that would otherwise corrupt those identifiers. (Case is
-/// normalized to lowercase when the handle row is written.)
+/// ATProto handle label: 1–63 chars of **lowercase** ASCII alphanumerics and
+/// internal hyphens, no leading/trailing hyphen. Lowercase-only matches ATProto
+/// (handles are case-insensitive, normalized to lowercase) and removes the
+/// `Alice` vs `alice` case-folding collision on the shared handle key. Blocks
+/// `.`, `:`, `/`, `#`, whitespace, uppercase, control, and non-ASCII.
 fn is_valid_username(username: &str) -> bool {
     let len = username.len();
     if len == 0 || len > 63 {
@@ -49,7 +50,7 @@ fn is_valid_username(username: &str) -> bool {
     }
     username
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub async fn start_register(
@@ -66,7 +67,8 @@ pub async fn start_register(
     // prod-handles key.
     if !is_valid_username(&username) {
         return Err(WebauthnError::InvalidUsername(
-            "must be 1-63 chars of [a-zA-Z0-9-] with no leading/trailing hyphen".to_string(),
+            "must be 1-63 chars of [a-z0-9-] (lowercase) with no leading/trailing hyphen"
+                .to_string(),
         ));
     }
 
@@ -602,6 +604,8 @@ mod tests {
         assert!(!is_valid_username("a#b"));
         assert!(!is_valid_username("alice bob")); // whitespace
         assert!(!is_valid_username("älice")); // non-ascii
+        assert!(!is_valid_username("Alice")); // uppercase (ATProto handles are lowercase)
+        assert!(!is_valid_username("aliceBob")); // uppercase
         assert!(!is_valid_username(&"a".repeat(64))); // too long
     }
 

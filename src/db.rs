@@ -212,12 +212,14 @@ impl DynamoDBStore {
     /// The handle is lowercased to match ATProto normalisation and the
     /// resolveHandle Lambda's lowercased read key.
     ///
-    /// SECURITY: the write is conditional on handle ownership — a handle row may
-    /// only be (re)written by its owning `user_id`. This is defense-in-depth
-    /// against handle/identity takeover (the shared store the resolveHandle
-    /// Lambda serves). Legacy rows that predate the `user_id` attribute are
-    /// claimable once, then bound. A cross-user attempt returns
-    /// [`DynamoDBError::LinkConflict`].
+    /// SECURITY: the write is conditional on handle ownership — a row may only be
+    /// created when the handle is unclaimed, or rewritten by its owning
+    /// `user_id`. Defense-in-depth against handle/identity takeover (the shared
+    /// store the resolveHandle Lambda serves). Pre-existing rows that lack a
+    /// `user_id` (legacy did:plc/did:key seeds) are intentionally NOT claimable
+    /// here — they require an explicit operator migration (stamp the owning
+    /// `user_id`, or delete) rather than being silently overwritten by the first
+    /// registrant. A conflicting attempt returns [`DynamoDBError::LinkConflict`].
     pub async fn put_handle(
         &self,
         handle: &str,
@@ -231,9 +233,7 @@ impl DynamoDBStore {
             .item("handle", AttributeValue::S(handle.to_lowercase()))
             .item("did", AttributeValue::S(did.to_string()))
             .item("user_id", AttributeValue::S(user_id.to_string()))
-            .condition_expression(
-                "attribute_not_exists(handle) OR attribute_not_exists(user_id) OR user_id = :uid",
-            )
+            .condition_expression("attribute_not_exists(handle) OR user_id = :uid")
             .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
             .send()
             .await;
