@@ -273,6 +273,8 @@ export OIDC_CLIENT_OPENTDF_ID=opentdf
 export OIDC_CLIENT_OPENTDF_SECRET=...                           # optional; public clients use PKCE
 export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/cb,https://opentdf.example/oauth/cb
 # Additional RPs follow the same OIDC_CLIENT_<TAG>_{ID,SECRET,REDIRECT_URIS} pattern.
+# AuthZEN PEP service accounts: docs/pep-service-clients.md
+# (`catalog-node` and `mcp-edge` are registered; mint with scripts/mint-pep-cwt.py).
 
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS bundle + web Service ID
 ```

@@ -59,6 +59,10 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # Additional RPs follow the same pattern with a different tag:
 # export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
 # export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
+# AuthZEN PEPs (service CWT, client_credentials): see docs/pep-service-clients.md.
+# catalog-node and mcp-edge are registered in production (401 without secret).
+# Mint on the identity host with scripts/mint-pep-cwt.py — do not paste secrets.
+# _REDIRECT_URIS is required even for client_credentials (parser). Use a dummy URI.
 
 # Optional: shared resource audience appended to every OIDC access token
 # (RFC 8707-style). Set this to the OpenTDF platform's configured audience so

@@ -153,6 +153,12 @@ AWS_REGION=us-east-1
 
 # Optional: DynamoDB Endpoint (for local development)
 # DYNAMODB_ENDPOINT=http://localhost:8000
+
+# OIDC (required for AuthZEN PEP service CWTs — see docs/pep-service-clients.md)
+# OIDC_ISSUER=https://identity.arkavo.net
+# OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net
+# catalog-node and mcp-edge are registered; do not recreate them.
+# Mint: python3 scripts/mint-pep-cwt.py catalog-node --eval
 ```
 
 #### `identity_links` Table
