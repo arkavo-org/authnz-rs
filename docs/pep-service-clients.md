@@ -146,17 +146,30 @@ expected deny for the all-zeros probe subject.
 ## 4. Tighten the facade allowlist
 
 Both clients exist and the 200 row is green (above), so this is the only step
-left. On the **platform** host (`arks`), not this host:
+left. On the **platform** host (`arks`), not this host. Insert the var in the
+file arks actually sources **above** any `exec` (same trap as identity
+`production/start.sh` — `>>` after `exec` is dead). Keep
+`AUTHZEN_UPSTREAM_BEARER` unset.
 
 ```sh
 AUTHZEN_PEP_CLIENT_IDS=catalog-node,mcp-edge
 ```
 
-Restart arks. A valid service CWT for some other registered client (`opentdf`)
-must then be HTTP **403**. Keep `AUTHZEN_UPSTREAM_BEARER` unset.
+Restart arks. Then from the identity host (keeps secrets and CWTs off argv):
 
-Until that allowlist is set, any valid `service-account` CWT from this issuer
-is an authenticated PEP.
+```sh
+python3 scripts/mint-pep-cwt.py catalog-node --eval   # still 200, decision false
+python3 scripts/mint-pep-cwt.py mcp-edge --eval       # 200
+python3 scripts/mint-pep-cwt.py opentdf --eval        # 403
+```
+
+`opentdf` 200 before the restart, **403** after, is the allowlist proof. A
+user CWT / garbage Bearer stays **401** (not a PEP). Catalog `AUTHZ_PROXY`
+GetDecision is a different path and must keep working — the allowlist is
+AuthZEN-only.
+
+Until that var is set, any valid `service-account` CWT from this issuer is an
+authenticated PEP.
 
 ## Do not
 

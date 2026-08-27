@@ -5,6 +5,7 @@ Run on identity.arkavo.net (or any host that can read the EnvironmentFile):
 
     python3 scripts/mint-pep-cwt.py catalog-node --eval
     python3 scripts/mint-pep-cwt.py mcp-edge
+    python3 scripts/mint-pep-cwt.py opentdf --eval   # 403 after AUTHZEN_PEP_CLIENT_IDS
 
 Looks up OIDC_CLIENT_<TAG>_ID / _SECRET in an env file. With no --env-file and
 no AUTHNZ_ENV_FILE, the first readable candidate wins:
@@ -123,7 +124,7 @@ def post_json(url: str, token: str, payload: dict) -> tuple[int, bytes]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("client_id", choices=("catalog-node", "mcp-edge"))
+    p.add_argument("client_id", choices=("catalog-node", "mcp-edge", "opentdf"))
     p.add_argument("--env-file", default=None)
     p.add_argument(
         "--eval",
