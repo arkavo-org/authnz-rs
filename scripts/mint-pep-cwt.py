@@ -6,9 +6,18 @@ Run on identity.arkavo.net (or any host that can read the EnvironmentFile):
     python3 scripts/mint-pep-cwt.py catalog-node --eval
     python3 scripts/mint-pep-cwt.py mcp-edge
 
-Looks up OIDC_CLIENT_<TAG>_ID / _SECRET in AUTHNZ_ENV_FILE
-(default /etc/authnz-rs/production.env). The secret is POSTed on a pipe, not
-argv, so it does not appear in `ps` or in this process's stdout.
+Looks up OIDC_CLIENT_<TAG>_ID / _SECRET in an env file. With no --env-file and
+no AUTHNZ_ENV_FILE, the first readable candidate wins:
+
+    /etc/authnz-rs/production.env   (systemd EnvironmentFile deployment)
+    <repo>/production/start.sh      (the current identity.arkavo.net box)
+
+The live host runs authnz-rs from a foreground `sudo ./start.sh`, so its env
+source of truth is production/start.sh (gitignored), not an EnvironmentFile.
+Both parse the same way: `export KEY=value` lines.
+
+The secret is POSTed on a pipe, not argv, so it does not appear in `ps` or in
+this process's stdout.
 """
 
 from __future__ import annotations
@@ -25,7 +34,21 @@ TOKEN_URL = os.environ.get("AUTHZEN_TOKEN_URL", "https://identity.arkavo.net/oau
 EVAL_URL = os.environ.get(
     "AUTHZEN_EVAL_URL", "https://platform.arkavo.net/access/v1/evaluation"
 )
-DEFAULT_ENV_FILE = os.environ.get("AUTHNZ_ENV_FILE", "/etc/authnz-rs/production.env")
+ENV_FILE_CANDIDATES = (
+    "/etc/authnz-rs/production.env",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "production", "start.sh"),
+)
+
+
+def default_env_file() -> str:
+    """First readable candidate, or the first candidate for the error message."""
+    override = os.environ.get("AUTHNZ_ENV_FILE")
+    if override:
+        return override
+    for candidate in ENV_FILE_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return ENV_FILE_CANDIDATES[0]
 
 
 def load_env_file(path: str) -> dict[str, str]:
@@ -101,7 +124,7 @@ def post_json(url: str, token: str, payload: dict) -> tuple[int, bytes]:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("client_id", choices=("catalog-node", "mcp-edge"))
-    p.add_argument("--env-file", default=DEFAULT_ENV_FILE)
+    p.add_argument("--env-file", default=None)
     p.add_argument(
         "--eval",
         action="store_true",
@@ -109,7 +132,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    env = load_env_file(args.env_file)
+    env_file = args.env_file or default_env_file()
+    if not os.path.isfile(env_file):
+        raise SystemExit(
+            "env file not found: %s (tried %s; override with --env-file or AUTHNZ_ENV_FILE)"
+            % (env_file, ", ".join(ENV_FILE_CANDIDATES))
+        )
+    env = load_env_file(env_file)
     secret = secret_for_client(env, args.client_id)
     status, raw = post_form(
         TOKEN_URL,
