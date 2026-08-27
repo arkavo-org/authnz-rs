@@ -134,7 +134,7 @@ curl -sS -D - -X POST https://platform.arkavo.net/access/v1/evaluation \
 
 Expect **200** and `"decision": true` or `false` (deny is success). **401**
 means the CWT is not a service token the sidecar will accept (`aud` / `iss` /
-`roles`). **403** will not happen until the allowlist below is set.
+`roles`). **403** `pep client not allowlisted` is the allowlist (below), now live.
 
 **Result 2026-08-27**, run from the identity host against pid 2499:
 `{"eval_http": 200, "decision": false}`. The row is green — the sidecar
@@ -143,33 +143,32 @@ expected deny for the all-zeros probe subject.
 
 `/ws` and both rewrap paths must stay unchanged.
 
-## 4. Tighten the facade allowlist
+## 4. Facade allowlist — live
 
-Both clients exist and the 200 row is green (above), so this is the only step
-left. On the **platform** host (`arks`), not this host. Insert the var in the
-file arks actually sources **above** any `exec` (same trap as identity
-`production/start.sh` — `>>` after `exec` is dead). Keep
-`AUTHZEN_UPSTREAM_BEARER` unset.
+On the **platform** host (`arks`), in the file arks actually sources **above**
+any `exec` (same trap as identity `production/start.sh`).
+`AUTHZEN_UPSTREAM_BEARER` stays unset.
 
 ```sh
 AUTHZEN_PEP_CLIENT_IDS=catalog-node,mcp-edge
 ```
 
-Restart arks. Then from the identity host (keeps secrets and CWTs off argv):
+**Result 2026-08-27:** allowlist is enforcing. `catalog-node` and `mcp-edge`
+are the only client ids that get past `/access/v1/evaluation*`. Any other valid
+`service-account` CWT from `identity.arkavo.net` (including `opentdf`) gets
+HTTP **403** `pep client not allowlisted`.
+
+Re-check from the identity host (keeps secrets and CWTs off argv):
 
 ```sh
-python3 scripts/mint-pep-cwt.py catalog-node --eval   # still 200, decision false
+python3 scripts/mint-pep-cwt.py catalog-node --eval   # 200, decision false
 python3 scripts/mint-pep-cwt.py mcp-edge --eval       # 200
 python3 scripts/mint-pep-cwt.py opentdf --eval        # 403
 ```
 
-`opentdf` 200 before the restart, **403** after, is the allowlist proof. A
-user CWT / garbage Bearer stays **401** (not a PEP). Catalog `AUTHZ_PROXY`
+A user CWT / garbage Bearer stays **401** (not a PEP). Catalog `AUTHZ_PROXY`
 GetDecision is a different path and must keep working — the allowlist is
 AuthZEN-only.
-
-Until that var is set, any valid `service-account` CWT from this issuer is an
-authenticated PEP.
 
 ## Do not
 
