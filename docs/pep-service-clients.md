@@ -136,12 +136,17 @@ Expect **200** and `"decision": true` or `false` (deny is success). **401**
 means the CWT is not a service token the sidecar will accept (`aud` / `iss` /
 `roles`). **403** will not happen until the allowlist below is set.
 
+**Result 2026-08-27**, run from the identity host against pid 2499:
+`{"eval_http": 200, "decision": false}`. The row is green — the sidecar
+accepts a `catalog-node` service CWT and returns a decision. `false` is the
+expected deny for the all-zeros probe subject.
+
 `/ws` and both rewrap paths must stay unchanged.
 
 ## 4. Tighten the facade allowlist
 
-Only after both clients exist and the 200 row is green. On the **platform**
-host (`arks`), not this host:
+Both clients exist and the 200 row is green (above), so this is the only step
+left. On the **platform** host (`arks`), not this host:
 
 ```sh
 AUTHZEN_PEP_CLIENT_IDS=catalog-node,mcp-edge
