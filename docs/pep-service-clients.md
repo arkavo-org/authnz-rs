@@ -4,18 +4,21 @@
 CWT** from this IdP (`client_credentials`). Subject CWTs stay in SARC
 `subject`; they are not the AuthZEN `Authorization` Bearer.
 
-Probed 2026-08-27 against `https://identity.arkavo.net/oauth/token`
-(`grant_type=client_credentials`, no secret):
+Probed `https://identity.arkavo.net/oauth/token` with
+`grant_type=client_credentials` and **no secret**:
 
-| `client_id` | HTTP | Meaning |
-|---|---|---|
-| `catalog-node` | **401** `Invalid client credentials` | Already registered. Retrieve the existing secret; do **not** create a second client. |
-| `opentdf` | **401** `Invalid client credentials` | Already registered. Leave it. |
-| `mcp-edge` | **400** `Unknown client_id` | Not registered. Add it. |
-| any never-seen id | **400** `Unknown client_id` | Distinguishes unknown from "secret missing/wrong". |
+| `client_id` | When | HTTP | Meaning |
+|---|---|---|---|
+| `catalog-node` | 2026-08-27 | **401** `Invalid client credentials` | Already registered. Do **not** recreate. |
+| `opentdf` | 2026-08-27 | **401** `Invalid client credentials` | Already registered. Leave it. |
+| `mcp-edge` | before pid 2499 | **400** `Unknown client_id` | Was missing. |
+| `mcp-edge` | after pid 2499 @ 10:38:03 | **401** `Invalid client credentials` | Restart picked up `OIDC_CLIENT_MCPEDGE_*`. |
+| never-seen id | both | **400** `Unknown client_id` | Control: unknown is still 400. |
 
 Unknown is **400**. Known-but-wrong-or-missing-secret is **401**. That split is
-in `handle_client_credentials_grant` (`src/oidc.rs`).
+in `handle_client_credentials_grant` (`src/oidc.rs`). Registration is proven.
+Secret round-trip is a mint (next section). Do not paste the secret into chat,
+a PR, or `curl …&client_secret=…` (argv + classifier).
 
 ## What the token must look like
 
@@ -44,50 +47,48 @@ SSM `client_secret_param`). Copy it from there; do not mint a new client id.
 Confirm `OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net` is set (no restart
 needed to *read* it; a restart is needed only if you change it).
 
-Mint (secret on stdin / env, not argv):
+Mint **on the identity host** so the secret never leaves `production.env`.
+`scripts/mint-pep-cwt.py` reads `OIDC_CLIENT_<TAG>_ID` / `_SECRET`, POSTs the
+form on a pipe (not argv), and prints only status metadata — not the secret
+and not the token:
 
 ```sh
-# identity.arkavo.net — uses the existing catalog-node registration
-curl -sS -X POST https://identity.arkavo.net/oauth/token \
-  -H 'content-type: application/x-www-form-urlencoded' \
-  --data-urlencode 'grant_type=client_credentials' \
-  --data-urlencode 'client_id=catalog-node' \
-  --data-urlencode "client_secret=${CATALOG_AUTHZ_CLIENT_SECRET}"
+# on 71.179.48.230; AUTHNZ_ENV_FILE defaults to /etc/authnz-rs/production.env
+python3 scripts/mint-pep-cwt.py catalog-node --eval
+python3 scripts/mint-pep-cwt.py mcp-edge
 ```
 
-Expect HTTP 200, `token_type=Bearer`, `expires_in=3600`, `access_token` a
-base64url CWT (no `.` JWT dots). `id_token` is still JWT (OIDC Core); PEPs
-use `access_token`.
+Expect mint JSON:
 
-Wrong secret → 401 `Invalid client credentials`.
+```json
+{"mint_http": 200, "token_type": "Bearer", "expires_in": 3600,
+ "access_token_len": <n>, "access_token_has_dot": false, "id_token_has_dot": true}
+```
 
-## 2. `mcp-edge` — register
+`access_token_has_dot: false` is the CWT check (OIDC `id_token` is still JWT).
+`--eval` then POSTs `/access/v1/evaluation` and prints
+`{"eval_http": 200, "decision": true|false}` (deny is success).
 
-Clients are env-only, loaded at process start. There is no admin API.
-`<TAG>` groups the three vars and does not appear in tokens. `_REDIRECT_URIS`
-is **required even for `client_credentials`** (parser). Use a dummy URI; this
-client must not run the authorize code flow.
+Wrong secret → `mint_http: 401`. Missing env file / tag → process exits before
+the POST.
 
-In `/etc/authnz-rs/production.env` (or the unit's `EnvironmentFile`):
+## 2. `mcp-edge` — registered (pid 2499)
+
+Env-only, loaded at process start. There is no admin API. `<TAG>` groups the
+three vars and does not appear in tokens. `_REDIRECT_URIS` is required even
+for `client_credentials` (parser); dummy URI is fine.
+
+Already in `/etc/authnz-rs/production.env` after the 10:38:03 restart:
 
 ```sh
 OIDC_CLIENT_MCPEDGE_ID=mcp-edge
-OIDC_CLIENT_MCPEDGE_SECRET=<generate a new confidential secret; store only in env>
+OIDC_CLIENT_MCPEDGE_SECRET=<confidential; never paste>
 OIDC_CLIENT_MCPEDGE_REDIRECT_URIS=https://identity.arkavo.net/oauth/unused
 ```
 
-Restart authnz-rs. Then:
-
-```sh
-# unknown → 400 before restart; 401 without secret after restart
-curl -sS -X POST https://identity.arkavo.net/oauth/token \
-  -H 'content-type: application/x-www-form-urlencoded' \
-  -d 'grant_type=client_credentials&client_id=mcp-edge'
-```
-
-Mint with `--data-urlencode "client_secret=${MCP_EDGE_CLIENT_SECRET}"` the same
-way as catalog-node. Put that secret on the MCP host as `AUTHZEN_CLIENT_SECRET`
-when arkavo-edge #659 lands — not in `arks`.
+Mint the same way as catalog-node (`python3 scripts/mint-pep-cwt.py mcp-edge`).
+When arkavo-edge #659 lands, that secret goes on the MCP host as
+`AUTHZEN_CLIENT_SECRET` — not in `arks`.
 
 ## 3. Missing platform row (after catalog-node mint)
 
