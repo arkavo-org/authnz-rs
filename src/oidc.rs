@@ -22,7 +22,7 @@ use crate::AppState;
 use crate::apple_signin;
 use crate::constants::{
     ACCESS_TOKEN_LIFETIME_SECONDS, AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER,
-    ID_TOKEN_LIFETIME_SECONDS,
+    DEFAULT_USER_ENTITLEMENTS, ID_TOKEN_LIFETIME_SECONDS,
 };
 use axum::Json;
 use axum::extract::{Extension, Form, Query};
@@ -1080,7 +1080,10 @@ async fn handle_client_credentials_grant(
         arkavo_account_id: client_subject.clone(),
         arkavo_roles: vec!["service-account".to_string()],
         // Grant standard entitlements so service accounts can encrypt/decrypt OpenTDF payloads
-        arkavo_entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+        arkavo_entitlements: vec![
+            DEFAULT_USER_ENTITLEMENTS[0].to_string(),
+            DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+        ],
     };
 
     let mut header = Header::new(Algorithm::ES256);
@@ -1242,7 +1245,10 @@ async fn handle_refresh_token_grant(
     let (roles, entitlements, idp) = if record.subject.starts_with("client:") {
         (
             vec!["service-account".to_string()],
-            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+            vec![
+                DEFAULT_USER_ENTITLEMENTS[0].to_string(),
+                DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+            ],
             "client_credentials".to_string(),
         )
     } else {
@@ -1251,11 +1257,22 @@ async fn handle_refresh_token_grant(
         } else {
             "webauthn"
         };
-        (
-            vec!["user".to_string()],
-            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
-            auth_idp.to_string(),
-        )
+        // Look up the account's stored entitlements when the subject carries
+        // a resolvable Arkavo user_id (the webauthn `arkavo:<uuid>` case);
+        // fall back to the defaults otherwise (e.g. `apple:<sub>`, which
+        // isn't a uuid and isn't tracked on this record — #53 follow-up).
+        let entitlements = match parse_uuid_from_subject(&record.subject) {
+            Some(user_id) => app_state
+                .db_store
+                .get_user_entitlements(&user_id)
+                .await
+                .unwrap_or_default(),
+            None => DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        (vec!["user".to_string()], entitlements, auth_idp.to_string())
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
@@ -1578,7 +1595,13 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
     let account_id = claims.sub;
-    // Best-effort role/entitlement defaults. Future work: persist these on the user.
+    let user_id = Uuid::parse_str(&account_id)
+        .map_err(|_| AuthorizeError::InvalidArkavoJwt("sub is not a uuid".into()))?;
+    let entitlements = app_state
+        .db_store
+        .get_user_entitlements(&user_id)
+        .await
+        .map_err(|e| AuthorizeError::InvalidArkavoJwt(format!("entitlement lookup: {}", e)))?;
     Ok(AuthenticatedUser {
         subject: format!("arkavo:{}", account_id),
         arkavo_account_id: account_id,
@@ -1586,7 +1609,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         email_verified: None,
         idp: "webauthn".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+        entitlements,
     })
 }
 
@@ -1957,7 +1980,7 @@ mod tests {
             email_verified: Some(true),
             idp: "apple".into(),
             roles: vec!["user".into()],
-            entitlements: vec!["tdf:create".into()],
+            entitlements: vec![DEFAULT_USER_ENTITLEMENTS[0].to_string()],
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2199,7 +2222,10 @@ mod tests {
             idp: "apple".into(),
             arkavo_account_id: "uuid".into(),
             arkavo_roles: vec!["user".into()],
-            arkavo_entitlements: vec!["tdf:create".into(), "tdf:decrypt".into()],
+            arkavo_entitlements: vec![
+                DEFAULT_USER_ENTITLEMENTS[0].to_string(),
+                DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+            ],
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(!json.contains("nonce"));
@@ -2598,10 +2624,20 @@ mod tests {
         };
 
         let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
-        assert!(
-            result.is_ok(),
-            "CWT token should be accepted, got {:?}",
-            result.err()
-        );
+        // This test's job is the CWT-vs-JWT discriminator: the token must get
+        // past decode + signature verification + sub-parsing. There's no
+        // DynamoDB test double in this crate, so the entitlement lookup that
+        // follows hits a real (unreachable in unit tests) AWS call and fails
+        // — an "entitlement lookup:" error means the CWT itself *was*
+        // accepted; any other outcome means it wasn't.
+        match result {
+            Ok(_) => {}
+            Err(AuthorizeError::InvalidArkavoJwt(msg))
+                if msg.starts_with("entitlement lookup:") => {}
+            other => panic!(
+                "CWT should be accepted (or fail only at entitlement lookup), got {:?}",
+                other
+            ),
+        }
     }
 }
