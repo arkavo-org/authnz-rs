@@ -47,12 +47,11 @@ use crate::oidc::{
     token as oidc_token, userinfo as oidc_userinfo,
 };
 use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
+use authnz_rs::{constants, cwt, keys};
 
 mod agent;
 mod apple_signin;
 mod authn;
-mod constants;
-mod cwt;
 mod db;
 mod device_check;
 mod entities;
@@ -804,56 +803,19 @@ fn load_ec_keys(
         LoadKeysError::InvalidKeyFormat
     })?;
 
-    // Load the same EC key material as p256 type for CWT signing.
-    let cwt_signing_key = {
-        use p256::pkcs8::DecodePrivateKey;
-        p256::SecretKey::from_pkcs8_pem(encoding_pem_str)
-            .map_err(|e| format!("Failed to parse CWT signing key as PKCS8 PEM: {e}"))?
-            .into()
-    };
+    // Load the same EC key material as p256 type for CWT signing/verification,
+    // plus the RFC 7638 thumbprint kid. Shared with `src/bin/seed-test-user.rs`
+    // via `authnz_rs::keys::load_cwt_signing_key` so both binaries derive
+    // identical CWT keys/kid from the same encoding key PEM.
+    let (cwt_signing_key, cwt_verifying_key, cwt_kid) =
+        keys::load_cwt_signing_key(encoding_pem_str)?;
 
     debug!("Attempting to create DecodingKey from PEM contents");
     let decoding_pem = std::fs::read(decoding_key_path)?;
-    let decoding_pem_str = std::str::from_utf8(&decoding_pem)
-        .map_err(|e| format!("Decoding key PEM is not valid UTF-8: {e}"))?;
-
     let decoding_key = DecodingKey::from_ec_pem(&decoding_pem).map_err(|e| {
         error!("Failed to create DecodingKey: {:?}", e);
         LoadKeysError::InvalidKeyFormat
     })?;
-
-    // Load the same EC key material as p256 type for CWT verification.
-    let cwt_verifying_key = {
-        use p256::pkcs8::DecodePublicKey;
-        let pk = p256::PublicKey::from_public_key_pem(decoding_pem_str)
-            .map_err(|e| format!("Failed to parse CWT verifying key as SPKI PEM: {e}"))?;
-        p256::ecdsa::VerifyingKey::from(pk)
-    };
-
-    // kid = RFC 7638 JWK thumbprint, raw 32-byte SHA-256 hash.
-    // JWKS advertises the base64url-encoded form of the same bytes
-    // (see src/oidc.rs::ec_public_key_to_jwk), so CWT and JWT advertise
-    // the same physical kid.
-    let cwt_kid = {
-        use base64::Engine;
-        use sha2::{Digest, Sha256};
-        let encoded = cwt_verifying_key.to_encoded_point(false);
-        let x = encoded
-            .x()
-            .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
-        let y = encoded
-            .y()
-            .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let thumb_input = format!(
-            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
-            b64.encode(x),
-            b64.encode(y)
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(thumb_input.as_bytes());
-        hasher.finalize().to_vec()
-    };
 
     debug!("Successfully loaded EC keys");
     Ok((

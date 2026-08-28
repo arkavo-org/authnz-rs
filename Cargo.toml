@@ -4,6 +4,8 @@ version = "0.7.0"
 edition = "2024"
 license = "BSD-2"
 rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
+# Adding src/bin/seed-test-user.rs makes `cargo run` ambiguous without this.
+default-run = "authnz-rs"
 
 [profile.release]
 opt-level = 2  # Lower optimization level
@@ -65,6 +67,10 @@ bs58 = "0.5"
 # bump to 1.95 (rust-version above). The Ed25519 update key is loaded via the
 # crate's re-exported `Secret`, so no other direct dep is required.
 didwebvh-rs = { version = "0.5.5", default-features = false, optional = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [features]
 default = []
