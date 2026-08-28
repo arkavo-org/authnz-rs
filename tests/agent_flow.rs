@@ -49,11 +49,21 @@ async fn authorize_challenge_token_refresh_revoke() {
         .unwrap();
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
 
-    // authorize
-    let r = client.post(format!("{base}/agents/authorize"))
+    // authorize — delegate both entitlements the delegator currently holds,
+    // so the later stale-entitlements step (I2) has something to intersect
+    // against a stored set that only keeps one of them.
+    let r = client
+        .post(format!("{base}/agents/authorize"))
         .header("X-Auth-Token", &human_cwt)
-        .json(&json!({"agent_did": did, "name": "it-agent", "entitlements": ["https://arkavo.ai/attr/tdf/value/decrypt"]}))
-        .send().await.unwrap();
+        .json(
+            &json!({"agent_did": did, "name": "it-agent", "entitlements": [
+                "https://arkavo.ai/attr/tdf/value/decrypt",
+                "https://arkavo.ai/attr/action/value/read"
+            ]}),
+        )
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
 
     // challenge → token (twice = refresh)
@@ -82,6 +92,49 @@ async fn authorize_challenge_token_refresh_revoke() {
             "https://arkavo.ai/attr/tdf/value/decrypt"
         );
     }
+
+    // I2: agents must not keep stale entitlements for the delegation
+    // lifetime. Restrict the delegator's stored entitlements to a strict
+    // subset of what was delegated; the next minted token must reflect only
+    // the intersection (delegation.entitlements ∩ stored), not the full
+    // delegated set captured at authorize time.
+    let r = client
+        .put(format!("{base}/admin/users/{SEED_USER_ID}/entitlements"))
+        .header("X-Auth-Token", &service_cwt)
+        .json(&json!({"entitlements": [
+            "https://arkavo.ai/attr/action/value/read"
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+    let ch: Value = client
+        .get(format!("{base}/agents/challenge"))
+        .query(&[("did", &did)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(ch["challenge"].as_str().unwrap())
+        .unwrap();
+    let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(&bytes).to_bytes());
+    let tok: Value = client
+        .post(format!("{base}/agents/token"))
+        .json(&json!({"did": did, "challenge": ch["challenge"], "signature": sig, "nonce": ch["nonce"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tok["entitlements"],
+        json!(["https://arkavo.ai/attr/action/value/read"])
+    );
 
     // GET /entities/{did} (service-CWT gated) reflects the live delegation.
     let r = client
