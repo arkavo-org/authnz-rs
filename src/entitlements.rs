@@ -6,6 +6,7 @@
 
 use crate::AppState;
 use crate::cwt;
+use crate::db::DynamoDBError;
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path},
@@ -95,13 +96,13 @@ pub async fn put_user_entitlements(
         .db_store
         .get_user_by_id(&user_id)
         .await
-        .map_err(|e| EntitlementError::Database(e.to_string()))?
+        .map_err(|e| EntitlementError::Database(Box::new(e)))?
         .ok_or(EntitlementError::UserNotFound)?;
     app_state
         .db_store
         .put_user_entitlements(&user_id, &req.entitlements)
         .await
-        .map_err(|e| EntitlementError::Database(e.to_string()))?;
+        .map_err(|e| EntitlementError::Database(Box::new(e)))?;
     Ok(Json(PutEntitlementsResponse {
         user_id,
         entitlements: req.entitlements,
@@ -123,21 +124,29 @@ pub enum EntitlementError {
     #[error("User not found")]
     UserNotFound,
     #[error("Database error: {0}")]
-    Database(String),
+    Database(#[from] Box<DynamoDBError>),
 }
 
 impl IntoResponse for EntitlementError {
     fn into_response(self) -> axum::response::Response {
-        let status = match &self {
+        let (status, body) = match &self {
             EntitlementError::MissingToken | EntitlementError::InvalidToken => {
-                StatusCode::UNAUTHORIZED
+                (StatusCode::UNAUTHORIZED, self.to_string())
             }
-            EntitlementError::Forbidden => StatusCode::FORBIDDEN,
-            EntitlementError::Empty | EntitlementError::InvalidFqn(_) => StatusCode::BAD_REQUEST,
-            EntitlementError::UserNotFound => StatusCode::NOT_FOUND,
-            EntitlementError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            EntitlementError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
+            EntitlementError::Empty | EntitlementError::InvalidFqn(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
+            }
+            EntitlementError::UserNotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            EntitlementError::Database(e) => match e.as_ref() {
+                DynamoDBError::TableNotExists(table) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Service setup incomplete: {} table not configured", table),
+                ),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            },
         };
-        (status, self.to_string()).into_response()
+        (status, body).into_response()
     }
 }
 
@@ -188,6 +197,24 @@ mod tests {
         assert_eq!(
             EntitlementError::UserNotFound.into_response().status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn table_not_exists_maps_to_service_unavailable_like_agent_errors() {
+        let err = EntitlementError::Database(Box::new(crate::db::DynamoDBError::TableNotExists(
+            "credentials".into(),
+        )));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let other =
+            EntitlementError::Database(Box::new(crate::db::DynamoDBError::SdkError("boom".into())));
+        assert_eq!(
+            other.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

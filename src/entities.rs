@@ -2,6 +2,7 @@
 //! shape the platform ERS sees, for gateway audit/admin use without a token.
 
 use crate::AppState;
+use crate::db::DynamoDBError;
 use crate::entitlements::{EntitlementError, require_service_cwt};
 use axum::http::HeaderMap;
 use axum::{
@@ -60,7 +61,7 @@ pub async fn get_entity(
             let u = db
                 .get_user_by_id(&uid)
                 .await
-                .map_err(|e| EntityError::Database(e.to_string()))?
+                .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
             EntityRepresentation {
                 id,
@@ -80,7 +81,7 @@ pub async fn get_entity(
             let d = db
                 .get_agent_delegation(&did)
                 .await
-                .map_err(|e| EntityError::Database(e.to_string()))?
+                .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
             EntityRepresentation {
                 id,
@@ -101,7 +102,7 @@ pub async fn get_entity(
             let b = db
                 .get_device_binding(&key_id)
                 .await
-                .map_err(|e| EntityError::Database(e.to_string()))?
+                .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
             let (class, expiry) =
                 crate::device_check::device_class(b.updated_at, Utc::now().timestamp());
@@ -128,25 +129,52 @@ pub enum EntityError {
     #[error("Entity not found")]
     NotFound,
     #[error("Database error: {0}")]
-    Database(String),
+    Database(#[from] Box<DynamoDBError>),
 }
 
 impl IntoResponse for EntityError {
     fn into_response(self) -> axum::response::Response {
-        match self {
-            EntityError::Auth(e) => e.into_response(),
-            EntityError::BadId(_) => (StatusCode::BAD_REQUEST, self.to_string()).into_response(),
-            EntityError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
-            EntityError::Database(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
-            }
+        if let EntityError::Auth(e) = self {
+            return e.into_response();
         }
+        let (status, body) = match &self {
+            EntityError::Auth(_) => unreachable!("handled above"),
+            EntityError::BadId(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            EntityError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            EntityError::Database(e) => match e.as_ref() {
+                DynamoDBError::TableNotExists(table) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Service setup incomplete: {} table not configured", table),
+                ),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            },
+        };
+        (status, body).into_response()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_not_exists_maps_to_service_unavailable_like_agent_errors() {
+        use axum::response::IntoResponse;
+        let err = EntityError::Database(Box::new(crate::db::DynamoDBError::TableNotExists(
+            "credentials".into(),
+        )));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let other =
+            EntityError::Database(Box::new(crate::db::DynamoDBError::SdkError("boom".into())));
+        assert_eq!(
+            other.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn parse_entity_id_namespaces() {
