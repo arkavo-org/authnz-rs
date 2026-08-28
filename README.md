@@ -20,6 +20,7 @@ export DECODING_KEY_PATH=/path/to/decodekey.pem
 # DynamoDB Configuration
 export DYNAMODB_CREDENTIALS_TABLE=prod-credentials
 export DYNAMODB_HANDLES_TABLE=prod-handles
+export DYNAMODB_AGENT_DELEGATIONS_TABLE=prod-agent-delegations
 export AWS_REGION=your-region
 ```
 

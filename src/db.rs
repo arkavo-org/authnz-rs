@@ -15,6 +15,45 @@ pub struct UserCredentials {
     pub did: String,
 }
 
+/// Delegation of a human (PE) or agent to an agent NPE identified by did:key.
+///
+/// One row per agent DID. A pending challenge for the token flow is stored on
+/// the same row (`challenge`, `challenge_nonce`, `challenge_issued_at`) and
+/// removed atomically when taken, so no cookie session is involved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDelegation {
+    /// Agent's DID (did:key:z6Mk...)
+    pub agent_did: String,
+    /// Type of delegator: "human" or "agent"
+    pub delegator_type: String,
+    /// Delegator's identifier (user UUID for human, DID for agent)
+    pub delegator_id: String,
+    /// Delegator's username (if human)
+    pub delegator_username: Option<String>,
+    /// Entitlements granted to the agent (attribute FQNs)
+    pub entitlements: Vec<String>,
+    /// Human-readable name for the agent
+    pub name: String,
+    /// Delegation depth (0 = direct from human)
+    pub depth: u8,
+    /// Original human's UUID (root of delegation chain)
+    pub root_user_id: Uuid,
+    /// DID chain from root to immediate delegator (empty for depth 0)
+    pub chain: Vec<String>,
+    /// Creation timestamp (Unix epoch)
+    pub created_at: i64,
+    /// Expiration timestamp (Unix epoch)
+    pub expires_at: Option<i64>,
+    /// Revocation timestamp (Unix epoch)
+    pub revoked_at: Option<i64>,
+}
+
+/// A challenge taken from a delegation row by [`DynamoDBStore::take_agent_challenge`].
+#[derive(Debug, Clone)]
+pub struct TakenChallenge {
+    pub issued_at: i64,
+}
+
 #[derive(Error, Debug)]
 pub enum DynamoDBError {
     #[error("AWS SDK error: {0}")]
@@ -67,6 +106,7 @@ pub struct DynamoDBStore {
     device_bindings_table: String,
     identity_links_table: String,
     patreon_tokens_table: String,
+    agent_delegations_table: String,
 }
 
 impl DynamoDBStore {
@@ -76,6 +116,7 @@ impl DynamoDBStore {
         device_bindings_table: String,
         identity_links_table: String,
         patreon_tokens_table: String,
+        agent_delegations_table: String,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -87,6 +128,7 @@ impl DynamoDBStore {
             device_bindings_table,
             identity_links_table,
             patreon_tokens_table,
+            agent_delegations_table,
         })
     }
 
@@ -923,6 +965,377 @@ impl DynamoDBStore {
             app_id,
             created_at,
             updated_at,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Agent delegation (PE → agent NPE)
+    // ------------------------------------------------------------------
+
+    /// Create (or overwrite a revoked) agent delegation record.
+    pub async fn create_agent_delegation(
+        &self,
+        delegation: &AgentDelegation,
+    ) -> Result<(), DynamoDBError> {
+        info!(
+            "Creating agent delegation. Table: {}, Agent DID: {}",
+            self.agent_delegations_table, delegation.agent_did
+        );
+
+        let mut item_builder = self
+            .client
+            .put_item()
+            .table_name(&self.agent_delegations_table)
+            .item("agent_did", AttributeValue::S(delegation.agent_did.clone()))
+            .item(
+                "delegator_type",
+                AttributeValue::S(delegation.delegator_type.clone()),
+            )
+            .item(
+                "delegator_id",
+                AttributeValue::S(delegation.delegator_id.clone()),
+            )
+            .item(
+                "entitlements",
+                AttributeValue::L(
+                    delegation
+                        .entitlements
+                        .iter()
+                        .map(|e| AttributeValue::S(e.clone()))
+                        .collect(),
+                ),
+            )
+            .item("name", AttributeValue::S(delegation.name.clone()))
+            .item("depth", AttributeValue::N(delegation.depth.to_string()))
+            .item(
+                "root_user_id",
+                AttributeValue::S(delegation.root_user_id.to_string()),
+            )
+            .item(
+                "chain",
+                AttributeValue::L(
+                    delegation
+                        .chain
+                        .iter()
+                        .map(|d| AttributeValue::S(d.clone()))
+                        .collect(),
+                ),
+            )
+            .item(
+                "created_at",
+                AttributeValue::N(delegation.created_at.to_string()),
+            );
+
+        if let Some(username) = &delegation.delegator_username {
+            item_builder =
+                item_builder.item("delegator_username", AttributeValue::S(username.clone()));
+        }
+        if let Some(expires_at) = delegation.expires_at {
+            item_builder =
+                item_builder.item("expires_at", AttributeValue::N(expires_at.to_string()));
+        }
+        if let Some(revoked_at) = delegation.revoked_at {
+            item_builder =
+                item_builder.item("revoked_at", AttributeValue::N(revoked_at.to_string()));
+        }
+
+        match item_builder.send().await {
+            Ok(_) => {
+                info!("Created agent delegation for: {}", delegation.agent_did);
+                Ok(())
+            }
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err
+                    && service_error.err().meta().code() == Some("ResourceNotFoundException")
+                {
+                    error!(
+                        "agent_delegations table {} does not exist",
+                        self.agent_delegations_table
+                    );
+                    return Err(DynamoDBError::TableNotExists(
+                        self.agent_delegations_table.clone(),
+                    ));
+                }
+                error!("Failed to write agent delegation: {:?}", err);
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    /// Get an agent delegation by agent DID.
+    pub async fn get_agent_delegation(
+        &self,
+        agent_did: &str,
+    ) -> Result<Option<AgentDelegation>, DynamoDBError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to query agent delegation {}: {:?}", agent_did, err);
+                DynamoDBError::from(err)
+            })?;
+
+        match result.item {
+            Some(item) => Ok(Some(Self::item_to_agent_delegation(&item)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all delegations rooted at a user (GSI `root_user_id-index`).
+    pub async fn list_delegations_by_root_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<AgentDelegation>, DynamoDBError> {
+        let result = self
+            .client
+            .query()
+            .table_name(&self.agent_delegations_table)
+            .index_name("root_user_id-index")
+            .key_condition_expression("root_user_id = :root_user_id")
+            .expression_attribute_values(":root_user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to list delegations for user {}: {:?}", user_id, err);
+                DynamoDBError::from(err)
+            })?;
+
+        let mut delegations = Vec::new();
+        for item in result.items.unwrap_or_default() {
+            match Self::item_to_agent_delegation(&item) {
+                Ok(d) => delegations.push(d),
+                Err(err) => warn!("Skipping unparseable delegation item: {:?}", err),
+            }
+        }
+        Ok(delegations)
+    }
+
+    /// Count active (non-revoked) delegations rooted at a user.
+    pub async fn count_delegations_by_root_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<u32, DynamoDBError> {
+        let result = self
+            .client
+            .query()
+            .table_name(&self.agent_delegations_table)
+            .index_name("root_user_id-index")
+            .key_condition_expression("root_user_id = :root_user_id")
+            .filter_expression("attribute_not_exists(revoked_at)")
+            .expression_attribute_values(":root_user_id", AttributeValue::S(user_id.to_string()))
+            .select(aws_sdk_dynamodb::types::Select::Count)
+            .send()
+            .await
+            .map_err(|err| {
+                error!(
+                    "Failed to count delegations for user {}: {:?}",
+                    user_id, err
+                );
+                DynamoDBError::from(err)
+            })?;
+
+        Ok(result.count as u32)
+    }
+
+    /// Revoke one delegation (sets `revoked_at`).
+    pub async fn revoke_delegation(&self, agent_did: &str) -> Result<(), DynamoDBError> {
+        let revoked_at = chrono::Utc::now().timestamp();
+        self.client
+            .update_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .update_expression("SET revoked_at = :revoked_at")
+            .expression_attribute_values(":revoked_at", AttributeValue::N(revoked_at.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to revoke delegation {}: {:?}", agent_did, err);
+                DynamoDBError::SdkError(err.to_string())
+            })?;
+        info!("Revoked delegation for: {}", agent_did);
+        Ok(())
+    }
+
+    /// Cascade: revoke every active delegation whose chain contains `did`.
+    ///
+    /// Uses a table scan; chains are short and this runs on revoke only.
+    pub async fn revoke_delegations_with_chain(&self, did: &str) -> Result<u32, DynamoDBError> {
+        let result = self
+            .client
+            .scan()
+            .table_name(&self.agent_delegations_table)
+            .filter_expression("contains(#chain, :did) AND attribute_not_exists(revoked_at)")
+            .expression_attribute_names("#chain", "chain")
+            .expression_attribute_values(":did", AttributeValue::S(did.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to scan delegations for chain {}: {:?}", did, err);
+                DynamoDBError::from(err)
+            })?;
+
+        let mut revoked = 0u32;
+        for item in result.items.unwrap_or_default() {
+            if let Some(agent_did_av) = item.get("agent_did")
+                && let Ok(agent_did) = agent_did_av.as_s()
+            {
+                match self.revoke_delegation(agent_did).await {
+                    Ok(()) => revoked += 1,
+                    Err(err) => warn!("Cascade revoke failed for {}: {:?}", agent_did, err),
+                }
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// Store a pending challenge on the delegation row (replaces any prior one).
+    /// Fails if no delegation row exists for the DID.
+    pub async fn put_agent_challenge(
+        &self,
+        agent_did: &str,
+        challenge: &str,
+        nonce: &str,
+        issued_at: i64,
+    ) -> Result<(), DynamoDBError> {
+        self.client
+            .update_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .condition_expression("attribute_exists(agent_did)")
+            .update_expression("SET challenge = :c, challenge_nonce = :n, challenge_issued_at = :t")
+            .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
+            .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
+            .expression_attribute_values(":t", AttributeValue::N(issued_at.to_string()))
+            .send()
+            .await
+            .map_err(|err| {
+                error!(
+                    "Failed to store agent challenge for {}: {:?}",
+                    agent_did, err
+                );
+                DynamoDBError::SdkError(err.to_string())
+            })?;
+        Ok(())
+    }
+
+    /// Atomically take the pending challenge if `(challenge, nonce)` match.
+    ///
+    /// Returns `Ok(None)` when nothing matched (unknown DID, no pending
+    /// challenge, or mismatch) — the caller treats all of those as a failed
+    /// proof. A matched challenge is removed so it can never be replayed.
+    pub async fn take_agent_challenge(
+        &self,
+        agent_did: &str,
+        challenge: &str,
+        nonce: &str,
+    ) -> Result<Option<TakenChallenge>, DynamoDBError> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .condition_expression("challenge = :c AND challenge_nonce = :n")
+            .update_expression("REMOVE challenge, challenge_nonce, challenge_issued_at")
+            .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
+            .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+            .send()
+            .await;
+
+        match result {
+            Ok(out) => {
+                let issued_at = out
+                    .attributes
+                    .as_ref()
+                    .and_then(|a| a.get("challenge_issued_at"))
+                    .and_then(|av| av.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        DynamoDBError::Internal("challenge_issued_at missing on take".into())
+                    })?;
+                Ok(Some(TakenChallenge { issued_at }))
+            }
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err
+                    && service_error.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    return Ok(None);
+                }
+                error!(
+                    "Failed to take agent challenge for {}: {:?}",
+                    agent_did, err
+                );
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    fn item_to_agent_delegation(
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<AgentDelegation, DynamoDBError> {
+        fn req_s(
+            item: &std::collections::HashMap<String, AttributeValue>,
+            key: &str,
+        ) -> Result<String, DynamoDBError> {
+            item.get(key)
+                .ok_or_else(|| DynamoDBError::Internal(format!("No {} found", key)))?
+                .as_s()
+                .map(|s| s.to_string())
+                .map_err(|_| DynamoDBError::Internal(format!("Invalid {} format", key)))
+        }
+        fn req_n<T: std::str::FromStr>(
+            item: &std::collections::HashMap<String, AttributeValue>,
+            key: &str,
+        ) -> Result<T, DynamoDBError> {
+            item.get(key)
+                .ok_or_else(|| DynamoDBError::Internal(format!("No {} found", key)))?
+                .as_n()
+                .map_err(|_| DynamoDBError::Internal(format!("Invalid {} format", key)))?
+                .parse::<T>()
+                .map_err(|_| DynamoDBError::Internal(format!("Failed to parse {}", key)))
+        }
+        fn opt_n(
+            item: &std::collections::HashMap<String, AttributeValue>,
+            key: &str,
+        ) -> Option<i64> {
+            item.get(key)
+                .and_then(|av| av.as_n().ok())
+                .and_then(|n| n.parse::<i64>().ok())
+        }
+        fn list_s(
+            item: &std::collections::HashMap<String, AttributeValue>,
+            key: &str,
+        ) -> Result<Vec<String>, DynamoDBError> {
+            Ok(item
+                .get(key)
+                .ok_or_else(|| DynamoDBError::Internal(format!("No {} found", key)))?
+                .as_l()
+                .map_err(|_| DynamoDBError::Internal(format!("Invalid {} format", key)))?
+                .iter()
+                .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
+                .collect())
+        }
+
+        Ok(AgentDelegation {
+            agent_did: req_s(item, "agent_did")?,
+            delegator_type: req_s(item, "delegator_type")?,
+            delegator_id: req_s(item, "delegator_id")?,
+            delegator_username: item
+                .get("delegator_username")
+                .and_then(|av| av.as_s().ok())
+                .map(|s| s.to_string()),
+            entitlements: list_s(item, "entitlements")?,
+            name: req_s(item, "name")?,
+            depth: req_n(item, "depth")?,
+            root_user_id: Uuid::parse_str(&req_s(item, "root_user_id")?)?,
+            chain: list_s(item, "chain")?,
+            created_at: req_n(item, "created_at")?,
+            expires_at: opt_n(item, "expires_at"),
+            revoked_at: opt_n(item, "revoked_at"),
         })
     }
 }

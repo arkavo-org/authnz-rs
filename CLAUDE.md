@@ -40,6 +40,7 @@ export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
+export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 
 # Optional: Set port (defaults to 8080)
 export PORT=8080
@@ -117,6 +118,7 @@ export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
+export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 export AWS_REGION=us-east-1
 
 # Run the server
@@ -183,6 +185,22 @@ aws dynamodb create-table \
     --table-name patreon_tokens \
     --attribute-definitions AttributeName=user_id,AttributeType=S \
     --key-schema AttributeName=user_id,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
+
+# Create agent_delegations table (human PE → agent NPE delegations)
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name agent_delegations \
+    --attribute-definitions \
+        AttributeName=agent_did,AttributeType=S \
+        AttributeName=root_user_id,AttributeType=S \
+    --key-schema AttributeName=agent_did,KeyType=HASH \
+    --global-secondary-indexes \
+        "[{
+            \"IndexName\": \"root_user_id-index\",
+            \"KeySchema\": [{\"AttributeName\":\"root_user_id\",\"KeyType\":\"HASH\"}],
+            \"Projection\":{\"ProjectionType\":\"ALL\"}
+        }]" \
     --billing-mode PAY_PER_REQUEST
 ```
 
@@ -313,6 +331,23 @@ aws dynamodb create-table \
   duplicate client_id, a redirect URI claimed by two clients) also disable
   Patreon entirely — loud warn, fail-closed — rather than guessing which
   credentials to use.
+
+**agent.rs** - Agent delegation (human PE → agent NPE, `did:key`)
+- `/.well-known/agent-configuration`: discovery metadata
+- `POST /agents/authorize` (human CWT via `X-Auth-Token`): create a
+  delegation record for `agent_did` with a subset of the delegable set
+  (`constants::HUMAN_DELEGABLE_ENTITLEMENTS` until per-user storage, #53)
+- `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
+- `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
+  challenge is stored on the delegation row (no cookie session)
+- `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
+  Ed25519 proof over the decoded challenge bytes, returns
+  `{token (CWT, 1h, sub = agent DID, arkavo_roles = ["agent"]),
+  expires_at, entitlements, delegation_jwt (ES256, sub = agent DID,
+  act = root user, scope = array)}` — the contract
+  `arkavo-edge/crates/arkavo-agent-auth` expects (#54)
+- Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
+  (#50) and the ERS surface (#48) are follow-ups
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
@@ -506,6 +541,17 @@ When modifying token lifetimes, update these in authn.rs:
 - **Future GSI** `user_id-index`: Add when an endpoint needs to enumerate
   "which providers has this user linked?" — not required by the current
   endpoint surface.
+
+### agent_delegations table
+- **Primary Key**: agent_did (String) - `did:key:z6Mk…`
+- **Attributes**: delegator_type (`human`|`agent`), delegator_id (String),
+  delegator_username (String, optional), entitlements (List of String),
+  name (String), depth (Number), root_user_id (String/UUID), chain (List of
+  String), created_at / expires_at / revoked_at (Number), and the transient
+  challenge triple `challenge`, `challenge_nonce`, `challenge_issued_at`
+  (set by `/agents/challenge`, removed atomically by `/agents/token`)
+- **GSI**: root_user_id-index (partition key: root_user_id) — list/count a
+  user's agents
 
 ### patreon_tokens table
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link

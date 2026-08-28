@@ -2257,6 +2257,7 @@ mod tests {
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
+                    "agent_delegations".to_string(),
                 )
                 .await
                 .unwrap(),
@@ -2355,6 +2356,7 @@ mod tests {
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
+                    "agent_delegations".to_string(),
                 )
                 .await
                 .unwrap(),

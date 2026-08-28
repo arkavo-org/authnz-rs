@@ -72,3 +72,36 @@ pub const PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE: &str =
 /// `verified_at`/`expires_at` are recorded in the cached materialization so a
 /// stale cache after Patreon goes down can be detected and rejected.
 pub const PATREON_CACHE_TTL_SECONDS: i64 = 300;
+
+// Agent delegation (PE → agent NPE) constants
+
+/// Lifetime of a delegation record in days. A delegation outlives any single
+/// agent token; the agent re-proves key possession to mint a fresh token.
+pub const AGENT_DELEGATION_DAYS: i64 = 30;
+
+/// Lifetime of an issued agent access token in hours (same order as the
+/// human auth token — a 30-day bearer would be wrong).
+pub const AGENT_TOKEN_HOURS: i64 = 1;
+
+/// Agent challenge TTL in seconds. The challenge is stored on the delegation
+/// row (not a cookie session) so headless CLIs can complete the two-step flow.
+pub const AGENT_CHALLENGE_TTL_SECONDS: i64 = 60;
+
+/// Maximum delegation depth (human -> agent1 -> agent2 -> ... -> agent5)
+pub const MAX_DELEGATION_DEPTH: u8 = 5;
+
+/// Maximum number of active agents delegated by a single root user
+pub const MAX_AGENTS_PER_USER: u32 = 640;
+
+/// Entitlements a human (PE) may delegate to an agent. Per-user entitlement
+/// storage (#53) replaces this constant; until then every human delegator is
+/// treated as holding exactly this set for the delegation subset check.
+pub const HUMAN_DELEGABLE_ENTITLEMENTS: &[&str] = &[
+    "https://arkavo.ai/attr/action/value/read",
+    "https://arkavo.ai/attr/action/value/write",
+    "https://arkavo.ai/attr/action/value/execute",
+    "https://arkavo.ai/attr/action/value/delegate",
+    "https://arkavo.ai/attr/action/value/admin",
+    "https://arkavo.ai/attr/mesh/value/orchestrator",
+    "https://arkavo.ai/attr/mesh/value/worker",
+];
