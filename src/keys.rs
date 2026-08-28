@@ -65,38 +65,40 @@ pub fn load_cwt_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
-    const TEST_ENCODING_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-REDACTED-TEST-KEY-LINE\n\
-REDACTED-TEST-KEY-LINE\n\
-REDACTED-TEST-KEY-LINE\n\
------END PRIVATE KEY-----\n";
-
-    /// The matching public key for `TEST_ENCODING_PEM` (`openssl ec -in ... -pubout`).
-    const TEST_DECODING_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEUgBW+OlXwHjIcei1AZYXz7bavEHw\n\
-1UAd3mey0bTO4bDtwVy95YAEmt5PiiwJs2hBmhQjJSqZqF7+6fI/coAl+Q==\n\
------END PUBLIC KEY-----\n";
-
-    /// An unrelated public key (different key pair entirely) — used to
-    /// exercise the mismatch tripwire.
-    const OTHER_DECODING_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE39baYYeplhclgB0g9/C0eLmlZjqC\n\
-D5iEvzG525GklPpixzlKTlO/uJ/IqSINR6ZIYuGgl/vcJ4PkBSdkc50nKw==\n\
------END PUBLIC KEY-----\n";
+    /// Build a PKCS8 private-key PEM and matching SPKI public-key PEM at
+    /// runtime from a fixed 32-byte scalar, rather than hardcoding literal
+    /// PEM blocks in source (GitGuardian flags a literal PEM private key
+    /// even when it's test-only and derived from a trivially-fixed scalar).
+    fn test_key_pems(scalar_byte: u8) -> (String, String) {
+        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[scalar_byte; 32]).unwrap();
+        let secret = p256::SecretKey::new(scalar);
+        let encoding_pem = secret
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("encode PKCS8 PEM")
+            .to_string();
+        let decoding_pem = secret
+            .public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("encode SPKI PEM");
+        (encoding_pem, decoding_pem)
+    }
 
     #[test]
     fn load_cwt_keys_derives_matching_pair_and_kid() {
-        let (sk, vk, kid) = load_cwt_keys(TEST_ENCODING_PEM, TEST_DECODING_PEM)
-            .expect("matching encoding/decoding PEMs");
+        let (encoding_pem, decoding_pem) = test_key_pems(0x42);
+        let (sk, vk, kid) =
+            load_cwt_keys(&encoding_pem, &decoding_pem).expect("matching encoding/decoding PEMs");
         assert_eq!(*sk.verifying_key(), vk);
         assert_eq!(kid.len(), 32, "kid must be a raw 32-byte SHA-256 hash");
     }
 
     #[test]
     fn load_cwt_keys_is_deterministic() {
-        let (_, _, kid1) = load_cwt_keys(TEST_ENCODING_PEM, TEST_DECODING_PEM).unwrap();
-        let (_, _, kid2) = load_cwt_keys(TEST_ENCODING_PEM, TEST_DECODING_PEM).unwrap();
+        let (encoding_pem, decoding_pem) = test_key_pems(0x42);
+        let (_, _, kid1) = load_cwt_keys(&encoding_pem, &decoding_pem).unwrap();
+        let (_, _, kid2) = load_cwt_keys(&encoding_pem, &decoding_pem).unwrap();
         assert_eq!(kid1, kid2);
     }
 
@@ -107,7 +109,9 @@ D5iEvzG525GklPpixzlKTlO/uJ/IqSINR6ZIYuGgl/vcJ4PkBSdkc50nKw==\n\
 
     #[test]
     fn load_cwt_keys_rejects_mismatched_decoding_key() {
-        let err = load_cwt_keys(TEST_ENCODING_PEM, OTHER_DECODING_PEM)
+        let (encoding_pem, _) = test_key_pems(0x42);
+        let (_, other_decoding_pem) = test_key_pems(0x43);
+        let err = load_cwt_keys(&encoding_pem, &other_decoding_pem)
             .expect_err("mismatched decoding key must be rejected");
         assert_eq!(
             err,
