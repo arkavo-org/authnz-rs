@@ -363,12 +363,18 @@ pub fn cnf_from_ed25519(public_key: &[u8; 32], kid: &[u8]) -> Cnf {
 
 /// CBOR encoding of tag #6.61 (CWT, RFC 8392 §6):
 /// major type 6, additional info 24, uint8 = 61.
-pub(crate) const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
+// `pub` (not `pub(crate)`): now that `cwt` lives in the `authnz_rs` lib crate
+// (Task 7), the bin's whitebox wire-format tests (authn.rs, device_check.rs,
+// oidc.rs `#[cfg(test)]` modules) need cross-crate access via
+// `authnz_rs::cwt::…`. `pub(crate)` would only be visible within this lib
+// crate, not from the bin. No behavior change — internal helper, still
+// undocumented in any public API surface beyond the wire-format test usage.
+pub const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
 
 /// Strip the CWT CBOR tag #6.61 prefix. Strict: input MUST start with the
 /// tag. Untagged COSE_Sign1 is rejected so a downstream verifier cannot be
 /// tricked by feeding raw COSE_Sign1 to a CWT consumer.
-pub(crate) fn strip_cwt_tag(bytes: &[u8]) -> Result<&[u8], CwtError> {
+pub fn strip_cwt_tag(bytes: &[u8]) -> Result<&[u8], CwtError> {
     bytes
         .strip_prefix(&CWT_TAG_PREFIX[..])
         .ok_or(CwtError::Malformed)
@@ -666,7 +672,8 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
     })
 }
 
-pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
+// `pub` for the same cross-crate test-access reason as `strip_cwt_tag` above.
+pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
     let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
