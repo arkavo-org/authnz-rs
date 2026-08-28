@@ -570,8 +570,8 @@ pub enum DeviceClass {
     Attested,
     Managed,
     // Not produced by `device_class` today (a binding always exists once we
-    // mint here) — reserved for a verifier-side caller (Task 6) that finds
-    // no binding at all.
+    // mint here) — reserved for a verifier-side caller that finds no binding
+    // at all.
     #[allow(dead_code)]
     Unverified,
 }
