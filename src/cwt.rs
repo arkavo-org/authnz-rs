@@ -172,13 +172,15 @@ impl ArkavoClaims {
             .expect("ArkavoClaims: weeks * 7*24*3600 overflowed i64")
     }
 
-    pub fn auth(iss: &str, sub: &str, hours: i64) -> Self {
-        Self::base(
-            iss,
-            sub,
-            Audience::Single("arkavo".into()),
-            Self::hours_to_secs(hours),
-        )
+    /// Human auth token. `platform_audience` extends `aud` so the app can
+    /// present the same CWT to arks/KAS once Track 3 pins
+    /// `CWT_EXPECTED_AUDIENCE` to a single non-`"arkavo"` audience.
+    pub fn auth(iss: &str, sub: &str, hours: i64, platform_audience: Option<&str>) -> Self {
+        let aud = match platform_audience {
+            Some(p) => Audience::Multiple(vec!["arkavo".into(), p.to_string()]),
+            None => Audience::Single("arkavo".into()),
+        };
+        Self::base(iss, sub, aud, Self::hours_to_secs(hours))
     }
 
     pub fn registration(iss: &str, sub: &str, weeks: i64) -> Self {
@@ -190,13 +192,14 @@ impl ArkavoClaims {
         )
     }
 
-    pub fn devicecheck(iss: &str, sub: &str, hours: i64) -> Self {
-        Self::base(
-            iss,
-            sub,
-            Audience::Single("arkavo:devicecheck".into()),
-            Self::hours_to_secs(hours),
-        )
+    /// DeviceCheck assertion token. `platform_audience` extends `aud` so the
+    /// platform verifier accepts the device CWT as its own subject (spec §1.3).
+    pub fn devicecheck(iss: &str, sub: &str, hours: i64, platform_audience: Option<&str>) -> Self {
+        let aud = match platform_audience {
+            Some(p) => Audience::Multiple(vec!["arkavo:devicecheck".into(), p.to_string()]),
+            None => Audience::Single("arkavo:devicecheck".into()),
+        };
+        Self::base(iss, sub, aud, Self::hours_to_secs(hours))
     }
 
     pub fn oidc_access(iss: &str, sub: &str, audience: &str, hours: i64) -> Self {
@@ -992,7 +995,7 @@ mod tests {
     #[test]
     fn mint_produces_parseable_cose_sign1() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         // Strip the CWT tag and decode the COSE_Sign1 envelope.
         let inner = strip_cwt_tag(&bytes).expect("CWT tag");
@@ -1008,7 +1011,7 @@ mod tests {
     #[test]
     fn mint_payload_contains_expected_claims() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         let sign1 = coset::CoseSign1::from_slice(strip_cwt_tag(&bytes).unwrap()).unwrap();
         let payload_bytes = sign1.payload.unwrap();
@@ -1031,7 +1034,7 @@ mod tests {
 
     #[test]
     fn arkavo_claims_auth_defaults() {
-        let c = ArkavoClaims::auth("https://identity.arkavo.net", "user-uuid", 1);
+        let c = ArkavoClaims::auth("https://identity.arkavo.net", "user-uuid", 1, None);
         assert_eq!(c.iss, "https://identity.arkavo.net");
         assert_eq!(c.sub, "user-uuid");
         assert_eq!(c.aud, Audience::Single("arkavo".to_string()));
@@ -1039,6 +1042,17 @@ mod tests {
         assert_eq!(c.exp - c.iat, 3600);
         assert_eq!(c.cti.len(), 16);
         assert!(c.cnf.is_none());
+    }
+
+    #[test]
+    fn auth_claims_carry_platform_audience() {
+        let c = ArkavoClaims::auth("i", "u", 1, Some("https://platform.arkavo.net"));
+        assert_eq!(
+            c.aud,
+            Audience::Multiple(vec!["arkavo".into(), "https://platform.arkavo.net".into()])
+        );
+        let c = ArkavoClaims::auth("i", "u", 1, None);
+        assert_eq!(c.aud, Audience::Single("arkavo".into()));
     }
 
     #[test]
@@ -1062,14 +1076,14 @@ mod tests {
 
     #[test]
     fn arkavo_claims_cti_differs_across_mints() {
-        let a = ArkavoClaims::auth("iss", "sub", 1);
-        let b = ArkavoClaims::auth("iss", "sub", 1);
+        let a = ArkavoClaims::auth("iss", "sub", 1, None);
+        let b = ArkavoClaims::auth("iss", "sub", 1, None);
         assert_ne!(a.cti, b.cti);
     }
 
     #[test]
     fn cbor_roundtrip_minimal_claims() {
-        let c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let c = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
         assert_eq!(decoded.iss, c.iss);
@@ -1164,7 +1178,7 @@ mod tests {
 
     #[test]
     fn cbor_roundtrip_audience_multiple() {
-        let mut c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let mut c = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         c.aud = Audience::Multiple(vec!["a".into(), "b".into()]);
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
@@ -1219,7 +1233,7 @@ mod tests {
     #[test]
     fn verify_roundtrip_succeeds() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1235,7 +1249,7 @@ mod tests {
     #[test]
     fn mint_emits_cwt_cbor_tag_61() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         // RFC 8392 §6: tag 61 encodes as [0xD8, 0x3D] (major-6 + uint8(61)).
         assert_eq!(&bytes[..2], &[0xD8, 0x3D]);
@@ -1244,7 +1258,7 @@ mod tests {
     #[test]
     fn verify_rejects_untagged_cose_sign1() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let tagged = mint(&claims, &sk, &test_kid()).unwrap();
         // Strip the tag -> bare COSE_Sign1; verifier must reject.
         let untagged = &tagged[CWT_TAG_PREFIX.len()..];
@@ -1267,7 +1281,7 @@ mod tests {
     fn verify_rejects_wrong_key() {
         let (sk, _vk) = test_keypair();
         let (_sk2, vk2) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1283,7 +1297,7 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_payload() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let mut bytes = mint(&claims, &sk, &test_kid()).unwrap();
         // Flip a bit somewhere in the middle (likely in the payload).
         let mid = bytes.len() / 2;
@@ -1307,7 +1321,7 @@ mod tests {
         let (sk, vk) = test_keypair();
         // Manually build a COSE_Sign1 with alg=ES384 but still ES256-signed,
         // simulating an attacker swapping the alg field.
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let payload = claims_to_cbor(&claims).unwrap();
 
         let protected = coset::HeaderBuilder::new()
@@ -1343,7 +1357,7 @@ mod tests {
     #[test]
     fn verify_rejects_missing_alg() {
         // Build a COSE_Sign1 with NO algorithm in protected header.
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let payload = claims_to_cbor(&claims).unwrap();
         let (sk, vk) = test_keypair();
 
@@ -1377,7 +1391,7 @@ mod tests {
     #[test]
     fn verify_rejects_expired() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1394,7 +1408,7 @@ mod tests {
     #[test]
     fn verify_rejects_not_yet_valid() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1415,7 +1429,7 @@ mod tests {
     #[test]
     fn verify_accepts_within_skew_window() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         // now is 30s before iat: within ±60 skew, accepted.
@@ -1431,7 +1445,7 @@ mod tests {
     #[test]
     fn verify_rejects_iss_mismatch() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-other"),
@@ -1448,7 +1462,7 @@ mod tests {
     #[test]
     fn verify_rejects_aud_mismatch() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -1465,7 +1479,25 @@ mod tests {
     #[test]
     fn verify_accepts_aud_match_against_arkavo() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: Some("arkavo"),
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        verify(&bytes, &vk, &opts).expect("verify");
+    }
+
+    #[test]
+    fn verify_accepts_aud_match_against_multiple_audience() {
+        let (sk, vk) = test_keypair();
+        let mut claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        claims.aud = Audience::Multiple(vec![
+            "arkavo".to_string(),
+            "https://platform.arkavo.net".to_string(),
+        ]);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -1500,7 +1532,7 @@ mod tests {
     fn mint_with_cnf_roundtrips() {
         let (sk, vk) = test_keypair();
         let cose_key = sample_cose_key();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1).with_cnf(Cnf {
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None).with_cnf(Cnf {
             cose_key: cose_key.clone(),
             kid: b"cred-id".to_vec(),
         });
@@ -1525,7 +1557,7 @@ mod tests {
     #[test]
     fn without_cnf_omits_cnf_from_payload() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None)
             .with_cnf(Cnf {
                 cose_key: sample_cose_key(),
                 kid: b"x".to_vec(),
@@ -1540,7 +1572,7 @@ mod tests {
     #[test]
     fn encode_for_header_is_unpadded_base64url() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let encoded = encode_for_header(&bytes);
         // No padding, no '+' or '/' chars.
@@ -1661,8 +1693,8 @@ mod tests {
     fn device_npe_round_trip() {
         let (sk, vk) = test_keypair();
         let kid = test_kid();
-        let claims =
-            ArkavoClaims::auth("https://identity.arkavo.net", "u", 1).with_arkavo_npe(ArkavoNpe {
+        let claims = ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None)
+            .with_arkavo_npe(ArkavoNpe {
                 npe_type: "device".into(),
                 class: Some("attested".into()),
                 attestation_expiry: Some(1_800_000_000),

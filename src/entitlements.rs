@@ -163,11 +163,13 @@ mod tests {
 
     #[test]
     fn service_cwt_rule_requires_service_account_role() {
-        let svc = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "client:ops", 1)
-            .with_arkavo_roles(vec!["service-account".into()]);
+        let svc =
+            crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "client:ops", 1, None)
+                .with_arkavo_roles(vec!["service-account".into()]);
         assert!(is_service_claims(&svc));
-        let user = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "arkavo:abc", 1)
-            .with_arkavo_roles(vec!["user".into()]);
+        let user =
+            crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "arkavo:abc", 1, None)
+                .with_arkavo_roles(vec!["user".into()]);
         assert!(!is_service_claims(&user));
     }
 

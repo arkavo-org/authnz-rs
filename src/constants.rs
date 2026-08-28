@@ -11,6 +11,12 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// Freshness window (seconds) for a device's last successful App Attest
+/// assertion. Within this window since the last verified assertion, the
+/// device is classed `attested`; once it expires the device is `managed`
+/// (a binding exists but the hardware attestation is stale).
+pub const DEVICE_ATTESTATION_TTL_SECONDS: i64 = 900;
+
 /// Session inactivity timeout in seconds (10 minutes)
 pub const SESSION_TIMEOUT_SECONDS: i64 = 600;
 

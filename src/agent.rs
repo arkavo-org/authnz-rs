@@ -879,6 +879,7 @@ mod tests {
             "https://identity.arkavo.net",
             "arkavo:00000000-0000-0000-0000-000000000002",
             1,
+            None,
         );
         assert_eq!(
             user_id_from_claims(&c).unwrap().to_string(),
@@ -889,12 +890,14 @@ mod tests {
             user_id_from_claims(&c).unwrap().to_string(),
             "00000000-0000-0000-0000-000000000003"
         );
-        let apple = cwt::ArkavoClaims::auth("https://identity.arkavo.net", "apple:001234.abc", 1);
+        let apple =
+            cwt::ArkavoClaims::auth("https://identity.arkavo.net", "apple:001234.abc", 1, None);
         assert!(matches!(
             user_id_from_claims(&apple),
             Err(AgentError::Unauthorized(_))
         ));
-        let svc = cwt::ArkavoClaims::auth("https://identity.arkavo.net", "client:mcp-edge", 1);
+        let svc =
+            cwt::ArkavoClaims::auth("https://identity.arkavo.net", "client:mcp-edge", 1, None);
         assert!(matches!(
             user_id_from_claims(&svc),
             Err(AgentError::Unauthorized(_))
