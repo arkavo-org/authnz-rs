@@ -214,9 +214,12 @@ struct HumanDelegator {
 
 /// Authenticate the human delegator from `X-Auth-Token` (Arkavo CWT, `aud = "arkavo"`).
 ///
-/// Only WebAuthn-derived subjects (`arkavo:<uuid>`) may delegate; Apple-only
-/// and service-account subjects are rejected. Agent-to-agent delegation is
-/// not supported yet (the delegator must be a human CWT).
+/// Only WebAuthn-derived subjects (a bare UUID — the shape `authn::mint_auth_token`
+/// mints — or the `arkavo:<uuid>` prefixed form some other issuers use) may
+/// delegate; Apple-only and service-account subjects are rejected, as are any
+/// claims describing an agent or device NPE (`arkavo_npe` set, or `arkavo_roles`
+/// containing `"agent"`). Agent-to-agent delegation is not supported yet (the
+/// delegator must be a human CWT).
 async fn authenticate_human(
     app_state: &AppState,
     headers: &HeaderMap,
@@ -251,22 +254,36 @@ async fn authenticate_human(
     Ok(HumanDelegator { user_id, username })
 }
 
-/// Root user id from a verified CWT: `arkavo_account_id` when present, else
-/// the `arkavo:<uuid>` subject. Other subject namespaces cannot delegate.
+/// Root user id from a verified CWT: `claims.sub` parsed as a bare UUID (the
+/// shape `authn::mint_auth_token` mints) or an `arkavo:<uuid>`-prefixed UUID.
+/// `arkavo_account_id` is deliberately NOT consulted — the real WebAuthn auth
+/// CWT never sets it, so trusting it would accept a shape no genuine human
+/// token has. Other subject namespaces (`apple:`, `client:`, …) cannot
+/// delegate. Claims describing an agent or device NPE (`arkavo_npe` set, or
+/// `arkavo_roles` containing `"agent"`) are rejected outright — only a human
+/// may delegate.
 fn user_id_from_claims(claims: &cwt::ArkavoClaims) -> Result<Uuid, AgentError> {
-    let raw = claims
+    if claims.custom.arkavo_npe.is_some() {
+        return Err(AgentError::Unauthorized(
+            "delegator must be a human; token describes an agent/device NPE".into(),
+        ));
+    }
+    if claims
         .custom
-        .arkavo_account_id
-        .as_deref()
-        .or_else(|| claims.sub.strip_prefix("arkavo:"))
-        .ok_or_else(|| {
-            AgentError::Unauthorized(format!(
-                "subject '{}' is not a WebAuthn-registered user",
-                claims.sub
-            ))
-        })?;
+        .arkavo_roles
+        .as_ref()
+        .is_some_and(|roles| roles.iter().any(|r| r == "agent"))
+    {
+        return Err(AgentError::Unauthorized(
+            "delegator must be a human; token carries the 'agent' role".into(),
+        ));
+    }
+    let raw = claims.sub.strip_prefix("arkavo:").unwrap_or(&claims.sub);
     Uuid::parse_str(raw).map_err(|_| {
-        AgentError::Unauthorized(format!("subject '{}' has no valid account id", claims.sub))
+        AgentError::Unauthorized(format!(
+            "subject '{}' is not a WebAuthn-registered user",
+            claims.sub
+        ))
     })
 }
 
@@ -874,22 +891,47 @@ mod tests {
     }
 
     #[test]
-    fn user_id_from_claims_prefers_account_id_then_arkavo_subject() {
-        let mut c = cwt::ArkavoClaims::auth(
+    fn user_id_from_claims_accepts_bare_uuid_and_arkavo_prefixed_subjects() {
+        // The real WebAuthn auth CWT (authn::mint_auth_token) has a bare-UUID
+        // `sub` and no `arkavo_account_id` — this is the shape C1 fixes.
+        let bare = cwt::ArkavoClaims::auth(
             "https://identity.arkavo.net",
-            "arkavo:00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000002",
             1,
             None,
         );
         assert_eq!(
-            user_id_from_claims(&c).unwrap().to_string(),
+            user_id_from_claims(&bare).unwrap().to_string(),
             "00000000-0000-0000-0000-000000000002"
         );
-        c = c.with_arkavo_account_id("00000000-0000-0000-0000-000000000003");
+
+        let prefixed = cwt::ArkavoClaims::auth(
+            "https://identity.arkavo.net",
+            "arkavo:00000000-0000-0000-0000-000000000003",
+            1,
+            None,
+        );
         assert_eq!(
-            user_id_from_claims(&c).unwrap().to_string(),
+            user_id_from_claims(&prefixed).unwrap().to_string(),
             "00000000-0000-0000-0000-000000000003"
         );
+    }
+
+    #[test]
+    fn user_id_from_claims_does_not_consult_arkavo_account_id() {
+        // arkavo_account_id must never be trusted on its own — the real auth
+        // CWT never sets it, so honoring it would accept a shape no genuine
+        // human token has.
+        let c = cwt::ArkavoClaims::auth("https://identity.arkavo.net", "apple:001234.abc", 1, None)
+            .with_arkavo_account_id("00000000-0000-0000-0000-000000000099");
+        assert!(matches!(
+            user_id_from_claims(&c),
+            Err(AgentError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn user_id_from_claims_rejects_apple_and_service_subjects() {
         let apple =
             cwt::ArkavoClaims::auth("https://identity.arkavo.net", "apple:001234.abc", 1, None);
         assert!(matches!(
@@ -902,6 +944,64 @@ mod tests {
             user_id_from_claims(&svc),
             Err(AgentError::Unauthorized(_))
         ));
+    }
+
+    #[test]
+    fn user_id_from_claims_rejects_agent_npe_and_agent_role() {
+        let by_npe = cwt::ArkavoClaims::agent(
+            "https://identity.arkavo.net",
+            TEST_DID,
+            vec!["arkavo".into()],
+            15,
+        )
+        .with_arkavo_npe(cwt::ArkavoNpe {
+            npe_type: "agent".into(),
+            class: None,
+            attestation_expiry: None,
+            device_id: None,
+            delegation_id: None,
+            depth: None,
+            chain: None,
+        });
+        assert!(matches!(
+            user_id_from_claims(&by_npe),
+            Err(AgentError::Unauthorized(_))
+        ));
+
+        // Load-bearing: a bare-UUID `sub` that would otherwise parse fine,
+        // but carries the "agent" role, must still be rejected.
+        let by_role = cwt::ArkavoClaims::auth(
+            "https://identity.arkavo.net",
+            "00000000-0000-0000-0000-000000000004",
+            1,
+            None,
+        )
+        .with_arkavo_roles(vec!["agent".to_string()]);
+        assert!(matches!(
+            user_id_from_claims(&by_role),
+            Err(AgentError::Unauthorized(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticate_human_accepts_real_webauthn_auth_token() {
+        // End-to-end: a token minted the way the real WebAuthn flow mints it
+        // (authn::mint_auth_token — bare-UUID sub, aud = "arkavo") must be
+        // accepted by authenticate_human.
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = Uuid::new_v4();
+        let token = crate::authn::mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", token.parse().unwrap());
+        let human = authenticate_human(&app_state, &headers)
+            .await
+            .expect("a real WebAuthn auth CWT must be accepted");
+        assert_eq!(human.user_id, user_id);
     }
 
     #[test]

@@ -91,11 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_id = Uuid::parse_str(TEST_USER_ID).expect("TEST_USER_ID is a valid UUID literal");
 
-    // Human CWT. `sub` carries the "arkavo:" prefix because
-    // `authenticate_human` (src/agent.rs) only resolves a delegator's account
-    // id from `arkavo_account_id` or a `sub` of the form "arkavo:<uuid>" —
-    // the same shape the OIDC token endpoint mints (src/oidc.rs).
-    let human_claims = cwt::ArkavoClaims::auth(&args.issuer, &format!("arkavo:{user_id}"), 1, None);
+    // Human CWT. `sub` is a bare UUID with no "arkavo:" prefix and no
+    // `arkavo_account_id` claim — the exact shape `authn::mint_auth_token`
+    // mints for a real WebAuthn auth token, and what `authenticate_human`
+    // (src/agent.rs) actually accepts. Minting the "arkavo:<uuid>" shape here
+    // would let this test pass without proving the real token shape works.
+    let human_claims = cwt::ArkavoClaims::auth(&args.issuer, &user_id.to_string(), 1, None);
     let human_cwt = cwt::mint(&human_claims, &signing_key, &kid)?;
     println!("{}", cwt::encode_for_header(&human_cwt));
 
