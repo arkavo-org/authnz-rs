@@ -32,7 +32,7 @@ secret into chat, a PR, or `curl …&client_secret=…` (argv + transcript).
 - `arkavo_roles` contains `service-account`
 - `iss` = `https://identity.arkavo.net`
 - `aud` = `[client_id, https://platform.arkavo.net]` when `OIDC_PLATFORM_AUDIENCE` is set (RFC 8707; production)
-- `arkavo_entitlements` = `["tdf:create", "tdf:decrypt"]` — **hardcoded for
+- `arkavo_entitlements` = `["https://arkavo.ai/attr/tdf/value/create", "https://arkavo.ai/attr/tdf/value/decrypt"]` — **hardcoded for
   every `client_credentials` token** (`src/oidc.rs`, `handle_client_credentials_grant`),
   not per-client config. So `mcp-edge` carries standing TDF decrypt entitlement
   it has no use for as a decision-point PEP. Not currently load-bearing (the
