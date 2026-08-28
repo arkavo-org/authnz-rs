@@ -527,7 +527,7 @@ pub async fn issue_agent_token(
         return Err(AgentError::ChallengeExpired);
     }
 
-    let delegation = active_delegation(&app_state, &request.did).await?;
+    let mut delegation = active_delegation(&app_state, &request.did).await?;
 
     let challenge_bytes = base64::engine::general_purpose::STANDARD
         .decode(&request.challenge)
@@ -543,6 +543,22 @@ pub async fn issue_agent_token(
         .verify(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
+    // Agents keep stale entitlements for the whole delegation lifetime
+    // otherwise: mint against what the delegator currently holds, not what
+    // was captured at authorize time.
+    let stored = app_state
+        .db_store
+        .get_user_entitlements(&delegation.root_user_id)
+        .await
+        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+    let effective = intersect_entitlements(&delegation.entitlements, &stored);
+    if effective.is_empty() {
+        return Err(AgentError::InsufficientEntitlements(
+            "delegated entitlements no longer held by delegator".into(),
+        ));
+    }
+    delegation.entitlements = effective;
+
     let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
 
     info!(
@@ -554,6 +570,17 @@ pub async fn issue_agent_token(
         expires_at,
         entitlements: delegation.entitlements,
     }))
+}
+
+/// Entitlements a delegation may actually exercise right now: the delegated
+/// set filtered to what the delegator (`root_user_id`) currently holds in
+/// storage, preserving the delegation's own entitlement order.
+fn intersect_entitlements(delegated: &[String], stored: &[String]) -> Vec<String> {
+    delegated
+        .iter()
+        .filter(|e| stored.contains(e))
+        .cloned()
+        .collect()
 }
 
 // ============================================================================
@@ -1032,6 +1059,19 @@ mod tests {
         for (err, status) in cases {
             assert_eq!(err.into_response().status(), status);
         }
+    }
+
+    #[test]
+    fn intersect_entitlements_filters_to_stored_preserving_delegation_order() {
+        let delegated = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let stored = vec!["c".to_string(), "a".to_string()];
+        assert_eq!(
+            intersect_entitlements(&delegated, &stored),
+            vec!["a".to_string(), "c".to_string()]
+        );
+        assert!(intersect_entitlements(&delegated, &[]).is_empty());
+        assert_eq!(intersect_entitlements(&[], &stored), Vec::<String>::new());
+        assert_eq!(intersect_entitlements(&delegated, &delegated), delegated);
     }
 
     #[test]
