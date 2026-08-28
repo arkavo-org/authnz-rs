@@ -48,6 +48,7 @@ use crate::oidc::{
 };
 use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
 
+mod agent;
 mod apple_signin;
 mod authn;
 mod constants;
@@ -232,7 +233,9 @@ async fn handle_h3_request(
     // This gives H3 clients (including HEAD probes, where the body is suppressed
     // below) the same Content-Length they would see over HTTP/2. Streaming bodies
     // of unknown size are left without it, exactly as on the TCP path.
-    if !resp_parts.headers.contains_key(http::header::CONTENT_LENGTH)
+    if !resp_parts
+        .headers
+        .contains_key(http::header::CONTENT_LENGTH)
         && let Some(len) = http_body::Body::size_hint(&resp_body).exact()
         && let Ok(value) = http::HeaderValue::from_str(&len.to_string())
     {
@@ -371,6 +374,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "device_bindings".to_string()),
         env::var("DYNAMODB_IDENTITY_LINKS_TABLE").unwrap_or_else(|_| "identity_links".to_string()),
         env::var("DYNAMODB_PATREON_TOKENS_TABLE").unwrap_or_else(|_| "patreon_tokens".to_string()),
+        env::var("DYNAMODB_AGENT_DELEGATIONS_TABLE")
+            .unwrap_or_else(|_| "agent_delegations".to_string()),
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -497,6 +502,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(generate_assertion_challenge),
         )
         .route("/device-check/assert", post(finish_assertion))
+        // Agent delegation: a human (PE) delegates to an agent NPE (did:key).
+        // Contract per arkavo-edge `arkavo-agent-auth` (issue #54).
+        .route(
+            "/.well-known/agent-configuration",
+            get(agent::serve_agent_configuration),
+        )
+        .route("/agents/authorize", post(agent::authorize_agent))
+        .route("/agents/delegations", get(agent::list_delegations))
+        .route(
+            "/agents/delegations/:did",
+            axum::routing::delete(agent::revoke_delegation),
+        )
+        .route("/agents/challenge", get(agent::generate_agent_challenge))
+        .route("/agents/token", post(agent::issue_agent_token))
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
@@ -1307,6 +1326,7 @@ pub(crate) mod test_helpers {
                 "device_bindings".to_string(),
                 "identity_links".to_string(),
                 "patreon_tokens".to_string(),
+                "agent_delegations".to_string(),
             )
             .await
             .unwrap(),
