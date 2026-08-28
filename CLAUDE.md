@@ -42,6 +42,11 @@ export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 
+# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
+export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
+export AGENT_TOKEN_MINUTES=15   # hard cap 15
+
 # Optional: Set port (defaults to 8080)
 export PORT=8080
 
@@ -120,6 +125,11 @@ export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 export AWS_REGION=us-east-1
+
+# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
+export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
+export AGENT_TOKEN_MINUTES=15   # hard cap 15
 
 # Run the server
 cargo run --release
@@ -335,17 +345,20 @@ aws dynamodb create-table \
 **agent.rs** - Agent delegation (human PE → agent NPE, `did:key`)
 - `/.well-known/agent-configuration`: discovery metadata
 - `POST /agents/authorize` (human CWT via `X-Auth-Token`): create a
-  delegation record for `agent_did` with a subset of the delegable set
-  (`constants::HUMAN_DELEGABLE_ENTITLEMENTS` until per-user storage, #53)
+  delegation record for `agent_did` with a subset of the delegator's own
+  stored entitlements (`DynamoDBStore::get_user_entitlements`)
 - `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
 - `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
   challenge is stored on the delegation row (no cookie session)
 - `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
   Ed25519 proof over the decoded challenge bytes, returns
-  `{token (CWT, 1h, sub = agent DID, arkavo_roles = ["agent"]),
-  expires_at, entitlements, delegation_jwt (ES256, sub = agent DID,
-  act = root user, scope = array)}` — the contract
-  `arkavo-edge/crates/arkavo-agent-auth` expects (#54)
+  `{token, expires_at, entitlements}`. `token` is a single CWT (no
+  delegation JWT): `aud` = the configured `AGENT_TOKEN_AUDIENCES` list,
+  `exp - iat` capped at `AGENT_TOKEN_MINUTES` (hard max 15 min), `act` =
+  `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe` describes the agent (type, delegation
+  id, depth, chain), `cnf` is bound to the agent's Ed25519 `did:key`. There is
+  no refresh — the agent re-runs the challenge/token exchange for a new one.
+  This is the contract `arkavo-edge/crates/arkavo-agent-auth` expects (#54)
 - Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
   (#50) and the ERS surface (#48) are follow-ups
 

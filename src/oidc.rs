@@ -2317,6 +2317,11 @@ mod tests {
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(crate::agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2422,6 +2427,11 @@ mod tests {
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(crate::agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
         };
 
         let mut oidc = (*test_oidc_config()).clone();

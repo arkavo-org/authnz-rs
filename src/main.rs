@@ -294,6 +294,9 @@ pub struct AppState {
     /// still built and served as a legacy did:web view, but no signed
     /// `did.jsonl` log is emitted.
     pub webvh_sign_key: Arc<Option<String>>,
+    /// Agent access token issuance config, parsed once at startup from
+    /// `AGENT_TOKEN_AUDIENCES` / `AGENT_AUTHORIZED_ACTORS` / `AGENT_TOKEN_MINUTES`.
+    pub agent_tokens: Arc<agent::AgentTokenConfig>,
 }
 
 #[tokio::main]
@@ -390,6 +393,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // did:webvh Ed25519 update-signing key (fail-open: None when WEBVH_SIGN_KEY_PATH unset)
     let webvh_sign_key = webvh::load_sign_key();
 
+    let agent_tokens = agent::AgentTokenConfig::parse(
+        env::var("AGENT_TOKEN_AUDIENCES").ok(),
+        env::var("AGENT_AUTHORIZED_ACTORS").ok(),
+        env::var("AGENT_TOKEN_MINUTES").ok(),
+    )
+    .map_err(|e| format!("agent token config: {e}"))?;
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -407,6 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|v| !v.is_empty()),
         ),
         webvh_sign_key: Arc::new(webvh_sign_key),
+        agent_tokens: Arc::new(agent_tokens),
     };
 
     // Set up Redis Client using fred
@@ -1350,6 +1361,11 @@ pub(crate) mod test_helpers {
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
         }
     }
 }

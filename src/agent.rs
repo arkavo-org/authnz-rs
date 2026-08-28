@@ -1,6 +1,6 @@
 //! Agent delegation: a human (PE) authorizes an agent (NPE, identified by
 //! `did:key`) to act on their behalf; the agent then proves key possession
-//! and receives an agent access token plus a signed delegation JWT.
+//! and receives a short-lived, multi-audience agent access token.
 //!
 //! Extracted from PR #23 onto the CWT-based `main`. Wire contract follows
 //! `arkavo-edge/crates/arkavo-agent-auth` (issue #54):
@@ -12,26 +12,28 @@
 //!                                                X-Auth-Token: <human CWT>
 //!                                                {agent_did, name, entitlements}
 //! GET  /agents/challenge?did=…   ──►  {challenge: b64(32 bytes), nonce}
-//! POST /agents/token             ──►  {token, expires_at, entitlements, delegation_jwt}
+//! POST /agents/token             ──►  {token, expires_at, entitlements}
 //!      {did, challenge, signature: b64(Ed25519 over challenge bytes), nonce}
 //! ```
 //!
-//! - `token` is a CWT access token (`sub` = agent DID, `arkavo_roles = ["agent"]`,
-//!   `arkavo_entitlements` = delegated set, `arkavo_account_id` = root user).
-//! - `delegation_jwt` is ES256 under the OIDC signing key (`kid` matches the
-//!   JWKS): `sub` = agent DID, `act` = root user, `scope` = entitlement array.
-//!   `arkavo-protocol/src/registration` already parses this shape.
+//! - `token` is a CWT access token (`sub` = agent DID, `aud` = the configured
+//!   `AGENT_TOKEN_AUDIENCES` list, `act` = `AGENT_AUTHORIZED_ACTORS`,
+//!   `arkavo_roles = ["agent"]`, `arkavo_entitlements` = delegated set,
+//!   `arkavo_account_id` = root user, `arkavo_npe` describing the agent,
+//!   `cnf` bound to the agent's Ed25519 `did:key`) with `exp - iat` capped at
+//!   [`crate::constants::AGENT_TOKEN_MINUTES_MAX`] minutes.
 //! - The pending challenge lives on the delegation row and is removed
 //!   atomically when taken — no cookie session, so headless CLIs work.
+//! - There is no refresh token: the agent re-runs the challenge/token
+//!   exchange to mint a fresh token.
 //!
 //! Not in this module (tracked separately): agent→agent delegation
 //! (delegator must be a human CWT today), per-agent OAuth clients (#50),
-//! the ERS resolution surface (#48), per-user entitlement storage (#53).
+//! the ERS resolution surface (#48).
 
 use crate::AppState;
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_HOURS,
-    DEFAULT_USER_ENTITLEMENTS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
 };
 use crate::cwt;
 use crate::db::{AgentDelegation, DynamoDBError};
@@ -44,7 +46,6 @@ use axum::{
 use base64::Engine;
 use chrono::Utc;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use jsonwebtoken::{Algorithm, Header, encode};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,7 +64,6 @@ pub struct AgentConfiguration {
     pub agent_revocation_endpoint: String,
     pub agent_challenge_endpoint: String,
     pub agent_token_endpoint: String,
-    pub entitlements_supported: Vec<&'static str>,
     pub max_delegation_depth: u8,
     pub max_agents_per_user: u32,
     pub delegation_lifetime_seconds: i64,
@@ -71,7 +71,6 @@ pub struct AgentConfiguration {
     pub challenge_ttl_seconds: i64,
     pub did_methods_supported: Vec<&'static str>,
     pub proof_signing_alg_values_supported: Vec<&'static str>,
-    pub delegation_jwt_signing_alg: &'static str,
     pub authorization_deep_link_scheme: String,
 }
 
@@ -85,15 +84,13 @@ impl AgentConfiguration {
             agent_revocation_endpoint: format!("{}/agents/delegations", base),
             agent_challenge_endpoint: format!("{}/agents/challenge", base),
             agent_token_endpoint: format!("{}/agents/token", base),
-            entitlements_supported: DEFAULT_USER_ENTITLEMENTS.to_vec(),
             max_delegation_depth: MAX_DELEGATION_DEPTH,
             max_agents_per_user: MAX_AGENTS_PER_USER,
             delegation_lifetime_seconds: AGENT_DELEGATION_DAYS * 24 * 60 * 60,
-            agent_token_lifetime_seconds: AGENT_TOKEN_HOURS * 60 * 60,
+            agent_token_lifetime_seconds: crate::constants::AGENT_TOKEN_MINUTES_MAX * 60,
             challenge_ttl_seconds: AGENT_CHALLENGE_TTL_SECONDS,
             did_methods_supported: vec!["did:key"],
             proof_signing_alg_values_supported: vec!["EdDSA"],
-            delegation_jwt_signing_alg: "ES256",
             authorization_deep_link_scheme: "arkavo://agent/authorize".to_string(),
         }
     }
@@ -152,8 +149,6 @@ pub struct TokenResponse {
     /// Unix epoch seconds.
     pub expires_at: i64,
     pub entitlements: Vec<String>,
-    /// ES256 JWT binding the root user to this agent DID.
-    pub delegation_jwt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,23 +165,6 @@ pub struct DelegationInfo {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked: bool,
-}
-
-/// Claims of the delegation JWT. `scope` is a JSON array (not a space-joined
-/// string) because that is what the arkavo-edge registration path parses.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DelegationJwtClaims {
-    pub iss: String,
-    /// Agent did:key
-    pub sub: String,
-    /// Root user id (the PE the agent acts for)
-    pub act: String,
-    pub scope: Vec<String>,
-    pub iat: i64,
-    pub exp: i64,
-    /// Delegation id (agent DID is the row key; jti is per-mint)
-    pub jti: String,
-    pub depth: u8,
 }
 
 // ============================================================================
@@ -315,11 +293,16 @@ pub async fn authorize_agent(
 
     let human = authenticate_human(&app_state, &headers).await?;
 
-    // Subset check against the delegable set for humans (per-user storage: #53).
+    // Subset check against the delegator's own stored entitlements.
+    let delegable = app_state
+        .db_store
+        .get_user_entitlements(&human.user_id)
+        .await
+        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
     for entitlement in &request.entitlements {
-        if !DEFAULT_USER_ENTITLEMENTS.contains(&entitlement.as_str()) {
+        if !delegable.contains(entitlement) {
             return Err(AgentError::InsufficientEntitlements(format!(
-                "Entitlement '{}' is not delegable",
+                "Entitlement '{}' is not held by the delegator",
                 entitlement
             )));
         }
@@ -507,7 +490,7 @@ pub async fn generate_agent_challenge(
     Ok(Json(ChallengeResponse { challenge, nonce }))
 }
 
-/// POST /agents/token — verify the signed challenge, mint agent token + delegation JWT.
+/// POST /agents/token — verify the signed challenge, mint the agent CWT.
 pub async fn issue_agent_token(
     Extension(app_state): Extension<AppState>,
     Json(request): Json<TokenRequest>,
@@ -544,7 +527,6 @@ pub async fn issue_agent_token(
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
     let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
-    let delegation_jwt = mint_delegation_jwt(&app_state, &delegation)?;
 
     info!(
         "Agent token issued for {} (depth {})",
@@ -554,7 +536,6 @@ pub async fn issue_agent_token(
         token,
         expires_at,
         entitlements: delegation.entitlements,
-        delegation_jwt,
     }))
 }
 
@@ -562,57 +543,103 @@ pub async fn issue_agent_token(
 // Token minting
 // ============================================================================
 
-/// CWT access token for the agent NPE. Audience is the platform audience when
-/// configured (so the OpenTDF verifier accepts it), else `"arkavo"`.
+/// Agent token issuance config (spec §1). Parsed once at startup.
+#[derive(Debug, Clone)]
+pub struct AgentTokenConfig {
+    pub audiences: Vec<String>,
+    pub authorized_actors: Vec<String>,
+    pub minutes: i64,
+}
+
+impl AgentTokenConfig {
+    /// `AGENT_TOKEN_AUDIENCES` (required, comma-separated), `AGENT_AUTHORIZED_ACTORS`
+    /// (optional, comma-separated), `AGENT_TOKEN_MINUTES` (optional, default 15, cap 15).
+    pub fn parse(
+        audiences: Option<String>,
+        actors: Option<String>,
+        minutes: Option<String>,
+    ) -> Result<Self, String> {
+        fn split(s: Option<String>) -> Vec<String> {
+            s.unwrap_or_default()
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        }
+        let audiences = split(audiences);
+        if audiences.is_empty() {
+            return Err("AGENT_TOKEN_AUDIENCES must list at least one audience".into());
+        }
+        let authorized_actors = split(actors);
+        if authorized_actors.is_empty() {
+            warn!("AGENT_AUTHORIZED_ACTORS is empty: agent tokens will carry no act claim");
+        }
+        let requested = minutes
+            .as_deref()
+            .map(|m| {
+                m.trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("AGENT_TOKEN_MINUTES not an integer: {m}"))
+            })
+            .transpose()?
+            .unwrap_or(crate::constants::AGENT_TOKEN_MINUTES_MAX);
+        let minutes = requested.clamp(1, crate::constants::AGENT_TOKEN_MINUTES_MAX);
+        if minutes != requested {
+            warn!("AGENT_TOKEN_MINUTES={requested} clamped to {minutes}");
+        }
+        Ok(Self {
+            audiences,
+            authorized_actors,
+            minutes,
+        })
+    }
+}
+
+pub(crate) fn agent_cwt_claims(
+    issuer: &str,
+    cfg: &AgentTokenConfig,
+    delegation: &AgentDelegation,
+) -> Result<cwt::ArkavoClaims, AgentError> {
+    let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
+    Ok(cwt::ArkavoClaims::agent(
+        issuer,
+        &delegation.agent_did,
+        cfg.audiences.clone(),
+        cfg.minutes,
+    )
+    .with_act(
+        cfg.authorized_actors
+            .iter()
+            .map(|s| cwt::Actor { sub: s.clone() })
+            .collect(),
+    )
+    .with_arkavo_account_id(&delegation.root_user_id.to_string())
+    .with_arkavo_roles(vec!["agent".to_string()])
+    .with_arkavo_entitlements(delegation.entitlements.clone())
+    .with_arkavo_npe(cwt::ArkavoNpe {
+        npe_type: "agent".into(),
+        class: None,
+        attestation_expiry: None,
+        device_id: None,
+        delegation_id: Some(delegation.agent_did.clone()),
+        depth: Some(delegation.depth),
+        chain: Some(delegation.chain.clone()),
+    })
+    .with_cnf(cwt::cnf_from_ed25519(
+        &pubkey,
+        delegation.agent_did.as_bytes(),
+    )))
+}
+
 fn mint_agent_cwt(
     app_state: &AppState,
     delegation: &AgentDelegation,
 ) -> Result<(String, i64), AgentError> {
-    let audience = app_state.platform_audience.as_deref().unwrap_or("arkavo");
-    let claims = cwt::ArkavoClaims::oidc_access(
-        &app_state.issuer,
-        &delegation.agent_did,
-        audience,
-        AGENT_TOKEN_HOURS,
-    )
-    .with_arkavo_account_id(&delegation.root_user_id.to_string())
-    .with_arkavo_roles(vec!["agent".to_string()])
-    .with_arkavo_entitlements(delegation.entitlements.clone());
+    let claims = agent_cwt_claims(&app_state.issuer, &app_state.agent_tokens, delegation)?;
     let expires_at = claims.exp;
     let bytes = cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)
         .map_err(|e| AgentError::TokenGenerationError(e.to_string()))?;
     Ok((cwt::encode_for_header(&bytes), expires_at))
-}
-
-pub fn delegation_jwt_claims(
-    issuer: &str,
-    delegation: &AgentDelegation,
-    now: i64,
-) -> DelegationJwtClaims {
-    DelegationJwtClaims {
-        iss: issuer.to_string(),
-        sub: delegation.agent_did.clone(),
-        act: delegation.root_user_id.to_string(),
-        scope: delegation.entitlements.clone(),
-        iat: now,
-        exp: delegation
-            .expires_at
-            .unwrap_or(now + AGENT_DELEGATION_DAYS * 24 * 60 * 60),
-        jti: Uuid::new_v4().to_string(),
-        depth: delegation.depth,
-    }
-}
-
-fn mint_delegation_jwt(
-    app_state: &AppState,
-    delegation: &AgentDelegation,
-) -> Result<String, AgentError> {
-    let claims = delegation_jwt_claims(&app_state.issuer, delegation, Utc::now().timestamp());
-    let mut header = Header::new(Algorithm::ES256);
-    // Same kid the JWKS advertises (base64url of the CWT kid bytes).
-    header.kid = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&*app_state.cwt_kid));
-    encode(&header, &claims, &app_state.encoding_key)
-        .map_err(|e| AgentError::TokenGenerationError(format!("delegation_jwt: {}", e)))
 }
 
 // ============================================================================
@@ -702,6 +729,7 @@ impl IntoResponse for AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::DEFAULT_USER_ENTITLEMENTS;
     use ed25519_dalek::{Signer, SigningKey};
 
     const TEST_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -777,44 +805,57 @@ mod tests {
     }
 
     #[test]
-    fn delegation_jwt_claims_shape_matches_edge_parser() {
-        let d = sample_delegation(TEST_DID);
-        let c = delegation_jwt_claims("https://identity.arkavo.net", &d, 1_700_000_100);
-        let json = serde_json::to_value(&c).unwrap();
-        assert_eq!(json["sub"], TEST_DID);
-        assert_eq!(json["act"], "00000000-0000-0000-0000-000000000001");
-        assert!(json["scope"].is_array(), "scope must be a JSON array");
-        assert_eq!(json["exp"], 1_700_000_000 + 30 * 86_400);
-        assert_eq!(json["depth"], 0);
+    fn agent_token_config_from_env_strings() {
+        let cfg = AgentTokenConfig::parse(
+            Some("https://platform.arkavo.net, https://kas.arkavo.net".into()),
+            Some("https://kg.arkavo.net".into()),
+            Some("60".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.audiences,
+            vec!["https://platform.arkavo.net", "https://kas.arkavo.net"]
+        );
+        assert_eq!(cfg.authorized_actors, vec!["https://kg.arkavo.net"]);
+        assert_eq!(cfg.minutes, 15, "values above the cap clamp to 15");
+        assert!(
+            AgentTokenConfig::parse(None, None, None).is_err(),
+            "audiences are required"
+        );
+        assert!(AgentTokenConfig::parse(Some("".into()), None, None).is_err());
     }
 
     #[test]
-    fn delegation_jwt_signs_and_verifies_es256() {
-        use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
-        let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
-        let secret = p256::SecretKey::new(scalar);
-        let enc = jsonwebtoken::EncodingKey::from_ec_der(secret.to_pkcs8_der().unwrap().as_bytes());
-        let pem = secret
-            .public_key()
-            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
-            .unwrap();
-        let dec = jsonwebtoken::DecodingKey::from_ec_pem(pem.as_bytes()).unwrap();
-
-        let mut d = sample_delegation(TEST_DID);
-        let now = Utc::now().timestamp();
-        d.expires_at = Some(now + AGENT_DELEGATION_DAYS * 86_400);
-        let claims = delegation_jwt_claims("https://identity.arkavo.net", &d, now);
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some("test-kid".into());
-        let jwt = encode(&header, &claims, &enc).unwrap();
-
-        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
-        validation.validate_aud = false;
-        validation.set_issuer(&["https://identity.arkavo.net"]);
-        let decoded = jsonwebtoken::decode::<DelegationJwtClaims>(&jwt, &dec, &validation).unwrap();
-        assert_eq!(decoded.header.kid.as_deref(), Some("test-kid"));
-        assert_eq!(decoded.claims.sub, TEST_DID);
-        assert_eq!(decoded.claims.scope, d.entitlements);
+    fn agent_cwt_claims_have_required_shape() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec!["https://kg.arkavo.net".into()],
+            minutes: 15,
+        };
+        let d = sample_delegation(TEST_DID);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(claims.sub, TEST_DID);
+        assert_eq!(
+            claims.aud,
+            cwt::Audience::Multiple(vec!["https://platform.arkavo.net".into()])
+        );
+        assert_eq!(claims.exp - claims.iat, 900);
+        assert_eq!(
+            claims.custom.act.as_ref().unwrap()[0].sub,
+            "https://kg.arkavo.net"
+        );
+        assert_eq!(
+            claims.custom.arkavo_roles.as_deref(),
+            Some(&["agent".to_string()][..])
+        );
+        assert_eq!(
+            claims.custom.arkavo_account_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        let npe = claims.custom.arkavo_npe.as_ref().unwrap();
+        assert_eq!(npe.npe_type, "agent");
+        assert_eq!(npe.delegation_id.as_deref(), Some(TEST_DID));
+        assert!(claims.cnf.is_some());
     }
 
     #[test]
@@ -885,15 +926,13 @@ mod tests {
         );
         assert!(!c.agent_authorization_endpoint.contains("//agents"));
         assert_eq!(c.max_delegation_depth, MAX_DELEGATION_DEPTH);
-        assert_eq!(c.agent_token_lifetime_seconds, AGENT_TOKEN_HOURS * 3600);
+        assert_eq!(
+            c.agent_token_lifetime_seconds,
+            crate::constants::AGENT_TOKEN_MINUTES_MAX * 60
+        );
         assert_eq!(
             c.delegation_lifetime_seconds,
             AGENT_DELEGATION_DAYS * 86_400
         );
-        assert!(
-            c.entitlements_supported
-                .contains(&DEFAULT_USER_ENTITLEMENTS[5])
-        );
-        assert_eq!(c.delegation_jwt_signing_alg, "ES256");
     }
 }

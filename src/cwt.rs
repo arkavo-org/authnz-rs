@@ -210,22 +210,16 @@ impl ArkavoClaims {
 
     /// Agent NPE token: multi-audience, minutes-scale lifetime, hard-capped
     /// at [`crate::constants::AGENT_TOKEN_MINUTES_MAX`].
-    // TODO(Task 4): remove allow when agent.rs consumes this.
-    #[allow(dead_code)]
     pub fn agent(iss: &str, sub: &str, audiences: Vec<String>, minutes: i64) -> Self {
         let capped = minutes.clamp(1, crate::constants::AGENT_TOKEN_MINUTES_MAX);
         Self::base(iss, sub, Audience::Multiple(audiences), capped * 60)
     }
 
-    // TODO(Task 4): remove allow when agent.rs consumes this.
-    #[allow(dead_code)]
     pub fn with_act(mut self, actors: Vec<Actor>) -> Self {
         self.custom.act = Some(actors);
         self
     }
 
-    // TODO(Task 4): remove allow when agent.rs consumes this.
-    #[allow(dead_code)]
     pub fn with_arkavo_npe(mut self, npe: ArkavoNpe) -> Self {
         self.custom.arkavo_npe = Some(npe);
         self
@@ -341,8 +335,6 @@ pub fn cnf_from_app_attest(public_key_bytes: &[u8], device_id: &[u8]) -> Result<
 }
 
 /// `cnf` for an Ed25519 key (agent did:key): COSE_Key kty=OKP, crv=Ed25519.
-// TODO(Task 4): remove allow when agent.rs consumes this.
-#[allow(dead_code)]
 pub fn cnf_from_ed25519(public_key: &[u8; 32], kid: &[u8]) -> Cnf {
     use coset::{CoseKey, KeyType, Label, iana};
     let cose_key = CoseKey {
