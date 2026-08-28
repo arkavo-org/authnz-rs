@@ -850,7 +850,9 @@ pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                         (Value::Text(k), Value::Text(v)) if k == "type" => n.npe_type = v,
                         (Value::Text(k), Value::Text(v)) if k == "class" => n.class = Some(v),
                         (Value::Text(k), Value::Integer(v)) if k == "attestation_expiry" => {
-                            n.attestation_expiry = Some(i128::from(v) as i64)
+                            n.attestation_expiry = Some(
+                                i64::try_from(i128::from(v)).map_err(|_| CwtError::Malformed)?,
+                            )
                         }
                         (Value::Text(k), Value::Text(v)) if k == "device_id" => {
                             n.device_id = Some(v)
@@ -859,20 +861,18 @@ pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                             n.delegation_id = Some(v)
                         }
                         (Value::Text(k), Value::Integer(v)) if k == "depth" => {
-                            n.depth = Some(i128::from(v) as u8)
+                            n.depth =
+                                Some(u8::try_from(i128::from(v)).map_err(|_| CwtError::Malformed)?)
                         }
                         (Value::Text(k), Value::Array(a)) if k == "chain" => {
-                            n.chain = Some(
-                                a.into_iter()
-                                    .filter_map(|x| {
-                                        if let Value::Text(t) = x {
-                                            Some(t)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
-                            )
+                            let parts: Result<Vec<String>, CwtError> = a
+                                .into_iter()
+                                .map(|x| match x {
+                                    Value::Text(t) => Ok(t),
+                                    _ => Err(CwtError::Malformed),
+                                })
+                                .collect();
+                            n.chain = Some(parts?)
                         }
                         _ => {}
                     }
@@ -1641,6 +1641,22 @@ mod tests {
             cnf.cose_key.kty,
             coset::KeyType::Assigned(coset::iana::KeyType::OKP)
         );
+        let crv = cnf
+            .cose_key
+            .params
+            .iter()
+            .find(|(l, _)| *l == coset::Label::Int(-1))
+            .map(|(_, v)| v.clone())
+            .expect("crv param present");
+        assert_eq!(crv, Value::from(coset::iana::EllipticCurve::Ed25519 as u64));
+        let x = cnf
+            .cose_key
+            .params
+            .iter()
+            .find(|(l, _)| *l == coset::Label::Int(-2))
+            .map(|(_, v)| v.clone())
+            .expect("x param present");
+        assert_eq!(x, Value::Bytes(vec![7u8; 32]));
     }
 
     #[test]
@@ -1677,5 +1693,86 @@ mod tests {
             .unwrap();
         assert_eq!(back.class.as_deref(), Some("attested"));
         assert_eq!(back.attestation_expiry, Some(1_800_000_000));
+    }
+
+    /// Hand-craft a minimal well-formed claims map (iss/sub/aud/exp/iat/cti)
+    /// plus an `arkavo_npe` entry set to `npe_value`, so an out-of-range or
+    /// wrongly-typed field can be injected without going through the
+    /// type-safe `ArkavoNpe`/`claims_to_cbor` path.
+    fn claims_bytes_with_npe(npe_value: Value) -> Vec<u8> {
+        let entries = vec![
+            (Value::Integer(1.into()), Value::Text("iss-1".into())),
+            (Value::Integer(2.into()), Value::Text("sub-1".into())),
+            (Value::Integer(3.into()), Value::Text("aud-1".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Integer(0.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+            (Value::Text("arkavo_npe".into()), npe_value),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
+        bytes
+    }
+
+    #[test]
+    fn npe_depth_out_of_range_is_malformed() {
+        let too_big = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (Value::Text("depth".into()), Value::Integer(256.into())),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(too_big));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+
+        let negative = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (Value::Text("depth".into()), Value::Integer((-1).into())),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(negative));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn npe_attestation_expiry_out_of_range_is_malformed() {
+        // i64::MAX + 1, as an i128 — fits in CBOR's u64-backed uint range but
+        // overflows i64::try_from.
+        let too_big = i128::from(i64::MAX) + 1;
+        let npe = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("device".into())),
+            (
+                Value::Text("attestation_expiry".into()),
+                Value::Integer(Integer::try_from(too_big).expect("fits CBOR uint range")),
+            ),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn npe_chain_non_text_is_malformed() {
+        let npe = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (
+                Value::Text("chain".into()),
+                Value::Array(vec![Value::Text("ok".into()), Value::Integer(1.into())]),
+            ),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
     }
 }
