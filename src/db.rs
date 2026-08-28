@@ -13,6 +13,10 @@ pub struct UserCredentials {
     pub username: String,
     pub credentials: Vec<Passkey>,
     pub did: String,
+    /// Attribute FQNs the user holds. Populated from the `entitlements`
+    /// list attribute; rows written before the attribute existed get
+    /// [`crate::constants::DEFAULT_USER_ENTITLEMENTS`].
+    pub entitlements: Vec<String>,
 }
 
 /// Delegation of a human (PE) or agent to an agent NPE identified by did:key.
@@ -411,6 +415,10 @@ impl DynamoDBStore {
             username: username.to_string(),
             credentials: Vec::new(),
             did: did.to_string(),
+            entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
 
         // Try to create user record first
@@ -422,6 +430,15 @@ impl DynamoDBStore {
             .item("username", AttributeValue::S(username.to_string()))
             .item("credentials", AttributeValue::L(vec![]))
             .item("did", AttributeValue::S(user.did.clone()))
+            .item(
+                "entitlements",
+                AttributeValue::L(
+                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                        .iter()
+                        .map(|s| AttributeValue::S(s.to_string()))
+                        .collect(),
+                ),
+            )
             .send()
             .await
         {
@@ -523,6 +540,48 @@ impl DynamoDBStore {
             Some(item) => self.item_to_user_credentials(&item).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Entitlements for a user; defaults when the row predates the attribute.
+    pub async fn get_user_entitlements(
+        &self,
+        user_id: &Uuid,
+    ) -> Result<Vec<String>, DynamoDBError> {
+        Ok(self
+            .get_user_by_id(user_id)
+            .await?
+            .map(|u| u.entitlements)
+            .unwrap_or_default())
+    }
+
+    /// Replace a user's entitlement list. Fails if the user does not exist.
+    pub async fn put_user_entitlements(
+        &self,
+        user_id: &Uuid,
+        entitlements: &[String],
+    ) -> Result<(), DynamoDBError> {
+        self.client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .condition_expression("attribute_exists(user_id)")
+            .update_expression("SET entitlements = :e")
+            .expression_attribute_values(
+                ":e",
+                AttributeValue::L(
+                    entitlements
+                        .iter()
+                        .map(|s| AttributeValue::S(s.clone()))
+                        .collect(),
+                ),
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                error!("Failed to put entitlements for {}: {:?}", user_id, err);
+                DynamoDBError::SdkError(err.to_string())
+            })?;
+        Ok(())
     }
 
     pub async fn add_credential(
@@ -645,8 +704,7 @@ impl DynamoDBStore {
         }
     }
 
-    fn item_to_user_credentials(
-        &self,
+    pub(crate) fn parse_user_credentials(
         item: &std::collections::HashMap<String, AttributeValue>,
     ) -> Result<UserCredentials, DynamoDBError> {
         log::debug!("Parsing item: {:?}", item);
@@ -695,12 +753,30 @@ impl DynamoDBStore {
             .map_err(|_| DynamoDBError::Internal("Invalid DID format".into()))?
             .to_string();
         log::debug!("Parsed DID: {}", did);
+        let entitlements = match item.get("entitlements").and_then(|av| av.as_l().ok()) {
+            Some(list) => list
+                .iter()
+                .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
+                .collect(),
+            None => crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
         Ok(UserCredentials {
             user_id,
             username,
             credentials,
             did,
+            entitlements,
         })
+    }
+
+    fn item_to_user_credentials(
+        &self,
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<UserCredentials, DynamoDBError> {
+        Self::parse_user_credentials(item)
     }
 
     /// Persist the did:webvh append-only log (`did.jsonl`) for a user, as a
@@ -1483,6 +1559,10 @@ mod tests {
             username: "testuser".to_string(),
             credentials: vec![],
             did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
+            entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
 
         assert_eq!(user.username, "testuser");
@@ -1497,6 +1577,10 @@ mod tests {
             username: "alice".to_string(),
             credentials: vec![],
             did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
+            entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
 
         // Serialize to JSON
@@ -1563,5 +1647,54 @@ mod tests {
         let prefix = log_subject_prefix(sub);
         assert_eq!(prefix, "αβγδεζηθ");
         assert_eq!(prefix.chars().count(), 8);
+    }
+
+    #[test]
+    fn user_credentials_entitlements_default_when_attribute_missing() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "user_id".to_string(),
+            AttributeValue::S(Uuid::nil().to_string()),
+        );
+        item.insert("username".to_string(), AttributeValue::S("alice".into()));
+        item.insert(
+            "did".to_string(),
+            AttributeValue::S("did:key:z6Mkabc".into()),
+        );
+        let parsed = DynamoDBStore::parse_user_credentials(&item).unwrap();
+        assert_eq!(
+            parsed.entitlements,
+            crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn user_credentials_entitlements_parsed_from_list() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "user_id".to_string(),
+            AttributeValue::S(Uuid::nil().to_string()),
+        );
+        item.insert("username".to_string(), AttributeValue::S("alice".into()));
+        item.insert(
+            "did".to_string(),
+            AttributeValue::S("did:key:z6Mkabc".into()),
+        );
+        item.insert(
+            "entitlements".to_string(),
+            AttributeValue::L(vec![AttributeValue::S(
+                "https://arkavo.ai/attr/action/value/read".into(),
+            )]),
+        );
+        let parsed = DynamoDBStore::parse_user_credentials(&item).unwrap();
+        assert_eq!(
+            parsed.entitlements,
+            vec!["https://arkavo.ai/attr/action/value/read".to_string()]
+        );
     }
 }

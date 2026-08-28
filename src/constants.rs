@@ -93,15 +93,17 @@ pub const MAX_DELEGATION_DEPTH: u8 = 5;
 /// Maximum number of active agents delegated by a single root user
 pub const MAX_AGENTS_PER_USER: u32 = 640;
 
-/// Entitlements a human (PE) may delegate to an agent. Per-user entitlement
-/// storage (#53) replaces this constant; until then every human delegator is
-/// treated as holding exactly this set for the delegation subset check.
-pub const HUMAN_DELEGABLE_ENTITLEMENTS: &[&str] = &[
+/// Entitlements granted to a newly created user and used when a stored user
+/// row predates the `entitlements` attribute. Attribute FQNs, never bare
+/// strings — the OpenTDF platform's `arkavo` ERS mode emits these verbatim
+/// as direct entitlements.
+pub const DEFAULT_USER_ENTITLEMENTS: &[&str] = &[
+    "https://arkavo.ai/attr/tdf/value/create",
+    "https://arkavo.ai/attr/tdf/value/decrypt",
+    // Delegable to agents (the vocabulary arkavo-edge's --trust QR and the
+    // app's canonicalizer request). Must be a superset of the QR default.
     "https://arkavo.ai/attr/action/value/read",
     "https://arkavo.ai/attr/action/value/write",
     "https://arkavo.ai/attr/action/value/execute",
     "https://arkavo.ai/attr/action/value/delegate",
-    "https://arkavo.ai/attr/action/value/admin",
-    "https://arkavo.ai/attr/mesh/value/orchestrator",
-    "https://arkavo.ai/attr/mesh/value/worker",
 ];

@@ -31,7 +31,7 @@
 use crate::AppState;
 use crate::constants::{
     AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_HOURS,
-    HUMAN_DELEGABLE_ENTITLEMENTS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    DEFAULT_USER_ENTITLEMENTS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
 };
 use crate::cwt;
 use crate::db::{AgentDelegation, DynamoDBError};
@@ -85,7 +85,7 @@ impl AgentConfiguration {
             agent_revocation_endpoint: format!("{}/agents/delegations", base),
             agent_challenge_endpoint: format!("{}/agents/challenge", base),
             agent_token_endpoint: format!("{}/agents/token", base),
-            entitlements_supported: HUMAN_DELEGABLE_ENTITLEMENTS.to_vec(),
+            entitlements_supported: DEFAULT_USER_ENTITLEMENTS.to_vec(),
             max_delegation_depth: MAX_DELEGATION_DEPTH,
             max_agents_per_user: MAX_AGENTS_PER_USER,
             delegation_lifetime_seconds: AGENT_DELEGATION_DAYS * 24 * 60 * 60,
@@ -317,7 +317,7 @@ pub async fn authorize_agent(
 
     // Subset check against the delegable set for humans (per-user storage: #53).
     for entitlement in &request.entitlements {
-        if !HUMAN_DELEGABLE_ENTITLEMENTS.contains(&entitlement.as_str()) {
+        if !DEFAULT_USER_ENTITLEMENTS.contains(&entitlement.as_str()) {
             return Err(AgentError::InsufficientEntitlements(format!(
                 "Entitlement '{}' is not delegable",
                 entitlement
@@ -718,7 +718,7 @@ mod tests {
             delegator_type: "human".into(),
             delegator_id: "00000000-0000-0000-0000-000000000001".into(),
             delegator_username: Some("alice".into()),
-            entitlements: vec![HUMAN_DELEGABLE_ENTITLEMENTS[0].to_string()],
+            entitlements: vec![DEFAULT_USER_ENTITLEMENTS[0].to_string()],
             name: "CLI Agent".into(),
             depth: 0,
             root_user_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
@@ -892,7 +892,7 @@ mod tests {
         );
         assert!(
             c.entitlements_supported
-                .contains(&HUMAN_DELEGABLE_ENTITLEMENTS[3])
+                .contains(&DEFAULT_USER_ENTITLEMENTS[5])
         );
         assert_eq!(c.delegation_jwt_signing_alg, "ES256");
     }
