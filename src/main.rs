@@ -803,19 +803,25 @@ fn load_ec_keys(
         LoadKeysError::InvalidKeyFormat
     })?;
 
-    // Load the same EC key material as p256 type for CWT signing/verification,
-    // plus the RFC 7638 thumbprint kid. Shared with `src/bin/seed-test-user.rs`
-    // via `authnz_rs::keys::load_cwt_signing_key` so both binaries derive
-    // identical CWT keys/kid from the same encoding key PEM.
-    let (cwt_signing_key, cwt_verifying_key, cwt_kid) =
-        keys::load_cwt_signing_key(encoding_pem_str)?;
-
     debug!("Attempting to create DecodingKey from PEM contents");
     let decoding_pem = std::fs::read(decoding_key_path)?;
+    let decoding_pem_str = std::str::from_utf8(&decoding_pem)
+        .map_err(|e| format!("Decoding key PEM is not valid UTF-8: {e}"))?;
+
     let decoding_key = DecodingKey::from_ec_pem(&decoding_pem).map_err(|e| {
         error!("Failed to create DecodingKey: {:?}", e);
         LoadKeysError::InvalidKeyFormat
     })?;
+
+    // Load the same EC key material as p256 type for CWT signing/verification,
+    // plus the RFC 7638 thumbprint kid. Shared with `src/bin/seed-test-user.rs`
+    // via `authnz_rs::keys::load_cwt_keys` so both binaries derive identical
+    // CWT keys/kid from the same encoding/decoding key PEMs. The verifying
+    // key comes from `decoding_pem_str` (not derived from the signing key)
+    // and is checked against it — a mismatched pair errors out here rather
+    // than silently minting tokens nothing can verify.
+    let (cwt_signing_key, cwt_verifying_key, cwt_kid) =
+        keys::load_cwt_keys(encoding_pem_str, decoding_pem_str)?;
 
     debug!("Successfully loaded EC keys");
     Ok((
