@@ -641,6 +641,7 @@ When modifying token lifetimes, update these in authn.rs:
 - **Replay protection**: Monotonic counter must increment with each assertion
 - **Nonce binding**: Challenge bound to attestation/assertion via SHA256
 - **Device verification**: Proves request comes from genuine Apple device running unmodified app
+- Assertion CWT carries `arkavo_npe = {type: device, class, attestation_expiry, device_id}` and, when `OIDC_PLATFORM_AUDIENCE` is set, that audience.
 
 ### Requirements
 - iOS 14+ with Secure Enclave support

@@ -430,8 +430,12 @@ pub fn mint_auth_token(
     user_id: &Uuid,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
-    let mut claims =
-        crate::cwt::ArkavoClaims::auth(&app_state.issuer, &user_id.to_string(), AUTH_TOKEN_HOURS);
+    let mut claims = crate::cwt::ArkavoClaims::auth(
+        &app_state.issuer,
+        &user_id.to_string(),
+        AUTH_TOKEN_HOURS,
+        app_state.platform_audience.as_deref(),
+    );
     if let Some(c) = cnf {
         claims = claims.with_cnf(c);
     }
