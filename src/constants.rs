@@ -81,7 +81,17 @@ pub const AGENT_DELEGATION_DAYS: i64 = 30;
 
 /// Lifetime of an issued agent access token in hours (same order as the
 /// human auth token — a 30-day bearer would be wrong).
+// removed in Task 4 (superseded by AGENT_TOKEN_MINUTES_MAX); kept here so
+// src/agent.rs (rewritten in Task 4) still compiles.
 pub const AGENT_TOKEN_HOURS: i64 = 1;
+
+/// Maximum lifetime, in minutes, of an agent NPE CWT minted via
+/// [`crate::cwt::ArkavoClaims::agent`]. Agent tokens are short-lived by
+/// design — the agent re-proves key possession (via `/agents/token`) to
+/// mint a fresh one rather than holding a long-lived bearer.
+// TODO(Task 4): remove allow when agent.rs consumes this.
+#[allow(dead_code)]
+pub const AGENT_TOKEN_MINUTES_MAX: i64 = 15;
 
 /// Agent challenge TTL in seconds. The challenge is stored on the delegation
 /// row (not a cookie session) so headless CLIs can complete the two-step flow.
