@@ -601,34 +601,37 @@ pub(crate) fn agent_cwt_claims(
     delegation: &AgentDelegation,
 ) -> Result<cwt::ArkavoClaims, AgentError> {
     let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
-    Ok(cwt::ArkavoClaims::agent(
+    let mut claims = cwt::ArkavoClaims::agent(
         issuer,
         &delegation.agent_did,
         cfg.audiences.clone(),
         cfg.minutes,
-    )
-    .with_act(
-        cfg.authorized_actors
-            .iter()
-            .map(|s| cwt::Actor { sub: s.clone() })
-            .collect(),
-    )
-    .with_arkavo_account_id(&delegation.root_user_id.to_string())
-    .with_arkavo_roles(vec!["agent".to_string()])
-    .with_arkavo_entitlements(delegation.entitlements.clone())
-    .with_arkavo_npe(cwt::ArkavoNpe {
-        npe_type: "agent".into(),
-        class: None,
-        attestation_expiry: None,
-        device_id: None,
-        delegation_id: Some(delegation.agent_did.clone()),
-        depth: Some(delegation.depth),
-        chain: Some(delegation.chain.clone()),
-    })
-    .with_cnf(cwt::cnf_from_ed25519(
-        &pubkey,
-        delegation.agent_did.as_bytes(),
-    )))
+    );
+    if !cfg.authorized_actors.is_empty() {
+        claims = claims.with_act(
+            cfg.authorized_actors
+                .iter()
+                .map(|s| cwt::Actor { sub: s.clone() })
+                .collect(),
+        );
+    }
+    Ok(claims
+        .with_arkavo_account_id(&delegation.root_user_id.to_string())
+        .with_arkavo_roles(vec!["agent".to_string()])
+        .with_arkavo_entitlements(delegation.entitlements.clone())
+        .with_arkavo_npe(cwt::ArkavoNpe {
+            npe_type: "agent".into(),
+            class: None,
+            attestation_expiry: None,
+            device_id: None,
+            delegation_id: Some(delegation.agent_did.clone()),
+            depth: Some(delegation.depth),
+            chain: Some(delegation.chain.clone()),
+        })
+        .with_cnf(cwt::cnf_from_ed25519(
+            &pubkey,
+            delegation.agent_did.as_bytes(),
+        )))
 }
 
 fn mint_agent_cwt(
@@ -856,6 +859,18 @@ mod tests {
         assert_eq!(npe.npe_type, "agent");
         assert_eq!(npe.delegation_id.as_deref(), Some(TEST_DID));
         assert!(claims.cnf.is_some());
+    }
+
+    #[test]
+    fn agent_cwt_claims_omit_act_when_no_authorized_actors() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let d = sample_delegation(TEST_DID);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(claims.custom.act, None);
     }
 
     #[test]
