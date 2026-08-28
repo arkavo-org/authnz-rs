@@ -81,7 +81,7 @@ jobs:
           echo "DECODING_KEY_PATH=$PWD/decodekey.pem" >> $GITHUB_ENV
       - run: cargo build
       - name: seed user + mint human/service CWTs
-        run: cargo run --bin seed-test-user -- --encoding-key encodekey.pem --issuer http://127.0.0.1:8080 > human.cwt
+        run: cargo run --bin seed-test-user -- --encoding-key encodekey.pem --decoding-key decodekey.pem --issuer http://127.0.0.1:8080 > human.cwt
       # main.rs loads this unconditionally at startup (`?` on the read); it's
       # gitignored (deployment-specific, real Apple app ids), so CI needs a
       # placeholder — content doesn't matter, this test never hits the
