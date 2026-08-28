@@ -358,7 +358,9 @@ aws dynamodb create-table \
   `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe` describes the agent (type, delegation
   id, depth, chain), `cnf` is bound to the agent's Ed25519 `did:key`. There is
   no refresh — the agent re-runs the challenge/token exchange for a new one.
-  This is the contract `arkavo-edge/crates/arkavo-agent-auth` expects (#54)
+  This is the contract `arkavo-edge/crates/arkavo-agent-auth` expects (#54);
+  its `delegation_jwt` field is `Option` with `#[serde(default)]`, so
+  omitting it is wire-compatible.
 - Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
   (#50) and the ERS surface (#48) are follow-ups
 
