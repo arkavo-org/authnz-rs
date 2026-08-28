@@ -375,6 +375,13 @@ aws dynamodb create-table \
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
 
+**entities.rs** - Service-gated entity lookup (spec §2.4)
+- `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace
+- Id namespaces: `arkavo:<uuid>` (person), `did:key:…` (agent), `device:<key_id>` (device)
+- Unknown namespace → HTTP 400 (BadId); missing entity → HTTP 404 (NotFound)
+- Category mapping: Person/Agent → "subject"/"environment" with npe_type (None/"agent"/"device")
+- Claims include authorization profile (entitlements, roles) and entity-specific metadata (device class, agent depth/chain)
+
 ### Key Data Flow
 
 1. **Registration Flow**:
