@@ -55,6 +55,7 @@ mod constants;
 mod cwt;
 mod db;
 mod device_check;
+mod entitlements;
 mod oidc;
 mod patreon;
 mod webvh;
@@ -488,6 +489,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // only on the resulting OIDC access_token CWT; there is deliberately
         // no /me/patreon or /entitlements endpoint surface.
         .route("/oauth/patreon/link", post(patreon_link_handler))
+        // Admin: per-user entitlement FQNs (service CWT required). Spec §2.3.
+        .route(
+            "/admin/users/:id/entitlements",
+            axum::routing::put(entitlements::put_user_entitlements),
+        )
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
