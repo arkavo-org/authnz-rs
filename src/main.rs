@@ -55,6 +55,7 @@ mod constants;
 mod cwt;
 mod db;
 mod device_check;
+mod entities;
 mod entitlements;
 mod oidc;
 mod patreon;
@@ -505,6 +506,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/admin/users/:id/entitlements",
             axum::routing::put(entitlements::put_user_entitlements),
         )
+        // Entity lookup (service CWT required). Spec §2.4.
+        .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
