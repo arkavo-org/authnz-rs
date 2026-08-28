@@ -22,7 +22,8 @@ use crate::AppState;
 use crate::apple_signin;
 use crate::constants::{
     ACCESS_TOKEN_LIFETIME_SECONDS, AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER,
-    DEFAULT_USER_ENTITLEMENTS, ID_TOKEN_LIFETIME_SECONDS,
+    DEFAULT_USER_ENTITLEMENTS, ENTITLEMENT_TDF_CREATE, ENTITLEMENT_TDF_DECRYPT,
+    ID_TOKEN_LIFETIME_SECONDS,
 };
 use axum::Json;
 use axum::extract::{Extension, Form, Query};
@@ -1088,8 +1089,8 @@ async fn handle_client_credentials_grant(
         arkavo_roles: vec!["service-account".to_string()],
         // Grant standard entitlements so service accounts can encrypt/decrypt OpenTDF payloads
         arkavo_entitlements: vec![
-            DEFAULT_USER_ENTITLEMENTS[0].to_string(),
-            DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+            ENTITLEMENT_TDF_CREATE.to_string(),
+            ENTITLEMENT_TDF_DECRYPT.to_string(),
         ],
     };
 
@@ -1253,8 +1254,8 @@ async fn handle_refresh_token_grant(
         (
             vec!["service-account".to_string()],
             vec![
-                DEFAULT_USER_ENTITLEMENTS[0].to_string(),
-                DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+                ENTITLEMENT_TDF_CREATE.to_string(),
+                ENTITLEMENT_TDF_DECRYPT.to_string(),
             ],
             "client_credentials".to_string(),
         )
@@ -1268,9 +1269,12 @@ async fn handle_refresh_token_grant(
         // the webauthn (`arkavo:<uuid>`) and Apple (`apple:<sub>`) subject
         // shapes — both auth paths set `AuthenticatedUser::arkavo_account_id`
         // to `UserCredentials.user_id`, which is threaded onto the refresh
-        // record at issuance/rotation. Fall back to the defaults if it's
-        // ever unparseable (e.g. a pre-existing refresh token minted before
-        // this field existed).
+        // record at issuance/rotation. `arkavo_account_id` is a required
+        // `String` field on `RefreshTokenRecord` (no `#[serde(default)]`), so
+        // a record predating this field would fail to deserialize before
+        // reaching this code at all — this fallback can't actually be
+        // reached that way. It stays purely defensive: fall back to the
+        // defaults if the value is ever unparseable for some other reason.
         let entitlements = match Uuid::parse_str(&record.arkavo_account_id) {
             Ok(user_id) => app_state
                 .db_store
@@ -1997,7 +2001,7 @@ mod tests {
             email_verified: Some(true),
             idp: "apple".into(),
             roles: vec!["user".into()],
-            entitlements: vec![DEFAULT_USER_ENTITLEMENTS[0].to_string()],
+            entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2243,8 +2247,8 @@ mod tests {
             arkavo_account_id: "uuid".into(),
             arkavo_roles: vec!["user".into()],
             arkavo_entitlements: vec![
-                DEFAULT_USER_ENTITLEMENTS[0].to_string(),
-                DEFAULT_USER_ENTITLEMENTS[1].to_string(),
+                ENTITLEMENT_TDF_CREATE.to_string(),
+                ENTITLEMENT_TDF_DECRYPT.to_string(),
             ],
         };
         let json = serde_json::to_string(&claims).unwrap();

@@ -249,7 +249,7 @@ Token claims issued for OpenTDF compatibility:
   "idp": "apple",
   "arkavo_account_id": "uuid",
   "arkavo_roles": ["user"],
-  "arkavo_entitlements": ["tdf:create", "tdf:decrypt"]
+  "arkavo_entitlements": ["https://arkavo.ai/attr/tdf/value/create", "https://arkavo.ai/attr/tdf/value/decrypt"]
 }
 ```
 
