@@ -230,7 +230,11 @@ mod tests {
     fn parse_user_default_entitlements_unset_uses_constant() {
         let got = parse_user_default_entitlements(None).unwrap();
         assert_eq!(got.len(), crate::constants::DEFAULT_USER_ENTITLEMENTS.len());
-        assert!(!parse_user_default_entitlements(Some("")).unwrap().is_empty());
+        assert!(
+            !parse_user_default_entitlements(Some(""))
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse_user_default_entitlements(Some("not-an-fqn")).is_err());
         let one = parse_user_default_entitlements(Some("https://arkavo.ai/attr/tdf/value/decrypt"))
             .unwrap();
