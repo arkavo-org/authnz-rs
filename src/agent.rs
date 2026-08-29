@@ -479,13 +479,18 @@ async fn active_delegation(
         return Err(AgentError::DelegationExpired);
     }
     for ancestor_did in &delegation.chain {
-        if let Some(ancestor) = app_state
+        // Every chain entry is an agent DID with its own delegation row
+        // (that is what `revoke_delegations_with_chain` cascades over), so a
+        // missing ancestor means the chain cannot be shown intact. Treat it
+        // as broken rather than skipping it — skipping would let a delegation
+        // whose parent row is gone keep minting tokens.
+        let ancestor = app_state
             .db_store
             .get_agent_delegation(ancestor_did)
             .await
             .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
-            && ancestor.revoked_at.is_some()
-        {
+            .ok_or_else(|| AgentError::ChainRevoked(ancestor_did.clone()))?;
+        if ancestor.revoked_at.is_some() {
             return Err(AgentError::ChainRevoked(ancestor_did.clone()));
         }
     }
