@@ -1134,11 +1134,20 @@ impl DynamoDBStore {
         }
 
         // Close the TOCTOU between authorize_agent's existence check and
-        // this put: an active row must not be clobbered. Re-authorize of a
-        // revoked DID is allowed (attribute_exists(revoked_at)).
-        let item_builder = item_builder.condition_expression(
-            "attribute_not_exists(agent_did) OR attribute_exists(revoked_at)",
-        );
+        // this put: an *active* row must not be clobbered. Re-authorize is
+        // allowed for a revoked DID (attribute_exists(revoked_at)) and for an
+        // expired one (expires_at < now) -- otherwise the DID deadlocks once
+        // the delegation ages out. A row with no expires_at is never
+        // replaceable this way, since the comparison is false when the
+        // attribute is absent.
+        let item_builder = item_builder
+            .condition_expression(
+                "attribute_not_exists(agent_did) OR attribute_exists(revoked_at) OR expires_at < :now",
+            )
+            .expression_attribute_values(
+                ":now",
+                AttributeValue::N(chrono::Utc::now().timestamp().to_string()),
+            );
 
         match item_builder.send().await {
             Ok(_) => {
@@ -1318,20 +1327,24 @@ impl DynamoDBStore {
         nonce: &str,
         issued_at: i64,
     ) -> Result<(), DynamoDBError> {
-        let expired_before = issued_at - crate::constants::AGENT_CHALLENGE_TTL_SECONDS;
+        // Last writer wins. Refusing to replace an unexpired challenge made
+        // GET /agents/challenge -- which needs no credential -- a denial of
+        // service: anyone who knows the agent's did:key (it is in the pairing
+        // QR) could re-request once a minute and keep the real agent on 409
+        // forever. It also stranded a legitimate agent for the rest of the
+        // TTL whenever a token response was lost. Overwriting costs nothing:
+        // challenges are single-use, high-entropy, and taken atomically, so a
+        // racing writer can only make the honest client ask again.
         let result = self
             .client
             .update_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
-            .condition_expression(
-                "attribute_exists(agent_did) AND (attribute_not_exists(challenge_issued_at) OR challenge_issued_at < :expired)",
-            )
+            .condition_expression("attribute_exists(agent_did)")
             .update_expression("SET challenge = :c, challenge_nonce = :n, challenge_issued_at = :t")
             .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
             .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
             .expression_attribute_values(":t", AttributeValue::N(issued_at.to_string()))
-            .expression_attribute_values(":expired", AttributeValue::N(expired_before.to_string()))
             .send()
             .await;
         match result {

@@ -343,6 +343,7 @@ pub async fn authorize_agent(
         return Err(AgentError::MaxDepthExceeded(depth));
     }
 
+    let now = Utc::now().timestamp();
     let current_count = app_state
         .db_store
         .count_delegations_by_root_user(human.user_id)
@@ -352,17 +353,22 @@ pub async fn authorize_agent(
         return Err(AgentError::MaxAgentsExceeded(current_count));
     }
 
+    // Only a delegation that is still usable blocks re-authorization. A
+    // revoked one has always been replaceable; an *expired* one must be too,
+    // or the DID deadlocks after AGENT_DELEGATION_DAYS -- /agents/challenge
+    // refuses it as expired while re-authorizing it returns 409 forever, and
+    // nothing in the flow tells the user to DELETE it first.
     if let Some(existing) = app_state
         .db_store
         .get_agent_delegation(&request.agent_did)
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
         && existing.revoked_at.is_none()
+        && existing.expires_at.is_none_or(|e| now <= e)
     {
         return Err(AgentError::DelegationAlreadyExists);
     }
 
-    let now = Utc::now().timestamp();
     let delegation = AgentDelegation {
         agent_did: request.agent_did.clone(),
         delegator_type: "human".to_string(),
@@ -519,7 +525,10 @@ pub async fn generate_agent_challenge(
         .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
         .await
         .map_err(|e| match e {
-            DynamoDBError::ConditionalConflict => AgentError::ChallengeInFlight,
+            // The only condition left on the write is that the delegation row
+            // exists, so a conflict means it was deleted between
+            // `active_delegation` above and this write.
+            DynamoDBError::ConditionalConflict => AgentError::DelegationNotFound,
             other => AgentError::DatabaseError(Box::new(other)),
         })?;
 
@@ -754,8 +763,6 @@ pub enum AgentError {
     ChallengeExpired,
     #[error("Challenge mismatch")]
     ChallengeMismatch,
-    #[error("Challenge already pending")]
-    ChallengeInFlight,
     #[error("Database error: {0}")]
     DatabaseError(#[from] Box<DynamoDBError>),
 }
@@ -780,7 +787,6 @@ impl IntoResponse for AgentError {
             | AgentError::MaxAgentsExceeded(_)
             | AgentError::ChallengeExpired
             | AgentError::ChallengeMismatch => (StatusCode::BAD_REQUEST, self.to_string()),
-            AgentError::ChallengeInFlight => (StatusCode::CONFLICT, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -1108,7 +1114,6 @@ mod tests {
             (AgentError::InvalidDID("x".into()), StatusCode::BAD_REQUEST),
             (AgentError::DelegationNotFound, StatusCode::NOT_FOUND),
             (AgentError::DelegationAlreadyExists, StatusCode::CONFLICT),
-            (AgentError::ChallengeInFlight, StatusCode::CONFLICT),
             (AgentError::DelegationRevoked, StatusCode::FORBIDDEN),
             (
                 AgentError::InvalidProof("x".into()),
