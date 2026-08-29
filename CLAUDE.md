@@ -71,6 +71,12 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # Additional RPs follow the same pattern with a different tag:
 # export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
 # export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
+# CLI passkey login (arkavo-edge): PUBLIC client, no _SECRET, PKCE S256. One
+# client class for every install (RFC 8252); per-install state is the refresh
+# token on disk, not a registration. Loopback redirect URIs are exact-match,
+# so every port the CLI may bind is listed verbatim.
+# export OIDC_CLIENT_EDGE_ID=arkavo-edge
+# export OIDC_CLIENT_EDGE_REDIRECT_URIS=http://127.0.0.1:52171/cb,...,http://127.0.0.1:52178/cb
 # AuthZEN PEPs (service CWT, client_credentials): see docs/pep-service-clients.md.
 # catalog-node and mcp-edge are registered in production (401 without secret).
 # Mint on the identity host with scripts/mint-pep-cwt.py — do not paste secrets.
