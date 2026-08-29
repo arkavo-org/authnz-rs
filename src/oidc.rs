@@ -1535,6 +1535,9 @@ impl IntoResponse for AuthorizeError {
             }
             AuthorizeError::AppleNonceRequired => (StatusCode::BAD_REQUEST, "invalid_request"),
             AuthorizeError::AppleSigninError(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
+            AuthorizeError::Database(msg) if msg.starts_with("Table does not exist") => {
+                (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+            }
             AuthorizeError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
         oidc_error_response(status, code, &self.to_string())
@@ -1622,7 +1625,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         .db_store
         .get_user_entitlements(&user_id)
         .await
-        .map_err(|e| AuthorizeError::InvalidArkavoJwt(format!("entitlement lookup: {}", e)))?;
+        .map_err(|e| AuthorizeError::Database(e.to_string()))?;
     Ok(AuthenticatedUser {
         subject: format!("arkavo:{}", account_id),
         arkavo_account_id: account_id,
@@ -1868,6 +1871,21 @@ mod tests {
     fn test_authorize_error_apple_nonce_required_is_400() {
         let resp = AuthorizeError::AppleNonceRequired.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_authorize_error_database_is_not_invalid_token() {
+        let table_missing = AuthorizeError::Database(
+            crate::db::DynamoDBError::TableNotExists("credentials".into()).to_string(),
+        )
+        .into_response();
+        assert_eq!(table_missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let other = AuthorizeError::Database("Amazon SdkError: throttling".into()).into_response();
+        assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let invalid = AuthorizeError::InvalidArkavoJwt("nope".into()).into_response();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
     }
 
     fn env_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -2675,15 +2693,13 @@ mod tests {
         // past decode + signature verification + sub-parsing before it can
         // even reach the entitlement lookup. The DynamoDB endpoint above is
         // pinned to a closed local port, so the lookup itself always fails
-        // deterministically here — an "entitlement lookup:" error therefore
-        // proves the CWT was accepted and the code reached the store; any
-        // other outcome means the CWT itself was rejected. The lookup's
-        // success path (a real DynamoDB Local backend) is covered by the
-        // integration test in Task 7.
+        // deterministically here — a Database error therefore proves the CWT
+        // was accepted and the code reached the store; any other outcome
+        // means the CWT itself was rejected. The lookup's success path (a
+        // real DynamoDB Local backend) is covered by tests/agent_flow.rs.
         match result {
             Ok(_) => {}
-            Err(AuthorizeError::InvalidArkavoJwt(msg))
-                if msg.starts_with("entitlement lookup:") => {}
+            Err(AuthorizeError::Database(_)) => {}
             other => panic!(
                 "CWT should be accepted (or fail only at entitlement lookup), got {:?}",
                 other

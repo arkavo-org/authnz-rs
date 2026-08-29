@@ -86,6 +86,11 @@ pub enum DynamoDBError {
 
     #[error("Identity already linked to a different user")]
     LinkConflict,
+
+    /// A DynamoDB condition expression rejected the write (lost a race, or
+    /// the row is in a state the caller may not overwrite).
+    #[error("conditional write rejected")]
+    ConditionalConflict,
 }
 
 impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
@@ -1115,22 +1120,35 @@ impl DynamoDBStore {
                 item_builder.item("revoked_at", AttributeValue::N(revoked_at.to_string()));
         }
 
+        // Close the TOCTOU between authorize_agent's existence check and
+        // this put: an active row must not be clobbered. Re-authorize of a
+        // revoked DID is allowed (attribute_exists(revoked_at)).
+        let item_builder = item_builder.condition_expression(
+            "attribute_not_exists(agent_did) OR attribute_exists(revoked_at)",
+        );
+
         match item_builder.send().await {
             Ok(_) => {
                 info!("Created agent delegation for: {}", delegation.agent_did);
                 Ok(())
             }
             Err(err) => {
-                if let SdkError::ServiceError(ref service_error) = err
-                    && service_error.err().meta().code() == Some("ResourceNotFoundException")
-                {
-                    error!(
-                        "agent_delegations table {} does not exist",
-                        self.agent_delegations_table
-                    );
-                    return Err(DynamoDBError::TableNotExists(
-                        self.agent_delegations_table.clone(),
-                    ));
+                if let SdkError::ServiceError(ref service_error) = err {
+                    match service_error.err().meta().code() {
+                        Some("ConditionalCheckFailedException") => {
+                            return Err(DynamoDBError::ConditionalConflict);
+                        }
+                        Some("ResourceNotFoundException") => {
+                            error!(
+                                "agent_delegations table {} does not exist",
+                                self.agent_delegations_table
+                            );
+                            return Err(DynamoDBError::TableNotExists(
+                                self.agent_delegations_table.clone(),
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
                 error!("Failed to write agent delegation: {:?}", err);
                 Err(DynamoDBError::SdkError(err.to_string()))

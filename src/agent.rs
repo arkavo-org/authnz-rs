@@ -369,7 +369,7 @@ pub async fn authorize_agent(
         .db_store
         .create_agent_delegation(&delegation)
         .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+        .map_err(map_create_delegation_error)?;
 
     info!("Agent delegation created for: {}", request.agent_did);
     Ok(Json(AuthorizeAgentResponse {
@@ -676,6 +676,13 @@ pub(crate) fn agent_cwt_claims(
             &pubkey,
             delegation.agent_did.as_bytes(),
         )))
+}
+
+fn map_create_delegation_error(e: DynamoDBError) -> AgentError {
+    match e {
+        DynamoDBError::ConditionalConflict => AgentError::DelegationAlreadyExists,
+        other => AgentError::DatabaseError(Box::new(other)),
+    }
 }
 
 fn mint_agent_cwt(
@@ -1059,6 +1066,21 @@ mod tests {
         for (err, status) in cases {
             assert_eq!(err.into_response().status(), status);
         }
+    }
+
+    #[test]
+    fn create_delegation_conditional_conflict_is_already_exists() {
+        assert!(matches!(
+            map_create_delegation_error(DynamoDBError::ConditionalConflict),
+            AgentError::DelegationAlreadyExists
+        ));
+        let mapped =
+            map_create_delegation_error(DynamoDBError::TableNotExists("agent_delegations".into()));
+        assert!(matches!(mapped, AgentError::DatabaseError(_)));
+        assert_eq!(
+            mapped.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
