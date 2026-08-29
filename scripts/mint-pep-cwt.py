@@ -73,10 +73,13 @@ def load_env_file(path: str) -> dict[str, str]:
 
 
 def secret_for_client(env: dict[str, str], client_id: str) -> str:
-    if client_id == "catalog-node":
-        fallback = env.get("CATALOG_AUTHZ_CLIENT_SECRET", "")
-        if fallback:
-            return fallback
+    """The registered OIDC_CLIENT_<TAG>_SECRET wins.
+
+    CATALOG_AUTHZ_CLIENT_SECRET is only a fallback for hosts that predate the
+    tagged registration. Consulting it first meant a stale copy left in the
+    env file silently shadowed a rotated secret, and the only symptom was an
+    unexplained `mint_http: 401`.
+    """
     for key, val in env.items():
         if not key.startswith("OIDC_CLIENT_") or not key.endswith("_ID"):
             continue
@@ -87,6 +90,15 @@ def secret_for_client(env: dict[str, str], client_id: str) -> str:
         if not secret:
             raise SystemExit(f"OIDC_CLIENT_{tag}_ID={client_id} but _SECRET is empty")
         return secret
+    if client_id == "catalog-node":
+        fallback = env.get("CATALOG_AUTHZ_CLIENT_SECRET", "")
+        if fallback:
+            print(
+                "warning: no OIDC_CLIENT_<TAG>_ID=catalog-node in the env file; "
+                "falling back to CATALOG_AUTHZ_CLIENT_SECRET",
+                file=sys.stderr,
+            )
+            return fallback
     raise SystemExit(f"no OIDC_CLIENT_<TAG>_ID={client_id} in env file")
 
 

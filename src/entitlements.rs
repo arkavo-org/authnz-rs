@@ -140,7 +140,13 @@ pub async fn put_user_entitlements(
         .db_store
         .put_user_entitlements(&user_id, &req.entitlements)
         .await
-        .map_err(|e| EntitlementError::Database(Box::new(e)))?;
+        .map_err(|e| match e {
+            // The write is conditioned on the row existing, so losing the
+            // race with a delete between the check above and this update is
+            // the same answer the check would have given: 404, not 500.
+            DynamoDBError::ConditionalConflict => EntitlementError::UserNotFound,
+            other => EntitlementError::Database(Box::new(other)),
+        })?;
     Ok(Json(PutEntitlementsResponse {
         user_id,
         entitlements: req.entitlements,

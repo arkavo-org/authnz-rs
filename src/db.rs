@@ -598,6 +598,16 @@ impl DynamoDBStore {
             .send()
             .await
             .map_err(|err| {
+                // The condition failing means the user row is gone. The
+                // handler checked it existed a moment earlier, so this is the
+                // narrow race between that read and this write -- report it
+                // as the 404 the handler already knows how to render, not a
+                // 500 that reads like the service is broken.
+                if let SdkError::ServiceError(ref se) = err
+                    && se.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    return DynamoDBError::ConditionalConflict;
+                }
                 error!("Failed to put entitlements for {}: {:?}", user_id, err);
                 DynamoDBError::SdkError(err.to_string())
             })?;
@@ -1206,25 +1216,39 @@ impl DynamoDBStore {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<AgentDelegation>, DynamoDBError> {
-        let result = self
-            .client
-            .query()
-            .table_name(&self.agent_delegations_table)
-            .index_name("root_user_id-index")
-            .key_condition_expression("root_user_id = :root_user_id")
-            .expression_attribute_values(":root_user_id", AttributeValue::S(user_id.to_string()))
-            .send()
-            .await
-            .map_err(|err| {
+        // Paginate: a single query stops at DynamoDB's 1 MB page boundary,
+        // which would silently drop delegations from the listing -- a revoked
+        // one that never appears is worse than a slow response.
+        let mut delegations = Vec::new();
+        let mut exclusive_start = None;
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.agent_delegations_table)
+                .index_name("root_user_id-index")
+                .key_condition_expression("root_user_id = :root_user_id")
+                .expression_attribute_values(
+                    ":root_user_id",
+                    AttributeValue::S(user_id.to_string()),
+                );
+            if let Some(key) = exclusive_start {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let result = query.send().await.map_err(|err| {
                 error!("Failed to list delegations for user {}: {:?}", user_id, err);
                 DynamoDBError::from(err)
             })?;
 
-        let mut delegations = Vec::new();
-        for item in result.items.unwrap_or_default() {
-            match Self::item_to_agent_delegation(&item) {
-                Ok(d) => delegations.push(d),
-                Err(err) => warn!("Skipping unparseable delegation item: {:?}", err),
+            for item in result.items.unwrap_or_default() {
+                match Self::item_to_agent_delegation(&item) {
+                    Ok(d) => delegations.push(d),
+                    Err(err) => warn!("Skipping unparseable delegation item: {:?}", err),
+                }
+            }
+            match result.last_evaluated_key {
+                Some(k) => exclusive_start = Some(k),
+                None => break,
             }
         }
         Ok(delegations)
@@ -1235,26 +1259,48 @@ impl DynamoDBStore {
         &self,
         user_id: Uuid,
     ) -> Result<u32, DynamoDBError> {
-        let result = self
-            .client
-            .query()
-            .table_name(&self.agent_delegations_table)
-            .index_name("root_user_id-index")
-            .key_condition_expression("root_user_id = :root_user_id")
-            .filter_expression("attribute_not_exists(revoked_at)")
-            .expression_attribute_values(":root_user_id", AttributeValue::S(user_id.to_string()))
-            .select(aws_sdk_dynamodb::types::Select::Count)
-            .send()
-            .await
-            .map_err(|err| {
+        // Paginate, and count only rows that still hold the quota. `Count`
+        // with a filter reports what survived the filter *on the scanned
+        // page*, so a single call under-reports once the index spans pages.
+        // Expired-but-unrevoked rows are excluded because they are now
+        // replaceable (see `create_agent_delegation`); counting them would
+        // let dead rows accumulate against MAX_AGENTS_PER_USER forever.
+        let now = chrono::Utc::now().timestamp();
+        let mut total = 0u32;
+        let mut exclusive_start = None;
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.agent_delegations_table)
+                .index_name("root_user_id-index")
+                .key_condition_expression("root_user_id = :root_user_id")
+                .filter_expression(
+                    "attribute_not_exists(revoked_at) AND (attribute_not_exists(expires_at) OR expires_at >= :now)",
+                )
+                .expression_attribute_values(
+                    ":root_user_id",
+                    AttributeValue::S(user_id.to_string()),
+                )
+                .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+                .select(aws_sdk_dynamodb::types::Select::Count);
+            if let Some(key) = exclusive_start {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let result = query.send().await.map_err(|err| {
                 error!(
                     "Failed to count delegations for user {}: {:?}",
                     user_id, err
                 );
                 DynamoDBError::from(err)
             })?;
-
-        Ok(result.count as u32)
+            total = total.saturating_add(result.count as u32);
+            match result.last_evaluated_key {
+                Some(k) => exclusive_start = Some(k),
+                None => break,
+            }
+        }
+        Ok(total)
     }
 
     /// Revoke one delegation (sets `revoked_at`).
