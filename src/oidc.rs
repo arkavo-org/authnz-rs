@@ -1284,7 +1284,21 @@ async fn handle_refresh_token_grant(
             Ok(user_id) => match app_state.db_store.get_user_entitlements(&user_id).await {
                 Ok(list) => list,
                 Err(e) => {
+                    // The token was already consumed by `take()` above, so a
+                    // bare 503 would tell the client to retry with a token
+                    // that no longer exists (the retry would 400
+                    // invalid_grant and force full re-authentication). Put
+                    // the record back first so the retry this status invites
+                    // can actually succeed. The record keeps its original
+                    // `expires_at`, so restoring it does not extend the
+                    // refresh token's lifetime.
                     error!("refresh_token grant: entitlement lookup failed: {}", e);
+                    if let Err(restore) = refresh_store.insert(r_token, record.clone()).await {
+                        error!(
+                            "refresh_token grant: could not restore the rotated refresh token: {};                              the client must re-authenticate",
+                            restore
+                        );
+                    }
                     return oidc_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "temporarily_unavailable",
@@ -2605,6 +2619,15 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A retryable status has to leave something to retry with: the token
+        // was consumed by rotation before the lookup ran, so the grant must
+        // put it back rather than stranding the client on invalid_grant.
+        let restored = refresh_store.take(token).await.unwrap();
+        assert!(
+            restored.is_some(),
+            "503 must restore the rotated refresh token"
+        );
     }
 
     #[tokio::test]
