@@ -4,6 +4,8 @@ version = "0.7.0"
 edition = "2024"
 license = "BSD-2"
 rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
+# Adding src/bin/seed-test-user.rs makes `cargo run` ambiguous without this.
+default-run = "authnz-rs"
 
 [profile.release]
 opt-level = 2  # Lower optimization level
@@ -55,6 +57,11 @@ x509-parser = "=0.16.0"  # Certificate chain validation
 base64 = "=0.22.1"       # Encoding/decoding for attestation data
 hex = "=0.4.3"           # Hex encoding for hashes
 aes-gcm = "0.10"         # AES-256-GCM for sealing Patreon tokens under KMS-wrapped DEK
+
+# Agent delegation: did:key (Ed25519 multicodec, base58btc) parsing + proof verification
+ed25519-dalek = "2"
+bs58 = "0.5"
+getrandom = "0.2"
 
 # did:webvh log engine (opt-in via the `webvh` feature) — DIF reference impl.
 # Heavy transitive tree, so gated to keep the default build lean. Needs the MSRV

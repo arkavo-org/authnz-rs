@@ -22,6 +22,7 @@ use crate::AppState;
 use crate::apple_signin;
 use crate::constants::{
     ACCESS_TOKEN_LIFETIME_SECONDS, AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER,
+    DEFAULT_USER_ENTITLEMENTS, ENTITLEMENT_TDF_CREATE, ENTITLEMENT_TDF_DECRYPT,
     ID_TOKEN_LIFETIME_SECONDS,
 };
 use axum::Json;
@@ -160,6 +161,12 @@ pub struct AuthorizationCodeRecord {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RefreshTokenRecord {
     pub subject: String,
+    /// The Arkavo account UUID (as a string), for both the `arkavo:<uuid>`
+    /// and `apple:<sub>` subject shapes — see `AuthenticatedUser::arkavo_account_id`,
+    /// which both auth paths populate with `UserCredentials.user_id`.
+    /// Threaded through refresh-token rotation so per-user entitlements can
+    /// be looked up at refresh time regardless of idp.
+    pub arkavo_account_id: String,
     pub client_id: String,
     pub scopes: String,
     pub expires_at: i64,
@@ -976,6 +983,7 @@ async fn handle_authorization_code_grant(
         let expires_at = now + crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
         let refresh_record = RefreshTokenRecord {
             subject: record.user.subject.clone(),
+            arkavo_account_id: record.user.arkavo_account_id.clone(),
             client_id: record.client_id.clone(),
             scopes: record.scope.clone(),
             expires_at,
@@ -1080,7 +1088,10 @@ async fn handle_client_credentials_grant(
         arkavo_account_id: client_subject.clone(),
         arkavo_roles: vec!["service-account".to_string()],
         // Grant standard entitlements so service accounts can encrypt/decrypt OpenTDF payloads
-        arkavo_entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+        arkavo_entitlements: vec![
+            ENTITLEMENT_TDF_CREATE.to_string(),
+            ENTITLEMENT_TDF_DECRYPT.to_string(),
+        ],
     };
 
     let mut header = Header::new(Algorithm::ES256);
@@ -1242,7 +1253,10 @@ async fn handle_refresh_token_grant(
     let (roles, entitlements, idp) = if record.subject.starts_with("client:") {
         (
             vec!["service-account".to_string()],
-            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+            vec![
+                ENTITLEMENT_TDF_CREATE.to_string(),
+                ENTITLEMENT_TDF_DECRYPT.to_string(),
+            ],
             "client_credentials".to_string(),
         )
     } else {
@@ -1251,11 +1265,59 @@ async fn handle_refresh_token_grant(
         } else {
             "webauthn"
         };
-        (
-            vec!["user".to_string()],
-            vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
-            auth_idp.to_string(),
-        )
+        // The record's `arkavo_account_id` is the Arkavo user UUID for both
+        // the webauthn (`arkavo:<uuid>`) and Apple (`apple:<sub>`) subject
+        // shapes — both auth paths set `AuthenticatedUser::arkavo_account_id`
+        // to `UserCredentials.user_id`, which is threaded onto the refresh
+        // record at issuance/rotation. `arkavo_account_id` is a required
+        // `String` field on `RefreshTokenRecord` (no `#[serde(default)]`), so
+        // a record predating this field would fail to deserialize before
+        // reaching this code at all — this fallback can't actually be
+        // reached that way. It stays purely defensive: fall back to the
+        // defaults if the value is ever unparseable for some other reason.
+        let entitlements = match Uuid::parse_str(&record.arkavo_account_id) {
+            // A DB failure here must NOT silently mint an entitlement-free
+            // token: the client would get a valid access_token that quietly
+            // decrypts nothing for its full lifetime, with no error to react
+            // to. Surface it as retryable, the same way the authorize path
+            // does, and let the client retry the refresh.
+            Ok(user_id) => match app_state.db_store.get_user_entitlements(&user_id).await {
+                Ok(list) => list,
+                Err(e) => {
+                    // The token was already consumed by `take()` above, so a
+                    // bare 503 would tell the client to retry with a token
+                    // that no longer exists (the retry would 400
+                    // invalid_grant and force full re-authentication). Put
+                    // the record back first so the retry this status invites
+                    // can actually succeed. The record keeps its original
+                    // `expires_at`, so restoring it does not extend the
+                    // refresh token's lifetime.
+                    error!("refresh_token grant: entitlement lookup failed: {}", e);
+                    if let Err(restore) = refresh_store.insert(r_token, record.clone()).await {
+                        error!(
+                            "refresh_token grant: could not restore the rotated refresh token: {};                              the client must re-authenticate",
+                            restore
+                        );
+                    }
+                    return oidc_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "temporarily_unavailable",
+                        "entitlement lookup failed",
+                    );
+                }
+            },
+            Err(_) => {
+                warn!(
+                    "refresh_token grant: arkavo_account_id {:?} is not a uuid, using default entitlements",
+                    record.arkavo_account_id
+                );
+                DEFAULT_USER_ENTITLEMENTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        };
+        (vec!["user".to_string()], entitlements, auth_idp.to_string())
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
@@ -1332,6 +1394,7 @@ async fn handle_refresh_token_grant(
     let expires_at = now + crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
     let new_refresh_record = RefreshTokenRecord {
         subject: record.subject.clone(),
+        arkavo_account_id: record.arkavo_account_id.clone(),
         client_id: record.client_id.clone(),
         scopes: record.scopes.clone(),
         expires_at,
@@ -1497,6 +1560,9 @@ impl IntoResponse for AuthorizeError {
             }
             AuthorizeError::AppleNonceRequired => (StatusCode::BAD_REQUEST, "invalid_request"),
             AuthorizeError::AppleSigninError(_) => (StatusCode::UNAUTHORIZED, "invalid_token"),
+            AuthorizeError::Database(msg) if msg.starts_with("Table does not exist") => {
+                (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+            }
             AuthorizeError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
         oidc_error_response(status, code, &self.to_string())
@@ -1578,7 +1644,13 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
     let account_id = claims.sub;
-    // Best-effort role/entitlement defaults. Future work: persist these on the user.
+    let user_id = Uuid::parse_str(&account_id)
+        .map_err(|_| AuthorizeError::InvalidArkavoJwt("sub is not a uuid".into()))?;
+    let entitlements = app_state
+        .db_store
+        .get_user_entitlements(&user_id)
+        .await
+        .map_err(|e| AuthorizeError::Database(e.to_string()))?;
     Ok(AuthenticatedUser {
         subject: format!("arkavo:{}", account_id),
         arkavo_account_id: account_id,
@@ -1586,7 +1658,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         email_verified: None,
         idp: "webauthn".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+        entitlements,
     })
 }
 
@@ -1826,6 +1898,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn test_authorize_error_database_is_not_invalid_token() {
+        let table_missing = AuthorizeError::Database(
+            crate::db::DynamoDBError::TableNotExists("credentials".into()).to_string(),
+        )
+        .into_response();
+        assert_eq!(table_missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let other = AuthorizeError::Database("Amazon SdkError: throttling".into()).into_response();
+        assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let invalid = AuthorizeError::InvalidArkavoJwt("nope".into()).into_response();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    }
+
     fn env_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
@@ -1957,7 +2044,7 @@ mod tests {
             email_verified: Some(true),
             idp: "apple".into(),
             roles: vec!["user".into()],
-            entitlements: vec!["tdf:create".into()],
+            entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2008,6 +2095,7 @@ mod tests {
         let token = "some-secure-token-value-123456789";
         let record = RefreshTokenRecord {
             subject: "client:opentdf".into(),
+            arkavo_account_id: Uuid::nil().to_string(),
             client_id: "opentdf".into(),
             scopes: "openid offline_access".into(),
             expires_at: Utc::now().timestamp() + 600,
@@ -2016,7 +2104,9 @@ mod tests {
         store.insert(token, record).await.unwrap();
         let taken = store.take(token).await.unwrap();
         assert!(taken.is_some());
-        assert_eq!(taken.unwrap().client_id, "opentdf");
+        let taken = taken.unwrap();
+        assert_eq!(taken.client_id, "opentdf");
+        assert_eq!(taken.arkavo_account_id, Uuid::nil().to_string());
         // rotated/single-use: second take returns None
         assert!(store.take(token).await.unwrap().is_none());
     }
@@ -2199,7 +2289,10 @@ mod tests {
             idp: "apple".into(),
             arkavo_account_id: "uuid".into(),
             arkavo_roles: vec!["user".into()],
-            arkavo_entitlements: vec!["tdf:create".into(), "tdf:decrypt".into()],
+            arkavo_entitlements: vec![
+                ENTITLEMENT_TDF_CREATE.to_string(),
+                ENTITLEMENT_TDF_DECRYPT.to_string(),
+            ],
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(!json.contains("nonce"));
@@ -2257,6 +2350,11 @@ mod tests {
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
+                    "agent_delegations".to_string(),
+                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                 )
                 .await
                 .unwrap(),
@@ -2270,6 +2368,12 @@ mod tests {
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(crate::agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2314,6 +2418,12 @@ mod tests {
             std::env::set_var("AWS_REGION", "us-east-1");
             std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+            // Force the DynamoDB client to a closed local port so the
+            // Apple-subject entitlement lookup below (which now runs for
+            // real, see arkavo_account_id on the refresh record) fails fast
+            // and deterministically instead of depending on real network
+            // reachability to AWS.
+            std::env::set_var("AWS_ENDPOINT_URL_DYNAMODB", "http://127.0.0.1:1");
         }
         let scalar = p256::elliptic_curve::ScalarPrimitive::from_slice(&[0x42u8; 32]).unwrap();
         let secret = SecretKey::new(scalar);
@@ -2355,6 +2465,11 @@ mod tests {
                     "device_bindings".to_string(),
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
+                    "agent_delegations".to_string(),
+                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                 )
                 .await
                 .unwrap(),
@@ -2368,6 +2483,12 @@ mod tests {
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(crate::agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2383,8 +2504,15 @@ mod tests {
 
         let refresh_store = RefreshTokenStore::new(test_redis());
         let token = "my-refresh-token-123";
+        // A non-uuid `arkavo_account_id` short-circuits the entitlement
+        // lookup to the configured defaults *before* any DynamoDB call, which
+        // is what lets this test cover the rest of the grant (client auth,
+        // minting, rotation, response shape) with no database. The uuid path
+        // needs a real store; its failure mode is covered by
+        // `test_refresh_token_grant_entitlement_lookup_failure_is_503`.
         let record = RefreshTokenRecord {
             subject: "apple:123".into(),
+            arkavo_account_id: "legacy-record-without-uuid".into(),
             client_id: "test-client".into(),
             scopes: "openid offline_access".into(),
             expires_at: Utc::now().timestamp() + 3600,
@@ -2425,6 +2553,81 @@ mod tests {
 
         // Verification of rotation: original token must be gone
         assert!(refresh_store.take(token).await.unwrap().is_none());
+    }
+
+    /// A failed entitlement lookup must not mint a token: an access_token
+    /// carrying an empty entitlement list would be structurally valid and
+    /// silently decrypt nothing for its whole lifetime, giving the client
+    /// nothing to retry on. The grant reports the outage instead.
+    #[tokio::test]
+    async fn test_refresh_token_grant_entitlement_lookup_failure_is_503() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        // The test store points at table names that do not exist, so the
+        // uuid path's `get_user_entitlements` call fails.
+        let app_state = crate::test_helpers::build_test_app_state().await;
+
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "test-client".to_string(),
+            OidcClient {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                redirect_uris: vec![],
+            },
+        );
+        let oidc = Arc::new(oidc);
+
+        let refresh_store = RefreshTokenStore::new(test_redis());
+        let token = "refresh-token-db-down";
+        refresh_store
+            .insert(
+                token,
+                RefreshTokenRecord {
+                    subject: "apple:123".into(),
+                    arkavo_account_id: Uuid::new_v4().to_string(),
+                    client_id: "test-client".into(),
+                    scopes: "openid offline_access".into(),
+                    expires_at: Utc::now().timestamp() + 3600,
+                    created_at: Utc::now().timestamp(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let form = TokenForm {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: Some("test-client".to_string()),
+            client_secret: Some("test-secret".to_string()),
+            code_verifier: None,
+            refresh_token: Some(token.to_string()),
+            scope: None,
+        };
+
+        let resp = handle_refresh_token_grant(
+            app_state,
+            oidc,
+            refresh_store.clone(),
+            test_patreon_state(),
+            HeaderMap::new(),
+            form,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A retryable status has to leave something to retry with: the token
+        // was consumed by rotation before the lookup ran, so the grant must
+        // put it back rather than stranding the client on invalid_grant.
+        let restored = refresh_store.take(token).await.unwrap();
+        assert!(
+            restored.is_some(),
+            "503 must restore the rotated refresh token"
+        );
     }
 
     #[tokio::test]
@@ -2583,6 +2786,12 @@ mod tests {
         unsafe {
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
         }
+        // Force the DynamoDB client to a closed local port so the entitlement
+        // lookup below fails fast and deterministically (connection refused)
+        // instead of depending on real network reachability to AWS.
+        unsafe {
+            std::env::set_var("AWS_ENDPOINT_URL_DYNAMODB", "http://127.0.0.1:1");
+        }
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
@@ -2596,10 +2805,21 @@ mod tests {
         };
 
         let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
-        assert!(
-            result.is_ok(),
-            "CWT token should be accepted, got {:?}",
-            result.err()
-        );
+        // This test's job is the CWT-vs-JWT discriminator: the token must get
+        // past decode + signature verification + sub-parsing before it can
+        // even reach the entitlement lookup. The DynamoDB endpoint above is
+        // pinned to a closed local port, so the lookup itself always fails
+        // deterministically here — a Database error therefore proves the CWT
+        // was accepted and the code reached the store; any other outcome
+        // means the CWT itself was rejected. The lookup's success path (a
+        // real DynamoDB Local backend) is covered by tests/agent_flow.rs.
+        match result {
+            Ok(_) => {}
+            Err(AuthorizeError::Database(_)) => {}
+            other => panic!(
+                "CWT should be accepted (or fail only at entitlement lookup), got {:?}",
+                other
+            ),
+        }
     }
 }

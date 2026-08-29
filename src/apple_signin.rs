@@ -446,7 +446,7 @@ pub async fn map_apple_user(
         email_verified,
         idp: "apple".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: vec!["tdf:create".to_string(), "tdf:decrypt".to_string()],
+        entitlements: user.entitlements.clone(),
     })
 }
 

@@ -52,3 +52,52 @@ jobs:
         with:
           name: ${{ matrix.target }}-build
           path: target/${{ matrix.target }}/release/authnz-rs
+  agent-flow:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports: ["8000:8000"]
+    env:
+      AWS_ENDPOINT_URL_DYNAMODB: http://localhost:8000
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+      AGENT_TOKEN_AUDIENCES: https://platform.test
+      AGENT_AUTHORIZED_ACTORS: https://kg.test
+      ADMIN_CLIENT_IDS: it
+      OIDC_ISSUER: http://127.0.0.1:8080
+      PORT: "8080"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/dynamodb-local-tables.sh
+      - name: keys
+        run: |
+          openssl ecparam -genkey -name prime256v1 -noout -out signkey.pem
+          openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out encodekey.pem
+          openssl ec -in encodekey.pem -pubout -out decodekey.pem
+          echo "SIGN_KEY_PATH=$PWD/signkey.pem" >> $GITHUB_ENV
+          echo "ENCODING_KEY_PATH=$PWD/encodekey.pem" >> $GITHUB_ENV
+          echo "DECODING_KEY_PATH=$PWD/decodekey.pem" >> $GITHUB_ENV
+      - run: cargo build
+      - name: seed user + mint human/service CWTs
+        run: cargo run --bin seed-test-user -- --encoding-key encodekey.pem --decoding-key decodekey.pem --issuer http://127.0.0.1:8080 > human.cwt
+      # main.rs loads this unconditionally at startup (`?` on the read); it's
+      # gitignored (deployment-specific, real Apple app ids), so CI needs a
+      # placeholder — content doesn't matter, this test never hits the
+      # /.well-known/apple-app-site-association route.
+      - run: echo '{}' > apple-app-site-association.json
+      - name: start server and wait for health
+        run: |
+          cargo run &
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "authnz-rs did not become healthy within 30s"
+            exit 1
+          fi
+      - run: AUTHNZ_TEST_BASE_URL=http://127.0.0.1:8080 AUTHNZ_TEST_HUMAN_CWT=$(cat human.cwt) AUTHNZ_TEST_SERVICE_CWT=$(cat service.cwt) cargo test --test agent_flow -- --ignored

@@ -42,6 +42,24 @@ pub struct Cnf {
     pub kid: Vec<u8>,
 }
 
+/// RFC 8693 §4.1 actor entry: who may present this token on the subject's behalf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    pub sub: String,
+}
+
+/// Non-person-entity descriptor (spec §1). `npe_type` is `"agent"` or `"device"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkavoNpe {
+    pub npe_type: String,
+    pub class: Option<String>,
+    pub attestation_expiry: Option<i64>,
+    pub device_id: Option<String>,
+    pub delegation_id: Option<String>,
+    pub depth: Option<u8>,
+    pub chain: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CustomClaims {
     pub idp: Option<String>,
@@ -56,6 +74,8 @@ pub struct CustomClaims {
     /// per the architecture statement, "Patreon proves membership, authnz-rs
     /// materializes entitlement", and the materialization lives in the token.
     pub arkavo_patreon: Option<ArkavoPatreon>,
+    pub act: Option<Vec<Actor>>,
+    pub arkavo_npe: Option<ArkavoNpe>,
 }
 
 /// Materialized Patreon membership for embedding in a CWT access token.
@@ -152,13 +172,15 @@ impl ArkavoClaims {
             .expect("ArkavoClaims: weeks * 7*24*3600 overflowed i64")
     }
 
-    pub fn auth(iss: &str, sub: &str, hours: i64) -> Self {
-        Self::base(
-            iss,
-            sub,
-            Audience::Single("arkavo".into()),
-            Self::hours_to_secs(hours),
-        )
+    /// Human auth token. `platform_audience` extends `aud` so the app can
+    /// present the same CWT to arks/KAS once Track 3 pins
+    /// `CWT_EXPECTED_AUDIENCE` to a single non-`"arkavo"` audience.
+    pub fn auth(iss: &str, sub: &str, hours: i64, platform_audience: Option<&str>) -> Self {
+        let aud = match platform_audience {
+            Some(p) => Audience::Multiple(vec!["arkavo".into(), p.to_string()]),
+            None => Audience::Single("arkavo".into()),
+        };
+        Self::base(iss, sub, aud, Self::hours_to_secs(hours))
     }
 
     pub fn registration(iss: &str, sub: &str, weeks: i64) -> Self {
@@ -170,13 +192,14 @@ impl ArkavoClaims {
         )
     }
 
-    pub fn devicecheck(iss: &str, sub: &str, hours: i64) -> Self {
-        Self::base(
-            iss,
-            sub,
-            Audience::Single("arkavo:devicecheck".into()),
-            Self::hours_to_secs(hours),
-        )
+    /// DeviceCheck assertion token. `platform_audience` extends `aud` so the
+    /// platform verifier accepts the device CWT as its own subject (spec §1.3).
+    pub fn devicecheck(iss: &str, sub: &str, hours: i64, platform_audience: Option<&str>) -> Self {
+        let aud = match platform_audience {
+            Some(p) => Audience::Multiple(vec!["arkavo:devicecheck".into(), p.to_string()]),
+            None => Audience::Single("arkavo:devicecheck".into()),
+        };
+        Self::base(iss, sub, aud, Self::hours_to_secs(hours))
     }
 
     pub fn oidc_access(iss: &str, sub: &str, audience: &str, hours: i64) -> Self {
@@ -186,6 +209,23 @@ impl ArkavoClaims {
             Audience::Single(audience.into()),
             Self::hours_to_secs(hours),
         )
+    }
+
+    /// Agent NPE token: multi-audience, minutes-scale lifetime, hard-capped
+    /// at [`crate::constants::AGENT_TOKEN_MINUTES_MAX`].
+    pub fn agent(iss: &str, sub: &str, audiences: Vec<String>, minutes: i64) -> Self {
+        let capped = minutes.clamp(1, crate::constants::AGENT_TOKEN_MINUTES_MAX);
+        Self::base(iss, sub, Audience::Multiple(audiences), capped * 60)
+    }
+
+    pub fn with_act(mut self, actors: Vec<Actor>) -> Self {
+        self.custom.act = Some(actors);
+        self
+    }
+
+    pub fn with_arkavo_npe(mut self, npe: ArkavoNpe) -> Self {
+        self.custom.arkavo_npe = Some(npe);
+        self
     }
 
     pub fn with_cnf(mut self, cnf: Cnf) -> Self {
@@ -297,14 +337,44 @@ pub fn cnf_from_app_attest(public_key_bytes: &[u8], device_id: &[u8]) -> Result<
     })
 }
 
+/// `cnf` for an Ed25519 key (agent did:key): COSE_Key kty=OKP, crv=Ed25519.
+pub fn cnf_from_ed25519(public_key: &[u8; 32], kid: &[u8]) -> Cnf {
+    use coset::{CoseKey, KeyType, Label, iana};
+    let cose_key = CoseKey {
+        kty: KeyType::Assigned(iana::KeyType::OKP),
+        key_id: kid.to_vec(),
+        params: vec![
+            (
+                Label::Int(iana::OkpKeyParameter::Crv as i64),
+                Value::from(iana::EllipticCurve::Ed25519 as u64),
+            ),
+            (
+                Label::Int(iana::OkpKeyParameter::X as i64),
+                Value::Bytes(public_key.to_vec()),
+            ),
+        ],
+        ..Default::default()
+    };
+    Cnf {
+        cose_key,
+        kid: kid.to_vec(),
+    }
+}
+
 /// CBOR encoding of tag #6.61 (CWT, RFC 8392 §6):
 /// major type 6, additional info 24, uint8 = 61.
-pub(crate) const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
+// `pub` (not `pub(crate)`): now that `cwt` lives in the `authnz_rs` lib crate
+// (Task 7), the bin's whitebox wire-format tests (authn.rs, device_check.rs,
+// oidc.rs `#[cfg(test)]` modules) need cross-crate access via
+// `authnz_rs::cwt::…`. `pub(crate)` would only be visible within this lib
+// crate, not from the bin. No behavior change — internal helper, still
+// undocumented in any public API surface beyond the wire-format test usage.
+pub const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
 
 /// Strip the CWT CBOR tag #6.61 prefix. Strict: input MUST start with the
 /// tag. Untagged COSE_Sign1 is rejected so a downstream verifier cannot be
 /// tricked by feeding raw COSE_Sign1 to a CWT consumer.
-pub(crate) fn strip_cwt_tag(bytes: &[u8]) -> Result<&[u8], CwtError> {
+pub fn strip_cwt_tag(bytes: &[u8]) -> Result<&[u8], CwtError> {
     bytes
         .strip_prefix(&CWT_TAG_PREFIX[..])
         .ok_or(CwtError::Malformed)
@@ -403,6 +473,53 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     }
     if let Some(p) = &c.custom.arkavo_patreon {
         entries.push((Value::Text("arkavo_patreon".into()), patreon_to_cbor(p)));
+    }
+    if let Some(actors) = &c.custom.act {
+        entries.push((
+            Value::Text("act".into()),
+            Value::Array(
+                actors
+                    .iter()
+                    .map(|a| {
+                        Value::Map(vec![(
+                            Value::Text("sub".into()),
+                            Value::Text(a.sub.clone()),
+                        )])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(n) = &c.custom.arkavo_npe {
+        let mut m = vec![(Value::Text("type".into()), Value::Text(n.npe_type.clone()))];
+        if let Some(v) = &n.class {
+            m.push((Value::Text("class".into()), Value::Text(v.clone())));
+        }
+        if let Some(v) = n.attestation_expiry {
+            m.push((
+                Value::Text("attestation_expiry".into()),
+                Value::Integer(v.into()),
+            ));
+        }
+        if let Some(v) = &n.device_id {
+            m.push((Value::Text("device_id".into()), Value::Text(v.clone())));
+        }
+        if let Some(v) = &n.delegation_id {
+            m.push((Value::Text("delegation_id".into()), Value::Text(v.clone())));
+        }
+        if let Some(v) = n.depth {
+            m.push((
+                Value::Text("depth".into()),
+                Value::Integer((v as i64).into()),
+            ));
+        }
+        if let Some(v) = &n.chain {
+            m.push((
+                Value::Text("chain".into()),
+                Value::Array(v.iter().map(|s| Value::Text(s.clone())).collect()),
+            ));
+        }
+        entries.push((Value::Text("arkavo_npe".into()), Value::Map(m)));
     }
 
     let mut bytes = Vec::new();
@@ -555,7 +672,8 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
     })
 }
 
-pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
+// `pub` for the same cross-crate test-access reason as `strip_cwt_tag` above.
+pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
     let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
@@ -702,6 +820,86 @@ pub(crate) fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
             (Value::Text(s), v) if s == "arkavo_patreon" => {
                 custom.arkavo_patreon = Some(patreon_from_cbor(v)?);
             }
+            (Value::Text(s), Value::Array(a)) if s == "act" => {
+                let mut actors = Vec::new();
+                for entry in a {
+                    let Value::Map(m) = entry else {
+                        return Err(CwtError::Malformed);
+                    };
+                    let sub = m
+                        .into_iter()
+                        .find_map(|(k, v)| match (k, v) {
+                            (Value::Text(k), Value::Text(v)) if k == "sub" => Some(v),
+                            _ => None,
+                        })
+                        .ok_or(CwtError::Malformed)?;
+                    actors.push(Actor { sub });
+                }
+                custom.act = Some(actors);
+            }
+            (Value::Text(s), _) if s == "act" => return Err(CwtError::Malformed),
+            (Value::Text(s), Value::Map(m)) if s == "arkavo_npe" => {
+                let mut n = ArkavoNpe {
+                    npe_type: String::new(),
+                    class: None,
+                    attestation_expiry: None,
+                    device_id: None,
+                    delegation_id: None,
+                    depth: None,
+                    chain: None,
+                };
+                for (k, v) in m {
+                    match (k, v) {
+                        (Value::Text(k), Value::Text(v)) if k == "type" => n.npe_type = v,
+                        (Value::Text(k), Value::Text(v)) if k == "class" => n.class = Some(v),
+                        (Value::Text(k), Value::Integer(v)) if k == "attestation_expiry" => {
+                            n.attestation_expiry = Some(
+                                i64::try_from(i128::from(v)).map_err(|_| CwtError::Malformed)?,
+                            )
+                        }
+                        (Value::Text(k), Value::Text(v)) if k == "device_id" => {
+                            n.device_id = Some(v)
+                        }
+                        (Value::Text(k), Value::Text(v)) if k == "delegation_id" => {
+                            n.delegation_id = Some(v)
+                        }
+                        (Value::Text(k), Value::Integer(v)) if k == "depth" => {
+                            n.depth =
+                                Some(u8::try_from(i128::from(v)).map_err(|_| CwtError::Malformed)?)
+                        }
+                        (Value::Text(k), Value::Array(a)) if k == "chain" => {
+                            let parts: Result<Vec<String>, CwtError> = a
+                                .into_iter()
+                                .map(|x| match x {
+                                    Value::Text(t) => Ok(t),
+                                    _ => Err(CwtError::Malformed),
+                                })
+                                .collect();
+                            n.chain = Some(parts?)
+                        }
+                        (Value::Text(k), _)
+                            if matches!(
+                                k.as_str(),
+                                "type"
+                                    | "class"
+                                    | "attestation_expiry"
+                                    | "device_id"
+                                    | "delegation_id"
+                                    | "depth"
+                                    | "chain"
+                            ) =>
+                        {
+                            return Err(CwtError::Malformed);
+                        }
+                        _ => {}
+                    }
+                }
+                if n.npe_type.is_empty() {
+                    return Err(CwtError::Malformed);
+                }
+                custom.arkavo_npe = Some(n);
+            }
+            (Value::Text(s), _) if s == "arkavo_npe" => return Err(CwtError::Malformed),
             _ => {} // Ignore unknown claims (forward-compat).
         }
     }
@@ -820,7 +1018,7 @@ mod tests {
     #[test]
     fn mint_produces_parseable_cose_sign1() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         // Strip the CWT tag and decode the COSE_Sign1 envelope.
         let inner = strip_cwt_tag(&bytes).expect("CWT tag");
@@ -836,7 +1034,7 @@ mod tests {
     #[test]
     fn mint_payload_contains_expected_claims() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         let sign1 = coset::CoseSign1::from_slice(strip_cwt_tag(&bytes).unwrap()).unwrap();
         let payload_bytes = sign1.payload.unwrap();
@@ -859,7 +1057,7 @@ mod tests {
 
     #[test]
     fn arkavo_claims_auth_defaults() {
-        let c = ArkavoClaims::auth("https://identity.arkavo.net", "user-uuid", 1);
+        let c = ArkavoClaims::auth("https://identity.arkavo.net", "user-uuid", 1, None);
         assert_eq!(c.iss, "https://identity.arkavo.net");
         assert_eq!(c.sub, "user-uuid");
         assert_eq!(c.aud, Audience::Single("arkavo".to_string()));
@@ -867,6 +1065,17 @@ mod tests {
         assert_eq!(c.exp - c.iat, 3600);
         assert_eq!(c.cti.len(), 16);
         assert!(c.cnf.is_none());
+    }
+
+    #[test]
+    fn auth_claims_carry_platform_audience() {
+        let c = ArkavoClaims::auth("i", "u", 1, Some("https://platform.arkavo.net"));
+        assert_eq!(
+            c.aud,
+            Audience::Multiple(vec!["arkavo".into(), "https://platform.arkavo.net".into()])
+        );
+        let c = ArkavoClaims::auth("i", "u", 1, None);
+        assert_eq!(c.aud, Audience::Single("arkavo".into()));
     }
 
     #[test]
@@ -890,14 +1099,14 @@ mod tests {
 
     #[test]
     fn arkavo_claims_cti_differs_across_mints() {
-        let a = ArkavoClaims::auth("iss", "sub", 1);
-        let b = ArkavoClaims::auth("iss", "sub", 1);
+        let a = ArkavoClaims::auth("iss", "sub", 1, None);
+        let b = ArkavoClaims::auth("iss", "sub", 1, None);
         assert_ne!(a.cti, b.cti);
     }
 
     #[test]
     fn cbor_roundtrip_minimal_claims() {
-        let c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let c = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
         assert_eq!(decoded.iss, c.iss);
@@ -992,7 +1201,7 @@ mod tests {
 
     #[test]
     fn cbor_roundtrip_audience_multiple() {
-        let mut c = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let mut c = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         c.aud = Audience::Multiple(vec!["a".into(), "b".into()]);
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
@@ -1047,7 +1256,7 @@ mod tests {
     #[test]
     fn verify_roundtrip_succeeds() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1063,7 +1272,7 @@ mod tests {
     #[test]
     fn mint_emits_cwt_cbor_tag_61() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).expect("mint");
         // RFC 8392 §6: tag 61 encodes as [0xD8, 0x3D] (major-6 + uint8(61)).
         assert_eq!(&bytes[..2], &[0xD8, 0x3D]);
@@ -1072,7 +1281,7 @@ mod tests {
     #[test]
     fn verify_rejects_untagged_cose_sign1() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let tagged = mint(&claims, &sk, &test_kid()).unwrap();
         // Strip the tag -> bare COSE_Sign1; verifier must reject.
         let untagged = &tagged[CWT_TAG_PREFIX.len()..];
@@ -1095,7 +1304,7 @@ mod tests {
     fn verify_rejects_wrong_key() {
         let (sk, _vk) = test_keypair();
         let (_sk2, vk2) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1111,7 +1320,7 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_payload() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let mut bytes = mint(&claims, &sk, &test_kid()).unwrap();
         // Flip a bit somewhere in the middle (likely in the payload).
         let mid = bytes.len() / 2;
@@ -1135,7 +1344,7 @@ mod tests {
         let (sk, vk) = test_keypair();
         // Manually build a COSE_Sign1 with alg=ES384 but still ES256-signed,
         // simulating an attacker swapping the alg field.
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let payload = claims_to_cbor(&claims).unwrap();
 
         let protected = coset::HeaderBuilder::new()
@@ -1171,7 +1380,7 @@ mod tests {
     #[test]
     fn verify_rejects_missing_alg() {
         // Build a COSE_Sign1 with NO algorithm in protected header.
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let payload = claims_to_cbor(&claims).unwrap();
         let (sk, vk) = test_keypair();
 
@@ -1205,7 +1414,7 @@ mod tests {
     #[test]
     fn verify_rejects_expired() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1222,7 +1431,7 @@ mod tests {
     #[test]
     fn verify_rejects_not_yet_valid() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         let opts = VerifyOptions {
@@ -1243,7 +1452,7 @@ mod tests {
     #[test]
     fn verify_accepts_within_skew_window() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
 
         // now is 30s before iat: within ±60 skew, accepted.
@@ -1259,7 +1468,7 @@ mod tests {
     #[test]
     fn verify_rejects_iss_mismatch() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-other"),
@@ -1276,7 +1485,7 @@ mod tests {
     #[test]
     fn verify_rejects_aud_mismatch() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -1293,7 +1502,25 @@ mod tests {
     #[test]
     fn verify_accepts_aud_match_against_arkavo() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: Some("arkavo"),
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        verify(&bytes, &vk, &opts).expect("verify");
+    }
+
+    #[test]
+    fn verify_accepts_aud_match_against_multiple_audience() {
+        let (sk, vk) = test_keypair();
+        let mut claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        claims.aud = Audience::Multiple(vec![
+            "arkavo".to_string(),
+            "https://platform.arkavo.net".to_string(),
+        ]);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("iss-1"),
@@ -1328,7 +1555,7 @@ mod tests {
     fn mint_with_cnf_roundtrips() {
         let (sk, vk) = test_keypair();
         let cose_key = sample_cose_key();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1).with_cnf(Cnf {
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None).with_cnf(Cnf {
             cose_key: cose_key.clone(),
             kid: b"cred-id".to_vec(),
         });
@@ -1353,7 +1580,7 @@ mod tests {
     #[test]
     fn without_cnf_omits_cnf_from_payload() {
         let (sk, _vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1)
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None)
             .with_cnf(Cnf {
                 cose_key: sample_cose_key(),
                 kid: b"x".to_vec(),
@@ -1368,7 +1595,7 @@ mod tests {
     #[test]
     fn encode_for_header_is_unpadded_base64url() {
         let (sk, vk) = test_keypair();
-        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1);
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let encoded = encode_for_header(&bytes);
         // No padding, no '+' or '/' chars.
@@ -1409,5 +1636,222 @@ mod tests {
     fn cnf_from_app_attest_rejects_invalid_pubkey() {
         let cnf = cnf_from_app_attest(&[0xde, 0xad, 0xbe, 0xef], b"id");
         assert!(matches!(cnf, Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn agent_claims_round_trip_act_npe_cnf() {
+        let (sk, vk) = test_keypair();
+        let kid = test_kid();
+        let npe = ArkavoNpe {
+            npe_type: "agent".into(),
+            class: None,
+            attestation_expiry: None,
+            device_id: None,
+            delegation_id: Some("deleg-1".into()),
+            depth: Some(0),
+            chain: Some(vec![]),
+        };
+        let claims = ArkavoClaims::agent(
+            "https://identity.arkavo.net",
+            "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            vec![
+                "https://platform.arkavo.net".into(),
+                "https://kas.arkavo.net".into(),
+            ],
+            15,
+        )
+        .with_act(vec![Actor {
+            sub: "https://kg.arkavo.net".into(),
+        }])
+        .with_arkavo_npe(npe.clone())
+        .with_cnf(cnf_from_ed25519(&[7u8; 32], b"agent-kid"))
+        .with_arkavo_roles(vec!["agent".into()])
+        .with_arkavo_entitlements(vec!["https://arkavo.ai/attr/action/value/read".into()]);
+
+        assert_eq!(claims.exp - claims.iat, 15 * 60);
+        let bytes = mint(&claims, &sk, &kid).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: Some("https://identity.arkavo.net"),
+            expected_aud: Some("https://kas.arkavo.net"),
+            now: claims.iat + 1,
+            skew_secs: DEFAULT_SKEW_SECS,
+        };
+        let back = verify(&bytes, &vk, &opts).unwrap();
+        assert_eq!(back.custom.act.unwrap()[0].sub, "https://kg.arkavo.net");
+        let got = back.custom.arkavo_npe.unwrap();
+        assert_eq!(got.npe_type, "agent");
+        assert_eq!(got.delegation_id.as_deref(), Some("deleg-1"));
+        assert_eq!(got.depth, Some(0));
+        let cnf = back.cnf.unwrap();
+        assert_eq!(cnf.kid, b"agent-kid");
+        assert_eq!(
+            cnf.cose_key.kty,
+            coset::KeyType::Assigned(coset::iana::KeyType::OKP)
+        );
+        let crv = cnf
+            .cose_key
+            .params
+            .iter()
+            .find(|(l, _)| *l == coset::Label::Int(-1))
+            .map(|(_, v)| v.clone())
+            .expect("crv param present");
+        assert_eq!(crv, Value::from(coset::iana::EllipticCurve::Ed25519 as u64));
+        let x = cnf
+            .cose_key
+            .params
+            .iter()
+            .find(|(l, _)| *l == coset::Label::Int(-2))
+            .map(|(_, v)| v.clone())
+            .expect("x param present");
+        assert_eq!(x, Value::Bytes(vec![7u8; 32]));
+    }
+
+    #[test]
+    fn agent_claims_never_exceed_15_minutes() {
+        let c = ArkavoClaims::agent("i", "did:key:z", vec!["a".into()], 60);
+        assert_eq!(c.exp - c.iat, 15 * 60);
+    }
+
+    #[test]
+    fn device_npe_round_trip() {
+        let (sk, vk) = test_keypair();
+        let kid = test_kid();
+        let claims = ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None)
+            .with_arkavo_npe(ArkavoNpe {
+                npe_type: "device".into(),
+                class: Some("attested".into()),
+                attestation_expiry: Some(1_800_000_000),
+                device_id: Some("keyid".into()),
+                delegation_id: None,
+                depth: None,
+                chain: None,
+            });
+        let bytes = mint(&claims, &sk, &kid).unwrap();
+        let opts = VerifyOptions {
+            expected_iss: None,
+            expected_aud: None,
+            now: claims.iat,
+            skew_secs: 60,
+        };
+        let back = verify(&bytes, &vk, &opts)
+            .unwrap()
+            .custom
+            .arkavo_npe
+            .unwrap();
+        assert_eq!(back.class.as_deref(), Some("attested"));
+        assert_eq!(back.attestation_expiry, Some(1_800_000_000));
+    }
+
+    /// Hand-craft a minimal well-formed claims map (iss/sub/aud/exp/iat/cti)
+    /// plus an `arkavo_npe` entry set to `npe_value`, so an out-of-range or
+    /// wrongly-typed field can be injected without going through the
+    /// type-safe `ArkavoNpe`/`claims_to_cbor` path.
+    fn claims_bytes_with_npe(npe_value: Value) -> Vec<u8> {
+        let entries = vec![
+            (Value::Integer(1.into()), Value::Text("iss-1".into())),
+            (Value::Integer(2.into()), Value::Text("sub-1".into())),
+            (Value::Integer(3.into()), Value::Text("aud-1".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Integer(0.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+            (Value::Text("arkavo_npe".into()), npe_value),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
+        bytes
+    }
+
+    #[test]
+    fn npe_depth_out_of_range_is_malformed() {
+        let too_big = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (Value::Text("depth".into()), Value::Integer(256.into())),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(too_big));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+
+        let negative = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (Value::Text("depth".into()), Value::Integer((-1).into())),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(negative));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn npe_attestation_expiry_out_of_range_is_malformed() {
+        // i64::MAX + 1, as an i128 — fits in CBOR's u64-backed uint range but
+        // overflows i64::try_from.
+        let too_big = i128::from(i64::MAX) + 1;
+        let npe = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("device".into())),
+            (
+                Value::Text("attestation_expiry".into()),
+                Value::Integer(Integer::try_from(too_big).expect("fits CBOR uint range")),
+            ),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn npe_chain_non_text_is_malformed() {
+        let npe = Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("agent".into())),
+            (
+                Value::Text("chain".into()),
+                Value::Array(vec![Value::Text("ok".into()), Value::Integer(1.into())]),
+            ),
+        ]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(
+            matches!(result, Err(CwtError::Malformed)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn act_non_array_is_malformed() {
+        let entries = vec![
+            (Value::Integer(1.into()), Value::Text("iss-1".into())),
+            (Value::Integer(2.into()), Value::Text("sub-1".into())),
+            (Value::Integer(3.into()), Value::Text("aud-1".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Integer(0.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+            (
+                Value::Text("act".into()),
+                Value::Text("not-an-array".into()),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
+        assert!(matches!(claims_from_cbor(&bytes), Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn npe_non_map_is_malformed() {
+        let result = claims_from_cbor(&claims_bytes_with_npe(Value::Text("nope".into())));
+        assert!(matches!(result, Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn npe_wrongly_typed_known_field_is_malformed() {
+        let npe = Value::Map(vec![(Value::Text("type".into()), Value::Integer(1.into()))]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(matches!(result, Err(CwtError::Malformed)));
     }
 }

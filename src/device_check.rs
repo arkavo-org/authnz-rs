@@ -435,12 +435,7 @@ pub async fn finish_assertion(
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
 
     // Mint CWT assertion token with device public key bound via cnf claim
-    let token = mint_assertion_token(
-        &app_state,
-        &binding.user_id,
-        &binding.public_key,
-        binding.device_id.as_bytes(),
-    )?;
+    let token = mint_assertion_token(&app_state, &binding, Utc::now().timestamp())?;
 
     info!("Assertion successful for key_id: {}", request.key_id);
 
@@ -569,24 +564,68 @@ fn verify_assertion_signature(
     Ok(())
 }
 
+/// Device class derived from App Attest assertion freshness (spec §1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Attested,
+    Managed,
+    // Not produced by `device_class` today (a binding always exists once we
+    // mint here) — reserved for a verifier-side caller that finds no binding
+    // at all.
+    #[allow(dead_code)]
+    Unverified,
+}
+
+impl DeviceClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeviceClass::Attested => "attested",
+            DeviceClass::Managed => "managed",
+            DeviceClass::Unverified => "unverified",
+        }
+    }
+}
+
+/// Class from the last successful assertion time. A binding always exists
+/// here (we are minting after a verified assertion), so the floor is `managed`.
+pub fn device_class(last_assertion_at: i64, now: i64) -> (DeviceClass, i64) {
+    let expiry = last_assertion_at + crate::constants::DEVICE_ATTESTATION_TTL_SECONDS;
+    if now <= expiry {
+        (DeviceClass::Attested, expiry)
+    } else {
+        (DeviceClass::Managed, expiry)
+    }
+}
+
 /// Mint a CWT assertion token for a successfully-attested device.
 ///
-/// The token audience is `"arkavo:devicecheck"` and carries the device's
-/// App Attest public key as the `cnf` claim so relying parties can perform
-/// DPoP-style proof-of-possession checks.
+/// The token audience is `"arkavo:devicecheck"` (plus the configured
+/// platform audience, when set) and carries the device's App Attest public
+/// key as the `cnf` claim so relying parties can perform DPoP-style
+/// proof-of-possession checks, along with an `arkavo_npe` device descriptor.
 pub fn mint_assertion_token(
     app_state: &AppState,
-    user_id: &Uuid,
-    device_public_key: &[u8],
-    device_id: &[u8],
+    binding: &DeviceBinding,
+    now: i64,
 ) -> Result<String, DeviceCheckError> {
-    let cnf = crate::cwt::cnf_from_app_attest(device_public_key, device_id)?;
+    let cnf = crate::cwt::cnf_from_app_attest(&binding.public_key, binding.device_id.as_bytes())?;
+    let (class, attestation_expiry) = device_class(now, now); // assertion just verified
     let claims = crate::cwt::ArkavoClaims::devicecheck(
         &app_state.issuer,
-        &user_id.to_string(),
+        &binding.user_id.to_string(),
         AUTH_TOKEN_HOURS,
+        app_state.platform_audience.as_deref(),
     )
-    .with_cnf(cnf);
+    .with_cnf(cnf)
+    .with_arkavo_npe(crate::cwt::ArkavoNpe {
+        npe_type: "device".into(),
+        class: Some(class.as_str().into()),
+        attestation_expiry: Some(attestation_expiry),
+        device_id: Some(binding.device_id.clone()),
+        delegation_id: None,
+        depth: None,
+        chain: None,
+    });
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
 }
@@ -890,7 +929,7 @@ mod tests {
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let device_id = b"device-1".to_vec();
+        let now = chrono::Utc::now().timestamp();
 
         // Sample P-256 public key for cnf (uncompressed SEC1).
         let scalar = p256::FieldBytes::from([0x99u8; 32]);
@@ -898,9 +937,18 @@ mod tests {
         let vk: p256::ecdsa::VerifyingKey = *p256::ecdsa::SigningKey::from(&secret).verifying_key();
         let pubkey = vk.to_encoded_point(false).as_bytes().to_vec();
 
+        let binding = DeviceBinding {
+            device_id: "device-1".to_string(),
+            user_id,
+            public_key: pubkey,
+            counter: 1,
+            app_id: "app-id".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+
         let token =
-            crate::device_check::mint_assertion_token(&app_state, &user_id, &pubkey, &device_id)
-                .expect("mint");
+            crate::device_check::mint_assertion_token(&app_state, &binding, now).expect("mint");
 
         let raw = crate::cwt::decode_from_header(&token).unwrap();
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
@@ -911,6 +959,10 @@ mod tests {
             crate::cwt::Audience::Single("arkavo:devicecheck".into())
         );
         assert!(claims.cnf.is_some());
+        let npe = claims.custom.arkavo_npe.expect("arkavo_npe present");
+        assert_eq!(npe.npe_type, "device");
+        assert_eq!(npe.class.as_deref(), Some("attested"));
+        assert_eq!(npe.device_id.as_deref(), Some("device-1"));
     }
 
     #[tokio::test]
@@ -938,6 +990,38 @@ mod tests {
         };
         let jwt = jsonwebtoken::encode(&header, &claims, &app_state.encoding_key).unwrap();
         let result = crate::device_check::verify_inbound_token(&app_state, &jwt);
-        assert!(matches!(result, Err(_)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_class_from_assertion_freshness() {
+        let now = 1_800_000_000;
+        let ttl = crate::constants::DEVICE_ATTESTATION_TTL_SECONDS;
+        let (c, exp) = device_class(now - 10, now);
+        assert_eq!(c, DeviceClass::Attested);
+        assert_eq!(exp, now - 10 + ttl);
+        let (c, _) = device_class(now - ttl, now);
+        assert_eq!(c, DeviceClass::Attested, "now == expiry is still attested");
+        let (c, _) = device_class(now - ttl - 1, now);
+        assert_eq!(c, DeviceClass::Managed);
+        assert_eq!(DeviceClass::Unverified.as_str(), "unverified");
+    }
+
+    #[test]
+    fn devicecheck_claims_carry_platform_audience() {
+        let c =
+            crate::cwt::ArkavoClaims::devicecheck("i", "u", 1, Some("https://platform.arkavo.net"));
+        assert_eq!(
+            c.aud,
+            crate::cwt::Audience::Multiple(vec![
+                "arkavo:devicecheck".into(),
+                "https://platform.arkavo.net".into()
+            ])
+        );
+        let c = crate::cwt::ArkavoClaims::devicecheck("i", "u", 1, None);
+        assert_eq!(
+            c.aud,
+            crate::cwt::Audience::Single("arkavo:devicecheck".into())
+        );
     }
 }

@@ -40,6 +40,18 @@ export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
+export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
+
+# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
+export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
+export AGENT_TOKEN_MINUTES=15   # hard cap 15
+# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
+# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
+export ADMIN_CLIENT_IDS=catalog-node
+# Optional override of the default entitlement FQNs written on new user rows
+# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
+# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 
 # Optional: Set port (defaults to 8080)
 export PORT=8080
@@ -59,6 +71,12 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # Additional RPs follow the same pattern with a different tag:
 # export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
 # export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
+# CLI passkey login (arkavo-edge): PUBLIC client, no _SECRET, PKCE S256. One
+# client class for every install (RFC 8252); per-install state is the refresh
+# token on disk, not a registration. Loopback redirect URIs are exact-match,
+# so every port the CLI may bind is listed verbatim.
+# export OIDC_CLIENT_EDGE_ID=arkavo-edge
+# export OIDC_CLIENT_EDGE_REDIRECT_URIS=http://127.0.0.1:52171/cb,...,http://127.0.0.1:52178/cb
 # AuthZEN PEPs (service CWT, client_credentials): see docs/pep-service-clients.md.
 # catalog-node and mcp-edge are registered in production (401 without secret).
 # Mint on the identity host with scripts/mint-pep-cwt.py — do not paste secrets.
@@ -117,7 +135,19 @@ export DYNAMODB_HANDLES_TABLE=handles
 export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
+export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 export AWS_REGION=us-east-1
+
+# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
+export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
+export AGENT_TOKEN_MINUTES=15   # hard cap 15
+# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
+# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
+export ADMIN_CLIENT_IDS=catalog-node
+# Optional override of the default entitlement FQNs written on new user rows
+# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
+# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 
 # Run the server
 cargo run --release
@@ -183,6 +213,22 @@ aws dynamodb create-table \
     --table-name patreon_tokens \
     --attribute-definitions AttributeName=user_id,AttributeType=S \
     --key-schema AttributeName=user_id,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
+
+# Create agent_delegations table (human PE → agent NPE delegations)
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name agent_delegations \
+    --attribute-definitions \
+        AttributeName=agent_did,AttributeType=S \
+        AttributeName=root_user_id,AttributeType=S \
+    --key-schema AttributeName=agent_did,KeyType=HASH \
+    --global-secondary-indexes \
+        "[{
+            \"IndexName\": \"root_user_id-index\",
+            \"KeySchema\": [{\"AttributeName\":\"root_user_id\",\"KeyType\":\"HASH\"}],
+            \"Projection\":{\"ProjectionType\":\"ALL\"}
+        }]" \
     --billing-mode PAY_PER_REQUEST
 ```
 
@@ -314,6 +360,28 @@ aws dynamodb create-table \
   Patreon entirely — loud warn, fail-closed — rather than guessing which
   credentials to use.
 
+**agent.rs** - Agent delegation (human PE → agent NPE, `did:key`)
+- `/.well-known/agent-configuration`: discovery metadata
+- `POST /agents/authorize` (human CWT via `X-Auth-Token`): create a
+  delegation record for `agent_did` with a subset of the delegator's own
+  stored entitlements (`DynamoDBStore::get_user_entitlements`)
+- `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
+- `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
+  challenge is stored on the delegation row (no cookie session)
+- `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
+  Ed25519 proof over the decoded challenge bytes, returns
+  `{token, expires_at, entitlements}`. `token` is a single CWT (no
+  delegation JWT): `aud` = the configured `AGENT_TOKEN_AUDIENCES` list,
+  `exp - iat` capped at `AGENT_TOKEN_MINUTES` (hard max 15 min), `act` =
+  `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe` describes the agent (type, delegation
+  id, depth, chain), `cnf` is bound to the agent's Ed25519 `did:key`. There is
+  no refresh — the agent re-runs the challenge/token exchange for a new one.
+  This is the contract `arkavo-edge/crates/arkavo-agent-auth` expects (#54);
+  its `delegation_jwt` field is `Option` with `#[serde(default)]`, so
+  omitting it is wire-compatible.
+- Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
+  (#50) and the ERS surface (#48) are follow-ups
+
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `generate_challenge`: Issues random challenge for attestation/assertion
 - `finish_attestation`: Validates attestation object, stores device binding
@@ -324,6 +392,13 @@ aws dynamodb create-table \
 - Nonce calculation: SHA256(authData || SHA256(clientData))
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
+
+**entities.rs** - Service-gated entity lookup (spec §2.4)
+- `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace
+- Id namespaces: `arkavo:<uuid>` (person), `did:key:…` (agent), `device:<key_id>` (device)
+- Unknown namespace → HTTP 400 (BadId); missing entity → HTTP 404 (NotFound)
+- Category mapping: Person → "subject"; Agent and Device → "environment" — with npe_type (None/"agent"/"device")
+- Claims include authorization profile (entitlements, roles) and entity-specific metadata (device class, agent depth/chain)
 
 ### Key Data Flow
 
@@ -507,6 +582,17 @@ When modifying token lifetimes, update these in authn.rs:
   "which providers has this user linked?" — not required by the current
   endpoint surface.
 
+### agent_delegations table
+- **Primary Key**: agent_did (String) - `did:key:z6Mk…`
+- **Attributes**: delegator_type (`human`|`agent`), delegator_id (String),
+  delegator_username (String, optional), entitlements (List of String),
+  name (String), depth (Number), root_user_id (String/UUID), chain (List of
+  String), created_at / expires_at / revoked_at (Number), and the transient
+  challenge triple `challenge`, `challenge_nonce`, `challenge_issued_at`
+  (set by `/agents/challenge`, removed atomically by `/agents/token`)
+- **GSI**: root_user_id-index (partition key: root_user_id) — list/count a
+  user's agents
+
 ### patreon_tokens table
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link
   overwrites in place.
@@ -580,6 +666,7 @@ When modifying token lifetimes, update these in authn.rs:
 - **Replay protection**: Monotonic counter must increment with each assertion
 - **Nonce binding**: Challenge bound to attestation/assertion via SHA256
 - **Device verification**: Proves request comes from genuine Apple device running unmodified app
+- Assertion CWT carries `arkavo_npe = {type: device, class, attestation_expiry, device_id}` and, when `OIDC_PLATFORM_AUDIENCE` is set, that audience.
 
 ### Requirements
 - iOS 14+ with Secure Enclave support

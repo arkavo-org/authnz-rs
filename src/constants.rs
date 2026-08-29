@@ -11,6 +11,12 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// Freshness window (seconds) for a device's last successful App Attest
+/// assertion. Within this window since the last verified assertion, the
+/// device is classed `attested`; once it expires the device is `managed`
+/// (a binding exists but the hardware attestation is stale).
+pub const DEVICE_ATTESTATION_TTL_SECONDS: i64 = 900;
+
 /// Session inactivity timeout in seconds (10 minutes)
 pub const SESSION_TIMEOUT_SECONDS: i64 = 600;
 
@@ -72,3 +78,46 @@ pub const PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE: &str =
 /// `verified_at`/`expires_at` are recorded in the cached materialization so a
 /// stale cache after Patreon goes down can be detected and rejected.
 pub const PATREON_CACHE_TTL_SECONDS: i64 = 300;
+
+// Agent delegation (PE → agent NPE) constants
+
+/// Lifetime of a delegation record in days. A delegation outlives any single
+/// agent token; the agent re-proves key possession to mint a fresh token.
+pub const AGENT_DELEGATION_DAYS: i64 = 30;
+
+/// Maximum lifetime, in minutes, of an agent NPE CWT minted via
+/// [`crate::cwt::ArkavoClaims::agent`]. Agent tokens are short-lived by
+/// design — the agent re-proves key possession (via `/agents/token`) to
+/// mint a fresh one rather than holding a long-lived bearer.
+pub const AGENT_TOKEN_MINUTES_MAX: i64 = 15;
+
+/// Agent challenge TTL in seconds. The challenge is stored on the delegation
+/// row (not a cookie session) so headless CLIs can complete the two-step flow.
+pub const AGENT_CHALLENGE_TTL_SECONDS: i64 = 60;
+
+/// Maximum delegation depth (human -> agent1 -> agent2 -> ... -> agent5)
+pub const MAX_DELEGATION_DEPTH: u8 = 5;
+
+/// Maximum number of active agents delegated by a single root user
+pub const MAX_AGENTS_PER_USER: u32 = 640;
+
+/// Attribute FQN for the "create a TDF" entitlement.
+pub const ENTITLEMENT_TDF_CREATE: &str = "https://arkavo.ai/attr/tdf/value/create";
+
+/// Attribute FQN for the "decrypt a TDF" entitlement.
+pub const ENTITLEMENT_TDF_DECRYPT: &str = "https://arkavo.ai/attr/tdf/value/decrypt";
+
+/// Entitlements granted to a newly created user and used when a stored user
+/// row predates the `entitlements` attribute. Attribute FQNs, never bare
+/// strings — the OpenTDF platform's `arkavo` ERS mode emits these verbatim
+/// as direct entitlements.
+pub const DEFAULT_USER_ENTITLEMENTS: &[&str] = &[
+    ENTITLEMENT_TDF_CREATE,
+    ENTITLEMENT_TDF_DECRYPT,
+    // Delegable to agents (the vocabulary arkavo-edge's --trust QR and the
+    // app's canonicalizer request). Must be a superset of the QR default.
+    "https://arkavo.ai/attr/action/value/read",
+    "https://arkavo.ai/attr/action/value/write",
+    "https://arkavo.ai/attr/action/value/execute",
+    "https://arkavo.ai/attr/action/value/delegate",
+];

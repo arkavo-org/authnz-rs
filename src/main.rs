@@ -47,13 +47,15 @@ use crate::oidc::{
     token as oidc_token, userinfo as oidc_userinfo,
 };
 use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
+use authnz_rs::{constants, cwt, keys};
 
+mod agent;
 mod apple_signin;
 mod authn;
-mod constants;
-mod cwt;
 mod db;
 mod device_check;
+mod entities;
+mod entitlements;
 mod oidc;
 mod patreon;
 mod webvh;
@@ -232,7 +234,9 @@ async fn handle_h3_request(
     // This gives H3 clients (including HEAD probes, where the body is suppressed
     // below) the same Content-Length they would see over HTTP/2. Streaming bodies
     // of unknown size are left without it, exactly as on the TCP path.
-    if !resp_parts.headers.contains_key(http::header::CONTENT_LENGTH)
+    if !resp_parts
+        .headers
+        .contains_key(http::header::CONTENT_LENGTH)
         && let Some(len) = http_body::Body::size_hint(&resp_body).exact()
         && let Ok(value) = http::HeaderValue::from_str(&len.to_string())
     {
@@ -290,6 +294,12 @@ pub struct AppState {
     /// still built and served as a legacy did:web view, but no signed
     /// `did.jsonl` log is emitted.
     pub webvh_sign_key: Arc<Option<String>>,
+    /// Agent access token issuance config, parsed once at startup from
+    /// `AGENT_TOKEN_AUDIENCES` / `AGENT_AUTHORIZED_ACTORS` / `AGENT_TOKEN_MINUTES`.
+    pub agent_tokens: Arc<agent::AgentTokenConfig>,
+    /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
+    /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
+    pub admin_client_ids: Arc<Vec<String>>,
 }
 
 #[tokio::main]
@@ -363,6 +373,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to build WebAuthn instance: {}", e))?,
     );
 
+    let default_entitlements = entitlements::parse_user_default_entitlements(
+        env::var("USER_DEFAULT_ENTITLEMENTS").ok().as_deref(),
+    )
+    .map_err(|e| format!("USER_DEFAULT_ENTITLEMENTS: {e}"))?;
+
     // Initialize DynamoDB store
     let db_store = DynamoDBStore::new(
         env::var("DYNAMODB_CREDENTIALS_TABLE").unwrap_or_else(|_| "credentials".to_string()),
@@ -371,6 +386,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "device_bindings".to_string()),
         env::var("DYNAMODB_IDENTITY_LINKS_TABLE").unwrap_or_else(|_| "identity_links".to_string()),
         env::var("DYNAMODB_PATREON_TOKENS_TABLE").unwrap_or_else(|_| "patreon_tokens".to_string()),
+        env::var("DYNAMODB_AGENT_DELEGATIONS_TABLE")
+            .unwrap_or_else(|_| "agent_delegations".to_string()),
+        default_entitlements,
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -383,6 +401,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // did:webvh Ed25519 update-signing key (fail-open: None when WEBVH_SIGN_KEY_PATH unset)
     let webvh_sign_key = webvh::load_sign_key();
+
+    let agent_tokens = agent::AgentTokenConfig::parse(
+        env::var("AGENT_TOKEN_AUDIENCES").ok(),
+        env::var("AGENT_AUTHORIZED_ACTORS").ok(),
+        env::var("AGENT_TOKEN_MINUTES").ok(),
+    )
+    .map_err(|e| format!("agent token config: {e}"))?;
+
+    let admin_client_ids: Vec<String> = env::var("ADMIN_CLIENT_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if admin_client_ids.is_empty() {
+        log::warn!(
+            "ADMIN_CLIENT_IDS is empty: PUT /admin/users/:id/entitlements and GET /entities/:id will 403"
+        );
+    }
 
     // Create the app state
     let app_state = AppState {
@@ -401,6 +438,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|v| !v.is_empty()),
         ),
         webvh_sign_key: Arc::new(webvh_sign_key),
+        agent_tokens: Arc::new(agent_tokens),
+        admin_client_ids: Arc::new(admin_client_ids),
     };
 
     // Set up Redis Client using fred
@@ -419,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let _conn_handle = redis_conn_client.connect();
         if let Err(err) = redis_conn_client.wait_for_connect().await {
-            log::error!("Failed to connect to Redis: {:?}", err);
+            log::warn!("Failed to connect to Redis: {:?}", err);
         } else {
             log::info!("Successfully connected to Redis");
         }
@@ -483,6 +522,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // only on the resulting OIDC access_token CWT; there is deliberately
         // no /me/patreon or /entitlements endpoint surface.
         .route("/oauth/patreon/link", post(patreon_link_handler))
+        // Admin: per-user entitlement FQNs (service CWT required). Spec §2.3.
+        .route(
+            "/admin/users/:id/entitlements",
+            axum::routing::put(entitlements::put_user_entitlements),
+        )
+        // Entity lookup (service CWT required). Spec §2.4.
+        .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
@@ -497,6 +543,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(generate_assertion_challenge),
         )
         .route("/device-check/assert", post(finish_assertion))
+        // Agent delegation: a human (PE) delegates to an agent NPE (did:key).
+        // Contract per arkavo-edge `arkavo-agent-auth` (issue #54).
+        .route(
+            "/.well-known/agent-configuration",
+            get(agent::serve_agent_configuration),
+        )
+        .route("/agents/authorize", post(agent::authorize_agent))
+        .route("/agents/delegations", get(agent::list_delegations))
+        .route(
+            "/agents/delegations/:did",
+            axum::routing::delete(agent::revoke_delegation),
+        )
+        .route("/agents/challenge", get(agent::generate_agent_challenge))
+        .route("/agents/token", post(agent::issue_agent_token))
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
@@ -765,14 +825,6 @@ fn load_ec_keys(
         LoadKeysError::InvalidKeyFormat
     })?;
 
-    // Load the same EC key material as p256 type for CWT signing.
-    let cwt_signing_key = {
-        use p256::pkcs8::DecodePrivateKey;
-        p256::SecretKey::from_pkcs8_pem(encoding_pem_str)
-            .map_err(|e| format!("Failed to parse CWT signing key as PKCS8 PEM: {e}"))?
-            .into()
-    };
-
     debug!("Attempting to create DecodingKey from PEM contents");
     let decoding_pem = std::fs::read(decoding_key_path)?;
     let decoding_pem_str = std::str::from_utf8(&decoding_pem)
@@ -783,38 +835,15 @@ fn load_ec_keys(
         LoadKeysError::InvalidKeyFormat
     })?;
 
-    // Load the same EC key material as p256 type for CWT verification.
-    let cwt_verifying_key = {
-        use p256::pkcs8::DecodePublicKey;
-        let pk = p256::PublicKey::from_public_key_pem(decoding_pem_str)
-            .map_err(|e| format!("Failed to parse CWT verifying key as SPKI PEM: {e}"))?;
-        p256::ecdsa::VerifyingKey::from(pk)
-    };
-
-    // kid = RFC 7638 JWK thumbprint, raw 32-byte SHA-256 hash.
-    // JWKS advertises the base64url-encoded form of the same bytes
-    // (see src/oidc.rs::ec_public_key_to_jwk), so CWT and JWT advertise
-    // the same physical kid.
-    let cwt_kid = {
-        use base64::Engine;
-        use sha2::{Digest, Sha256};
-        let encoded = cwt_verifying_key.to_encoded_point(false);
-        let x = encoded
-            .x()
-            .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
-        let y = encoded
-            .y()
-            .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let thumb_input = format!(
-            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
-            b64.encode(x),
-            b64.encode(y)
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(thumb_input.as_bytes());
-        hasher.finalize().to_vec()
-    };
+    // Load the same EC key material as p256 type for CWT signing/verification,
+    // plus the RFC 7638 thumbprint kid. Shared with `src/bin/seed-test-user.rs`
+    // via `authnz_rs::keys::load_cwt_keys` so both binaries derive identical
+    // CWT keys/kid from the same encoding/decoding key PEMs. The verifying
+    // key comes from `decoding_pem_str` (not derived from the signing key)
+    // and is checked against it — a mismatched pair errors out here rather
+    // than silently minting tokens nothing can verify.
+    let (cwt_signing_key, cwt_verifying_key, cwt_kid) =
+        keys::load_cwt_keys(encoding_pem_str, decoding_pem_str)?;
 
     debug!("Successfully loaded EC keys");
     Ok((
@@ -1307,6 +1336,11 @@ pub(crate) mod test_helpers {
                 "device_bindings".to_string(),
                 "identity_links".to_string(),
                 "patreon_tokens".to_string(),
+                "agent_delegations".to_string(),
+                crate::constants::DEFAULT_USER_ENTITLEMENTS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             )
             .await
             .unwrap(),
@@ -1324,6 +1358,12 @@ pub(crate) mod test_helpers {
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
             platform_audience: Arc::new(None),
             webvh_sign_key: Arc::new(None),
+            agent_tokens: Arc::new(agent::AgentTokenConfig {
+                audiences: vec!["https://platform.arkavo.net".into()],
+                authorized_actors: vec!["https://kg.arkavo.net".into()],
+                minutes: 15,
+            }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         }
     }
 }
