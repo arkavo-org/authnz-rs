@@ -990,7 +990,7 @@ mod tests {
         };
         let jwt = jsonwebtoken::encode(&header, &claims, &app_state.encoding_key).unwrap();
         let result = crate::device_check::verify_inbound_token(&app_state, &jwt);
-        assert!(matches!(result, Err(_)));
+        assert!(result.is_err());
     }
 
     #[test]
