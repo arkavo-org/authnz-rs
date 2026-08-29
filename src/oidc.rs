@@ -1276,11 +1276,22 @@ async fn handle_refresh_token_grant(
         // reached that way. It stays purely defensive: fall back to the
         // defaults if the value is ever unparseable for some other reason.
         let entitlements = match Uuid::parse_str(&record.arkavo_account_id) {
-            Ok(user_id) => app_state
-                .db_store
-                .get_user_entitlements(&user_id)
-                .await
-                .unwrap_or_default(),
+            // A DB failure here must NOT silently mint an entitlement-free
+            // token: the client would get a valid access_token that quietly
+            // decrypts nothing for its full lifetime, with no error to react
+            // to. Surface it as retryable, the same way the authorize path
+            // does, and let the client retry the refresh.
+            Ok(user_id) => match app_state.db_store.get_user_entitlements(&user_id).await {
+                Ok(list) => list,
+                Err(e) => {
+                    error!("refresh_token grant: entitlement lookup failed: {}", e);
+                    return oidc_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "temporarily_unavailable",
+                        "entitlement lookup failed",
+                    );
+                }
+            },
             Err(_) => {
                 warn!(
                     "refresh_token grant: arkavo_account_id {:?} is not a uuid, using default entitlements",
@@ -2479,9 +2490,15 @@ mod tests {
 
         let refresh_store = RefreshTokenStore::new(test_redis());
         let token = "my-refresh-token-123";
+        // A non-uuid `arkavo_account_id` short-circuits the entitlement
+        // lookup to the configured defaults *before* any DynamoDB call, which
+        // is what lets this test cover the rest of the grant (client auth,
+        // minting, rotation, response shape) with no database. The uuid path
+        // needs a real store; its failure mode is covered by
+        // `test_refresh_token_grant_entitlement_lookup_failure_is_503`.
         let record = RefreshTokenRecord {
             subject: "apple:123".into(),
-            arkavo_account_id: Uuid::new_v4().to_string(),
+            arkavo_account_id: "legacy-record-without-uuid".into(),
             client_id: "test-client".into(),
             scopes: "openid offline_access".into(),
             expires_at: Utc::now().timestamp() + 3600,
@@ -2522,6 +2539,72 @@ mod tests {
 
         // Verification of rotation: original token must be gone
         assert!(refresh_store.take(token).await.unwrap().is_none());
+    }
+
+    /// A failed entitlement lookup must not mint a token: an access_token
+    /// carrying an empty entitlement list would be structurally valid and
+    /// silently decrypt nothing for its whole lifetime, giving the client
+    /// nothing to retry on. The grant reports the outage instead.
+    #[tokio::test]
+    async fn test_refresh_token_grant_entitlement_lookup_failure_is_503() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        // The test store points at table names that do not exist, so the
+        // uuid path's `get_user_entitlements` call fails.
+        let app_state = crate::test_helpers::build_test_app_state().await;
+
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "test-client".to_string(),
+            OidcClient {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                redirect_uris: vec![],
+            },
+        );
+        let oidc = Arc::new(oidc);
+
+        let refresh_store = RefreshTokenStore::new(test_redis());
+        let token = "refresh-token-db-down";
+        refresh_store
+            .insert(
+                token,
+                RefreshTokenRecord {
+                    subject: "apple:123".into(),
+                    arkavo_account_id: Uuid::new_v4().to_string(),
+                    client_id: "test-client".into(),
+                    scopes: "openid offline_access".into(),
+                    expires_at: Utc::now().timestamp() + 3600,
+                    created_at: Utc::now().timestamp(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let form = TokenForm {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: Some("test-client".to_string()),
+            client_secret: Some("test-secret".to_string()),
+            code_verifier: None,
+            refresh_token: Some(token.to_string()),
+            scope: None,
+        };
+
+        let resp = handle_refresh_token_grant(
+            app_state,
+            oidc,
+            refresh_store.clone(),
+            test_patreon_state(),
+            HeaderMap::new(),
+            form,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
