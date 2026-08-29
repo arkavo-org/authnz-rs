@@ -46,6 +46,12 @@ export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
+# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
+# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
+export ADMIN_CLIENT_IDS=catalog-node
+# Optional override of the default entitlement FQNs written on new user rows
+# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
+# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 
 # Optional: Set port (defaults to 8080)
 export PORT=8080
@@ -130,6 +136,12 @@ export AWS_REGION=us-east-1
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
+# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
+# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
+export ADMIN_CLIENT_IDS=catalog-node
+# Optional override of the default entitlement FQNs written on new user rows
+# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
+# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 
 # Run the server
 cargo run --release

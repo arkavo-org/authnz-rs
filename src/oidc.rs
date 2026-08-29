@@ -2326,6 +2326,10 @@ mod tests {
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
                     "agent_delegations".to_string(),
+                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                 )
                 .await
                 .unwrap(),
@@ -2344,6 +2348,7 @@ mod tests {
                 authorized_actors: vec!["https://kg.arkavo.net".into()],
                 minutes: 15,
             }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2436,6 +2441,10 @@ mod tests {
                     "identity_links".to_string(),
                     "patreon_tokens".to_string(),
                     "agent_delegations".to_string(),
+                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                 )
                 .await
                 .unwrap(),
@@ -2454,6 +2463,7 @@ mod tests {
                 authorized_actors: vec!["https://kg.arkavo.net".into()],
                 minutes: 15,
             }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         };
 
         let mut oidc = (*test_oidc_config()).clone();

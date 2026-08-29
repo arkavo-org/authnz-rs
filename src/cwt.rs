@@ -837,6 +837,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 }
                 custom.act = Some(actors);
             }
+            (Value::Text(s), _) if s == "act" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Map(m)) if s == "arkavo_npe" => {
                 let mut n = ArkavoNpe {
                     npe_type: String::new(),
@@ -876,6 +877,20 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                                 .collect();
                             n.chain = Some(parts?)
                         }
+                        (Value::Text(k), _)
+                            if matches!(
+                                k.as_str(),
+                                "type"
+                                    | "class"
+                                    | "attestation_expiry"
+                                    | "device_id"
+                                    | "delegation_id"
+                                    | "depth"
+                                    | "chain"
+                            ) =>
+                        {
+                            return Err(CwtError::Malformed);
+                        }
                         _ => {}
                     }
                 }
@@ -884,6 +899,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 }
                 custom.arkavo_npe = Some(n);
             }
+            (Value::Text(s), _) if s == "arkavo_npe" => return Err(CwtError::Malformed),
             _ => {} // Ignore unknown claims (forward-compat).
         }
     }
@@ -1805,5 +1821,37 @@ mod tests {
             "got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn act_non_array_is_malformed() {
+        let entries = vec![
+            (Value::Integer(1.into()), Value::Text("iss-1".into())),
+            (Value::Integer(2.into()), Value::Text("sub-1".into())),
+            (Value::Integer(3.into()), Value::Text("aud-1".into())),
+            (Value::Integer(4.into()), Value::Integer(1.into())),
+            (Value::Integer(6.into()), Value::Integer(0.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+            (
+                Value::Text("act".into()),
+                Value::Text("not-an-array".into()),
+            ),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
+        assert!(matches!(claims_from_cbor(&bytes), Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn npe_non_map_is_malformed() {
+        let result = claims_from_cbor(&claims_bytes_with_npe(Value::Text("nope".into())));
+        assert!(matches!(result, Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn npe_wrongly_typed_known_field_is_malformed() {
+        let npe = Value::Map(vec![(Value::Text("type".into()), Value::Integer(1.into()))]);
+        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        assert!(matches!(result, Err(CwtError::Malformed)));
     }
 }

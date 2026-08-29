@@ -283,6 +283,8 @@ export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS b
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
+export ADMIN_CLIENT_IDS=catalog-node
+# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 ```
 
 ## Future Improvements

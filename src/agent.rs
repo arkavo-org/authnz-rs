@@ -33,7 +33,8 @@
 
 use crate::AppState;
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_MINUTES_MAX, AUTH_TOKEN_HOURS,
+    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
 };
 use crate::cwt;
 use crate::db::{AgentDelegation, DynamoDBError};
@@ -75,7 +76,7 @@ pub struct AgentConfiguration {
 }
 
 impl AgentConfiguration {
-    pub fn new(issuer: &str) -> Self {
+    pub fn new(issuer: &str, token_minutes: i64) -> Self {
         let base = issuer.trim_end_matches('/');
         Self {
             issuer: base.to_string(),
@@ -87,7 +88,7 @@ impl AgentConfiguration {
             max_delegation_depth: MAX_DELEGATION_DEPTH,
             max_agents_per_user: MAX_AGENTS_PER_USER,
             delegation_lifetime_seconds: AGENT_DELEGATION_DAYS * 24 * 60 * 60,
-            agent_token_lifetime_seconds: crate::constants::AGENT_TOKEN_MINUTES_MAX * 60,
+            agent_token_lifetime_seconds: token_minutes.clamp(1, AGENT_TOKEN_MINUTES_MAX) * 60,
             challenge_ttl_seconds: AGENT_CHALLENGE_TTL_SECONDS,
             did_methods_supported: vec!["did:key"],
             proof_signing_alg_values_supported: vec!["EdDSA"],
@@ -100,7 +101,10 @@ impl AgentConfiguration {
 pub async fn serve_agent_configuration(
     Extension(app_state): Extension<AppState>,
 ) -> impl IntoResponse {
-    Json(AgentConfiguration::new(&app_state.issuer))
+    Json(AgentConfiguration::new(
+        &app_state.issuer,
+        app_state.agent_tokens.minutes,
+    ))
 }
 
 // ============================================================================
@@ -207,6 +211,7 @@ pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
 // Human (PE) authentication
 // ============================================================================
 
+#[derive(Debug)]
 struct HumanDelegator {
     user_id: Uuid,
     username: Option<String>,
@@ -241,6 +246,14 @@ async fn authenticate_human(
         warn!("Rejected delegator token: {}", e);
         AgentError::InvalidToken
     })?;
+
+    let lifetime = claims.exp.saturating_sub(claims.iat);
+    let max_auth = AUTH_TOKEN_HOURS * 3600 + cwt::DEFAULT_SKEW_SECS;
+    if lifetime > max_auth {
+        return Err(AgentError::Unauthorized(
+            "delegator token is not a short-lived auth CWT".into(),
+        ));
+    }
 
     let user_id = user_id_from_claims(&claims)?;
     let username = app_state
@@ -481,8 +494,7 @@ async fn active_delegation(
 
 fn random_challenge_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
-    out[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-    out[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    getrandom::getrandom(&mut out).expect("OS RNG");
     out
 }
 
@@ -501,7 +513,10 @@ pub async fn generate_agent_challenge(
         .db_store
         .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
         .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+        .map_err(|e| match e {
+            DynamoDBError::ConditionalConflict => AgentError::ChallengeInFlight,
+            other => AgentError::DatabaseError(Box::new(other)),
+        })?;
 
     info!("Challenge issued for agent: {}", params.did);
     Ok(Json(ChallengeResponse { challenge, nonce }))
@@ -734,6 +749,8 @@ pub enum AgentError {
     ChallengeExpired,
     #[error("Challenge mismatch")]
     ChallengeMismatch,
+    #[error("Challenge already pending")]
+    ChallengeInFlight,
     #[error("Database error: {0}")]
     DatabaseError(#[from] Box<DynamoDBError>),
 }
@@ -758,6 +775,7 @@ impl IntoResponse for AgentError {
             | AgentError::MaxAgentsExceeded(_)
             | AgentError::ChallengeExpired
             | AgentError::ChallengeMismatch => (StatusCode::BAD_REQUEST, self.to_string()),
+            AgentError::ChallengeInFlight => (StatusCode::CONFLICT, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -1038,12 +1056,54 @@ mod tests {
         assert_eq!(human.user_id, user_id);
     }
 
+    #[tokio::test]
+    async fn authenticate_human_rejects_registration_cwt() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = Uuid::new_v4();
+        let cnf = cwt::cnf_from_ed25519(&[7u8; 32], b"kid");
+        let token = crate::authn::mint_registration_token(&app_state, &user_id, cnf).expect("mint");
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", token.parse().unwrap());
+        let err = authenticate_human(&app_state, &headers)
+            .await
+            .expect_err("99-year registration CWT must not authorize agents");
+        assert!(matches!(err, AgentError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn agent_token_config_rejects_non_integer_minutes() {
+        let err = AgentTokenConfig::parse(
+            Some("https://platform.test".into()),
+            None,
+            Some("fifteen".into()),
+        )
+        .unwrap_err();
+        assert!(err.contains("not an integer"), "{err}");
+        let ok =
+            AgentTokenConfig::parse(Some("https://platform.test".into()), None, Some("7".into()))
+                .unwrap();
+        assert_eq!(ok.minutes, 7);
+        let clamped = AgentTokenConfig::parse(
+            Some("https://platform.test".into()),
+            None,
+            Some("99".into()),
+        )
+        .unwrap();
+        assert_eq!(clamped.minutes, AGENT_TOKEN_MINUTES_MAX);
+    }
+
     #[test]
     fn error_status_codes() {
         let cases = vec![
             (AgentError::InvalidDID("x".into()), StatusCode::BAD_REQUEST),
             (AgentError::DelegationNotFound, StatusCode::NOT_FOUND),
             (AgentError::DelegationAlreadyExists, StatusCode::CONFLICT),
+            (AgentError::ChallengeInFlight, StatusCode::CONFLICT),
             (AgentError::DelegationRevoked, StatusCode::FORBIDDEN),
             (
                 AgentError::InvalidProof("x".into()),
@@ -1098,7 +1158,7 @@ mod tests {
 
     #[test]
     fn agent_configuration_endpoints_and_limits() {
-        let c = AgentConfiguration::new("https://identity.arkavo.net/");
+        let c = AgentConfiguration::new("https://identity.arkavo.net/", 15);
         assert_eq!(c.issuer, "https://identity.arkavo.net");
         assert_eq!(
             c.agent_token_endpoint,
@@ -1106,9 +1166,10 @@ mod tests {
         );
         assert!(!c.agent_authorization_endpoint.contains("//agents"));
         assert_eq!(c.max_delegation_depth, MAX_DELEGATION_DEPTH);
+        assert_eq!(c.agent_token_lifetime_seconds, 15 * 60);
         assert_eq!(
-            c.agent_token_lifetime_seconds,
-            crate::constants::AGENT_TOKEN_MINUTES_MAX * 60
+            AgentConfiguration::new("https://identity.arkavo.net/", 7).agent_token_lifetime_seconds,
+            7 * 60
         );
         assert_eq!(
             c.delegation_lifetime_seconds,

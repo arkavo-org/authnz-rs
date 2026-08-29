@@ -61,6 +61,7 @@ aes-gcm = "0.10"         # AES-256-GCM for sealing Patreon tokens under KMS-wrap
 # Agent delegation: did:key (Ed25519 multicodec, base58btc) parsing + proof verification
 ed25519-dalek = "2"
 bs58 = "0.5"
+getrandom = "0.2"
 
 # did:webvh log engine (opt-in via the `webvh` feature) — DIF reference impl.
 # Heavy transitive tree, so gated to keep the default build lean. Needs the MSRV

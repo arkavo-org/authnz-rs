@@ -297,6 +297,9 @@ pub struct AppState {
     /// Agent access token issuance config, parsed once at startup from
     /// `AGENT_TOKEN_AUDIENCES` / `AGENT_AUTHORIZED_ACTORS` / `AGENT_TOKEN_MINUTES`.
     pub agent_tokens: Arc<agent::AgentTokenConfig>,
+    /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
+    /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
+    pub admin_client_ids: Arc<Vec<String>>,
 }
 
 #[tokio::main]
@@ -370,6 +373,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to build WebAuthn instance: {}", e))?,
     );
 
+    let default_entitlements = entitlements::parse_user_default_entitlements(
+        env::var("USER_DEFAULT_ENTITLEMENTS").ok().as_deref(),
+    )
+    .map_err(|e| format!("USER_DEFAULT_ENTITLEMENTS: {e}"))?;
+
     // Initialize DynamoDB store
     let db_store = DynamoDBStore::new(
         env::var("DYNAMODB_CREDENTIALS_TABLE").unwrap_or_else(|_| "credentials".to_string()),
@@ -380,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_PATREON_TOKENS_TABLE").unwrap_or_else(|_| "patreon_tokens".to_string()),
         env::var("DYNAMODB_AGENT_DELEGATIONS_TABLE")
             .unwrap_or_else(|_| "agent_delegations".to_string()),
+        default_entitlements,
     )
     .await
     .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
@@ -400,6 +409,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("agent token config: {e}"))?;
 
+    let admin_client_ids: Vec<String> = env::var("ADMIN_CLIENT_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if admin_client_ids.is_empty() {
+        log::warn!(
+            "ADMIN_CLIENT_IDS is empty: PUT /admin/users/:id/entitlements and GET /entities/:id will 403"
+        );
+    }
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -418,6 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
+        admin_client_ids: Arc::new(admin_client_ids),
     };
 
     // Set up Redis Client using fred
@@ -436,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let _conn_handle = redis_conn_client.connect();
         if let Err(err) = redis_conn_client.wait_for_connect().await {
-            log::error!("Failed to connect to Redis: {:?}", err);
+            log::warn!("Failed to connect to Redis: {:?}", err);
         } else {
             log::info!("Successfully connected to Redis");
         }
@@ -1315,6 +1337,10 @@ pub(crate) mod test_helpers {
                 "identity_links".to_string(),
                 "patreon_tokens".to_string(),
                 "agent_delegations".to_string(),
+                crate::constants::DEFAULT_USER_ENTITLEMENTS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
             )
             .await
             .unwrap(),
@@ -1337,6 +1363,7 @@ pub(crate) mod test_helpers {
                 authorized_actors: vec!["https://kg.arkavo.net".into()],
                 minutes: 15,
             }),
+            admin_client_ids: Arc::new(vec!["it".into()]),
         }
     }
 }

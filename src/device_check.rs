@@ -1000,6 +1000,8 @@ mod tests {
         let (c, exp) = device_class(now - 10, now);
         assert_eq!(c, DeviceClass::Attested);
         assert_eq!(exp, now - 10 + ttl);
+        let (c, _) = device_class(now - ttl, now);
+        assert_eq!(c, DeviceClass::Attested, "now == expiry is still attested");
         let (c, _) = device_class(now - ttl - 1, now);
         assert_eq!(c, DeviceClass::Managed);
         assert_eq!(DeviceClass::Unverified.as_str(), "unverified");

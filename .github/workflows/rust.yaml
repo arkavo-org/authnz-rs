@@ -65,12 +65,13 @@ jobs:
       AWS_REGION: us-east-1
       AGENT_TOKEN_AUDIENCES: https://platform.test
       AGENT_AUTHORIZED_ACTORS: https://kg.test
+      ADMIN_CLIENT_IDS: it
       OIDC_ISSUER: http://127.0.0.1:8080
       PORT: "8080"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: pip install awscli && bash scripts/dynamodb-local-tables.sh
+      - run: bash scripts/dynamodb-local-tables.sh
       - name: keys
         run: |
           openssl ecparam -genkey -name prime256v1 -noout -out signkey.pem
@@ -87,5 +88,16 @@ jobs:
       # placeholder — content doesn't matter, this test never hits the
       # /.well-known/apple-app-site-association route.
       - run: echo '{}' > apple-app-site-association.json
-      - run: (cargo run &) ; for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health && break; sleep 1; done
+      - name: start server and wait for health
+        run: |
+          cargo run &
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "authnz-rs did not become healthy within 30s"
+            exit 1
+          fi
       - run: AUTHNZ_TEST_BASE_URL=http://127.0.0.1:8080 AUTHNZ_TEST_HUMAN_CWT=$(cat human.cwt) AUTHNZ_TEST_SERVICE_CWT=$(cat service.cwt) cargo test --test agent_flow -- --ignored

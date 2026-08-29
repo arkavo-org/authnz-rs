@@ -116,6 +116,7 @@ pub struct DynamoDBStore {
     identity_links_table: String,
     patreon_tokens_table: String,
     agent_delegations_table: String,
+    default_entitlements: Vec<String>,
 }
 
 impl DynamoDBStore {
@@ -126,6 +127,7 @@ impl DynamoDBStore {
         identity_links_table: String,
         patreon_tokens_table: String,
         agent_delegations_table: String,
+        default_entitlements: Vec<String>,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
@@ -138,7 +140,21 @@ impl DynamoDBStore {
             identity_links_table,
             patreon_tokens_table,
             agent_delegations_table,
+            default_entitlements,
         })
+    }
+
+    fn map_get_item_err(
+        &self,
+        table: &str,
+        err: SdkError<aws_sdk_dynamodb::operation::get_item::GetItemError>,
+    ) -> DynamoDBError {
+        if let SdkError::ServiceError(ref se) = err
+            && se.err().meta().code() == Some("ResourceNotFoundException")
+        {
+            return DynamoDBError::TableNotExists(table.to_string());
+        }
+        DynamoDBError::SdkError(err.to_string())
     }
 
     /// Persist (or replace) the Patreon token bundle for a user.
@@ -420,10 +436,7 @@ impl DynamoDBStore {
             username: username.to_string(),
             credentials: Vec::new(),
             did: did.to_string(),
-            entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            entitlements: self.default_entitlements.clone(),
         };
 
         // Try to create user record first
@@ -438,9 +451,9 @@ impl DynamoDBStore {
             .item(
                 "entitlements",
                 AttributeValue::L(
-                    crate::constants::DEFAULT_USER_ENTITLEMENTS
+                    self.default_entitlements
                         .iter()
-                        .map(|s| AttributeValue::S(s.to_string()))
+                        .map(|s| AttributeValue::S(s.clone()))
                         .collect(),
                 ),
             )
@@ -540,14 +553,16 @@ impl DynamoDBStore {
             .key("user_id", AttributeValue::S(user_id.to_string()))
             .send()
             .await
-            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+            .map_err(|e| self.map_get_item_err(&self.credentials_table, e))?;
         match result.item {
             Some(item) => self.item_to_user_credentials(&item).map(Some),
             None => Ok(None),
         }
     }
 
-    /// Entitlements for a user; defaults when the row predates the attribute.
+    /// Entitlements for a user. A missing user row yields an empty list
+    /// (fail-closed: no entitlements to grant). A missing `entitlements`
+    /// attribute on a legacy row uses the store's default list.
     pub async fn get_user_entitlements(
         &self,
         user_id: &Uuid,
@@ -711,6 +726,7 @@ impl DynamoDBStore {
 
     pub(crate) fn parse_user_credentials(
         item: &std::collections::HashMap<String, AttributeValue>,
+        default_entitlements: &[String],
     ) -> Result<UserCredentials, DynamoDBError> {
         log::debug!("Parsing item: {:?}", item);
         let user_id = Uuid::parse_str(
@@ -763,10 +779,7 @@ impl DynamoDBStore {
                 .iter()
                 .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
                 .collect(),
-            None => crate::constants::DEFAULT_USER_ENTITLEMENTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            None => default_entitlements.to_vec(),
         };
         Ok(UserCredentials {
             user_id,
@@ -781,7 +794,7 @@ impl DynamoDBStore {
         &self,
         item: &std::collections::HashMap<String, AttributeValue>,
     ) -> Result<UserCredentials, DynamoDBError> {
-        Self::parse_user_credentials(item)
+        Self::parse_user_credentials(item, &self.default_entitlements)
     }
 
     /// Persist the did:webvh append-only log (`did.jsonl`) for a user, as a
@@ -1256,31 +1269,41 @@ impl DynamoDBStore {
 
     /// Cascade: revoke every active delegation whose chain contains `did`.
     ///
-    /// Uses a table scan; chains are short and this runs on revoke only.
+    /// Paginates the table scan (`LastEvaluatedKey`) so a large table cannot
+    /// silently drop descendants. Agent→agent is out of v1 scope (`chain` is
+    /// empty for depth-0 rows) so this is typically a no-op.
     pub async fn revoke_delegations_with_chain(&self, did: &str) -> Result<u32, DynamoDBError> {
-        let result = self
-            .client
-            .scan()
-            .table_name(&self.agent_delegations_table)
-            .filter_expression("contains(#chain, :did) AND attribute_not_exists(revoked_at)")
-            .expression_attribute_names("#chain", "chain")
-            .expression_attribute_values(":did", AttributeValue::S(did.to_string()))
-            .send()
-            .await
-            .map_err(|err| {
+        let mut exclusive_start = None;
+        let mut revoked = 0u32;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.agent_delegations_table)
+                .filter_expression("contains(#chain, :did) AND attribute_not_exists(revoked_at)")
+                .expression_attribute_names("#chain", "chain")
+                .expression_attribute_values(":did", AttributeValue::S(did.to_string()));
+            if let Some(key) = exclusive_start {
+                scan = scan.set_exclusive_start_key(Some(key));
+            }
+            let result = scan.send().await.map_err(|err| {
                 error!("Failed to scan delegations for chain {}: {:?}", did, err);
                 DynamoDBError::from(err)
             })?;
 
-        let mut revoked = 0u32;
-        for item in result.items.unwrap_or_default() {
-            if let Some(agent_did_av) = item.get("agent_did")
-                && let Ok(agent_did) = agent_did_av.as_s()
-            {
-                match self.revoke_delegation(agent_did).await {
-                    Ok(()) => revoked += 1,
-                    Err(err) => warn!("Cascade revoke failed for {}: {:?}", agent_did, err),
+            for item in result.items.unwrap_or_default() {
+                if let Some(agent_did_av) = item.get("agent_did")
+                    && let Ok(agent_did) = agent_did_av.as_s()
+                {
+                    match self.revoke_delegation(agent_did).await {
+                        Ok(()) => revoked += 1,
+                        Err(err) => warn!("Cascade revoke failed for {}: {:?}", agent_did, err),
+                    }
                 }
+            }
+            match result.last_evaluated_key {
+                Some(k) => exclusive_start = Some(k),
+                None => break,
             }
         }
         Ok(revoked)
@@ -1295,25 +1318,37 @@ impl DynamoDBStore {
         nonce: &str,
         issued_at: i64,
     ) -> Result<(), DynamoDBError> {
-        self.client
+        let expired_before = issued_at - crate::constants::AGENT_CHALLENGE_TTL_SECONDS;
+        let result = self
+            .client
             .update_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
-            .condition_expression("attribute_exists(agent_did)")
+            .condition_expression(
+                "attribute_exists(agent_did) AND (attribute_not_exists(challenge_issued_at) OR challenge_issued_at < :expired)",
+            )
             .update_expression("SET challenge = :c, challenge_nonce = :n, challenge_issued_at = :t")
             .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
             .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
             .expression_attribute_values(":t", AttributeValue::N(issued_at.to_string()))
+            .expression_attribute_values(":expired", AttributeValue::N(expired_before.to_string()))
             .send()
-            .await
-            .map_err(|err| {
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if let SdkError::ServiceError(ref se) = err
+                    && se.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    return Err(DynamoDBError::ConditionalConflict);
+                }
                 error!(
                     "Failed to store agent challenge for {}: {:?}",
                     agent_did, err
                 );
-                DynamoDBError::SdkError(err.to_string())
-            })?;
-        Ok(())
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
     }
 
     /// Atomically take the pending challenge if `(challenge, nonce)` match.
@@ -1680,14 +1715,12 @@ mod tests {
             "did".to_string(),
             AttributeValue::S("did:key:z6Mkabc".into()),
         );
-        let parsed = DynamoDBStore::parse_user_credentials(&item).unwrap();
-        assert_eq!(
-            parsed.entitlements,
-            crate::constants::DEFAULT_USER_ENTITLEMENTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-        );
+        let defaults: Vec<String> = crate::constants::DEFAULT_USER_ENTITLEMENTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let parsed = DynamoDBStore::parse_user_credentials(&item, &defaults).unwrap();
+        assert_eq!(parsed.entitlements, defaults);
     }
 
     #[test]
@@ -1709,7 +1742,7 @@ mod tests {
                 "https://arkavo.ai/attr/action/value/read".into(),
             )]),
         );
-        let parsed = DynamoDBStore::parse_user_credentials(&item).unwrap();
+        let parsed = DynamoDBStore::parse_user_credentials(&item, &[]).unwrap();
         assert_eq!(
             parsed.entitlements,
             vec!["https://arkavo.ai/attr/action/value/read".to_string()]
