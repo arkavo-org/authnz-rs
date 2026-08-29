@@ -338,6 +338,10 @@ pub async fn authorize_agent(
         }
     }
 
+    // v1 only mints depth-0 delegations (the delegator is always a human, see
+    // `authenticate_human`), so this bound cannot trip yet. It stays as the
+    // guard sub-delegation will need, next to the constant it enforces,
+    // rather than being reintroduced from scratch later.
     let depth: u8 = 0;
     if depth >= MAX_DELEGATION_DEPTH {
         return Err(AgentError::MaxDepthExceeded(depth));
