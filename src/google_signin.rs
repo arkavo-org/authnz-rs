@@ -191,24 +191,18 @@ impl PendingAuthorizeStore {
     /// Fetch and delete (single-use). Expired records read as absent.
     pub async fn take(&self, state: &str) -> Result<Option<PendingAuthorize>, String> {
         let record = if self.redis.is_connected() {
-            let key = Self::key(state);
+            // GETDEL so two concurrent callbacks presenting the same state
+            // cannot both win the race between a GET and a DEL.
             let val: Option<String> = self
                 .redis
-                .get(&key)
+                .getdel(Self::key(state))
                 .await
-                .map_err(|e| format!("Redis get failed: {}", e))?;
+                .map_err(|e| format!("Redis getdel failed: {}", e))?;
             match val {
-                Some(json) => {
-                    let _: () = self
-                        .redis
-                        .del(&key)
-                        .await
-                        .map_err(|e| format!("Redis del failed: {}", e))?;
-                    Some(
-                        serde_json::from_str::<PendingAuthorize>(&json)
-                            .map_err(|e| format!("Deserialization failed: {}", e))?,
-                    )
-                }
+                Some(json) => Some(
+                    serde_json::from_str::<PendingAuthorize>(&json)
+                        .map_err(|e| format!("Deserialization failed: {}", e))?,
+                ),
                 None => None,
             }
         } else {
@@ -363,7 +357,10 @@ impl GoogleSignin {
             .append_pair("response_type", "code")
             .append_pair("scope", GOOGLE_SCOPES)
             .append_pair("state", &google_state)
-            .append_pair("nonce", &google_nonce);
+            .append_pair("nonce", &google_nonce)
+            // Let users with several Google sessions pick the account they
+            // want linked, instead of silently reusing the last one.
+            .append_pair("prompt", "select_account");
 
         info!(
             "Redirecting client_id={} to Google for sign-in",
@@ -558,6 +555,14 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Lower-case and trim an email address. Google addresses are
+/// case-insensitive, and downstream policy (the OpenTDF platform's recipient
+/// mapping) hashes the lower-cased address, so the CWT must carry the
+/// canonical form regardless of how the user typed it at Google.
+fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
 fn sanitize_for_username(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
@@ -585,7 +590,7 @@ pub async fn map_google_user(
     Ok(AuthenticatedUser {
         subject: format!("google:{}", claims.sub),
         arkavo_account_id: user.user_id.to_string(),
-        email: claims.email.clone(),
+        email: claims.email.as_deref().map(normalize_email),
         email_verified: claims.email_verified.as_ref().map(|v| v.as_bool()),
         name: claims.name.clone(),
         idp: "google".to_string(),
@@ -866,6 +871,7 @@ mod tests {
         );
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["scope"], "openid email profile");
+        assert_eq!(q["prompt"], "select_account");
         // Google state/nonce are fresh values, never the RP's.
         assert_ne!(q["state"], "rp-state-123");
         assert_ne!(q["nonce"], "rp-nonce");
@@ -932,6 +938,15 @@ mod tests {
         let (other_key, _) = test_keypair("kid-1");
         let forged = sign_google_token(&other_key, "kid-1", &google_claims(cid, "nonce-1"));
         assert!(verify_id_token_with_jwk(&jwk, &forged, cid, "nonce-1").is_err());
+    }
+
+    #[test]
+    fn normalize_email_lowercases_and_trims() {
+        assert_eq!(
+            normalize_email("  Someone@Example.com "),
+            "someone@example.com"
+        );
+        assert_eq!(normalize_email("plain@example.com"), "plain@example.com");
     }
 
     #[test]

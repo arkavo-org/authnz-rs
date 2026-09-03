@@ -295,7 +295,11 @@ aws dynamodb create-table \
   or Google via server-side redirect (`idp=google`, see google_signin.rs).
 - RFC 8707 `resource` on `/oauth/authorize` and `/oauth/token`: accepted when
   it names the client itself or `OIDC_PLATFORM_AUDIENCE` (both already in
-  `aud`); anything else is `invalid_target`. Omitted ⇒ unchanged behaviour.
+  `aud`); anything else is `invalid_target` (on the client's redirect URI
+  from authorize, JSON 400 from token). Omitted ⇒ unchanged behaviour.
+- Public clients (no `_SECRET`) without a `code_challenge` are refused at
+  authorize (`invalid_request` on the redirect URI), not just at the token
+  exchange, so an upstream (Google) login is never wasted.
 - Refresh tokens carry `idp`/`email`/`email_verified`/`name` from issuance so
   refreshed access tokens and id_tokens keep the same identity claims.
 
@@ -335,8 +339,8 @@ aws dynamodb create-table \
 - `GET /oauth/authorize?...&idp=google`: validates the RP request as usual,
   parks it in Redis (`oidc:google:pending:<state>`, 10 min, single-use,
   in-memory fallback) under a fresh random Google `state`, and 307s the
-  browser to `accounts.google.com` with `scope=openid email profile` and a
-  fresh random `nonce`. Not cookie-session based: the session cookie is
+  browser to `accounts.google.com` with `scope=openid email profile`,
+  `prompt=select_account`, and a fresh random `nonce`. Not cookie-session based: the session cookie is
   `SameSite=Strict` and would not survive the cross-site return.
 - `GET /oauth/google/callback?state&code|error`: takes the parked request,
   exchanges `code` at Google's token endpoint with `GOOGLE_CLIENT_SECRET`,
@@ -350,8 +354,8 @@ aws dynamodb create-table \
   `error=` (`access_denied` for user cancel / rejected id_token,
   `server_error` for exchange or DB failure, `temporarily_unavailable` when
   Google is unconfigured). Only an unknown `state` stays on this origin (400).
-- Tokens: `idp=google`, `email`/`email_verified` from Google, `name` on the
-  id_token. Disabled unless `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` are set.
+- Tokens: `idp=google`, `email` (lower-cased + trimmed) and `email_verified`
+  from Google, `name` on the id_token. Disabled unless `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` are set.
 
 **patreon.rs** - Patreon identity linking + membership materialization
 - Mirrors the Apple linking contract: minimum-PII row in `identity_links`

@@ -35,7 +35,8 @@ Errors after the RP request was validated go back to the RP as
 | Google id_token failed verification        | `access_denied`         |
 | Code exchange or account lookup failed     | `server_error`          |
 | `GOOGLE_CLIENT_ID`/`_SECRET` not set       | `temporarily_unavailable` |
-| `resource` names an audience we don't mint | `invalid_target` (400 JSON, before redirect) |
+| `resource` names an audience we don't mint | `invalid_target` (on the RP redirect; 400 JSON on `/oauth/token`) |
+| Public client sent no `code_challenge`     | `invalid_request` (stopped before the Google round trip) |
 
 An unknown/expired Google `state` on the callback is the one failure that has
 no RP to report to; it returns 400 JSON on this origin.
@@ -71,7 +72,7 @@ keyed by the `google-<sub>` username, exactly like `apple-<sub>`.
 | Google on the hosted login | `idp=google` redirects straight to Google. There is no chooser page yet; the hint parameter is `idp`, exactly as the app sends. |
 | Access token CWT, `aud` includes `https://platform.arkavo.net` | Yes: `aud = [closurekb-android, https://platform.arkavo.net]` from `OIDC_PLATFORM_AUDIENCE`. |
 | `resource=https://platform.arkavo.net` on authorize + token | Honoured (RFC 8707): accepted because it equals the platform audience. Any other value ⇒ `invalid_target`. |
-| Access token `iss`, `sub`, `exp`, `iat`, `cti`, `email`, `email_verified`, `idp=google` | All present. `email`/`email_verified` are Google's values, and they now survive refresh (previously refreshed tokens dropped them). |
+| Access token `iss`, `sub`, `exp`, `iat`, `cti`, `email`, `email_verified`, `idp=google` | All present. `email` is Google's address lower-cased and trimmed (so a SHA-256 of the lower-cased address matches regardless of how the user typed it); `email_verified` is Google's value. Both now survive refresh (previously refreshed tokens dropped them). |
 | id_token ES256, `kid` in JWKS, `aud` = client_id, `sub` stable, `email`, `email_verified` boolean, `name` optional | Yes. `sub` is `google:<google sub>`. `email_verified` is a JSON boolean. `name` is included when Google supplies it (needs `profile`). |
 | Refresh response may omit `refresh_token` | We always return a rotated one; the app's keep-previous behaviour is compatible. |
 | 400/401 on refresh ⇒ sign out                 | Expired/rotated/unknown refresh tokens return `400 invalid_grant`. |
@@ -85,9 +86,11 @@ keyed by the `google-<sub>` username, exactly like `apple-<sub>`.
 3. Access tokens carry `aud = ["closurekb-android", "https://platform.arkavo.net"]`
    and `resource=https://platform.arkavo.net` is accepted on both endpoints.
 4. `sub` on both tokens is `google:<sub>`; `idp` is `google`.
-5. Email is whatever Google asserts; `email_verified` is passed through
-   unchanged, so a Google account with an unverified address will get
-   `email_verified: false` and their API will (correctly) refuse it.
+5. Email is Google's address, lower-cased and trimmed. `email_verified` is
+   passed through unchanged, so a Google account with an unverified address
+   will get `email_verified: false` and their API will (correctly) refuse it.
+6. The Google authorize URL carries `prompt=select_account`, so a user with
+   several Google sessions gets the account picker every time.
 
 ### Not in scope here
 

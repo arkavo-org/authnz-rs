@@ -728,8 +728,37 @@ pub async fn authorize(
         );
     }
 
+    // client_id and redirect_uri are validated above, so from here on
+    // failures are reported on the client's redirect URI (RFC 6749 §4.1.2.1)
+    // rather than as a JSON page in the user's browser.
+
+    // Public clients must use PKCE. The token endpoint enforces this too, but
+    // catching it here avoids sending the user through a full upstream (Google)
+    // login only to fail the code exchange afterwards.
+    if client.client_secret.is_none()
+        && params
+            .code_challenge
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .is_none()
+    {
+        return redirect_error_to_client(
+            &params.redirect_uri,
+            params.state.as_deref(),
+            "invalid_request",
+            "Public clients must use PKCE (code_challenge with S256)",
+        );
+    }
+
     if let Err(resp) = check_resource(&app_state, params.resource.as_deref(), &client.client_id) {
-        return *resp;
+        // RFC 8707 §2: invalid_target goes back to the client.
+        return redirect_error_to_client(
+            &params.redirect_uri,
+            params.state.as_deref(),
+            "invalid_target",
+            resp.description,
+        );
     }
 
     let request = AuthorizeRequest {
@@ -837,18 +866,28 @@ fn check_resource(
     app_state: &AppState,
     resource: Option<&str>,
     client_id: &str,
-) -> Result<(), Box<Response>> {
+) -> Result<(), InvalidTarget> {
     let Some(resource) = resource.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(());
     };
     if resource == client_id || app_state.platform_audience.as_deref() == Some(resource) {
         return Ok(());
     }
-    Err(Box::new(oidc_error_response(
-        StatusCode::BAD_REQUEST,
-        "invalid_target",
-        "resource is not an audience this server issues tokens for",
-    )))
+    Err(InvalidTarget {
+        description: "resource is not an audience this server issues tokens for",
+    })
+}
+
+/// RFC 8707 `invalid_target`. Rendered as a redirect on the authorize
+/// endpoint and as a JSON 400 on the token endpoint.
+struct InvalidTarget {
+    description: &'static str,
+}
+
+impl InvalidTarget {
+    fn into_token_response(self) -> Response {
+        oidc_error_response(StatusCode::BAD_REQUEST, "invalid_target", self.description)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -966,8 +1005,8 @@ async fn handle_authorization_code_grant(
         );
     }
 
-    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
-        return *resp;
+    if let Err(e) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
+        return e.into_token_response();
     }
 
     let client = match oidc.clients.get(&presented_client_id) {
@@ -1209,8 +1248,8 @@ async fn handle_client_credentials_grant(
         }
     }
 
-    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &client.client_id) {
-        return *resp;
+    if let Err(e) = check_resource(&app_state, form.resource.as_deref(), &client.client_id) {
+        return e.into_token_response();
     }
 
     let now = Utc::now().timestamp();
@@ -1384,8 +1423,8 @@ async fn handle_refresh_token_grant(
         );
     }
 
-    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
-        return *resp;
+    if let Err(e) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
+        return e.into_token_response();
     }
 
     let now = Utc::now().timestamp();
@@ -2820,7 +2859,8 @@ mod tests {
             Some("https://platform.arkavo.net"),
             "closurekb-android",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .into_token_response();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(err.into_body(), 4096).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2918,7 +2958,10 @@ mod tests {
             "https://identity.arkavo.net/oauth/google/callback"
         );
 
-        // Unknown resource is refused before anything is parked.
+        assert_eq!(q["prompt"], "select_account");
+
+        // Unknown resource is refused before anything is parked, and since
+        // the client is already validated the error rides its redirect URI.
         let mut bad = closurekb_authorize_query();
         bad.resource = Some("https://not-ours.example".into());
         let resp = authorize(
@@ -2931,7 +2974,32 @@ mod tests {
             Query(bad),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp.headers()["location"].to_str().unwrap().to_string();
+        assert!(loc.starts_with("com.closurekb:/oauth2redirect?"), "{loc}");
+        assert!(loc.contains("error=invalid_target"), "{loc}");
+        assert!(loc.contains("state=rp-state"), "{loc}");
+
+        // A public client without PKCE is stopped here, not after the Google
+        // round trip.
+        let mut bad = closurekb_authorize_query();
+        bad.code_challenge = None;
+        bad.code_challenge_method = None;
+        let resp = authorize(
+            Extension(app_state.clone()),
+            Extension(closurekb_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(google.clone()),
+            Extension(AuthorizationCodeStore::new(test_redis())),
+            HeaderMap::new(),
+            Query(bad),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp.headers()["location"].to_str().unwrap().to_string();
+        assert!(loc.starts_with("com.closurekb:/oauth2redirect?"), "{loc}");
+        assert!(loc.contains("error=invalid_request"), "{loc}");
+        assert!(loc.contains("PKCE"), "{loc}");
 
         // Unregistered redirect_uri never reaches Google either.
         let mut bad = closurekb_authorize_query();
