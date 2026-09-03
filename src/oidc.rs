@@ -120,6 +120,9 @@ pub struct OidcClaims {
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email_verified: Option<bool>,
+    /// Display name from the upstream IdP (`profile` scope), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub idp: String,
     pub arkavo_account_id: String,
     pub arkavo_roles: Vec<String>,
@@ -136,7 +139,11 @@ pub struct AuthenticatedUser {
     pub arkavo_account_id: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
-    /// Upstream identity provider (`apple`, `webauthn`, ...).
+    /// Display name from the upstream IdP, when it supplies one. `default`
+    /// so authorization codes parked in Redis across a deploy still decode.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Upstream identity provider (`apple`, `google`, `webauthn`, ...).
     pub idp: String,
     pub roles: Vec<String>,
     pub entitlements: Vec<String>,
@@ -171,6 +178,36 @@ pub struct RefreshTokenRecord {
     pub scopes: String,
     pub expires_at: i64,
     pub created_at: i64,
+    /// Upstream IdP recorded at issuance so refreshed tokens keep the same
+    /// `idp` claim. `default` for records written before this field existed
+    /// (those fall back to deriving it from the subject prefix).
+    #[serde(default)]
+    pub idp: Option<String>,
+    /// Identity claims captured at issuance. Refreshed access tokens must
+    /// carry the same `email`/`email_verified` as the original: resource
+    /// servers (the OpenTDF platform) key policy on the access token's
+    /// `email` claim, and Apple only ever sends the address once.
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub email_verified: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// The relying-party-facing parameters of a validated authorize request —
+/// everything needed to mint the authorization code once the end user has
+/// been authenticated. Serializable so an upstream redirect flow (Google)
+/// can park it while the browser is away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizeRequest {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub state: Option<String>,
+    pub nonce: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
 }
 
 /// Redis-backed (with local in-memory fallback) authorization code store.
@@ -528,6 +565,7 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
             "nonce",
             "email",
             "email_verified",
+            "name",
             "idp",
             "arkavo_account_id",
             "arkavo_roles",
@@ -598,11 +636,16 @@ pub struct AuthorizeQuery {
     pub nonce: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
-    /// Identity-source hint. Currently supported: `apple` (with `id_token`),
-    /// `webauthn` (Arkavo CWT in `X-Auth-Token` header).
+    /// Identity-source hint. Supported: `apple` (with `id_token`), `google`
+    /// (server-side redirect to Google), `webauthn` (Arkavo CWT in the
+    /// `X-Auth-Token` header).
     pub idp: Option<String>,
     /// Apple id_token, when `idp=apple`. Alternatively pass `X-Apple-Id-Token` header.
     pub id_token: Option<String>,
+    /// RFC 8707 resource indicator. When present it must name an audience
+    /// this server already issues for (the client itself or the configured
+    /// `OIDC_PLATFORM_AUDIENCE`); anything else is `invalid_target`.
+    pub resource: Option<String>,
 }
 
 /// Authorization endpoint.
@@ -615,6 +658,10 @@ pub struct AuthorizeQuery {
 ///    authorization code.
 /// 2. `X-Auth-Token` header with a valid Arkavo CWT (from WebAuthn flow):
 ///    upgrades the WebAuthn session into an OIDC authorization code.
+/// 3. `idp=google`: no credential is presented; the browser is redirected to
+///    Google and the code grant completes at `/oauth/google/callback` (see
+///    [`crate::google_signin`]). This is the hosted-login path for relying
+///    parties that open the authorize URL in a system browser / Custom Tab.
 ///
 /// If no upstream credential is presented, returns 401 with a JSON body
 /// explaining how to authenticate. (A future enhancement is a login HTML page
@@ -625,6 +672,7 @@ pub async fn authorize(
     Extension(app_state): Extension<AppState>,
     Extension(oidc): Extension<Arc<OidcConfig>>,
     Extension(apple): Extension<Arc<apple_signin::AppleJwksCache>>,
+    Extension(google): Extension<Arc<crate::google_signin::GoogleSignin>>,
     Extension(code_store): Extension<AuthorizationCodeStore>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeQuery>,
@@ -680,25 +728,57 @@ pub async fn authorize(
         );
     }
 
+    if let Err(resp) = check_resource(&app_state, params.resource.as_deref(), &client.client_id) {
+        return *resp;
+    }
+
+    let request = AuthorizeRequest {
+        client_id: client.client_id.clone(),
+        redirect_uri: params.redirect_uri.clone(),
+        scope,
+        state: params.state.clone(),
+        nonce: params.nonce.clone(),
+        code_challenge: params.code_challenge.clone(),
+        code_challenge_method: params.code_challenge_method.clone(),
+    };
+
+    // Google is a browser redirect flow: nothing to verify yet, park the
+    // request and send the user-agent upstream.
+    if params.idp.as_deref() == Some("google") {
+        return google.begin_authorize(request).await;
+    }
+
     // Resolve the authenticated user from one of the supported upstream sources.
     let user = match resolve_user(&app_state, &oidc, &apple, &headers, &params).await {
         Ok(user) => user,
         Err(e) => return e.into_response(),
     };
 
-    // Mint an authorization code.
+    complete_authorization(&code_store, request, user).await
+}
+
+/// Mint a single-use authorization code for `user` and redirect the
+/// user-agent back to the relying party with `code` (+ `state`).
+///
+/// Shared by the synchronous authorize paths (Apple id_token, Arkavo CWT)
+/// and the Google callback.
+pub(crate) async fn complete_authorization(
+    code_store: &AuthorizationCodeStore,
+    request: AuthorizeRequest,
+    user: AuthenticatedUser,
+) -> Response {
     let code = generate_authz_code();
     let expires_at = Utc::now().timestamp() + AUTHORIZATION_CODE_LIFETIME_SECONDS;
     if let Err(err) = code_store
         .insert(
             code.clone(),
             AuthorizationCodeRecord {
-                client_id: client.client_id.clone(),
-                redirect_uri: params.redirect_uri.clone(),
-                scope,
-                nonce: params.nonce.clone(),
-                code_challenge: params.code_challenge.clone(),
-                code_challenge_method: params.code_challenge_method.clone(),
+                client_id: request.client_id.clone(),
+                redirect_uri: request.redirect_uri.clone(),
+                scope: request.scope,
+                nonce: request.nonce,
+                code_challenge: request.code_challenge,
+                code_challenge_method: request.code_challenge_method,
                 user,
                 expires_at,
             },
@@ -713,14 +793,62 @@ pub async fn authorize(
         );
     }
 
-    // Redirect back to the relying party with code + state.
-    let mut redirect = format!("{}?code={}", params.redirect_uri, code);
-    if let Some(state) = params.state.as_deref() {
-        redirect.push_str("&state=");
-        redirect
-            .push_str(&url::form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>());
+    let mut pairs = vec![("code", code.as_str())];
+    if let Some(state) = request.state.as_deref() {
+        pairs.push(("state", state));
     }
-    Redirect::temporary(&redirect).into_response()
+    Redirect::temporary(&append_query(&request.redirect_uri, &pairs)).into_response()
+}
+
+/// RFC 6749 §4.1.2.1: report an authorization failure to the relying party
+/// on its (already validated) redirect URI.
+pub(crate) fn redirect_error_to_client(
+    redirect_uri: &str,
+    state: Option<&str>,
+    error: &str,
+    description: &str,
+) -> Response {
+    let mut pairs = vec![("error", error), ("error_description", description)];
+    if let Some(state) = state {
+        pairs.push(("state", state));
+    }
+    Redirect::temporary(&append_query(redirect_uri, &pairs)).into_response()
+}
+
+/// Append form-encoded `pairs` to `uri`, using `&` when it already carries a
+/// query. Works for custom-scheme URIs (`com.example:/cb`) that `url::Url`
+/// would normalise differently from what the RP registered.
+fn append_query(uri: &str, pairs: &[(&str, &str)]) -> String {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        ser.append_pair(k, v);
+    }
+    let sep = if uri.contains('?') { '&' } else { '?' };
+    format!("{}{}{}", uri, sep, ser.finish())
+}
+
+/// RFC 8707 resource indicator check. Every access token this server mints
+/// already carries `aud = [client_id, OIDC_PLATFORM_AUDIENCE?]`, so a
+/// `resource` naming either is honoured as-is; anything else would require
+/// an audience we don't issue and is refused with `invalid_target` rather
+/// than silently ignored (which would leave the client with a token its
+/// resource server rejects).
+fn check_resource(
+    app_state: &AppState,
+    resource: Option<&str>,
+    client_id: &str,
+) -> Result<(), Box<Response>> {
+    let Some(resource) = resource.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    if resource == client_id || app_state.platform_audience.as_deref() == Some(resource) {
+        return Ok(());
+    }
+    Err(Box::new(oidc_error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_target",
+        "resource is not an audience this server issues tokens for",
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +861,8 @@ pub struct TokenForm {
     pub code_verifier: Option<String>,
     pub refresh_token: Option<String>,
     pub scope: Option<String>,
+    /// RFC 8707 resource indicator; see [`AuthorizeQuery::resource`].
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -836,6 +966,10 @@ async fn handle_authorization_code_grant(
         );
     }
 
+    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
+        return *resp;
+    }
+
     let client = match oidc.clients.get(&presented_client_id) {
         Some(c) => c,
         None => {
@@ -910,6 +1044,7 @@ async fn handle_authorization_code_grant(
         nonce: record.nonce.clone(),
         email: record.user.email.clone(),
         email_verified: record.user.email_verified,
+        name: record.user.name.clone(),
         idp: record.user.idp.clone(),
         arkavo_account_id: record.user.arkavo_account_id.clone(),
         arkavo_roles: record.user.roles.clone(),
@@ -988,6 +1123,10 @@ async fn handle_authorization_code_grant(
             scopes: record.scope.clone(),
             expires_at,
             created_at: now,
+            idp: Some(record.user.idp.clone()),
+            email: record.user.email.clone(),
+            email_verified: record.user.email_verified,
+            name: record.user.name.clone(),
         };
         if let Err(err) = refresh_store.insert(&r_token, refresh_record).await {
             error!("Failed to store refresh token: {}", err);
@@ -1070,6 +1209,10 @@ async fn handle_client_credentials_grant(
         }
     }
 
+    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &client.client_id) {
+        return *resp;
+    }
+
     let now = Utc::now().timestamp();
     let exp = now + ACCESS_TOKEN_LIFETIME_SECONDS;
     let client_subject = format!("client:{}", client.client_id);
@@ -1084,6 +1227,7 @@ async fn handle_client_credentials_grant(
         nonce: None,
         email: None,
         email_verified: None,
+        name: None,
         idp: "client_credentials".to_string(),
         arkavo_account_id: client_subject.clone(),
         arkavo_roles: vec!["service-account".to_string()],
@@ -1240,6 +1384,10 @@ async fn handle_refresh_token_grant(
         );
     }
 
+    if let Err(resp) = check_resource(&app_state, form.resource.as_deref(), &record.client_id) {
+        return *resp;
+    }
+
     let now = Utc::now().timestamp();
     if record.expires_at < now {
         return oidc_error_response(
@@ -1260,11 +1408,12 @@ async fn handle_refresh_token_grant(
             "client_credentials".to_string(),
         )
     } else {
-        let auth_idp = if record.subject.starts_with("apple:") {
-            "apple"
-        } else {
-            "webauthn"
-        };
+        // Prefer the idp recorded at issuance; derive from the subject
+        // prefix only for records that predate the field.
+        let auth_idp = record
+            .idp
+            .clone()
+            .unwrap_or_else(|| idp_from_subject(&record.subject).to_string());
         // The record's `arkavo_account_id` is the Arkavo user UUID for both
         // the webauthn (`arkavo:<uuid>`) and Apple (`apple:<sub>`) subject
         // shapes — both auth paths set `AuthenticatedUser::arkavo_account_id`
@@ -1317,7 +1466,7 @@ async fn handle_refresh_token_grant(
                     .collect()
             }
         };
-        (vec!["user".to_string()], entitlements, auth_idp.to_string())
+        (vec!["user".to_string()], entitlements, auth_idp)
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
@@ -1329,8 +1478,9 @@ async fn handle_refresh_token_grant(
         exp: id_exp,
         iat: now,
         nonce: None,
-        email: None,
-        email_verified: None,
+        email: record.email.clone(),
+        email_verified: record.email_verified,
+        name: record.name.clone(),
         idp,
         arkavo_account_id: record.subject.clone(),
         arkavo_roles: roles,
@@ -1399,6 +1549,10 @@ async fn handle_refresh_token_grant(
         scopes: record.scopes.clone(),
         expires_at,
         created_at: now,
+        idp: Some(id_claims.idp.clone()),
+        email: record.email.clone(),
+        email_verified: record.email_verified,
+        name: record.name.clone(),
     };
     if let Err(err) = refresh_store
         .insert(&new_refresh_token, new_refresh_record)
@@ -1435,6 +1589,18 @@ async fn handle_refresh_token_grant(
         axum::http::HeaderValue::from_static("no-cache"),
     );
     response
+}
+
+/// Derive the upstream IdP from a subject prefix (`apple:…`, `google:…`,
+/// `arkavo:…`). Used only for refresh records written before `idp` was stored.
+fn idp_from_subject(subject: &str) -> &'static str {
+    if subject.starts_with("apple:") {
+        "apple"
+    } else if subject.starts_with("google:") {
+        "google"
+    } else {
+        "webauthn"
+    }
 }
 
 fn generate_refresh_token() -> String {
@@ -1656,6 +1822,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         arkavo_account_id: account_id,
         email: None,
         email_verified: None,
+        name: None,
         idp: "webauthn".to_string(),
         roles: vec!["user".to_string()],
         entitlements,
@@ -1752,7 +1919,7 @@ struct OidcErrorBody {
     error_description: String,
 }
 
-fn oidc_error_response(status: StatusCode, code: &str, description: &str) -> Response {
+pub(crate) fn oidc_error_response(status: StatusCode, code: &str, description: &str) -> Response {
     (
         status,
         Json(OidcErrorBody {
@@ -2042,6 +2209,7 @@ mod tests {
             arkavo_account_id: "uuid".into(),
             email: Some("a@b".into()),
             email_verified: Some(true),
+            name: None,
             idp: "apple".into(),
             roles: vec!["user".into()],
             entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
@@ -2071,6 +2239,7 @@ mod tests {
             arkavo_account_id: "uuid".into(),
             email: None,
             email_verified: None,
+            name: None,
             idp: "apple".into(),
             roles: vec![],
             entitlements: vec![],
@@ -2098,6 +2267,10 @@ mod tests {
             arkavo_account_id: Uuid::nil().to_string(),
             client_id: "opentdf".into(),
             scopes: "openid offline_access".into(),
+            idp: Some("apple".into()),
+            email: Some("a@b".into()),
+            email_verified: Some(true),
+            name: None,
             expires_at: Utc::now().timestamp() + 600,
             created_at: Utc::now().timestamp(),
         };
@@ -2286,6 +2459,7 @@ mod tests {
             nonce: None,
             email: None,
             email_verified: None,
+            name: None,
             idp: "apple".into(),
             arkavo_account_id: "uuid".into(),
             arkavo_roles: vec!["user".into()],
@@ -2396,6 +2570,7 @@ mod tests {
             code_verifier: None,
             refresh_token: None,
             scope: None,
+            resource: None,
         };
 
         let headers = HeaderMap::new();
@@ -2515,6 +2690,10 @@ mod tests {
             arkavo_account_id: "legacy-record-without-uuid".into(),
             client_id: "test-client".into(),
             scopes: "openid offline_access".into(),
+            idp: Some("apple".into()),
+            email: Some("a@b".into()),
+            email_verified: Some(true),
+            name: None,
             expires_at: Utc::now().timestamp() + 3600,
             created_at: Utc::now().timestamp(),
         };
@@ -2529,6 +2708,7 @@ mod tests {
             code_verifier: None,
             refresh_token: Some(token.to_string()),
             scope: None,
+            resource: None,
         };
 
         let headers = HeaderMap::new();
@@ -2549,10 +2729,224 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(!body["access_token"].as_str().unwrap().is_empty());
         assert!(!body["id_token"].as_str().unwrap().is_empty());
-        assert!(!body["refresh_token"].as_str().unwrap().is_empty());
+        let rotated = body["refresh_token"].as_str().unwrap().to_string();
+        assert!(!rotated.is_empty());
 
-        // Verification of rotation: original token must be gone
+        // Identity claims captured at issuance must survive refresh: the
+        // platform keys policy on the access token's `email`, and a
+        // refreshed id_token should look like the original to the RP.
+        {
+            use coset::CborSerializable;
+            let raw =
+                crate::cwt::decode_from_header(body["access_token"].as_str().unwrap()).unwrap();
+            let inner = crate::cwt::strip_cwt_tag(&raw).unwrap();
+            let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+            let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+            assert_eq!(claims.custom.idp.as_deref(), Some("apple"));
+            assert_eq!(claims.custom.email.as_deref(), Some("a@b"));
+            assert_eq!(claims.custom.email_verified, Some(true));
+        }
+        {
+            let id_token = body["id_token"].as_str().unwrap();
+            let payload = id_token.split('.').nth(1).unwrap();
+            let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap();
+            let claims: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(claims["idp"], "apple");
+            assert_eq!(claims["email"], "a@b");
+            assert_eq!(claims["email_verified"], true);
+            assert!(claims.get("name").is_none(), "no name ⇒ claim omitted");
+        }
+
+        // Verification of rotation: original token must be gone, and the
+        // rotated record carries the identity claims forward.
         assert!(refresh_store.take(token).await.unwrap().is_none());
+        let next = refresh_store.take(&rotated).await.unwrap().unwrap();
+        assert_eq!(next.idp.as_deref(), Some("apple"));
+        assert_eq!(next.email.as_deref(), Some("a@b"));
+        assert_eq!(next.email_verified, Some(true));
+    }
+
+    #[test]
+    fn test_refresh_record_without_identity_fields_still_deserializes() {
+        // Records written before idp/email/name existed must keep working
+        // for their remaining lifetime (30 days) after deploy.
+        let legacy = serde_json::json!({
+            "subject": "google:42",
+            "arkavo_account_id": "x",
+            "client_id": "c",
+            "scopes": "openid",
+            "expires_at": 1,
+            "created_at": 0
+        });
+        let rec: RefreshTokenRecord = serde_json::from_value(legacy).unwrap();
+        assert!(rec.idp.is_none());
+        assert!(rec.email.is_none());
+        assert_eq!(idp_from_subject(&rec.subject), "google");
+        assert_eq!(idp_from_subject("apple:1"), "apple");
+        assert_eq!(idp_from_subject("arkavo:1"), "webauthn");
+    }
+
+    #[test]
+    fn test_append_query_handles_custom_schemes_and_existing_queries() {
+        assert_eq!(
+            append_query(
+                "com.closurekb:/oauth2redirect",
+                &[("code", "a b"), ("state", "s&t")]
+            ),
+            "com.closurekb:/oauth2redirect?code=a+b&state=s%26t"
+        );
+        assert_eq!(
+            append_query("https://rp.example/cb?x=1", &[("error", "access_denied")]),
+            "https://rp.example/cb?x=1&error=access_denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_resource_accepts_known_audiences_only() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let mut app_state = crate::test_helpers::build_test_app_state().await;
+        // No platform audience configured: only the client itself is valid.
+        assert!(check_resource(&app_state, None, "closurekb-android").is_ok());
+        assert!(check_resource(&app_state, Some(""), "closurekb-android").is_ok());
+        assert!(check_resource(&app_state, Some("closurekb-android"), "closurekb-android").is_ok());
+        let err = check_resource(
+            &app_state,
+            Some("https://platform.arkavo.net"),
+            "closurekb-android",
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(err.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "invalid_target");
+
+        app_state.platform_audience = Arc::new(Some("https://platform.arkavo.net".into()));
+        assert!(
+            check_resource(
+                &app_state,
+                Some("https://platform.arkavo.net"),
+                "closurekb-android"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resource(
+                &app_state,
+                Some("https://other.example"),
+                "closurekb-android"
+            )
+            .is_err()
+        );
+    }
+
+    fn closurekb_oidc_config() -> Arc<OidcConfig> {
+        let mut cfg = (*test_oidc_config()).clone();
+        cfg.clients.insert(
+            "closurekb-android".into(),
+            OidcClient {
+                client_id: "closurekb-android".into(),
+                client_secret: None,
+                redirect_uris: vec!["com.closurekb:/oauth2redirect".into()],
+            },
+        );
+        Arc::new(cfg)
+    }
+
+    fn closurekb_authorize_query() -> AuthorizeQuery {
+        AuthorizeQuery {
+            response_type: "code".into(),
+            client_id: "closurekb-android".into(),
+            redirect_uri: "com.closurekb:/oauth2redirect".into(),
+            scope: Some("openid email profile offline_access".into()),
+            state: Some("rp-state".into()),
+            nonce: Some("rp-nonce".into()),
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            idp: Some("google".into()),
+            id_token: None,
+            resource: Some("https://platform.arkavo.net".into()),
+        }
+    }
+
+    /// The exact request the ClosureKB Android app sends (see
+    /// docs/google-signin.md): idp=google + resource must land on Google.
+    #[tokio::test]
+    async fn test_authorize_idp_google_redirects_to_google() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let mut app_state = crate::test_helpers::build_test_app_state().await;
+        app_state.platform_audience = Arc::new(Some("https://platform.arkavo.net".into()));
+        let google = Arc::new(crate::google_signin::GoogleSignin::new(
+            Some(crate::google_signin::GoogleConfig {
+                client_id: "gid".into(),
+                client_secret: "gsecret".into(),
+                redirect_uri: "https://identity.arkavo.net/oauth/google/callback".into(),
+                authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                jwks_url: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            }),
+            test_redis(),
+            std::time::Duration::from_secs(1),
+        ));
+
+        let resp = authorize(
+            Extension(app_state.clone()),
+            Extension(closurekb_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(google.clone()),
+            Extension(AuthorizationCodeStore::new(test_redis())),
+            HeaderMap::new(),
+            Query(closurekb_authorize_query()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        assert_eq!(loc.host_str(), Some("accounts.google.com"));
+        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "gid");
+        assert_eq!(
+            q["redirect_uri"],
+            "https://identity.arkavo.net/oauth/google/callback"
+        );
+
+        // Unknown resource is refused before anything is parked.
+        let mut bad = closurekb_authorize_query();
+        bad.resource = Some("https://not-ours.example".into());
+        let resp = authorize(
+            Extension(app_state.clone()),
+            Extension(closurekb_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(google.clone()),
+            Extension(AuthorizationCodeStore::new(test_redis())),
+            HeaderMap::new(),
+            Query(bad),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Unregistered redirect_uri never reaches Google either.
+        let mut bad = closurekb_authorize_query();
+        bad.redirect_uri = "com.closurekb:/other".into();
+        let resp = authorize(
+            Extension(app_state),
+            Extension(closurekb_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(google),
+            Extension(AuthorizationCodeStore::new(test_redis())),
+            HeaderMap::new(),
+            Query(bad),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A failed entitlement lookup must not mint a token: an access_token
@@ -2591,6 +2985,10 @@ mod tests {
                     arkavo_account_id: Uuid::new_v4().to_string(),
                     client_id: "test-client".into(),
                     scopes: "openid offline_access".into(),
+                    idp: None,
+                    email: None,
+                    email_verified: None,
+                    name: None,
                     expires_at: Utc::now().timestamp() + 3600,
                     created_at: Utc::now().timestamp(),
                 },
@@ -2607,6 +3005,7 @@ mod tests {
             code_verifier: None,
             refresh_token: Some(token.to_string()),
             scope: None,
+            resource: None,
         };
 
         let resp = handle_refresh_token_grant(

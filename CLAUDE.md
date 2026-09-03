@@ -77,6 +77,12 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https:
 # so every port the CLI may bind is listed verbatim.
 # export OIDC_CLIENT_EDGE_ID=arkavo-edge
 # export OIDC_CLIENT_EDGE_REDIRECT_URIS=http://127.0.0.1:52171/cb,...,http://127.0.0.1:52178/cb
+# ClosureKB Android (closurekb/closurekb#40): PUBLIC client, PKCE S256,
+# custom-scheme redirect, signs in with idp=google, sends
+# resource=https://platform.arkavo.net (honoured because it equals
+# OIDC_PLATFORM_AUDIENCE). See docs/google-signin.md.
+# export OIDC_CLIENT_CLOSUREKB_ID=closurekb-android
+# export OIDC_CLIENT_CLOSUREKB_REDIRECT_URIS=com.closurekb:/oauth2redirect
 # AuthZEN PEPs (service CWT, client_credentials): see docs/pep-service-clients.md.
 # catalog-node and mcp-edge are registered in production (401 without secret).
 # Mint on the identity host with scripts/mint-pep-cwt.py — do not paste secrets.
@@ -91,6 +97,15 @@ export OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net
 # Optional: Sign in with Apple. Accepts a comma-separated list so the same
 # AuthNZ instance can serve an iOS bundle id + web Service ID.
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
+
+# Optional: Sign in with Google as an upstream IdP for
+# /oauth/authorize?idp=google (server-side redirect; docs/google-signin.md).
+# Both must be set or idp=google fails closed with temporarily_unavailable.
+# GOOGLE_REDIRECT_URI defaults to <OIDC_ISSUER>/oauth/google/callback and
+# must be an authorized redirect URI on the Google OAuth client.
+export GOOGLE_CLIENT_ID=<...>.apps.googleusercontent.com
+export GOOGLE_CLIENT_SECRET=<...>
+# export GOOGLE_REDIRECT_URI=https://identity.arkavo.net/oauth/google/callback
 
 # Optional: Patreon linking + membership materialization. Patreon issues one
 # OAuth client per app, so clients are registered with tagged env vars
@@ -275,8 +290,14 @@ aws dynamodb create-table \
 - Authorization codes stored in an in-memory `AuthorizationCodeStore` (10-min
   lifetime, single-use). For multi-instance deployments swap for a shared store.
 - Confidential clients use `client_secret`; public clients must use PKCE (S256).
-- Upstream authentication: WebAuthn-issued Arkavo CWT (via `X-Auth-Token`) or
-  Apple id_token (via `idp=apple` + `id_token` query/`X-Apple-Id-Token` header).
+- Upstream authentication: WebAuthn-issued Arkavo CWT (via `X-Auth-Token`),
+  Apple id_token (via `idp=apple` + `id_token` query/`X-Apple-Id-Token` header),
+  or Google via server-side redirect (`idp=google`, see google_signin.rs).
+- RFC 8707 `resource` on `/oauth/authorize` and `/oauth/token`: accepted when
+  it names the client itself or `OIDC_PLATFORM_AUDIENCE` (both already in
+  `aud`); anything else is `invalid_target`. Omitted ⇒ unchanged behaviour.
+- Refresh tokens carry `idp`/`email`/`email_verified`/`name` from issuance so
+  refreshed access tokens and id_tokens keep the same identity claims.
 
 **apple_signin.rs** - Sign in with Apple integration
 - Validates Apple-issued id_tokens against Apple's JWKS (cached 1h with
@@ -309,6 +330,28 @@ aws dynamodb create-table \
   is the canonical join key — email is optional metadata and never used to
   locate accounts (private-relay rotation safe).
 - Requires `APPLE_CLIENT_ID` to be set (one or more comma-separated values).
+
+**google_signin.rs** - Sign in with Google (upstream IdP, redirect flow)
+- `GET /oauth/authorize?...&idp=google`: validates the RP request as usual,
+  parks it in Redis (`oidc:google:pending:<state>`, 10 min, single-use,
+  in-memory fallback) under a fresh random Google `state`, and 307s the
+  browser to `accounts.google.com` with `scope=openid email profile` and a
+  fresh random `nonce`. Not cookie-session based: the session cookie is
+  `SameSite=Strict` and would not survive the cross-site return.
+- `GET /oauth/google/callback?state&code|error`: takes the parked request,
+  exchanges `code` at Google's token endpoint with `GOOGLE_CLIENT_SECRET`,
+  verifies the returned id_token (JWKS signature with kid-miss refresh,
+  `iss` ∈ {`https://accounts.google.com`, `accounts.google.com`},
+  `aud` = `GOOGLE_CLIENT_ID`, `nonce` constant-time match, `exp`), maps
+  `google:<sub>` → Arkavo account (`google-<sub>` username in the
+  credentials table, provisioned on first sight), then mints the OIDC code
+  and redirects to the RP with `code` + the RP's own `state`.
+- Failures after the RP was validated go back to the RP's redirect_uri as
+  `error=` (`access_denied` for user cancel / rejected id_token,
+  `server_error` for exchange or DB failure, `temporarily_unavailable` when
+  Google is unconfigured). Only an unknown `state` stays on this origin (400).
+- Tokens: `idp=google`, `email`/`email_verified` from Google, `name` on the
+  id_token. Disabled unless `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` are set.
 
 **patreon.rs** - Patreon identity linking + membership materialization
 - Mirrors the Apple linking contract: minimum-PII row in `identity_links`
@@ -529,6 +572,9 @@ The codebase uses thiserror for structured error handling:
   - `apple_signin.rs`: id_token claim deserialization, error status mapping,
     username sanitization, hash stability (6 tests)
   - `cwt.rs`: CWT encoder/decoder, mint/verify, cnf helpers, transport, and strictness (30 tests)
+  - `google_signin.rs`: pending store, authorize redirect shape, id_token
+    verification (nonce/aud/iss/exp/key), callback against a mock Google
+    token+JWKS server (8 tests)
 - Test app routing with tower::ServiceExt::oneshot for request simulation
 - Mock requests use axum::body::Body::empty()
 - Critical test coverage focuses on:

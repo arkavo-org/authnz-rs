@@ -56,6 +56,7 @@ mod db;
 mod device_check;
 mod entities;
 mod entitlements;
+mod google_signin;
 mod oidc;
 mod patreon;
 mod webvh;
@@ -472,6 +473,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
     let oidc_refresh_store = RefreshTokenStore::new(redis_client.clone());
     let apple_jwks_cache = Arc::new(AppleJwksCache::new());
+    let google_signin = Arc::new(google_signin::GoogleSignin::from_env(
+        &app_state.issuer,
+        redis_client.clone(),
+    ));
 
     // Patreon support is optional; if PATREON_CLIENT_ID isn't set, every
     // Patreon code path (link handler + access_token enrichment) is silently
@@ -517,6 +522,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
         .route("/oauth/apple/link", post(apple_link_handler))
         .route("/oauth/apple/callback", post(apple_callback_handler))
+        // Google sign-in return leg (see google_signin.rs): completes an
+        // `idp=google` /oauth/authorize request parked in Redis.
+        .route(
+            "/oauth/google/callback",
+            get(google_signin::google_callback_handler),
+        )
         // Patreon linking (mirrors /oauth/apple/link — same auth-required,
         // identity_links-write contract). Membership + tier are surfaced
         // only on the resulting OIDC access_token CWT; there is deliberately
@@ -570,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(oidc_code_store))
         .layer(Extension(oidc_refresh_store))
         .layer(Extension(apple_jwks_cache))
+        .layer(Extension(google_signin))
         .layer(Extension(patreon_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
