@@ -62,6 +62,13 @@ pub struct ArkavoNpe {
 
 #[derive(Debug, Clone, Default)]
 pub struct CustomClaims {
+    /// OpenID Connect `azp` (authorized party): the `client_id` of the relying
+    /// party that obtained the token. Present on every token minted through
+    /// the OIDC token endpoint; absent on native (non-OIDC) WebAuthn, agent
+    /// and device tokens, which no OAuth client obtains. Resource servers use
+    /// it to identify the calling client independently of `sub`/`aud`
+    /// (the OpenTDF platform's `client_id_claim` defaults to `azp`).
+    pub azp: Option<String>,
     pub idp: Option<String>,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
@@ -236,6 +243,11 @@ impl ArkavoClaims {
     #[cfg(test)]
     pub fn without_cnf(mut self) -> Self {
         self.cnf = None;
+        self
+    }
+
+    pub fn with_azp(mut self, client_id: &str) -> Self {
+        self.custom.azp = Some(client_id.into());
         self
     }
 
@@ -444,6 +456,9 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
         entries.push((Value::Integer(8.into()), Value::Map(cnf_entries)));
     }
 
+    if let Some(v) = &c.custom.azp {
+        entries.push((Value::Text("azp".into()), Value::Text(v.clone())));
+    }
     if let Some(v) = &c.custom.idp {
         entries.push((Value::Text("idp".into()), Value::Text(v.clone())));
     }
@@ -789,6 +804,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     kid: kid.unwrap_or_default(),
                 });
             }
+            (Value::Text(s), Value::Text(t)) if s == "azp" => custom.azp = Some(t),
             (Value::Text(s), Value::Text(t)) if s == "idp" => custom.idp = Some(t),
             (Value::Text(s), Value::Text(t)) if s == "email" => custom.email = Some(t),
             (Value::Text(s), Value::Bool(b)) if s == "email_verified" => {
@@ -1168,6 +1184,7 @@ mod tests {
     #[test]
     fn cbor_roundtrip_full_oidc_claims() {
         let c = ArkavoClaims::oidc_access("iss-1", "arkavo:abc", "opentdf", 1)
+            .with_azp("opentdf")
             .with_idp("arkavo")
             .with_email("a@b.c", true)
             .with_arkavo_account_id("acct-1")
@@ -1175,6 +1192,7 @@ mod tests {
             .with_arkavo_entitlements(vec!["ent-a".into()]);
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.custom.azp.as_deref(), Some("opentdf"));
         assert_eq!(decoded.custom.idp, c.custom.idp);
         assert_eq!(decoded.custom.email, c.custom.email);
         assert_eq!(decoded.custom.email_verified, c.custom.email_verified);

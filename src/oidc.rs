@@ -112,6 +112,9 @@ pub struct OidcClaims {
     pub iss: String,
     pub sub: String,
     pub aud: String,
+    /// OpenID Connect authorized party: the client_id the token was issued to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azp: Option<String>,
     pub exp: i64,
     pub iat: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -905,6 +908,7 @@ async fn handle_authorization_code_grant(
         iss: oidc.issuer.clone(),
         sub: record.user.subject.clone(),
         aud: record.client_id.clone(),
+        azp: Some(record.client_id.clone()),
         exp: id_exp,
         iat: now,
         nonce: record.nonce.clone(),
@@ -1079,6 +1083,7 @@ async fn handle_client_credentials_grant(
         iss: oidc.issuer.clone(),
         sub: client_subject.clone(),
         aud: client.client_id.clone(),
+        azp: Some(client.client_id.clone()),
         exp,
         iat: now,
         nonce: None,
@@ -1326,6 +1331,7 @@ async fn handle_refresh_token_grant(
         iss: oidc.issuer.clone(),
         sub: record.subject.clone(),
         aud: record.client_id.clone(),
+        azp: Some(record.client_id.clone()),
         exp: id_exp,
         iat: now,
         nonce: None,
@@ -1799,7 +1805,12 @@ pub fn mint_access_token(
     extras: Option<AccessTokenExtras>,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, crate::cwt::CwtError> {
-    let mut claims = crate::cwt::ArkavoClaims::oidc_access(&app_state.issuer, sub, audience, 1);
+    // `audience` is the client_id of the relying party the token is minted
+    // for, so it is also the OIDC authorized party. Emit it as `azp` on every
+    // OIDC-issued access token: with the shared platform audience appended
+    // below, `aud` alone no longer identifies the client.
+    let mut claims = crate::cwt::ArkavoClaims::oidc_access(&app_state.issuer, sub, audience, 1)
+        .with_azp(audience);
 
     // RFC 8707-style shared resource audience: a resource server validating
     // one fixed audience (the OpenTDF platform CWT verifier) must accept
@@ -2281,6 +2292,7 @@ mod tests {
             iss: "https://identity.arkavo.net".into(),
             sub: "apple:SUB".into(),
             aud: "opentdf".into(),
+            azp: None,
             exp: 0,
             iat: 0,
             nonce: None,
@@ -2409,6 +2421,30 @@ mod tests {
         assert!(!body["access_token"].as_str().unwrap().is_empty());
         assert!(!body["id_token"].as_str().unwrap().is_empty());
         assert_eq!(body["scope"].as_str().unwrap(), "openid");
+
+        // Both tokens name the client that obtained them as the OIDC
+        // authorized party (`azp`), so a resource server can identify the
+        // caller without relying on `sub`/`aud` conventions.
+        {
+            use coset::CborSerializable;
+            let raw =
+                crate::cwt::decode_from_header(body["access_token"].as_str().unwrap()).unwrap();
+            let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+            let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+            let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+            assert_eq!(claims.custom.azp.as_deref(), Some("test-client"));
+            assert_eq!(claims.sub, "client:test-client");
+        }
+        {
+            use base64::Engine;
+            let id_token = body["id_token"].as_str().unwrap();
+            let payload_b64 = id_token.split('.').nth(1).expect("JWT payload segment");
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .unwrap();
+            let id_claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(id_claims["azp"].as_str(), Some("test-client"));
+        }
     }
 
     #[tokio::test]
