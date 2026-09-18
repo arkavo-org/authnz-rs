@@ -78,6 +78,27 @@ pub struct CustomClaims {
     pub arkavo_npe: Option<ArkavoNpe>,
 }
 
+/// The Arkavo custom claims derived from one user record, shared by every
+/// token minted for a human user: the OIDC access token
+/// (`oidc::mint_access_token`) and the WebAuthn auth token
+/// (`authn::mint_auth_token`) both apply this through
+/// [`ArkavoClaims::with_arkavo_user`], so the OpenTDF platform sees one claim
+/// shape regardless of which token the client presents
+/// (`client_id_claim: arkavo_account_id`, `groups_claim: arkavo_roles`, and
+/// the Patreon entity resolver's `arkavo_patreon`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkavoUserClaims {
+    /// Internal Arkavo account id (UUID string) → `arkavo_account_id`.
+    pub account_id: String,
+    /// → `arkavo_roles`.
+    pub roles: Vec<String>,
+    /// Attribute FQNs the user holds → `arkavo_entitlements`.
+    pub entitlements: Vec<String>,
+    /// Materialized Patreon membership → `arkavo_patreon`; `None` when the
+    /// user is unlinked, Patreon is disabled, or materialization failed.
+    pub patreon: Option<ArkavoPatreon>,
+}
+
 /// Materialized Patreon membership for embedding in a CWT access token.
 ///
 /// One snapshot per minted token. `verified_at` is the wall-clock second when
@@ -267,6 +288,19 @@ impl ArkavoClaims {
 
     pub fn with_arkavo_patreon(mut self, p: ArkavoPatreon) -> Self {
         self.custom.arkavo_patreon = Some(p);
+        self
+    }
+
+    /// Apply the per-user Arkavo custom claims in one step, so every token
+    /// minted for a human user carries the same set.
+    pub fn with_arkavo_user(mut self, user: &ArkavoUserClaims) -> Self {
+        self = self
+            .with_arkavo_account_id(&user.account_id)
+            .with_arkavo_roles(user.roles.clone())
+            .with_arkavo_entitlements(user.entitlements.clone());
+        if let Some(p) = &user.patreon {
+            self = self.with_arkavo_patreon(p.clone());
+        }
         self
     }
 }

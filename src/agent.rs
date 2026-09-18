@@ -269,10 +269,11 @@ async fn authenticate_human(
 
 /// Root user id from a verified CWT: `claims.sub` parsed as a bare UUID (the
 /// shape `authn::mint_auth_token` mints) or an `arkavo:<uuid>`-prefixed UUID.
-/// `arkavo_account_id` is deliberately NOT consulted — the real WebAuthn auth
-/// CWT never sets it, so trusting it would accept a shape no genuine human
-/// token has. Other subject namespaces (`apple:`, `client:`, …) cannot
-/// delegate. Claims describing an agent or device NPE (`arkavo_npe` set, or
+/// `arkavo_account_id` is deliberately NOT consulted — on the real WebAuthn
+/// auth CWT it is only a copy of `sub`, so honoring it on its own would
+/// accept a shape (non-UUID `sub` plus an account id) no genuine human token
+/// has. Other subject namespaces (`apple:`, `client:`, …) cannot delegate.
+/// Claims describing an agent or device NPE (`arkavo_npe` set, or
 /// `arkavo_roles` containing `"agent"`) are rejected outright — only a human
 /// may delegate.
 fn user_id_from_claims(claims: &cwt::ArkavoClaims) -> Result<Uuid, AgentError> {
@@ -960,7 +961,8 @@ mod tests {
     #[test]
     fn user_id_from_claims_accepts_bare_uuid_and_arkavo_prefixed_subjects() {
         // The real WebAuthn auth CWT (authn::mint_auth_token) has a bare-UUID
-        // `sub` and no `arkavo_account_id` — this is the shape C1 fixes.
+        // `sub` (and, since the claims fix, an `arkavo_account_id` equal to
+        // it) — `sub` alone is what identifies the delegator.
         let bare = cwt::ArkavoClaims::auth(
             "https://identity.arkavo.net",
             "00000000-0000-0000-0000-000000000002",
@@ -986,9 +988,9 @@ mod tests {
 
     #[test]
     fn user_id_from_claims_does_not_consult_arkavo_account_id() {
-        // arkavo_account_id must never be trusted on its own — the real auth
-        // CWT never sets it, so honoring it would accept a shape no genuine
-        // human token has.
+        // arkavo_account_id must never be trusted on its own — on the real
+        // auth CWT it only mirrors `sub`, so honoring it with a non-UUID `sub`
+        // would accept a shape no genuine human token has.
         let c = cwt::ArkavoClaims::auth("https://identity.arkavo.net", "apple:001234.abc", 1, None)
             .with_arkavo_account_id("00000000-0000-0000-0000-000000000099");
         assert!(matches!(
@@ -1062,7 +1064,17 @@ mod tests {
         }
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = Uuid::new_v4();
-        let token = crate::authn::mint_auth_token(&app_state, &user_id, None).expect("mint");
+        // The real flow passes the Arkavo custom claims for the user record
+        // (`arkavo_account_id` == sub, roles ["user"]) — they must not trip
+        // the agent/NPE rejection in user_id_from_claims.
+        let user = cwt::ArkavoUserClaims {
+            account_id: user_id.to_string(),
+            roles: vec!["user".into()],
+            entitlements: vec![],
+            patreon: None,
+        };
+        let token =
+            crate::authn::mint_auth_token(&app_state, &user_id, Some(&user), None).expect("mint");
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", token.parse().unwrap());
         let human = authenticate_human(&app_state, &headers)

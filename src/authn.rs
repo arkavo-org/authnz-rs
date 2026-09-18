@@ -351,6 +351,7 @@ pub async fn start_authentication(
 
 pub async fn finish_authentication(
     Extension(app_state): Extension<AppState>,
+    Extension(patreon): Extension<crate::patreon::PatreonState>,
     session: Session,
     Json(auth): Json<PublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
@@ -368,9 +369,25 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
+            // The auth token carries the same Arkavo custom claims as the
+            // OIDC access token, derived from the same user record by the
+            // same helper (`oidc::arkavo_user_claims`) — the OpenTDF platform
+            // resolves the caller from `arkavo_account_id` / `arkavo_roles`
+            // and refuses a token without them at KAS rewrap. A row that
+            // vanished between start and finish fails closed rather than
+            // minting a claims-less token.
+            let record = app_state
+                .db_store
+                .get_user_by_id(&user_unique_id)
+                .await
+                .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
+                .ok_or(UserNotFound)?;
+            let user =
+                crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
+            let arkavo_user = crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await;
             // Generate CWT auth token (1-hour, no cnf binding at this point;
             // cnf binding is added in Task 15 once the passkey is retrieved from DB).
-            let token = mint_auth_token(&app_state, &user_unique_id, None)?;
+            let token = mint_auth_token(&app_state, &user_unique_id, Some(&arkavo_user), None)?;
             info!("Authentication successful for user: {}", user_unique_id);
 
             Ok((StatusCode::OK, Json(AuthResponse { token })))
@@ -425,9 +442,18 @@ impl AttestationEnvelope {
     }
 }
 
+/// Mint the 1-hour WebAuthn auth CWT for `user_id`.
+///
+/// `arkavo_user` carries the per-user Arkavo custom claims
+/// (`arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`,
+/// `arkavo_patreon`) as derived by `oidc::arkavo_user_claims`, the same
+/// helper the OIDC access token uses. `POST /authenticate` always passes
+/// them; `None` (tests, callers with no record) mints a token with only the
+/// registered claims, which the OpenTDF platform will refuse at KAS rewrap.
 pub fn mint_auth_token(
     app_state: &AppState,
     user_id: &Uuid,
+    arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
     let mut claims = crate::cwt::ArkavoClaims::auth(
@@ -436,6 +462,9 @@ pub fn mint_auth_token(
         AUTH_TOKEN_HOURS,
         app_state.platform_audience.as_deref(),
     );
+    if let Some(u) = arkavo_user {
+        claims = claims.with_arkavo_user(u);
+    }
     if let Some(c) = cnf {
         claims = claims.with_cnf(c);
     }
@@ -675,7 +704,7 @@ mod tests {
         }
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let token = mint_auth_token(&app_state, &user_id, None, None).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).expect("decode header");
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
         let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
@@ -763,8 +792,119 @@ mod tests {
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token = mint_auth_token(&app_state, &user_id, None).expect("mint");
+        let token = mint_auth_token(&app_state, &user_id, None, None).expect("mint");
         let claims = verify_inbound_account_token(&app_state, &token).expect("verify");
         assert_eq!(claims.sub, user_id.to_string());
+    }
+
+    fn decode_claims(token: &str) -> crate::cwt::ArkavoClaims {
+        use coset::CborSerializable;
+        let raw = crate::cwt::decode_from_header(token).expect("decode header");
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
+        crate::cwt::claims_from_cbor(sign1.payload.as_ref().expect("payload")).expect("claims")
+    }
+
+    fn sample_patreon() -> crate::cwt::ArkavoPatreon {
+        crate::cwt::ArkavoPatreon {
+            role: "consumer".into(),
+            patreon_user_id: "patreon-user-42".into(),
+            campaign_id: None,
+            memberships: vec![crate::cwt::ArkavoPatreonMembership {
+                campaign_id: "camp-1".into(),
+                patron_status: Some("active_patron".into()),
+                tier_ids: vec!["tier-gold".into()],
+                tier_slugs: vec!["gold".into()],
+            }],
+            verified_at: 1_700_000_000,
+            cache_expires_at: 1_700_000_300,
+        }
+    }
+
+    /// The WebAuthn auth CWT must carry the same Arkavo custom claims as the
+    /// OIDC access token for the same user record. The OpenTDF platform is
+    /// configured with `client_id_claim: arkavo_account_id` and
+    /// `groups_claim: arkavo_roles`, and its Patreon entity resolver reads
+    /// `arkavo_patreon`; a token without them is rejected at every KAS rewrap
+    /// ("missing authn idP clientID").
+    #[tokio::test]
+    async fn auth_token_carries_arkavo_custom_claims_like_the_access_token() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let user = crate::cwt::ArkavoUserClaims {
+            account_id: user_id.to_string(),
+            roles: vec!["user".into()],
+            entitlements: vec![
+                "https://arkavo.ai/attr/tdf/value/create".into(),
+                "https://arkavo.ai/attr/tdf/value/decrypt".into(),
+            ],
+            patreon: Some(sample_patreon()),
+        };
+
+        let auth = decode_claims(
+            &mint_auth_token(&app_state, &user_id, Some(&user), None).expect("mint auth"),
+        );
+        let access = decode_claims(
+            &crate::oidc::mint_access_token(
+                &app_state,
+                &format!("arkavo:{}", user_id),
+                "opentdf",
+                Some(crate::oidc::AccessTokenExtras {
+                    idp: "webauthn".into(),
+                    arkavo_user: Some(user.clone()),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .expect("mint access"),
+        );
+
+        assert_eq!(auth.sub, user_id.to_string());
+        assert_eq!(
+            auth.custom.arkavo_account_id.as_deref(),
+            Some(user_id.to_string().as_str())
+        );
+        assert!(auth.custom.arkavo_roles.is_some());
+        assert!(auth.custom.arkavo_entitlements.is_some());
+        assert!(auth.custom.arkavo_patreon.is_some());
+        assert_eq!(
+            auth.custom.arkavo_account_id,
+            access.custom.arkavo_account_id
+        );
+        assert_eq!(auth.custom.arkavo_roles, access.custom.arkavo_roles);
+        assert_eq!(
+            auth.custom.arkavo_entitlements,
+            access.custom.arkavo_entitlements
+        );
+        assert_eq!(auth.custom.arkavo_patreon, access.custom.arkavo_patreon);
+
+        // Registered claims are untouched: still the 1-hour "arkavo" auth token.
+        assert_eq!(auth.aud, crate::cwt::Audience::Single("arkavo".into()));
+        assert_eq!(auth.exp - auth.iat, AUTH_TOKEN_HOURS * 3600);
+        assert!(auth.cnf.is_none());
+    }
+
+    /// Callers without a user record (tests, diagnostics) still get the bare
+    /// token, so the Arkavo custom claims are simply absent.
+    #[tokio::test]
+    async fn auth_token_without_user_record_omits_arkavo_custom_claims() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let claims =
+            decode_claims(&mint_auth_token(&app_state, &user_id, None, None).expect("mint"));
+        assert!(claims.custom.arkavo_account_id.is_none());
+        assert!(claims.custom.arkavo_roles.is_none());
+        assert!(claims.custom.arkavo_entitlements.is_none());
+        assert!(claims.custom.arkavo_patreon.is_none());
     }
 }
