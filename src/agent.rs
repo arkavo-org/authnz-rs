@@ -1093,7 +1093,16 @@ mod tests {
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = Uuid::new_v4();
         let cnf = cwt::cnf_from_ed25519(&[7u8; 32], b"kid");
-        let token = crate::authn::mint_registration_token(&app_state, &user_id, cnf).expect("mint");
+        // Mint it the way `POST /register` does — with the Arkavo custom
+        // claims — so the rejection is proven against the production shape.
+        let user = cwt::ArkavoUserClaims {
+            account_id: user_id.to_string(),
+            roles: vec!["user".into()],
+            entitlements: vec![],
+            patreon: None,
+        };
+        let token = crate::authn::mint_registration_token(&app_state, &user_id, Some(&user), cnf)
+            .expect("mint");
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", token.parse().unwrap());
         let err = authenticate_human(&app_state, &headers)

@@ -1456,8 +1456,9 @@ async fn handle_refresh_token_grant(
         );
     }
 
-    // Resolve standard roles and entitlements based on subject pattern
-    let (roles, entitlements, idp) = if record.subject.starts_with("client:") {
+    // Resolve standard roles, entitlements and the `arkavo_account_id` claim
+    // based on subject pattern.
+    let (roles, entitlements, idp, account_id) = if record.subject.starts_with("client:") {
         (
             vec!["service-account".to_string()],
             vec![
@@ -1465,6 +1466,9 @@ async fn handle_refresh_token_grant(
                 ENTITLEMENT_TDF_DECRYPT.to_string(),
             ],
             "client_credentials".to_string(),
+            // Matches `handle_client_credentials_grant`, which sets
+            // `arkavo_account_id` to the `client:<id>` subject.
+            record.subject.clone(),
         )
     } else {
         // Prefer the idp recorded at issuance; derive from the subject
@@ -1525,7 +1529,16 @@ async fn handle_refresh_token_grant(
                     .collect()
             }
         };
-        (vec!["user".to_string()], entitlements, auth_idp)
+        // The account id claim must be the Arkavo user UUID, NOT the subject:
+        // for `apple:<sub>` / `google:<sub>` subjects the two differ, and
+        // OpenTDF keys off `arkavo_account_id`. Using the subject here would
+        // silently change the caller's identity across a refresh.
+        (
+            vec!["user".to_string()],
+            entitlements,
+            auth_idp,
+            record.arkavo_account_id.clone(),
+        )
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
@@ -1541,7 +1554,7 @@ async fn handle_refresh_token_grant(
         email_verified: record.email_verified,
         name: record.name.clone(),
         idp,
-        arkavo_account_id: record.subject.clone(),
+        arkavo_account_id: account_id,
         arkavo_roles: roles,
         arkavo_entitlements: entitlements,
     };
@@ -1561,12 +1574,16 @@ async fn handle_refresh_token_grant(
     };
     // Re-materialize Patreon membership on refresh so a downgrade/cancel
     // since the original code exchange propagates within the 5-min cache TTL.
-    // Only the user-flow subjects (not service-account `client:...`) carry a
-    // resolvable arkavo user_id; the parse_uuid_from_subject helper returns
-    // None for service accounts so we skip the lookup cleanly.
-    let arkavo_patreon = match parse_uuid_from_subject(&record.subject) {
-        Some(user_id) => crate::patreon::materialize_for_user(&app_state, &patreon, user_id).await,
-        None => None,
+    // Key off the record's `arkavo_account_id` (the Arkavo user UUID), not the
+    // subject: `apple:<sub>` / `google:<sub>` subjects hold no UUID, so
+    // parsing the subject would silently drop `arkavo_patreon` on refresh for
+    // every non-WebAuthn user. Service-account (`client:<id>`) records have no
+    // UUID here either, so they still skip the lookup cleanly.
+    let arkavo_patreon = match Uuid::parse_str(&record.arkavo_account_id) {
+        Ok(user_id) => {
+            crate::patreon::materialize_for_user_bounded(&app_state, &patreon, user_id).await
+        }
+        Err(_) => None,
     };
 
     let access_token = {
@@ -1923,11 +1940,6 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
     constant_time_eq(&expected, challenge)
 }
 
-/// Pull the arkavo `user_id` UUID off an [`AuthenticatedUser`] and run the
-/// Patreon materialization. We prefer `arkavo_account_id` (always set for
-/// user flows) but fall back to parsing the `arkavo:` subject so this stays
-/// resilient to refactors of `AuthenticatedUser`. Service-account subjects
-/// (`client:...`) don't have a Patreon link by construction — return None.
 /// The Arkavo custom claims for a user record — the single place a record
 /// becomes `arkavo_account_id` / `arkavo_roles` / `arkavo_entitlements` /
 /// `arkavo_patreon`. Used for the OIDC access token (code exchange) and the
@@ -1949,6 +1961,11 @@ pub(crate) async fn arkavo_user_claims(
     }
 }
 
+/// Pull the arkavo `user_id` UUID off an [`AuthenticatedUser`] and run the
+/// Patreon materialization. We prefer `arkavo_account_id` (always set for
+/// user flows) but fall back to parsing the `arkavo:` subject so this stays
+/// resilient to refactors of `AuthenticatedUser`. Service-account subjects
+/// (`client:...`) don't have a Patreon link by construction — return None.
 async fn resolve_arkavo_patreon(
     app_state: &AppState,
     patreon: &crate::patreon::PatreonState,
@@ -1957,7 +1974,7 @@ async fn resolve_arkavo_patreon(
     let user_id = Uuid::parse_str(&user.arkavo_account_id)
         .ok()
         .or_else(|| parse_uuid_from_subject(&user.subject))?;
-    crate::patreon::materialize_for_user(app_state, patreon, user_id).await
+    crate::patreon::materialize_for_user_bounded(app_state, patreon, user_id).await
 }
 
 /// Strip the `arkavo:` prefix (if present) and parse the remainder as a
@@ -2832,6 +2849,14 @@ mod tests {
             assert_eq!(claims.custom.idp.as_deref(), Some("apple"));
             assert_eq!(claims.custom.email.as_deref(), Some("a@b"));
             assert_eq!(claims.custom.email_verified, Some(true));
+            // `arkavo_account_id` must be the record's account id, NOT the
+            // subject: OpenTDF resolves the caller from this claim, so a
+            // refresh that swapped in `apple:123` would silently change the
+            // caller's identity mid-session.
+            assert_eq!(
+                claims.custom.arkavo_account_id.as_deref(),
+                Some("legacy-record-without-uuid")
+            );
         }
         {
             let id_token = body["id_token"].as_str().unwrap();
@@ -2843,6 +2868,7 @@ mod tests {
             assert_eq!(claims["idp"], "apple");
             assert_eq!(claims["email"], "a@b");
             assert_eq!(claims["email_verified"], true);
+            assert_eq!(claims["arkavo_account_id"], "legacy-record-without-uuid");
             assert!(claims.get("name").is_none(), "no name ⇒ claim omitted");
         }
 

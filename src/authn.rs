@@ -25,6 +25,10 @@ use webauthn_rs::prelude::*;
 
 const SESSION_REG_STATE_KEY: &str = "reg_state";
 
+/// `idp` claim value for every WebAuthn-minted CWT. Matches
+/// `oidc::idp_from_subject` for an `arkavo:<uuid>` subject.
+const IDP_WEBAUTHN: &str = "webauthn";
+
 #[derive(Deserialize)]
 pub struct RegisterParams {
     pub handle: String,
@@ -190,6 +194,7 @@ pub async fn start_register(
 
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
+    Extension(patreon): Extension<crate::patreon::PatreonState>,
     session: Session,
     Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
@@ -250,7 +255,44 @@ pub async fn finish_register(
             };
             let envelope = AttestationEnvelope::new(envelope_payload, &app_state);
 
-            let token = mint_registration_token(&app_state, &user_id, cnf)?;
+            // The account token carries the same Arkavo custom claims as the
+            // auth token: a just-registered client holds only this token and
+            // has no reason to call `POST /authenticate`, so without them
+            // every KAS rewrap fails with `missing authn idP clientID`.
+            //
+            // Unlike `finish_authentication` this does NOT fail closed. The
+            // credential is already stored, so a hard failure here would hand
+            // back no token at all — and `start_register` then demands an
+            // `X-Auth-Token` for the now-non-empty credential list, locking
+            // the user out. A claims-less account token still works for
+            // `POST /authenticate`, which mints a fully-claimed auth token.
+            let arkavo_user = match app_state.db_store.get_user_by_id(&user_id).await {
+                Ok(Some(record)) => {
+                    let user = crate::oidc::AuthenticatedUser::webauthn(
+                        record.user_id,
+                        record.entitlements,
+                    );
+                    Some(crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await)
+                }
+                Ok(None) => {
+                    error!(
+                        "User row for {} vanished after credential write; minting account token \
+                         without arkavo claims",
+                        user_id
+                    );
+                    None
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to read user row for {} after credential write: {}; minting \
+                         account token without arkavo claims",
+                        user_id, e
+                    );
+                    None
+                }
+            };
+
+            let token = mint_registration_token(&app_state, &user_id, arkavo_user.as_ref(), cnf)?;
 
             // did:webvh passport: build (and, with the `webvh` feature + a KMS
             // signer, sign + persist) the DID log for this passkey. Non-fatal —
@@ -358,6 +400,25 @@ pub async fn finish_authentication(
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
         session.get("auth_state").await?.ok_or(CorruptSession)?;
 
+    // The auth token carries the same Arkavo custom claims as the OIDC access
+    // token, derived from the same user record by the same helper
+    // (`oidc::arkavo_user_claims`) — the OpenTDF platform resolves the caller
+    // from `arkavo_account_id` / `arkavo_roles` and refuses a token without
+    // them at KAS rewrap. A row that vanished fails closed rather than minting
+    // a claims-less token.
+    //
+    // Read the record BEFORE consuming `auth_state`: a transient DynamoDB
+    // error must not turn a successful WebAuthn ceremony into a failed login
+    // that forces the client through the whole ceremony again. With the state
+    // still in the session the client can simply retry this POST. The state is
+    // still consumed exactly once per completed ceremony, below.
+    let record = app_state
+        .db_store
+        .get_user_by_id(&user_unique_id)
+        .await
+        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
+        .ok_or(UserNotFound)?;
+
     if let Err(err) = session.remove_value("auth_state").await {
         error!("Failed to remove auth_state from session: {:?}", err);
         return Err(WebauthnError::InvalidSessionState(err));
@@ -369,19 +430,6 @@ pub async fn finish_authentication(
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            // The auth token carries the same Arkavo custom claims as the
-            // OIDC access token, derived from the same user record by the
-            // same helper (`oidc::arkavo_user_claims`) — the OpenTDF platform
-            // resolves the caller from `arkavo_account_id` / `arkavo_roles`
-            // and refuses a token without them at KAS rewrap. A row that
-            // vanished between start and finish fails closed rather than
-            // minting a claims-less token.
-            let record = app_state
-                .db_store
-                .get_user_by_id(&user_unique_id)
-                .await
-                .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
-                .ok_or(UserNotFound)?;
             let user =
                 crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
             let arkavo_user = crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await;
@@ -461,7 +509,12 @@ pub fn mint_auth_token(
         &user_id.to_string(),
         AUTH_TOKEN_HOURS,
         app_state.platform_audience.as_deref(),
-    );
+    )
+    // This token is only ever minted by the WebAuthn ceremony, so the idp is
+    // fixed. Set it for parity with the OIDC access token, which always
+    // carries `idp` — a verifier keying on it must see the same shape from
+    // either token.
+    .with_idp(IDP_WEBAUTHN);
     if let Some(u) = arkavo_user {
         claims = claims.with_arkavo_user(u);
     }
@@ -472,17 +525,30 @@ pub fn mint_auth_token(
     Ok(crate::cwt::encode_for_header(&bytes))
 }
 
+/// Mint the ~99-year WebAuthn account CWT for `user_id`.
+///
+/// `arkavo_user` carries the same per-user Arkavo custom claims as
+/// [`mint_auth_token`]. A just-registered client holds *only* this token and
+/// has no reason to run `POST /authenticate`, so omitting the claims here
+/// would make every KAS rewrap fail with `missing authn idP clientID` until
+/// the user happened to re-authenticate. `POST /register` always passes them;
+/// `None` (tests) mints registered-claims-only.
 pub fn mint_registration_token(
     app_state: &AppState,
     user_id: &Uuid,
+    arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
     cnf: crate::cwt::Cnf,
 ) -> Result<String, WebauthnError> {
-    let claims = crate::cwt::ArkavoClaims::registration(
+    let mut claims = crate::cwt::ArkavoClaims::registration(
         &app_state.issuer,
         &user_id.to_string(),
         REGISTRATION_TOKEN_WEEKS,
     )
+    .with_idp(IDP_WEBAUTHN)
     .with_cnf(cnf);
+    if let Some(u) = arkavo_user {
+        claims = claims.with_arkavo_user(u);
+    }
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
 }
@@ -736,7 +802,7 @@ mod tests {
             kid: b"cred-1".to_vec(),
         };
 
-        let token = mint_registration_token(&app_state, &user_id, cnf).expect("mint");
+        let token = mint_registration_token(&app_state, &user_id, None, cnf).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).unwrap();
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
         let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
@@ -882,11 +948,58 @@ mod tests {
             access.custom.arkavo_entitlements
         );
         assert_eq!(auth.custom.arkavo_patreon, access.custom.arkavo_patreon);
+        // `idp` too — the access token always carries it, so a verifier that
+        // keys on it must see the same value from the auth token.
+        assert_eq!(auth.custom.idp.as_deref(), Some(IDP_WEBAUTHN));
+        assert_eq!(auth.custom.idp, access.custom.idp);
 
         // Registered claims are untouched: still the 1-hour "arkavo" auth token.
         assert_eq!(auth.aud, crate::cwt::Audience::Single("arkavo".into()));
         assert_eq!(auth.exp - auth.iat, AUTH_TOKEN_HOURS * 3600);
         assert!(auth.cnf.is_none());
+    }
+
+    /// The ~99-year account token minted by `POST /register` must carry the
+    /// same claims. A just-registered client holds only this token and has no
+    /// reason to call `POST /authenticate`, so without them every KAS rewrap
+    /// fails with "missing authn idP clientID".
+    #[tokio::test]
+    async fn registration_token_carries_arkavo_custom_claims() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        let cnf = crate::cwt::cnf_from_ed25519(&[9u8; 32], b"kid");
+        let user = crate::cwt::ArkavoUserClaims {
+            account_id: user_id.to_string(),
+            roles: vec!["user".into()],
+            entitlements: vec!["https://arkavo.ai/attr/tdf/value/decrypt".into()],
+            patreon: Some(sample_patreon()),
+        };
+
+        let claims = decode_claims(
+            &mint_registration_token(&app_state, &user_id, Some(&user), cnf).expect("mint"),
+        );
+        assert_eq!(
+            claims.custom.arkavo_account_id.as_deref(),
+            Some(user_id.to_string().as_str())
+        );
+        assert_eq!(claims.custom.arkavo_roles, Some(vec!["user".to_string()]));
+        assert_eq!(
+            claims.custom.arkavo_entitlements,
+            Some(vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()])
+        );
+        assert_eq!(claims.custom.arkavo_patreon, Some(sample_patreon()));
+        assert_eq!(claims.custom.idp.as_deref(), Some(IDP_WEBAUTHN));
+
+        // Registered claims are untouched: still the long-lived "arkavo" token.
+        assert_eq!(claims.aud, crate::cwt::Audience::Single("arkavo".into()));
+        assert!(claims.cnf.is_some());
+        let years_50 = 50 * 365 * 24 * 3600;
+        assert!(claims.exp - chrono::Utc::now().timestamp() > years_50);
     }
 
     /// Callers without a user record (tests, diagnostics) still get the bare
