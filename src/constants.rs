@@ -48,6 +48,29 @@ pub const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 /// Apple OIDC issuer (used to validate `iss` claim on Apple id_tokens)
 pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
+/// Google JWKS cache TTL in seconds (1 hour).
+pub const GOOGLE_JWKS_CACHE_TTL_SECONDS: i64 = 3600;
+
+/// Total HTTP timeout (seconds) for Google's token and JWKS endpoints.
+/// Override with the `GOOGLE_HTTP_TIMEOUT_SECS` env var.
+pub const GOOGLE_HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// Google OAuth 2.0 authorization endpoint (browser is redirected here).
+pub const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+
+/// Google OAuth 2.0 token endpoint (server-side code exchange).
+pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// Google JWKS URL (signing keys for Google id_tokens).
+pub const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+/// Accepted `iss` values on Google id_tokens. Google documents both forms.
+pub const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
+
+/// Lifetime (seconds) of a pending `idp=google` authorize request parked
+/// while the browser is at Google (10 minutes).
+pub const GOOGLE_PENDING_AUTHORIZE_TTL_SECONDS: i64 = 600;
+
 /// OIDC refresh token lifetime in seconds (30 days)
 pub const REFRESH_TOKEN_LIFETIME_SECONDS: i64 = 2592000;
 

@@ -444,6 +444,9 @@ pub async fn map_apple_user(
         arkavo_account_id: user.user_id.to_string(),
         email: claims.email.clone(),
         email_verified,
+        // Apple only surfaces the name in the first-auth `user` form post,
+        // never in the id_token, so there is nothing to carry here.
+        name: None,
         idp: "apple".to_string(),
         roles: vec!["user".to_string()],
         entitlements: user.entitlements.clone(),

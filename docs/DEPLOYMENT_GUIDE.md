@@ -159,6 +159,20 @@ AWS_REGION=us-east-1
 # OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net
 # catalog-node and mcp-edge are registered; do not recreate them.
 # Mint: python3 scripts/mint-pep-cwt.py catalog-node --eval
+
+# Sign in with Google as an upstream IdP for /oauth/authorize?idp=google
+# (browser redirect flow; see docs/google-signin.md). Create a "Web
+# application" OAuth client in Google Cloud Console and register
+# https://identity.arkavo.net/oauth/google/callback as an authorized
+# redirect URI. Both vars must be set or the idp=google path fails closed.
+# GOOGLE_CLIENT_ID=<...>.apps.googleusercontent.com
+# GOOGLE_CLIENT_SECRET=<...>
+# GOOGLE_REDIRECT_URI=https://identity.arkavo.net/oauth/google/callback   # default
+
+# ClosureKB Android: public PKCE client, signs in via Google, custom-scheme
+# redirect. Access tokens carry aud = [client_id, OIDC_PLATFORM_AUDIENCE].
+# OIDC_CLIENT_CLOSUREKB_ID=closurekb-android
+# OIDC_CLIENT_CLOSUREKB_REDIRECT_URIS=com.closurekb:/oauth2redirect
 ```
 
 #### `identity_links` Table
