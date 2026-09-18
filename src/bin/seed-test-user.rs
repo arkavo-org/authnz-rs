@@ -91,12 +91,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_id = Uuid::parse_str(TEST_USER_ID).expect("TEST_USER_ID is a valid UUID literal");
 
-    // Human CWT. `sub` is a bare UUID with no "arkavo:" prefix and no
-    // `arkavo_account_id` claim — the exact shape `authn::mint_auth_token`
+    // Human CWT. `sub` is a bare UUID with no "arkavo:" prefix, carrying the
+    // `idp` + `arkavo_*` claims — the exact shape `authn::mint_auth_token`
     // mints for a real WebAuthn auth token, and what `authenticate_human`
     // (src/agent.rs) actually accepts. Minting the "arkavo:<uuid>" shape here
     // would let this test pass without proving the real token shape works.
-    let human_claims = cwt::ArkavoClaims::auth(&args.issuer, &user_id.to_string(), 1, None);
+    let human_claims = cwt::ArkavoClaims::auth(&args.issuer, &user_id.to_string(), 1, None)
+        .with_idp("webauthn")
+        .with_arkavo_user(&cwt::ArkavoUserClaims {
+            account_id: user_id.to_string(),
+            roles: vec!["user".to_string()],
+            entitlements: constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            patreon: None,
+        });
     let human_cwt = cwt::mint(&human_claims, &signing_key, &kid)?;
     println!("{}", cwt::encode_for_header(&human_cwt));
 

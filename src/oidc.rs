@@ -149,6 +149,26 @@ pub struct AuthenticatedUser {
     pub entitlements: Vec<String>,
 }
 
+impl AuthenticatedUser {
+    /// The user record as seen by every WebAuthn-derived surface: bare-UUID
+    /// `arkavo_account_id`, `arkavo:<uuid>` subject, the `user` role, and
+    /// the entitlements stored on the credentials row. Shared by the OIDC
+    /// `/authorize` path (`X-Auth-Token`) and `POST /authenticate`, so both
+    /// tokens are minted from the same record.
+    pub fn webauthn(user_id: Uuid, entitlements: Vec<String>) -> Self {
+        Self {
+            subject: format!("arkavo:{}", user_id),
+            arkavo_account_id: user_id.to_string(),
+            email: None,
+            email_verified: None,
+            name: None,
+            idp: "webauthn".to_string(),
+            roles: vec!["user".to_string()],
+            entitlements,
+        }
+    }
+}
+
 /// Stored authorization code metadata, keyed by the random code value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
@@ -1103,23 +1123,21 @@ async fn handle_authorization_code_grant(
             );
         }
     };
-    // Materialize Patreon membership (if linked) for embedding in the
-    // access_token CWT. Per the architecture statement: "Patreon proves
-    // membership, authnz-rs materializes entitlement." Fails closed — the
-    // helper returns None on any Patreon-side error so the resulting token
-    // simply omits the `arkavo_patreon` claim and downstream policy treats
-    // that as "no entitlement".
-    let arkavo_patreon = resolve_arkavo_patreon(&app_state, &patreon, &record.user).await;
+    // Derive the Arkavo custom claims (and materialize Patreon membership,
+    // if linked) for embedding in the access_token CWT. Per the architecture
+    // statement: "Patreon proves membership, authnz-rs materializes
+    // entitlement." Fails closed — the Patreon snapshot is None on any
+    // Patreon-side error so the resulting token simply omits the
+    // `arkavo_patreon` claim and downstream policy treats that as "no
+    // entitlement".
+    let arkavo_user = arkavo_user_claims(&app_state, &patreon, &record.user).await;
 
     let access_token = {
         let extras = AccessTokenExtras {
             idp: record.user.idp.clone(),
             email: record.user.email.clone(),
             email_verified: record.user.email_verified,
-            arkavo_account_id: Some(record.user.arkavo_account_id.clone()),
-            arkavo_roles: Some(record.user.roles.clone()),
-            arkavo_entitlements: Some(record.user.entitlements.clone()),
-            arkavo_patreon,
+            arkavo_user: Some(arkavo_user),
         };
         match mint_access_token(
             &app_state,
@@ -1296,11 +1314,13 @@ async fn handle_client_credentials_grant(
             idp: id_claims.idp.clone(),
             email: id_claims.email.clone(),
             email_verified: id_claims.email_verified,
-            arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
-            arkavo_roles: Some(id_claims.arkavo_roles.clone()),
-            arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
-            // Service accounts (client_credentials) have no Patreon link.
-            arkavo_patreon: None,
+            arkavo_user: Some(crate::cwt::ArkavoUserClaims {
+                account_id: id_claims.arkavo_account_id.clone(),
+                roles: id_claims.arkavo_roles.clone(),
+                entitlements: id_claims.arkavo_entitlements.clone(),
+                // Service accounts (client_credentials) have no Patreon link.
+                patreon: None,
+            }),
         };
         match mint_access_token(
             &app_state,
@@ -1436,8 +1456,9 @@ async fn handle_refresh_token_grant(
         );
     }
 
-    // Resolve standard roles and entitlements based on subject pattern
-    let (roles, entitlements, idp) = if record.subject.starts_with("client:") {
+    // Resolve standard roles, entitlements and the `arkavo_account_id` claim
+    // based on subject pattern.
+    let (roles, entitlements, idp, account_id) = if record.subject.starts_with("client:") {
         (
             vec!["service-account".to_string()],
             vec![
@@ -1445,6 +1466,9 @@ async fn handle_refresh_token_grant(
                 ENTITLEMENT_TDF_DECRYPT.to_string(),
             ],
             "client_credentials".to_string(),
+            // Matches `handle_client_credentials_grant`, which sets
+            // `arkavo_account_id` to the `client:<id>` subject.
+            record.subject.clone(),
         )
     } else {
         // Prefer the idp recorded at issuance; derive from the subject
@@ -1505,7 +1529,16 @@ async fn handle_refresh_token_grant(
                     .collect()
             }
         };
-        (vec!["user".to_string()], entitlements, auth_idp)
+        // The account id claim must be the Arkavo user UUID, NOT the subject:
+        // for `apple:<sub>` / `google:<sub>` subjects the two differ, and
+        // OpenTDF keys off `arkavo_account_id`. Using the subject here would
+        // silently change the caller's identity across a refresh.
+        (
+            vec!["user".to_string()],
+            entitlements,
+            auth_idp,
+            record.arkavo_account_id.clone(),
+        )
     };
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
@@ -1521,7 +1554,7 @@ async fn handle_refresh_token_grant(
         email_verified: record.email_verified,
         name: record.name.clone(),
         idp,
-        arkavo_account_id: record.subject.clone(),
+        arkavo_account_id: account_id,
         arkavo_roles: roles,
         arkavo_entitlements: entitlements,
     };
@@ -1541,12 +1574,16 @@ async fn handle_refresh_token_grant(
     };
     // Re-materialize Patreon membership on refresh so a downgrade/cancel
     // since the original code exchange propagates within the 5-min cache TTL.
-    // Only the user-flow subjects (not service-account `client:...`) carry a
-    // resolvable arkavo user_id; the parse_uuid_from_subject helper returns
-    // None for service accounts so we skip the lookup cleanly.
-    let arkavo_patreon = match parse_uuid_from_subject(&record.subject) {
-        Some(user_id) => crate::patreon::materialize_for_user(&app_state, &patreon, user_id).await,
-        None => None,
+    // Key off the record's `arkavo_account_id` (the Arkavo user UUID), not the
+    // subject: `apple:<sub>` / `google:<sub>` subjects hold no UUID, so
+    // parsing the subject would silently drop `arkavo_patreon` on refresh for
+    // every non-WebAuthn user. Service-account (`client:<id>`) records have no
+    // UUID here either, so they still skip the lookup cleanly.
+    let arkavo_patreon = match Uuid::parse_str(&record.arkavo_account_id) {
+        Ok(user_id) => {
+            crate::patreon::materialize_for_user_bounded(&app_state, &patreon, user_id).await
+        }
+        Err(_) => None,
     };
 
     let access_token = {
@@ -1554,10 +1591,12 @@ async fn handle_refresh_token_grant(
             idp: id_claims.idp.clone(),
             email: id_claims.email.clone(),
             email_verified: id_claims.email_verified,
-            arkavo_account_id: Some(id_claims.arkavo_account_id.clone()),
-            arkavo_roles: Some(id_claims.arkavo_roles.clone()),
-            arkavo_entitlements: Some(id_claims.arkavo_entitlements.clone()),
-            arkavo_patreon,
+            arkavo_user: Some(crate::cwt::ArkavoUserClaims {
+                account_id: id_claims.arkavo_account_id.clone(),
+                roles: id_claims.arkavo_roles.clone(),
+                entitlements: id_claims.arkavo_entitlements.clone(),
+                patreon: arkavo_patreon,
+            }),
         };
         match mint_access_token(
             &app_state,
@@ -1848,24 +1887,14 @@ pub(crate) async fn resolve_from_arkavo_jwt(
     let claims = crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
-    let account_id = claims.sub;
-    let user_id = Uuid::parse_str(&account_id)
+    let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AuthorizeError::InvalidArkavoJwt("sub is not a uuid".into()))?;
     let entitlements = app_state
         .db_store
         .get_user_entitlements(&user_id)
         .await
         .map_err(|e| AuthorizeError::Database(e.to_string()))?;
-    Ok(AuthenticatedUser {
-        subject: format!("arkavo:{}", account_id),
-        arkavo_account_id: account_id,
-        email: None,
-        email_verified: None,
-        name: None,
-        idp: "webauthn".to_string(),
-        roles: vec!["user".to_string()],
-        entitlements,
-    })
+    Ok(AuthenticatedUser::webauthn(user_id, entitlements))
 }
 
 fn extract_client_credentials(
@@ -1911,6 +1940,27 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
     constant_time_eq(&expected, challenge)
 }
 
+/// The Arkavo custom claims for a user record — the single place a record
+/// becomes `arkavo_account_id` / `arkavo_roles` / `arkavo_entitlements` /
+/// `arkavo_patreon`. Used for the OIDC access token (code exchange) and the
+/// WebAuthn auth token (`authn::finish_authentication`) alike, so the
+/// OpenTDF platform sees one claim shape whichever token the client presents.
+///
+/// Patreon membership is materialized here (cached, fail-closed): "Patreon
+/// proves membership, authnz-rs materializes entitlement".
+pub(crate) async fn arkavo_user_claims(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    user: &AuthenticatedUser,
+) -> crate::cwt::ArkavoUserClaims {
+    crate::cwt::ArkavoUserClaims {
+        account_id: user.arkavo_account_id.clone(),
+        roles: user.roles.clone(),
+        entitlements: user.entitlements.clone(),
+        patreon: resolve_arkavo_patreon(app_state, patreon, user).await,
+    }
+}
+
 /// Pull the arkavo `user_id` UUID off an [`AuthenticatedUser`] and run the
 /// Patreon materialization. We prefer `arkavo_account_id` (always set for
 /// user flows) but fall back to parsing the `arkavo:` subject so this stays
@@ -1924,7 +1974,7 @@ async fn resolve_arkavo_patreon(
     let user_id = Uuid::parse_str(&user.arkavo_account_id)
         .ok()
         .or_else(|| parse_uuid_from_subject(&user.subject))?;
-    crate::patreon::materialize_for_user(app_state, patreon, user_id).await
+    crate::patreon::materialize_for_user_bounded(app_state, patreon, user_id).await
 }
 
 /// Strip the `arkavo:` prefix (if present) and parse the remainder as a
@@ -1975,15 +2025,12 @@ pub struct AccessTokenExtras {
     pub idp: String,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
-    pub arkavo_account_id: Option<String>,
-    pub arkavo_roles: Option<Vec<String>>,
-    pub arkavo_entitlements: Option<Vec<String>>,
-    /// Materialized Patreon membership snapshot. Set by the OIDC token
-    /// endpoint before calling [`mint_access_token`] when the authenticated
-    /// user has a Patreon link; embedded into the CWT `arkavo_patreon` claim.
+    /// Per-user Arkavo custom claims (`arkavo_account_id`, `arkavo_roles`,
+    /// `arkavo_entitlements`, `arkavo_patreon`), built by
+    /// [`arkavo_user_claims`] for human users. The Patreon snapshot inside is
     /// `None` when the user is unlinked, Patreon support is disabled, or
     /// materialization failed (fail-closed posture per the plan).
-    pub arkavo_patreon: Option<crate::cwt::ArkavoPatreon>,
+    pub arkavo_user: Option<crate::cwt::ArkavoUserClaims>,
 }
 
 impl AccessTokenExtras {
@@ -2025,17 +2072,8 @@ pub fn mint_access_token(
         if let Some(email) = e.email {
             claims = claims.with_email(&email, e.email_verified.unwrap_or(false));
         }
-        if let Some(id) = e.arkavo_account_id {
-            claims = claims.with_arkavo_account_id(&id);
-        }
-        if let Some(roles) = e.arkavo_roles {
-            claims = claims.with_arkavo_roles(roles);
-        }
-        if let Some(ents) = e.arkavo_entitlements {
-            claims = claims.with_arkavo_entitlements(ents);
-        }
-        if let Some(p) = e.arkavo_patreon {
-            claims = claims.with_arkavo_patreon(p);
+        if let Some(user) = &e.arkavo_user {
+            claims = claims.with_arkavo_user(user);
         }
     }
     if let Some(c) = cnf {
@@ -2237,6 +2275,33 @@ mod tests {
     /// the `arkavo_patreon` claim.
     fn test_patreon_state() -> crate::patreon::PatreonState {
         crate::patreon::PatreonState::new(None, None, test_redis())
+    }
+
+    /// The WebAuthn user record maps to the same Arkavo custom claims on
+    /// both the OIDC access token and the WebAuthn auth token: bare-UUID
+    /// `arkavo_account_id` (== the auth token's `sub`), the `["user"]` role
+    /// every WebAuthn-derived surface hardcodes, and the row's entitlements.
+    /// Patreon is disabled here, so the snapshot is absent (fail-closed).
+    #[tokio::test]
+    async fn arkavo_user_claims_for_webauthn_user_match_access_token_shape() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = Uuid::new_v4();
+        let entitlements = vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()];
+        let user = AuthenticatedUser::webauthn(user_id, entitlements.clone());
+        assert_eq!(user.subject, format!("arkavo:{}", user_id));
+        assert_eq!(user.arkavo_account_id, user_id.to_string());
+        assert_eq!(user.idp, "webauthn");
+
+        let claims = arkavo_user_claims(&app_state, &test_patreon_state(), &user).await;
+        assert_eq!(claims.account_id, user_id.to_string());
+        assert_eq!(claims.roles, vec!["user".to_string()]);
+        assert_eq!(claims.entitlements, entitlements);
+        assert_eq!(claims.patreon, None);
     }
 
     #[tokio::test]
@@ -2784,6 +2849,14 @@ mod tests {
             assert_eq!(claims.custom.idp.as_deref(), Some("apple"));
             assert_eq!(claims.custom.email.as_deref(), Some("a@b"));
             assert_eq!(claims.custom.email_verified, Some(true));
+            // `arkavo_account_id` must be the record's account id, NOT the
+            // subject: OpenTDF resolves the caller from this claim, so a
+            // refresh that swapped in `apple:123` would silently change the
+            // caller's identity mid-session.
+            assert_eq!(
+                claims.custom.arkavo_account_id.as_deref(),
+                Some("legacy-record-without-uuid")
+            );
         }
         {
             let id_token = body["id_token"].as_str().unwrap();
@@ -2795,6 +2868,7 @@ mod tests {
             assert_eq!(claims["idp"], "apple");
             assert_eq!(claims["email"], "a@b");
             assert_eq!(claims["email_verified"], true);
+            assert_eq!(claims["arkavo_account_id"], "legacy-record-without-uuid");
             assert!(claims.get("name").is_none(), "no name ⇒ claim omitted");
         }
 
@@ -3262,7 +3336,8 @@ mod tests {
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token = crate::authn::mint_auth_token(&app_state, &user_id, None).expect("mint cwt");
+        let token =
+            crate::authn::mint_auth_token(&app_state, &user_id, None, None).expect("mint cwt");
 
         let oidc = OidcConfig {
             issuer: "https://identity.arkavo.net".into(),

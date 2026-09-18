@@ -102,6 +102,22 @@ pub const PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE: &str =
 /// stale cache after Patreon goes down can be detected and rejected.
 pub const PATREON_CACHE_TTL_SECONDS: i64 = 300;
 
+/// TTL for the "this user has no Patreon link" marker. Without it every token
+/// mint for every unlinked user costs a DynamoDB GetItem on the login critical
+/// path, and unlinked users are the overwhelming majority. Kept short (and
+/// cleared by `MembershipCache::invalidate`, which the link handler calls) so a
+/// freshly linked user isn't held at "no membership" for long.
+pub const PATREON_UNLINKED_CACHE_TTL_SECONDS: i64 = 60;
+
+/// Wall-clock budget for Patreon materialization on a token-mint path. The
+/// underlying work can be a DynamoDB read + KMS decrypt + token refresh POST +
+/// retry fetch, each with its own 10s HTTP timeout, so an unbounded wait lets a
+/// degraded Patreon stall a WebAuthn login past the client's own timeout. Past
+/// this deadline the mint proceeds without the `arkavo_patreon` claim
+/// (fail-closed), while the materialization itself runs to completion in the
+/// background and warms the cache for the next mint.
+pub const PATREON_MATERIALIZE_DEADLINE_SECONDS: u64 = 3;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single

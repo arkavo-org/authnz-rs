@@ -366,6 +366,7 @@ pub async fn generate_assertion_challenge(
 /// Verify assertion and issue JWT token
 pub async fn finish_assertion(
     Extension(app_state): Extension<AppState>,
+    Extension(patreon): Extension<crate::patreon::PatreonState>,
     session: Session,
     Json(request): Json<AssertionRequest>,
 ) -> Result<impl IntoResponse, DeviceCheckError> {
@@ -434,8 +435,26 @@ pub async fn finish_assertion(
         .await
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
 
+    // The assertion token rides the platform audience and is what an iOS
+    // client presents at KAS rewrap, so it needs the same Arkavo custom
+    // claims as the WebAuthn auth token — without `arkavo_account_id` /
+    // `arkavo_roles` the platform refuses it. Fails closed on a missing row.
+    let record = app_state
+        .db_store
+        .get_user_by_id(&binding.user_id)
+        .await
+        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
+        .ok_or(DeviceCheckError::UserNotFound)?;
+    let user = crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
+    let arkavo_user = crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await;
+
     // Mint CWT assertion token with device public key bound via cnf claim
-    let token = mint_assertion_token(&app_state, &binding, Utc::now().timestamp())?;
+    let token = mint_assertion_token(
+        &app_state,
+        &binding,
+        Some(&arkavo_user),
+        Utc::now().timestamp(),
+    )?;
 
     info!("Assertion successful for key_id: {}", request.key_id);
 
@@ -603,14 +622,20 @@ pub fn device_class(last_assertion_at: i64, now: i64) -> (DeviceClass, i64) {
 /// platform audience, when set) and carries the device's App Attest public
 /// key as the `cnf` claim so relying parties can perform DPoP-style
 /// proof-of-possession checks, along with an `arkavo_npe` device descriptor.
+///
+/// `arkavo_user` carries the per-user Arkavo custom claims (as derived by
+/// `oidc::arkavo_user_claims`) so this token matches the WebAuthn auth token
+/// and the OIDC access token at the platform's verifier. `POST
+/// /device-check/assert` always passes them; `None` (tests) mints without.
 pub fn mint_assertion_token(
     app_state: &AppState,
     binding: &DeviceBinding,
+    arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
     now: i64,
 ) -> Result<String, DeviceCheckError> {
     let cnf = crate::cwt::cnf_from_app_attest(&binding.public_key, binding.device_id.as_bytes())?;
     let (class, attestation_expiry) = device_class(now, now); // assertion just verified
-    let claims = crate::cwt::ArkavoClaims::devicecheck(
+    let mut claims = crate::cwt::ArkavoClaims::devicecheck(
         &app_state.issuer,
         &binding.user_id.to_string(),
         AUTH_TOKEN_HOURS,
@@ -626,6 +651,9 @@ pub fn mint_assertion_token(
         depth: None,
         chain: None,
     });
+    if let Some(u) = arkavo_user {
+        claims = claims.with_arkavo_user(u);
+    }
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
 }
@@ -947,8 +975,8 @@ mod tests {
             updated_at: now,
         };
 
-        let token =
-            crate::device_check::mint_assertion_token(&app_state, &binding, now).expect("mint");
+        let token = crate::device_check::mint_assertion_token(&app_state, &binding, None, now)
+            .expect("mint");
 
         let raw = crate::cwt::decode_from_header(&token).unwrap();
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");

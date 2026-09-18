@@ -63,7 +63,7 @@
 use crate::AppState;
 use crate::constants::{
     PATREON_CACHE_TTL_SECONDS, PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE, PATREON_IDENTITY_URL,
-    PATREON_TOKEN_URL,
+    PATREON_MATERIALIZE_DEADLINE_SECONDS, PATREON_TOKEN_URL, PATREON_UNLINKED_CACHE_TTL_SECONDS,
 };
 use crate::cwt::{ArkavoPatreon, ArkavoPatreonMembership};
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -1031,6 +1031,9 @@ const MAX_LOCAL_CACHE_ENTRIES: usize = 10_000;
 pub struct MembershipCache {
     redis: fred::clients::RedisClient,
     local: Arc<Mutex<HashMap<String, (ArkavoPatreon, i64)>>>,
+    /// In-memory fallback for the "no Patreon link" marker (see
+    /// [`MembershipCache::mark_unlinked`]). Value is the expiry timestamp.
+    local_unlinked: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl MembershipCache {
@@ -1038,11 +1041,16 @@ impl MembershipCache {
         Self {
             redis,
             local: Arc::new(Mutex::new(HashMap::new())),
+            local_unlinked: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn key(user_id: Uuid) -> String {
         format!("patreon:materialized:{}", user_id)
+    }
+
+    fn unlinked_key(user_id: Uuid) -> String {
+        format!("patreon:unlinked:{}", user_id)
     }
 
     pub async fn get(&self, user_id: Uuid) -> Option<ArkavoPatreon> {
@@ -1100,13 +1108,56 @@ impl MembershipCache {
         }
     }
 
+    /// Remember that `user_id` has no Patreon link, so the next mint can skip
+    /// the DynamoDB lookup. Cleared by [`MembershipCache::invalidate`], which
+    /// the link handler calls, so linking takes effect immediately.
+    pub async fn mark_unlinked(&self, user_id: Uuid) {
+        let key = Self::unlinked_key(user_id);
+        if self.redis.is_connected() {
+            let _: Result<(), _> = self
+                .redis
+                .set(
+                    &key,
+                    "1",
+                    Some(fred::types::Expiration::EX(
+                        PATREON_UNLINKED_CACHE_TTL_SECONDS,
+                    )),
+                    None,
+                    false,
+                )
+                .await;
+        } else {
+            let now = Utc::now().timestamp();
+            let mut map = self.local_unlinked.lock().unwrap();
+            map.retain(|_, exp| *exp > now);
+            // Same cap as the positive cache: bound memory while Redis is down.
+            if map.len() < MAX_LOCAL_CACHE_ENTRIES || map.contains_key(&key) {
+                map.insert(key, now + PATREON_UNLINKED_CACHE_TTL_SECONDS);
+            }
+        }
+    }
+
+    pub async fn is_unlinked(&self, user_id: Uuid) -> bool {
+        let key = Self::unlinked_key(user_id);
+        if self.redis.is_connected() {
+            matches!(self.redis.get::<Option<String>, _>(&key).await, Ok(Some(_)))
+        } else {
+            let now = Utc::now().timestamp();
+            let mut map = self.local_unlinked.lock().unwrap();
+            map.retain(|_, exp| *exp > now);
+            map.contains_key(&key)
+        }
+    }
+
     pub async fn invalidate(&self, user_id: Uuid) {
         let key = Self::key(user_id);
+        let unlinked = Self::unlinked_key(user_id);
         if self.redis.is_connected() {
             let _: Result<(), _> = self.redis.del(&key).await;
+            let _: Result<(), _> = self.redis.del(&unlinked).await;
         } else {
-            let mut map = self.local.lock().unwrap();
-            map.remove(&key);
+            self.local.lock().unwrap().remove(&key);
+            self.local_unlinked.lock().unwrap().remove(&unlinked);
         }
     }
 }
@@ -1193,9 +1244,19 @@ pub async fn materialize_for_user(
         return Some(cached);
     }
 
+    // Unlinked users are the common case and every mint would otherwise pay a
+    // GetItem for them; the marker is cleared the moment they link.
+    if state.cache.is_unlinked(user_id).await {
+        debug!("Patreon link cache HIT (unlinked) for user {}", user_id);
+        return None;
+    }
+
     let link = match app_state.db_store.get_patreon_link(user_id).await {
         Ok(Some(link)) => link,
-        Ok(None) => return None,
+        Ok(None) => {
+            state.cache.mark_unlinked(user_id).await;
+            return None;
+        }
         Err(e) => {
             warn!(
                 "Patreon link lookup failed for user {}: {} — failing closed (no claim)",
@@ -1225,6 +1286,52 @@ pub async fn materialize_for_user(
 
     state.cache.put(user_id, &snap).await;
     Some(snap)
+}
+
+/// [`materialize_for_user`] under a wall-clock deadline, for the token-mint
+/// paths that sit on a user-facing critical path (WebAuthn login, OIDC code
+/// exchange and refresh).
+///
+/// The work is spawned rather than wrapped in a plain `timeout`: a successful
+/// Patreon token refresh consumes the old refresh token immediately, so
+/// cancelling [`materialize_for_user`] mid-flight could strand the user
+/// fail-closed until they re-link. Detaching lets it run to completion (and
+/// warm the cache for the next mint) while the caller stops waiting after
+/// [`PATREON_MATERIALIZE_DEADLINE_SECONDS`] and mints without the claim.
+pub async fn materialize_for_user_bounded(
+    app_state: &AppState,
+    state: &PatreonState,
+    user_id: Uuid,
+) -> Option<ArkavoPatreon> {
+    if !state.is_enabled() {
+        return None;
+    }
+    let app = app_state.clone();
+    let patreon = state.clone();
+    let handle = tokio::spawn(async move { materialize_for_user(&app, &patreon, user_id).await });
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PATREON_MATERIALIZE_DEADLINE_SECONDS),
+        handle,
+    )
+    .await
+    {
+        Ok(Ok(snap)) => snap,
+        Ok(Err(e)) => {
+            warn!(
+                "Patreon materialization task failed for user {}: {} — failing closed (no claim)",
+                user_id, e
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "Patreon materialization for user {} exceeded the {}s mint deadline — failing \
+                 closed (no claim); it continues in the background and will warm the cache",
+                user_id, PATREON_MATERIALIZE_DEADLINE_SECONDS
+            );
+            None
+        }
+    }
 }
 
 /// Persist a rotated Patreon token bundle, if one was produced. Best-effort:
@@ -1997,6 +2104,31 @@ mod tests {
         assert_eq!(got, snap);
         cache.invalidate(user_id).await;
         assert!(cache.get(user_id).await.is_none(), "invalidate clears");
+    }
+
+    /// The "no Patreon link" marker keeps every mint for an unlinked user
+    /// (the common case) off DynamoDB, and must be cleared the moment the
+    /// user links — `link` calls `invalidate`, so `invalidate` has to drop it.
+    #[tokio::test]
+    async fn unlinked_marker_roundtrips_and_is_cleared_by_invalidate() {
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let cache = MembershipCache::new(redis);
+        let user_id = Uuid::new_v4();
+
+        assert!(!cache.is_unlinked(user_id).await, "unmarked by default");
+        cache.mark_unlinked(user_id).await;
+        assert!(cache.is_unlinked(user_id).await, "marker sticks");
+        assert!(
+            !cache.is_unlinked(Uuid::new_v4()).await,
+            "marker is per-user"
+        );
+
+        cache.invalidate(user_id).await;
+        assert!(
+            !cache.is_unlinked(user_id).await,
+            "linking must take effect immediately, not after the marker TTL"
+        );
     }
 
     /// reqwest client whose DNS for the Patreon host resolves to a dead local
