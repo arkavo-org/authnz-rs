@@ -356,6 +356,14 @@ aws dynamodb create-table \
   (#50) and the ERS surface (#48) are follow-ups
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
+- `register_challenge` / `register_attest` (**unauthenticated**, Task 5): the registration
+  preflight. `GET /device-check/register-challenge` issues a challenge into the session;
+  `POST /device-check/register-attest` verifies the attestation, checks the registration budget
+  (advisory — takes no slot) and puts a one-shot `RegistrationTicket` (300s) in the session.
+  Errors on these two routes are **JSON with a stable `error` token**, unlike the rest of
+  `DeviceCheckError`, so a client can tell a permanent refusal (`attest_registration_cap`) from a
+  retryable one. See [docs/app-attest-preflight-contract.md](docs/app-attest-preflight-contract.md).
+  **These do not gate registration** — `/register` ignores the ticket until Task 6.
 - `generate_challenge`: Issues random challenge for attestation (**requires a
   CWT bound to `:username`** — App Attest proves the device is genuine, never
   which account it belongs to)
