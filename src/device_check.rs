@@ -306,6 +306,216 @@ pub fn verify_attestation(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Task 5: the unauthenticated registration preflight
+// ---------------------------------------------------------------------------
+
+/// Session key holding the preflight challenge, between the two calls.
+pub const SESSION_REG_CHALLENGE_KEY: &str = "reg_attest_challenge";
+/// Session key holding the ticket an attested caller spends at `/register`.
+pub const SESSION_REG_TICKET_KEY: &str = "reg_attest_ticket";
+
+/// How long an attested registration ticket remains spendable.
+const REG_TICKET_TTL_SECONDS: i64 = 300;
+
+/// Proof that a caller attested, spendable once at `/register`.
+///
+/// Server-side only: it lives in the session and is never sent to the client,
+/// so there is nothing for a caller to forge or replay across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationTicket {
+    pub key_id: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+
+/// Spent by Task 6, which is the change that makes `/register` require a
+/// ticket. Defined here with the type it validates so the two cannot drift.
+#[allow(dead_code)]
+pub fn ticket_is_valid(ticket: &RegistrationTicket, now: i64) -> bool {
+    now <= ticket.expires_at
+}
+
+/// What `register-attest` returns on success.
+///
+/// Carries only `expires_at`; the ticket itself stays in the session.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreflightResponse {
+    pub expires_at: i64,
+}
+
+/// A machine-readable refusal from the two preflight routes.
+///
+/// These routes answer JSON, unlike the rest of `DeviceCheckError`, which
+/// renders plain text. That is not cosmetic: without a stable token the client
+/// cannot tell a permanent refusal from a retryable one, falls back to
+/// retryable for everything, and a genuinely spent `key_id` is told to retry
+/// forever. See `docs/app-attest-preflight-contract.md`.
+#[derive(Debug, Serialize)]
+pub struct PreflightErrorBody {
+    pub error: &'static str,
+    pub error_description: String,
+}
+
+/// Wraps a [`DeviceCheckError`] so the preflight routes answer the contract's
+/// JSON shape instead of the legacy plain-text body.
+#[derive(Debug)]
+pub struct PreflightRejection(pub DeviceCheckError);
+
+impl From<DeviceCheckError> for PreflightRejection {
+    fn from(e: DeviceCheckError) -> Self {
+        Self(e)
+    }
+}
+
+/// Map an error to its contract `(status, token, retry_after)`.
+///
+/// Split out from `into_response` so the mapping is testable without building
+/// an HTTP response, and so the one rule that matters — exactly one permanent
+/// code — can be asserted directly.
+pub fn preflight_error_mapping(err: &DeviceCheckError) -> (StatusCode, &'static str, Option<i64>) {
+    match err {
+        DeviceCheckError::AppIdMismatch => (StatusCode::BAD_REQUEST, "app_id_mismatch", None),
+        DeviceCheckError::AppIdNotConfigured => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "app_id_not_configured",
+            None,
+        ),
+
+        DeviceCheckError::CorruptSession
+        | DeviceCheckError::InvalidSessionState(_)
+        | DeviceCheckError::SessionError(_) => (StatusCode::BAD_REQUEST, "session_invalid", None),
+
+        DeviceCheckError::InvalidAttestationObject(_)
+        | DeviceCheckError::InvalidFormat(_)
+        | DeviceCheckError::InvalidCertificateChain(_)
+        | DeviceCheckError::InvalidAuthenticatorData(_)
+        | DeviceCheckError::InvalidCounter(_)
+        | DeviceCheckError::InvalidClientData(_)
+        | DeviceCheckError::ChallengeMismatch => {
+            (StatusCode::BAD_REQUEST, "attestation_invalid", None)
+        }
+
+        DeviceCheckError::DynamoDBOperationError(db) => match **db {
+            // The only permanent refusal in this contract. `registrations`
+            // only increases, so no delay makes this succeed — and therefore
+            // no Retry-After.
+            DynamoDBError::AttestLifetimeCapExceeded => {
+                (StatusCode::FORBIDDEN, "attest_registration_cap", None)
+            }
+            DynamoDBError::RateLimited { retry_after } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "attest_rate_limited",
+                Some(retry_after),
+            ),
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "attest_unavailable", None),
+        },
+
+        // Anything else cannot arise on an unauthenticated route (no token is
+        // presented, no user is resolved). Answer retryable rather than
+        // inventing a permanent verdict from an unexpected variant.
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "attest_unavailable", None),
+    }
+}
+
+impl IntoResponse for PreflightRejection {
+    fn into_response(self) -> axum::response::Response {
+        let (status, error, retry_after) = preflight_error_mapping(&self.0);
+        let body = PreflightErrorBody {
+            error,
+            error_description: self.0.to_string(),
+        };
+        let mut resp = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after
+            && let Ok(v) = secs.to_string().parse()
+        {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+        resp
+    }
+}
+
+/// Issue an attestation challenge to a caller with no account yet.
+///
+/// Deliberately takes no username: pre-account, a username-keyed endpoint
+/// would tell an unauthenticated caller which handles exist.
+pub async fn register_challenge(session: Session) -> Result<impl IntoResponse, PreflightRejection> {
+    let challenge = generate_random_challenge();
+    session
+        .insert(SESSION_REG_CHALLENGE_KEY, challenge.clone())
+        .await
+        .map_err(DeviceCheckError::InvalidSessionState)?;
+    Ok(Json(ChallengeResponse { challenge }))
+}
+
+/// Verify an attestation from an unregistered caller and issue a one-shot
+/// registration ticket.
+///
+/// **This does not gate registration.** `/register` does not require a ticket
+/// until Task 6, so a 200 here is not evidence that registration is protected.
+pub async fn register_attest(
+    Extension(app_state): Extension<AppState>,
+    session: Session,
+    Json(request): Json<AttestationRequest>,
+) -> Result<impl IntoResponse, PreflightRejection> {
+    let challenge: String = session
+        .get(SESSION_REG_CHALLENGE_KEY)
+        .await
+        .map_err(DeviceCheckError::InvalidSessionState)?
+        .ok_or(DeviceCheckError::CorruptSession)?;
+
+    // One challenge, one attempt — consumed whether or not what follows
+    // succeeds, so a caller cannot grind attestations against one challenge.
+    session
+        .remove_value(SESSION_REG_CHALLENGE_KEY)
+        .await
+        .map_err(|e| DeviceCheckError::SessionError(e.to_string()))?;
+
+    let attested = verify_attestation(
+        &challenge,
+        &request.key_id,
+        &request.attestation_object,
+        &request.client_data_hash,
+        &VerifyOptions {
+            expected_app_ids: app_state.app_attest_app_id.as_slice(),
+            // Admission control: unset would admit an attestation from any
+            // App Attest-capable app, so this path refuses rather than warns.
+            require_app_id: true,
+        },
+    )?;
+
+    // Advisory only — takes no slot. The slot is charged at account creation
+    // (Task 6), so a device that abandons the passkey ceremony is not billed
+    // for an account it never made. Checking here keeps the 429/403 on the
+    // preflight response, where the client already handles them, rather than
+    // surfacing a budget refusal after a full WebAuthn ceremony.
+    app_state
+        .db_store
+        .check_attest_registration_budget(&attested.key_id)
+        .await
+        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
+
+    let now = Utc::now().timestamp();
+    let ticket = RegistrationTicket {
+        key_id: attested.key_id.clone(),
+        issued_at: now,
+        expires_at: now + REG_TICKET_TTL_SECONDS,
+    };
+    session
+        .insert(SESSION_REG_TICKET_KEY, ticket.clone())
+        .await
+        .map_err(DeviceCheckError::InvalidSessionState)?;
+
+    info!(
+        "Issued registration ticket for attested key_id {} (expires {})",
+        attested.key_id, ticket.expires_at
+    );
+    Ok(Json(PreflightResponse {
+        expires_at: ticket.expires_at,
+    }))
+}
+
 /// Is `rp_id_hash` one of the configured app-id hashes?
 ///
 /// Membership, not equality: more than one app registers users, so a single
@@ -991,6 +1201,209 @@ impl IntoResponse for DeviceCheckError {
 
 #[cfg(test)]
 mod tests {
+
+    use super::{
+        PreflightRejection, REG_TICKET_TTL_SECONDS, RegistrationTicket, preflight_error_mapping,
+        ticket_is_valid,
+    };
+    use crate::db::DynamoDBError;
+
+    #[tokio::test]
+    async fn register_challenge_route_answers_unauthenticated_and_sets_a_session() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+        use tower_sessions::{MemoryStore, SessionManagerLayer};
+
+        let app = Router::new()
+            .route("/device-check/register-challenge", get(register_challenge))
+            .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/device-check/register-challenge")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the preflight challenge must not require authentication — the caller has no account yet"
+        );
+        assert!(
+            resp.headers().get(axum::http::header::SET_COOKIE).is_some(),
+            "the challenge lives in the session, so the response must establish one; \
+             a client that drops this cookie gets session_invalid on register-attest"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["challenge"].as_str().is_some_and(|c| !c.is_empty()),
+            "challenge must be present and non-empty"
+        );
+    }
+
+    #[test]
+    fn ticket_expiry_is_enforced() {
+        let now = 1_800_000_000i64;
+        let fresh = RegistrationTicket {
+            key_id: "k".into(),
+            issued_at: now,
+            expires_at: now + REG_TICKET_TTL_SECONDS,
+        };
+        assert!(ticket_is_valid(&fresh, now));
+        assert!(ticket_is_valid(&fresh, now + REG_TICKET_TTL_SECONDS));
+        assert!(
+            !ticket_is_valid(&fresh, now + REG_TICKET_TTL_SECONDS + 1),
+            "an expired ticket must not admit"
+        );
+    }
+
+    /// Every contract code, asserted against docs/app-attest-preflight-contract.md.
+    #[test]
+    fn preflight_codes_match_the_published_contract() {
+        let cases: Vec<(DeviceCheckError, StatusCode, &str)> = vec![
+            (
+                DeviceCheckError::AppIdMismatch,
+                StatusCode::BAD_REQUEST,
+                "app_id_mismatch",
+            ),
+            (
+                DeviceCheckError::AppIdNotConfigured,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "app_id_not_configured",
+            ),
+            (
+                DeviceCheckError::CorruptSession,
+                StatusCode::BAD_REQUEST,
+                "session_invalid",
+            ),
+            (
+                DeviceCheckError::ChallengeMismatch,
+                StatusCode::BAD_REQUEST,
+                "attestation_invalid",
+            ),
+            (
+                DeviceCheckError::InvalidAttestationObject("x".into()),
+                StatusCode::BAD_REQUEST,
+                "attestation_invalid",
+            ),
+            (
+                DeviceCheckError::DynamoDBOperationError(Box::new(
+                    DynamoDBError::AttestLifetimeCapExceeded,
+                )),
+                StatusCode::FORBIDDEN,
+                "attest_registration_cap",
+            ),
+            (
+                DeviceCheckError::DynamoDBOperationError(Box::new(DynamoDBError::RateLimited {
+                    retry_after: 60,
+                })),
+                StatusCode::TOO_MANY_REQUESTS,
+                "attest_rate_limited",
+            ),
+            (
+                DeviceCheckError::DynamoDBOperationError(Box::new(DynamoDBError::Internal(
+                    "boom".into(),
+                ))),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attest_unavailable",
+            ),
+        ];
+        for (err, want_status, want_code) in cases {
+            let (status, code, _) = preflight_error_mapping(&err);
+            assert_eq!(status, want_status, "status for {code}");
+            assert_eq!(code, want_code);
+        }
+    }
+
+    #[test]
+    fn attest_registration_cap_is_the_only_permanent_code() {
+        // The contract's load-bearing rule. If a second code ever maps to 403,
+        // a client treating 403 as permanent starts barring devices for a
+        // reason that can clear — which at the first enforcing deploy would
+        // hit every user at once.
+        let every_error = vec![
+            DeviceCheckError::AppIdMismatch,
+            DeviceCheckError::AppIdNotConfigured,
+            DeviceCheckError::CorruptSession,
+            DeviceCheckError::ChallengeMismatch,
+            DeviceCheckError::InvalidFormat("x".into()),
+            DeviceCheckError::InvalidCounter("x".into()),
+            DeviceCheckError::InvalidClientData("x".into()),
+            DeviceCheckError::InvalidCertificateChain("x".into()),
+            DeviceCheckError::SessionError("x".into()),
+            DeviceCheckError::MissingToken,
+            DeviceCheckError::UserNotFound,
+            DeviceCheckError::DynamoDBOperationError(Box::new(DynamoDBError::RateLimited {
+                retry_after: 1,
+            })),
+            DeviceCheckError::DynamoDBOperationError(Box::new(
+                DynamoDBError::AttestLifetimeCapExceeded,
+            )),
+        ];
+        let permanent: Vec<&str> = every_error
+            .iter()
+            .map(preflight_error_mapping)
+            .filter(|(s, _, _)| *s == StatusCode::FORBIDDEN)
+            .map(|(_, c, _)| c)
+            .collect();
+        assert_eq!(permanent, vec!["attest_registration_cap"]);
+    }
+
+    #[test]
+    fn only_rate_limited_carries_retry_after() {
+        let (_, _, ra) = preflight_error_mapping(&DeviceCheckError::DynamoDBOperationError(
+            Box::new(DynamoDBError::RateLimited { retry_after: 3600 }),
+        ));
+        assert_eq!(ra, Some(3600));
+
+        // A permanent refusal must not suggest a retry that can never work.
+        let (_, _, ra) = preflight_error_mapping(&DeviceCheckError::DynamoDBOperationError(
+            Box::new(DynamoDBError::AttestLifetimeCapExceeded),
+        ));
+        assert_eq!(ra, None);
+    }
+
+    #[tokio::test]
+    async fn preflight_rejection_body_is_json_with_a_stable_token() {
+        // The Task 5 acceptance criterion: a plain-text body leaves the client
+        // with nothing to discriminate on, so it falls back to retryable and
+        // the permanent case becomes unreachable.
+        let resp = PreflightRejection(DeviceCheckError::AppIdNotConfigured).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "app_id_not_configured");
+        assert!(v["error_description"].is_string());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_rejection_sets_retry_after_header() {
+        let resp = PreflightRejection(DeviceCheckError::DynamoDBOperationError(Box::new(
+            DynamoDBError::RateLimited { retry_after: 120 },
+        )))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "120"
+        );
+    }
 
     use super::{AttestedKey, VerifyOptions, verify_attestation};
 
