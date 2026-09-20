@@ -148,6 +148,12 @@ DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 
+# App Attest registration gate — see docs/app-attest-gate-deployment.md before
+# setting these. The table is inert until the gate ships; APP_ATTEST_APP_ID is
+# not, and the gate fails closed when it is unset.
+# DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=device_attest_keys
+# APP_ATTEST_APP_ID=<comma-separated sha256(TeamID.BundleID), lower-case hex>
+
 # AWS Region (if using AWS DynamoDB)
 AWS_REGION=us-east-1
 
@@ -226,6 +232,12 @@ not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
 
 ### Systemd Service Setup
+
+> **Not the live deployment.** `identity.arkavo.net` runs on macOS, where there
+> is no systemd and no `/etc/authnz-rs/`. It is started by `sudo ./start.sh`
+> from `production/`, in the foreground, with its environment set inside that
+> script. This section is a reference for a Linux host; do not follow it when
+> operating the current production box.
 
 Create a systemd service file for automatic startup and management:
 
