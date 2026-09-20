@@ -24,9 +24,11 @@ legitimate user along with the bots.
 
 Two further facts shape the answer:
 
-1. Registration is iOS/macOS only, iOS 26+, Apple silicon only. Every
-   supported device has a Secure Enclave, so App Attest is universally
-   available with no fallback path to defend.
+1. Registration is iOS/macOS only, iOS 26+, Apple silicon only. **App Attest
+   covers the iOS half and not the macOS half** — see "The macOS hole" below.
+   An earlier draft of this spec claimed Secure Enclave presence made App
+   Attest universally available with no fallback path to defend. That was
+   wrong on both counts.
 2. The server already implements App Attest (`src/device_check.rs`) and the
    client never calls it. `ArkavoKit` has zero references to
    `DCAppAttestService` or `DeviceCheck`. The server half was built and the
@@ -236,6 +238,39 @@ release:
   registration — hex SHA-256 of `<TeamID>.<BundleID>`. The gate fails closed
   without it, so an unset value in production takes registration down.
 - A captured attestation blob for the validator fixture.
+
+## The macOS hole
+
+App Attest does not work on macOS. This is not a configuration problem and
+there is no entitlement that fixes it. Apple's own macOS SDK header for
+`DCAppAttestService` states that `supported` read "from an app running on a
+Mac device" is `false`, "includ[ing] Mac Catalyst apps, and iOS or iPadOS apps
+running on Apple silicon". The App Attest capability's portal tooltip lists
+Platform Support as iOS, visionOS and tvOS. A Mac provisioning profile never
+carries the entitlement, and Xcode strips it at signing without an error — the
+build succeeds and the signed binary simply lacks the key.
+
+Secure Enclave presence is not the gate. Apple excludes Macs outright.
+
+So the gate as designed covers iOS registrations and cannot cover macOS ones.
+That leaves three options, and the choice is not made here:
+
+1. **Gate iOS, drop macOS registration.** The guarantee holds, at the cost of
+   the platform. Existing macOS accounts are unaffected; only new ones are
+   refused.
+2. **Gate iOS, leave macOS ungated.** The cheapest option and the weakest:
+   an ungated path is the path an attacker takes, so the gate would stop
+   only attackers who decline to change one client. This is close to
+   equivalent to not shipping the gate, and should not be chosen by default
+   just because it requires no work.
+3. **Find a different macOS attestation.** DeviceCheck's `DCDevice` is also
+   iOS-only, and managed device attestation assumes MDM enrollment, so
+   nothing obvious fits a consumer Mac app. Worth a search before option 1 is
+   accepted, not worth blocking on.
+
+Until this is decided, the gate's guarantee must be stated as "registration
+from iOS requires an attested device", never as "registration requires an
+attested device".
 
 ## Out of scope
 

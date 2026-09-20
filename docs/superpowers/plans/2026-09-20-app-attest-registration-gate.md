@@ -25,10 +25,13 @@
 
 Every later task's tests need a genuine App Attest blob. App Attest does not run in the Simulator, so this is a one-time manual capture on real hardware. Nothing else can start until this lands.
 
-**Capture host: the Creator app** at `/Users/arkavo/Projects/Creator` (`ArkavoCreator.xcodeproj`). It is a macOS app on Apple silicon, so the Secure Enclave is present; it is already on team `M8GS7ZT95Y`, already carries the `com.arkavo.webauthn` keychain access group, and already links ArkavoKit. **No App Store or TestFlight release is required** — App Attest's `development` environment works from a locally signed build.
+**Capture host: a real iOS device running the `com.arkavo.Arkavo` app.**
+
+**App Attest does not work on macOS.** Not a signing problem — Apple excludes Macs outright. The macOS SDK's own `DCAppAttestService.h` states that `supported` "from an app running on a Mac device" is `false`, "includ[ing] Mac Catalyst apps, and iOS or iPadOS apps running on Apple silicon", and the App Attest capability's portal tooltip lists Platform Support as iOS, visionOS, tvOS — no macOS. A Mac provisioning profile therefore never carries the entitlement, and Xcode strips it silently at signing: the build succeeds, and the `.xcent` handed to `codesign` simply lacks the key. The Creator app was tried as a host for exactly this reason and cannot work. Simulators are unsupported too.
+
+`com.arkavo.Arkavo` already has App Attest enabled with an iOS profile carrying both `development` and `production`, so **no App Store or TestFlight release is required** — a locally signed development build on a physical device produces a genuine attestation. (`com.arkavo.AvatarMuse` is equally viable if more convenient.)
 
 **Files:**
-- Modify: `/Users/arkavo/Projects/Creator/ArkavoCreator/ArkavoCreator.entitlements`
 - Create: `tests/fixtures/appattest/README.md`
 - Create: `tests/fixtures/appattest/attestation.json`
 
@@ -36,20 +39,19 @@ Every later task's tests need a genuine App Attest blob. App Attest does not run
 - Consumes: nothing
 - Produces: `tests/fixtures/appattest/attestation.json`, a JSON object with keys `key_id` (String), `attestation_object` (String, standard base64), `client_data_hash` (String, standard base64), `challenge` (String, the raw challenge whose SHA-256 is `client_data_hash`), `app_id_hash` (String, lowercase hex), `environment` (String, `"development"` or `"production"`), and `verify_at` (Number, a Unix timestamp inside the leaf certificate's validity window — Task 3's tests check the chain against this instead of the wall clock, so the suite does not start failing the day the captured certificate expires).
 
-- [ ] **Step 0: Add the App Attest entitlement to Creator**
+- [ ] **Step 0: Confirm the entitlement actually survives signing**
 
-In `/Users/arkavo/Projects/Creator/ArkavoCreator/ArkavoCreator.entitlements`, add:
+`com.arkavo.Arkavo` already has App Attest enabled on its app ID, so no portal change should be needed. Verify on the signed binary rather than in the project, because Xcode strips entitlements the profile does not grant **without any error** — a successful build proves nothing:
 
-```xml
-	<key>com.apple.developer.devicecheck.appattest-environment</key>
-	<string>development</string>
+```bash
+codesign -d --entitlements - --xml "$APP" | plutil -p - | grep appattest
 ```
 
-Then enable the App Attest capability on the `com.arkavo.ArkavoCreator` app ID in the Apple Developer portal, so the provisioning profile carries the entitlement. This is portal configuration, not a release.
+Expect `com.apple.developer.devicecheck.appattest-environment`. If it is absent, stop: the profile does not grant it and no capture will work. Do not judge by build success, and do not judge by the `.app` bundle's mtime — re-signing rewrites `Contents/_CodeSignature`, not the bundle directory.
 
-- [ ] **Step 1: Add a temporary capture hook to Creator**
+- [ ] **Step 1: Add a temporary capture hook to the iOS app**
 
-In a scratch build of Creator (do not commit this — a debug menu item or a `#if DEBUG` call on launch is enough), run once on the Mac:
+In a scratch build of `com.arkavo.Arkavo` (do not commit this — a debug menu item or a `#if DEBUG` call on launch is enough), run once on a **physical iOS device**; the Simulator does not support App Attest:
 
 ```swift
 import DeviceCheck
@@ -68,14 +70,14 @@ print(#"{"key_id":"\#(keyId)","attestation_object":"\#(attestation.base64Encoded
 
 - [ ] **Step 2: Record the app id hash**
 
-Already computed for Creator — verify rather than re-derive:
+Already computed — verify rather than re-derive:
 
 ```bash
-printf '%s' 'M8GS7ZT95Y.com.arkavo.ArkavoCreator' | shasum -a 256 | cut -d' ' -f1
-# ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01
+printf '%s' 'M8GS7ZT95Y.com.arkavo.Arkavo' | shasum -a 256 | cut -d' ' -f1
+# 543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8
 ```
 
-This is Creator's identity, not the app that will ultimately serve registration. That is fine: Tasks 1-3 read `app_id_hash` out of the fixture, so they pass self-consistently. Production sets `APP_ATTEST_APP_ID` to whichever app actually registers users.
+Capturing from the app that actually registers users means this is also the value `APP_ATTEST_APP_ID` takes in deployment. If you capture from `com.arkavo.AvatarMuse` instead, recompute — Tasks 1-3 read `app_id_hash` out of the fixture, so they pass self-consistently either way.
 
 - [ ] **Step 3: Write the fixture file**
 
@@ -101,9 +103,10 @@ Fields:
 - `environment`         `development` or `production` — selects the expected aaguid
 - `verify_at`           Unix timestamp inside the leaf cert's validity window
 
-Captured from the Creator app (`com.arkavo.ArkavoCreator`, team M8GS7ZT95Y),
-a macOS build on Apple silicon. No release is needed: App Attest's
-`development` environment works from a locally signed build.
+Captured from `com.arkavo.Arkavo` (team M8GS7ZT95Y) on a physical iOS
+device. No release is needed: a locally signed development build
+attests. App Attest does not work on macOS or in the Simulator, so
+there is no way to regenerate this without an iOS device.
 
 Chain validation tests check against `verify_at`, not the wall clock. The
 leaf certificate has a finite validity window, so testing against `now`
