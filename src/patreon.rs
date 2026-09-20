@@ -1277,7 +1277,7 @@ pub async fn materialize_for_user(
             // fetch broke. Patreon consumed the old refresh token the moment
             // the refresh went through — persisting the rotated link is the
             // only way the next mint can refresh at all.
-            persist_rotated_tokens(app_state, user_id, failure.refreshed).await;
+            persist_rotated_tokens(app_state, user_id, failure.refreshed.map(|l| *l)).await;
             return None;
         }
     };
@@ -1363,7 +1363,11 @@ async fn persist_rotated_tokens(
 #[derive(Debug)]
 struct MaterializeFailure {
     error: PatreonError,
-    refreshed: Option<PatreonLink>,
+    /// Boxed to keep this out of the `Err` variant's inline size: `PatreonLink`
+    /// carries the sealed token blobs, which pushed every `Result` in this
+    /// module to ~304 bytes on the error path — paid on success too, since the
+    /// variants share a layout.
+    refreshed: Option<Box<PatreonLink>>,
 }
 
 impl From<PatreonError> for MaterializeFailure {
@@ -1514,7 +1518,7 @@ async fn fetch_memberships_with_refresh(
                 Ok(memberships) => Ok((memberships, Some(refreshed_link))),
                 Err(error) => Err(MaterializeFailure {
                     error,
-                    refreshed: Some(refreshed_link),
+                    refreshed: Some(Box::new(refreshed_link)),
                 }),
             }
         }

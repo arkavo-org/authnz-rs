@@ -255,10 +255,10 @@ async fn handle_h3_request(
         use http_body_util::BodyExt;
         while let Some(frame) = resp_body.frame().await {
             // Forward data frames; trailers (rare on these routes) are skipped.
-            if let Ok(data) = frame?.into_data() {
-                if !data.is_empty() {
-                    stream.send_data(data).await?;
-                }
+            if let Ok(data) = frame?.into_data()
+                && !data.is_empty()
+            {
+                stream.send_data(data).await?;
             }
         }
     }
@@ -312,6 +312,17 @@ pub struct AppState {
     /// (logged as a warning at attestation time).
     pub app_attest_app_id: Arc<Vec<String>>,
 }
+
+/// The key material loaded at boot: attestation-envelope signing key, the
+/// JWT encode/decode pair, the CWT sign/verify pair, and the `kid` bytes.
+type LoadedKeys = (
+    SigningKey<NistP256>,
+    EncodingKey,
+    DecodingKey,
+    p256::ecdsa::SigningKey,
+    p256::ecdsa::VerifyingKey,
+    Vec<u8>,
+);
 
 /// Parse `APP_ATTEST_APP_ID` into the set of accepted app-id hashes.
 ///
@@ -858,17 +869,7 @@ fn load_ec_keys(
     sign_key_path: &str,
     encoding_key_path: &str,
     decoding_key_path: &str,
-) -> Result<
-    (
-        SigningKey<NistP256>,
-        EncodingKey,
-        DecodingKey,
-        p256::ecdsa::SigningKey,
-        p256::ecdsa::VerifyingKey,
-        Vec<u8>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<LoadedKeys, Box<dyn std::error::Error>> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
 

@@ -989,10 +989,10 @@ pub fn verify(
     let claims = claims_from_cbor(payload)?;
 
     // iss check.
-    if let Some(want) = opts.expected_iss {
-        if claims.iss != want {
-            return Err(CwtError::IssuerMismatch);
-        }
+    if let Some(want) = opts.expected_iss
+        && claims.iss != want
+    {
+        return Err(CwtError::IssuerMismatch);
     }
 
     // aud check.
