@@ -296,9 +296,11 @@ aws dynamodb create-table \
 - `/oauth/authorize`: Authorization endpoint (code flow with PKCE)
 - `/oauth/token`: Token endpoint (issues access_token CWT + id_token JWT, both ES256-signed)
 - `/oauth/userinfo`: UserInfo endpoint
-- Issues OpenTDF-compatible claims: `iss`, `sub` (e.g. `apple:APPLE_SUB` or
-  `arkavo:UUID`), `aud`, `email`, `email_verified`, `idp`,
-  `arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`
+- Issues OpenTDF-compatible claims: `iss`, `sub` (always `arkavo:UUID` —
+  one human has one account under link-only identity, so an RP sees one
+  stable subject however they signed in; `idp` records which IdP was used),
+  `aud`, `email`, `email_verified`, `idp`, `arkavo_account_id`,
+  `arkavo_roles`, `arkavo_entitlements`
 - Authorization codes stored in an in-memory `AuthorizationCodeStore` (10-min
   lifetime, single-use). For multi-instance deployments swap for a shared store.
 - Confidential clients use `client_secret`; public clients must use PKCE (S256).
@@ -341,10 +343,10 @@ aws dynamodb create-table \
   Apple's token endpoint) *and* state-bound nonce verification. Until both
   are implemented this endpoint always rejects, so misconfigured Apple
   Service IDs fail loudly rather than being silently accepted.
-- `map_apple_user` persists `apple:<sub> → arkavo_account_id` in DynamoDB
-  (credentials table, keyed by `apple-<sanitized_sub>` username). Apple `sub`
-  is the canonical join key — email is optional metadata and never used to
-  locate accounts (private-relay rotation safe).
+- `resolve_apple_user` resolves `apple:<sub>` to an Arkavo account **through
+  the `identity_links` table only**. It never provisions: an unlinked `sub` is
+  refused. Apple `sub` is the canonical join key — email is optional metadata
+  and never used to locate accounts (private-relay rotation safe).
 - Requires `APPLE_CLIENT_ID` to be set (one or more comma-separated values).
 
 **google_signin.rs** - Sign in with Google (upstream IdP, redirect flow)
@@ -358,16 +360,35 @@ aws dynamodb create-table \
   exchanges `code` at Google's token endpoint with `GOOGLE_CLIENT_SECRET`,
   verifies the returned id_token (JWKS signature with kid-miss refresh,
   `iss` ∈ {`https://accounts.google.com`, `accounts.google.com`},
-  `aud` = `GOOGLE_CLIENT_ID`, `nonce` constant-time match, `exp`), maps
-  `google:<sub>` → Arkavo account (`google-<sub>` username in the
-  credentials table, provisioned on first sight), then mints the OIDC code
-  and redirects to the RP with `code` + the RP's own `state`.
+  `aud` = `GOOGLE_CLIENT_ID`, `nonce` constant-time match, `exp`), resolves
+  `google:<sub>` → Arkavo account **via the `identity_links` table only**,
+  then mints the OIDC code and redirects to the RP with `code` + the RP's own
+  `state`. An unlinked `sub` is refused, never provisioned.
+- `GET /oauth/google/nonce` + `POST /oauth/google/link`: the Apple pair's
+  counterpart, and the only way a Google identity becomes able to sign in.
+  Auth-required (`X-Auth-Token` CWT names the account), single-use session
+  nonce, HTTP 409 if the `sub` is bound to a different account. Minimum-PII:
+  only the `sub` is persisted.
 - Failures after the RP was validated go back to the RP's redirect_uri as
   `error=` (`access_denied` for user cancel / rejected id_token,
   `server_error` for exchange or DB failure, `temporarily_unavailable` when
   Google is unconfigured). Only an unknown `state` stays on this origin (400).
 - Tokens: `idp=google`, `email` (lower-cased + trimmed) and `email_verified`
   from Google, `name` on the id_token. Disabled unless `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` are set.
+
+**identity.rs** - Federated identity resolution (link-only)
+- `resolve_linked_account(db, provider, subject)`: the single policy shared by
+  Apple and Google sign-in. An identity reaches an Arkavo account **only**
+  through its `identity_links` row.
+- Accounts are created by **passkey registration alone**. Sign-in never
+  provisions. A missing link — or a link pointing at a deleted user row —
+  fails closed as `NotLinked`.
+- Refusal is uniform across every surface: `error=access_denied` with
+  `error_description=identity_not_linked` on the RP's redirect URI
+  (`/oauth/authorize?idp=apple`, `/oauth/google/callback`), or HTTP 403 with
+  the same marker from `POST /oauth/apple/idtoken`. The code stays standard
+  OAuth2 so existing RP handling works; the marker is what lets a client route
+  the user to passkey registration.
 
 **patreon.rs** - Patreon identity linking + membership materialization
 - Mirrors the Apple linking contract: minimum-PII row in `identity_links`
@@ -651,6 +672,11 @@ When modifying token lifetimes, update these in authn.rs:
   - provider (String) - IdP name (`apple`, `patreon`, future: `google`, etc.)
   - subject (String) - The IdP's stable subject identifier
   - linked_at (Number) - Unix timestamp
+- **Read path**: `DynamoDBStore::get_identity_link(provider, subject)`. This is
+  how *every* federated sign-in reaches an account — see `identity.rs`.
+- **Cardinality**: one account may link several subjects of the same provider
+  (work + personal Google). The reverse — one subject on two accounts — is
+  refused.
 - **Uniqueness**: Conditional put on `link_pk` enforces per-(provider, subject) uniqueness.
   Re-linking the same identity to the same user is idempotent; binding to a
   different user returns `DynamoDBError::LinkConflict` (HTTP 409 upstream).

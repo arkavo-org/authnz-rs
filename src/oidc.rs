@@ -794,6 +794,12 @@ pub async fn authorize(
     // Resolve the authenticated user from one of the supported upstream sources.
     let user = match resolve_user(&app_state, &oidc, &apple, &headers, &params).await {
         Ok(user) => user,
+        // The RP's redirect_uri is already validated at this point, so an
+        // unlinked identity goes back to the RP as a standard OAuth2 error
+        // rather than rendering on the identity origin.
+        Err(AuthorizeError::IdentityNotLinked) => {
+            return identity_not_linked_redirect(&params.redirect_uri, params.state.as_deref());
+        }
         Err(e) => return e.into_response(),
     };
 
@@ -856,6 +862,21 @@ pub(crate) fn redirect_error_to_client(
         pairs.push(("state", state));
     }
     Redirect::temporary(&append_query(redirect_uri, &pairs)).into_response()
+}
+
+/// The single refusal shape for a federated sign-in whose identity is not
+/// linked to an Arkavo account.
+///
+/// Shared by `/oauth/authorize?idp=apple` and the Google callback so both
+/// emit byte-identical errors: a client only has to recognise one thing to
+/// route the user to passkey registration.
+pub(crate) fn identity_not_linked_redirect(redirect_uri: &str, state: Option<&str>) -> Response {
+    redirect_error_to_client(
+        redirect_uri,
+        state,
+        "access_denied",
+        crate::constants::IDENTITY_NOT_LINKED,
+    )
 }
 
 /// Append form-encoded `pairs` to `uri`, using `&` when it already carries a
@@ -1787,6 +1808,11 @@ pub enum AuthorizeError {
     AppleSigninError(#[from] apple_signin::AppleSigninError),
     #[error("database error: {0}")]
     Database(String),
+    /// The upstream IdP authenticated the user, but no Arkavo account is
+    /// linked to that identity. Surfaced to the RP as a redirect, not as a
+    /// response on this origin — see [`identity_not_linked_redirect`].
+    #[error("{}", crate::constants::IDENTITY_NOT_LINKED)]
+    IdentityNotLinked,
 }
 
 impl IntoResponse for AuthorizeError {
@@ -1802,6 +1828,9 @@ impl IntoResponse for AuthorizeError {
                 (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
             }
             AuthorizeError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            // Normally redirected to the RP before reaching here; this is the
+            // fallback shape if it ever isn't.
+            AuthorizeError::IdentityNotLinked => (StatusCode::FORBIDDEN, "access_denied"),
         };
         oidc_error_response(status, code, &self.to_string())
     }
@@ -1845,9 +1874,14 @@ async fn resolve_user(
         }
 
         let apple_claims = apple_signin::verify_apple_id_token(apple, &token, nonce).await?;
-        return apple_signin::map_apple_user(app_state, &apple_claims)
+        return apple_signin::resolve_apple_user(&app_state.db_store, &apple_claims)
             .await
-            .map_err(|e| AuthorizeError::Database(e.to_string()));
+            .map_err(|e| match e {
+                crate::identity::IdentityResolveError::NotLinked => {
+                    AuthorizeError::IdentityNotLinked
+                }
+                other => AuthorizeError::Database(other.to_string()),
+            });
     }
 
     // Otherwise expect an Arkavo CWT (from WebAuthn flow).
@@ -2128,6 +2162,24 @@ mod tests {
         let a = test_jwk();
         let b = test_jwk();
         assert_eq!(a.kid, b.kid);
+    }
+
+    #[test]
+    fn identity_not_linked_redirect_is_access_denied_with_the_shared_marker() {
+        let resp = identity_not_linked_redirect("https://rp.example/cb", Some("xyz"));
+
+        // Standard OAuth2 code so existing RP handlers keep working...
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("refusal must go back to the RP, not render on this origin");
+        assert!(location.starts_with("https://rp.example/cb?"));
+        assert!(location.contains("error=access_denied"));
+        // ...plus the marker that lets the client route to registration.
+        assert!(location.contains("error_description=identity_not_linked"));
+        assert!(location.contains("state=xyz"));
     }
 
     #[test]

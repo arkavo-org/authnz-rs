@@ -50,13 +50,12 @@ use crate::constants::{
     GOOGLE_AUTHORIZE_URL, GOOGLE_HTTP_TIMEOUT_SECS, GOOGLE_ISSUERS, GOOGLE_JWKS_CACHE_TTL_SECONDS,
     GOOGLE_JWKS_URL, GOOGLE_PENDING_AUTHORIZE_TTL_SECONDS, GOOGLE_TOKEN_URL,
 };
-use crate::db::DynamoDBError;
 use crate::oidc::{
     AuthenticatedUser, AuthorizationCodeStore, AuthorizeRequest, complete_authorization,
     oidc_error_response, redirect_error_to_client,
 };
 use axum::extract::{Extension, Query};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
 use chrono::Utc;
@@ -65,12 +64,13 @@ use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tower_sessions::Session;
+use uuid::Uuid;
 
 /// Scopes requested from Google. `email` + `profile` yield the
 /// `email`/`email_verified`/`name` claims surfaced on the Arkavo id_token.
@@ -129,6 +129,182 @@ pub enum GoogleSigninError {
     NonceMismatch,
     #[error("Google code exchange failed: {0}")]
     CodeExchange(String),
+    /// This Google `sub` is already bound to a *different* Arkavo account.
+    /// The conflicting account id is deliberately not disclosed.
+    #[error("Google identity already linked to a different user")]
+    LinkConflict,
+    #[error("Missing or invalid X-Auth-Token")]
+    Unauthenticated,
+    #[error(
+        "No server-issued Google nonce in session — call GET /oauth/google/nonce before submitting an id_token"
+    )]
+    MissingSessionNonce,
+    #[error("session error: {0}")]
+    SessionError(String),
+    #[error("identity link storage failed")]
+    Storage,
+}
+
+impl IntoResponse for GoogleSigninError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            GoogleSigninError::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            GoogleSigninError::JwksFetch(_) | GoogleSigninError::JwksParse(_) => {
+                StatusCode::BAD_GATEWAY
+            }
+            GoogleSigninError::LinkConflict => StatusCode::CONFLICT,
+            GoogleSigninError::MissingSessionNonce => StatusCode::BAD_REQUEST,
+            GoogleSigninError::SessionError(_) | GoogleSigninError::Storage => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            _ => StatusCode::UNAUTHORIZED,
+        };
+        // Opaque body for storage failures — raw SDK strings must not leak.
+        (status, self.to_string()).into_response()
+    }
+}
+
+/// Session key holding the server-issued Google nonce.
+const SESSION_GOOGLE_NONCE_KEY: &str = "google_nonce_state";
+
+/// Nonce TTL (seconds). Mirrors the Apple pair; short-lived to bound replay.
+const GOOGLE_NONCE_TTL_SECONDS: i64 = 600;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GoogleNonceState {
+    raw_nonce: String,
+    expires_at: i64,
+}
+
+/// `GET /oauth/google/nonce` — issue a single-use nonce bound to this session.
+///
+/// The client passes the same value to Google when requesting an id_token, so
+/// the returned token's `nonce` claim proves the ceremony was the one this
+/// server asked for.
+pub async fn google_nonce_handler(session: Session) -> Response {
+    let raw_nonce = random_token();
+    let state = GoogleNonceState {
+        raw_nonce: raw_nonce.clone(),
+        expires_at: Utc::now().timestamp() + GOOGLE_NONCE_TTL_SECONDS,
+    };
+    if let Err(e) = session.insert(SESSION_GOOGLE_NONCE_KEY, &state).await {
+        return GoogleSigninError::SessionError(e.to_string()).into_response();
+    }
+    axum::Json(serde_json::json!({ "nonce": raw_nonce })).into_response()
+}
+
+/// Single-use consume of the session-stored Google nonce.
+async fn consume_google_nonce(session: &Session) -> Result<String, GoogleSigninError> {
+    let state: GoogleNonceState = session
+        .get(SESSION_GOOGLE_NONCE_KEY)
+        .await
+        .map_err(|e| GoogleSigninError::SessionError(e.to_string()))?
+        .ok_or(GoogleSigninError::MissingSessionNonce)?;
+    // Clear immediately — single-use, whether or not validation succeeds.
+    session
+        .remove_value(SESSION_GOOGLE_NONCE_KEY)
+        .await
+        .map_err(|e| GoogleSigninError::SessionError(e.to_string()))?;
+
+    if state.expires_at < Utc::now().timestamp() {
+        return Err(GoogleSigninError::MissingSessionNonce);
+    }
+    Ok(state.raw_nonce)
+}
+
+/// Bind a verified Google `sub` to an Arkavo account.
+///
+/// Idempotent for the same account; a `sub` already bound elsewhere is a
+/// conflict, never a silent re-point. This is the only way a Google identity
+/// becomes able to sign in — see [`crate::identity`].
+pub async fn link_google_identity(
+    db: &crate::db::DynamoDBStore,
+    user_id: Uuid,
+    subject: &str,
+) -> Result<(), GoogleSigninError> {
+    match db.link_identity(user_id, "google", subject).await {
+        Ok(()) => Ok(()),
+        Err(crate::db::DynamoDBError::LinkConflict) => Err(GoogleSigninError::LinkConflict),
+        Err(e) => {
+            error!("identity link write failed: {}", e);
+            Err(GoogleSigninError::Storage)
+        }
+    }
+}
+
+/// Request body for `POST /oauth/google/link`.
+#[derive(Debug, Deserialize)]
+pub struct GoogleLinkRequest {
+    pub id_token: String,
+}
+
+/// `POST /oauth/google/link` — bind a Google identity to the authenticated
+/// Arkavo account. Mirrors `POST /oauth/apple/link`.
+///
+/// Auth: `X-Auth-Token` CWT; its `sub` is the account the identity binds to.
+/// Preamble: the client must have called `GET /oauth/google/nonce` on this
+/// session and used that nonce with Google.
+///
+/// Minimum-PII: only the Google `sub` is persisted. Email and name claims are
+/// discarded even when Google sends them.
+pub async fn google_link_handler(
+    Extension(app_state): Extension<AppState>,
+    Extension(google): Extension<Arc<GoogleSignin>>,
+    session: Session,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<GoogleLinkRequest>,
+) -> Response {
+    let user_id = match crate::authn::verify_inbound_account_token(
+        &app_state,
+        headers
+            .get("X-Auth-Token")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default(),
+    ) {
+        Ok(claims) => match Uuid::parse_str(&claims.sub) {
+            Ok(id) => id,
+            Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
+        },
+        Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
+    };
+
+    let raw_nonce = match consume_google_nonce(&session).await {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+
+    let claims = match google.verify_id_token(&req.id_token, &raw_nonce).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Google id_token rejected at link: {}", e);
+            return e.into_response();
+        }
+    };
+
+    match link_google_identity(&app_state.db_store, user_id, &claims.sub).await {
+        Ok(()) => {
+            // Audit: a subject prefix is enough to triangulate with the DDB row
+            // without logging the pseudonymous identifier in full.
+            info!(
+                "audit identity_link outcome=linked user_id={} provider=google subject_prefix={}",
+                user_id,
+                claims.sub.chars().take(8).collect::<String>()
+            );
+            StatusCode::OK.into_response()
+        }
+        Err(e) => {
+            warn!(
+                "audit identity_link outcome={} user_id={} provider=google",
+                if matches!(e, GoogleSigninError::LinkConflict) {
+                    "conflict"
+                } else {
+                    "error"
+                },
+                user_id
+            );
+            e.into_response()
+        }
+    }
 }
 
 /// A validated OIDC authorize request parked while the browser is at Google.
@@ -549,12 +725,6 @@ fn random_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn sha256_hex(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 /// Lower-case and trim an email address. Google addresses are
 /// case-insensitive, and downstream policy (the OpenTDF platform's recipient
 /// mapping) hashes the lower-cased address, so the CWT must carry the
@@ -563,44 +733,29 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-fn sanitize_for_username(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .take(128)
-        .collect()
-}
-
-/// Map verified Google claims to an Arkavo account, provisioning one on
-/// first sight. Keyed by Google `sub` (never by email).
-pub async fn map_google_user(
-    app_state: &AppState,
+/// Resolve verified Google claims to the Arkavo account they are linked to.
+///
+/// Link-only: an account is reached through its `identity_links` row, written
+/// by an authenticated `POST /oauth/google/link`. An unlinked `sub` is
+/// refused, never provisioned — see [`crate::identity`].
+pub async fn resolve_google_user(
+    db: &crate::db::DynamoDBStore,
     claims: &GoogleIdTokenClaims,
-) -> Result<AuthenticatedUser, DynamoDBError> {
-    // SECURITY: the `google-` prefix is load-bearing. These rows are created
-    // with an empty credential list, and `authn::is_reserved_username` relies on
-    // the prefix to keep `start_register`'s zero-credential exemption away from
-    // them. Changing this format requires changing
-    // `constants::RESERVED_USERNAME_PREFIXES` in the same commit.
-    let username = format!("google-{}", sanitize_for_username(&claims.sub));
-    let did = format!("did:key:google-{}", &sha256_hex(&claims.sub)[..32]);
-
-    let user = match app_state.db_store.get_user_by_name(&username).await? {
-        Some(existing) => existing,
-        None => {
-            info!("Provisioning Arkavo account for Google sub {}", claims.sub);
-            app_state.db_store.create_user(&username, &did).await?
-        }
-    };
+) -> Result<AuthenticatedUser, crate::identity::IdentityResolveError> {
+    let account = crate::identity::resolve_linked_account(db, "google", &claims.sub).await?;
 
     Ok(AuthenticatedUser {
-        subject: format!("google:{}", claims.sub),
-        arkavo_account_id: user.user_id.to_string(),
+        // The Arkavo UUID, not `google:<sub>`: one human has one account under
+        // link-only, so an RP must see one stable subject however they signed
+        // in. `idp` below still records which IdP was used.
+        subject: format!("arkavo:{}", account.user_id),
+        arkavo_account_id: account.user_id.to_string(),
         email: claims.email.as_deref().map(normalize_email),
         email_verified: claims.email_verified.as_ref().map(|v| v.as_bool()),
         name: claims.name.clone(),
         idp: "google".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: user.entitlements.clone(),
+        entitlements: account.entitlements.clone(),
     })
 }
 
@@ -723,10 +878,15 @@ pub async fn google_callback_handler(
         }
     };
 
-    let user = match map_google_user(&app_state, &claims).await {
+    let user = match resolve_google_user(&app_state.db_store, &claims).await {
         Ok(u) => u,
+        Err(crate::identity::IdentityResolveError::NotLinked) => {
+            // Link-only: Google authenticated the user, but no Arkavo account
+            // is bound to this `sub`. Never provision one here.
+            return crate::oidc::identity_not_linked_redirect(&request.redirect_uri, rp_state);
+        }
         Err(e) => {
-            error!("Google user mapping failed: {}", e);
+            error!("Google user resolution failed: {}", e);
             return redirect_error_to_client(
                 &request.redirect_uri,
                 rp_state,
@@ -962,6 +1122,80 @@ mod tests {
         }))
         .unwrap();
         assert!(v.email_verified.unwrap().as_bool());
+    }
+
+    #[tokio::test]
+    async fn linking_a_google_identity_is_idempotent_for_the_same_account() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let account = store
+            .create_user(&format!("user-{}", Uuid::new_v4()), "did:key:zLinkIdem")
+            .await
+            .unwrap();
+        let sub = format!("sub-{}", Uuid::new_v4());
+
+        link_google_identity(&store, account.user_id, &sub)
+            .await
+            .expect("first link should succeed");
+        link_google_identity(&store, account.user_id, &sub)
+            .await
+            .expect("re-linking the same identity to the same account is a no-op");
+
+        // And the link is what sign-in now resolves through.
+        let claims = GoogleIdTokenClaims {
+            iss: "https://accounts.google.com".into(),
+            sub: sub.clone(),
+            aud: "client".into(),
+            iat: 0,
+            exp: 0,
+            nonce: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            hd: None,
+        };
+        let user = resolve_google_user(&store, &claims).await.unwrap();
+        assert_eq!(user.arkavo_account_id, account.user_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn linking_a_google_identity_already_bound_elsewhere_conflicts() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let first = store
+            .create_user(&format!("user-{}", Uuid::new_v4()), "did:key:zLinkA")
+            .await
+            .unwrap();
+        let second = store
+            .create_user(&format!("user-{}", Uuid::new_v4()), "did:key:zLinkB")
+            .await
+            .unwrap();
+        let sub = format!("sub-{}", Uuid::new_v4());
+
+        link_google_identity(&store, first.user_id, &sub)
+            .await
+            .expect("first link should succeed");
+
+        let err = link_google_identity(&store, second.user_id, &sub)
+            .await
+            .expect_err("a Google sub must not be claimable by a second account");
+        assert!(matches!(err, GoogleSigninError::LinkConflict));
+
+        // The original binding is untouched.
+        assert_eq!(
+            store.get_identity_link("google", &sub).await.unwrap(),
+            Some(first.user_id)
+        );
+    }
+
+    #[test]
+    fn google_link_conflict_is_409() {
+        assert_eq!(
+            GoogleSigninError::LinkConflict.into_response().status(),
+            StatusCode::CONFLICT
+        );
     }
 
     /// Minimal stand-in for Google's token + JWKS endpoints.

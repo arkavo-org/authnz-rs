@@ -52,7 +52,6 @@ use crate::AppState;
 use crate::constants::{
     APPLE_ISSUER, APPLE_JWKS_CACHE_TTL_SECONDS, APPLE_JWKS_HTTP_TIMEOUT_SECS, APPLE_JWKS_URL,
 };
-use crate::db::DynamoDBError;
 use crate::oidc::AuthenticatedUser;
 use axum::Json;
 use axum::extract::Extension;
@@ -141,6 +140,10 @@ pub enum AppleSigninError {
     MissingSessionNonce,
     #[error("APPLE_CLIENT_ID is not configured")]
     MissingClientId,
+    /// The Apple identity verified, but no Arkavo account is linked to it.
+    /// The message is the bare shared marker so clients can match on it.
+    #[error("{}", crate::constants::IDENTITY_NOT_LINKED)]
+    IdentityNotLinked,
     #[error("session error: {0}")]
     SessionError(String),
     #[error("Missing X-Auth-Token header")]
@@ -164,6 +167,9 @@ impl IntoResponse for AppleSigninError {
             | AppleSigninError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppleSigninError::MissingSessionNonce => StatusCode::BAD_REQUEST,
             AppleSigninError::LinkConflict => StatusCode::CONFLICT,
+            // 403, not 401: Apple authentication succeeded; there is simply no
+            // Arkavo account bound to this identity yet.
+            AppleSigninError::IdentityNotLinked => StatusCode::FORBIDDEN,
             _ => StatusCode::UNAUTHORIZED,
         };
         (status, self.to_string()).into_response()
@@ -422,47 +428,33 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 ///
 /// Roles/entitlements default to a minimal user policy; persisting these
 /// per-account is a tracked follow-up (see README).
-pub async fn map_apple_user(
-    app_state: &AppState,
+/// Resolve verified Apple claims to the Arkavo account they are linked to.
+///
+/// Link-only: an account is reached through its `identity_links` row, written
+/// by an authenticated `POST /oauth/apple/link`. An unlinked `sub` is
+/// refused, never provisioned — see [`crate::identity`].
+///
+/// Minimum-PII is unchanged: `email` is echoed into the token claims from the
+/// id_token in hand and is never persisted or used to locate the account.
+pub async fn resolve_apple_user(
+    db: &crate::db::DynamoDBStore,
     claims: &AppleIdTokenClaims,
-) -> Result<AuthenticatedUser, DynamoDBError> {
-    // SECURITY: the `apple-` prefix is load-bearing. These rows are created
-    // with an empty credential list, and `authn::is_reserved_username` relies on
-    // the prefix to keep `start_register`'s zero-credential exemption away from
-    // them. Changing this format requires changing
-    // `constants::RESERVED_USERNAME_PREFIXES` in the same commit.
-    let username = format!("apple-{}", sanitize_for_username(&claims.sub));
-    let did = format!("did:key:apple-{}", &sha256_hex(&claims.sub)[..32]);
-
-    let user = match app_state.db_store.get_user_by_name(&username).await? {
-        Some(existing) => existing,
-        None => {
-            info!("Provisioning Arkavo account for Apple sub {}", claims.sub);
-            app_state.db_store.create_user(&username, &did).await?
-        }
-    };
-
-    let email_verified = claims.email_verified.as_ref().map(|v| v.as_bool());
+) -> Result<AuthenticatedUser, crate::identity::IdentityResolveError> {
+    let account = crate::identity::resolve_linked_account(db, "apple", &claims.sub).await?;
 
     Ok(AuthenticatedUser {
-        subject: format!("apple:{}", claims.sub),
-        arkavo_account_id: user.user_id.to_string(),
+        // See `google_signin::resolve_google_user` — one account, one subject.
+        subject: format!("arkavo:{}", account.user_id),
+        arkavo_account_id: account.user_id.to_string(),
         email: claims.email.clone(),
-        email_verified,
+        email_verified: claims.email_verified.as_ref().map(|v| v.as_bool()),
         // Apple only surfaces the name in the first-auth `user` form post,
         // never in the id_token, so there is nothing to carry here.
         name: None,
         idp: "apple".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: user.entitlements.clone(),
+        entitlements: account.entitlements.clone(),
     })
-}
-
-fn sanitize_for_username(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .take(128)
-        .collect()
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -583,13 +575,18 @@ pub async fn apple_idtoken_handler(
         Err(e) => return e.into_response(),
     };
 
-    let user = match map_apple_user(&app_state, &claims).await {
+    let user = match resolve_apple_user(&app_state.db_store, &claims).await {
         Ok(u) => u,
+        Err(crate::identity::IdentityResolveError::NotLinked) => {
+            // Link-only: this endpoint resolves an already-linked identity. It
+            // no longer brings an account into existence.
+            return AppleSigninError::IdentityNotLinked.into_response();
+        }
         Err(e) => {
-            error!("Failed to map Apple user: {}", e);
+            error!("Failed to resolve Apple user: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to provision Arkavo account: {}", e),
+                "Account lookup failed".to_string(),
             )
                 .into_response();
         }
@@ -827,6 +824,18 @@ impl<'de> serde::Deserialize<'de> for AppleNonceResponse {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn identity_not_linked_is_forbidden_with_the_shared_marker() {
+        let resp = AppleSigninError::IdentityNotLinked.into_response();
+        // 403, not 401: the caller authenticated with Apple successfully —
+        // there is simply no Arkavo account bound to that identity.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            AppleSigninError::IdentityNotLinked.to_string(),
+            crate::constants::IDENTITY_NOT_LINKED
+        );
+    }
     use super::*;
 
     #[test]
@@ -839,17 +848,6 @@ mod tests {
         assert!(!v.as_bool());
         let v: EmailVerified = serde_json::from_str("false").unwrap();
         assert!(!v.as_bool());
-    }
-
-    #[test]
-    fn test_sanitize_for_username() {
-        assert_eq!(
-            sanitize_for_username("000123.abc-def_ghi"),
-            "000123.abc-def_ghi"
-        );
-        assert_eq!(sanitize_for_username("apple/sub<script>"), "applesubscript");
-        let long = "a".repeat(200);
-        assert_eq!(sanitize_for_username(&long).len(), 128);
     }
 
     #[test]
@@ -1027,19 +1025,6 @@ mod tests {
             check_nonce(Some(&other_hashed), "expected-nonce"),
             Err(AppleSigninError::NonceMismatch)
         ));
-    }
-
-    #[test]
-    fn test_apple_subject_is_account_key_not_email() {
-        // The mapping uses Apple sub for username derivation. Construct a
-        // claims value with a non-empty sub but no email; confirm the
-        // derived username is the same regardless of email rotation.
-        let sub = "000abc.123def";
-        let username = format!("apple-{}", sanitize_for_username(sub));
-        assert_eq!(username, "apple-000abc.123def");
-        // Email rotation must not affect the deterministic key.
-        let same = format!("apple-{}", sanitize_for_username(sub));
-        assert_eq!(username, same);
     }
 
     #[tokio::test]
