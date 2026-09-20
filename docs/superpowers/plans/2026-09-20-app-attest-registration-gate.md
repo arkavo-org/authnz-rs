@@ -150,7 +150,19 @@ Either way this converts an assumption into a fact before Tasks 5 and 6 rest on 
 
 - [ ] **Step 5: Settle the macOS binding question**
 
-One extra `attestKey` call from the working macOS build (Creator), then a decode. This answers the spec's "macOS hole" and does not produce a fixture — `attestation.json` stays the iOS one.
+Answers the spec's "macOS hole". Does **not** produce a fixture — `attestation.json` stays the iOS one.
+
+**5a. Capture from the macOS build.** Re-run the Step 1 snippet unchanged against the working `com.arkavo.ArkavoCreator` macOS build — `DCAppAttestService` is the same API and `isSupported` is true there via the `app-attest-opt-in` entitlement. Save its JSON as `macos-capture.json` (scratch, not committed).
+
+**5b. Get the code directory hash, positively.** Do not infer this by elimination — read it from the signed binary:
+
+```bash
+codesign -dvvv "$CREATOR_APP" 2>&1 | grep -i "CDHash"
+```
+
+`CandidateCDHashFull sha256=…` is the full 32-byte digest and is the one comparable to a 32-byte `rpIdHash`. The plain `CandidateCDHash sha256=…` is truncated to 20 bytes — if that is all the tool prints, note the length mismatch rather than forcing a comparison.
+
+**5c. Decode and compare against *both* candidates.**
 
 ```bash
 python3 -c "
@@ -162,18 +174,29 @@ except ImportError:
 d=json.load(open('macos-capture.json'))
 att=cbor2.loads(base64.b64decode(d['attestation_object']))
 ad=att['authData']
-print('rpIdHash :', ad[0:32].hex())
-print('aaguid   :', ad[37:53].decode('ascii','replace'))
-print('expected :', hashlib.sha256(b'M8GS7ZT95Y.com.arkavo.ArkavoCreator').hexdigest())
-"
+rp=ad[0:32].hex()
+aaguid_raw=ad[37:53]
+appid=hashlib.sha256(b'M8GS7ZT95Y.com.arkavo.ArkavoCreator').hexdigest()
+cdhash=(sys.argv[1] if len(sys.argv)>1 else '').strip().lower()
+print('rpIdHash      :', rp)
+print('SHA256(app id):', appid)
+print('CDHashFull    :', cdhash or '(pass as argv[1] from 5b)')
+print('aaguid        :', aaguid_raw.rstrip(b'\x00').decode('ascii','replace'), '| hex:', aaguid_raw.hex())
+if rp==appid:   print('=> BINDS TO APP ID  -- macOS hole CLOSES')
+elif cdhash and rp==cdhash: print('=> BINDS TO CDHASH  -- per-build, no static config can pin it')
+else:           print('=> MATCHES NEITHER  -- do not conclude; suspect wrong bundle id, team, capture file, or a truncated CDHash')
+" "<CandidateCDHashFull from 5b>"
 ```
 
-Two outcomes, both worth having:
+**Three outcomes, and only two of them are answers:**
 
 - **`rpIdHash` == `SHA256("<TeamID>.<BundleID>")`** — the macOS hole **closes**. A static `APP_ATTEST_APP_ID` entry pins Creator, both platforms are gateable, and the spec's three options collapse to "do nothing special."
-- **`rpIdHash` != that** — it is the CDhash, so it is per-build and no static config value can pin it. macOS must then be dropped from the gate or given a different identity check, and that is now known *before* the enforcing deploy rather than at it.
+- **`rpIdHash` == the full CDhash** — per-build, so no static config value can pin it. macOS must be dropped from the gate or given a different identity check. Known *before* the enforcing deploy rather than at it.
+- **Matches neither** — **not** a CDhash result. Treat as bad inputs: wrong bundle id, wrong team, stale `macos-capture.json`, or a truncated CDHash from 5b. Re-run before concluding anything.
 
-Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since Task 1's verifier checks it.
+That third branch is the point of comparing against both. Concluding "it's the CDhash" from non-equality alone lets one fat-fingered input close the macOS hole in the wrong direction — and this decision is meant to be the one made *before* the enforcing deploy.
+
+Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since Task 1's verifier checks it. The value is NUL-padded to 16 bytes, so the hex is printed alongside the text form — trailing `00`s are padding, not part of the value.
 
 - [ ] **Step 6: Write the README**
 
