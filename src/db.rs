@@ -423,14 +423,14 @@ impl DynamoDBStore {
         match result {
             Ok(_) => Ok(()),
             Err(err) => {
-                if let SdkError::ServiceError(ref se) = err {
-                    if se.err().meta().code() == Some("ConditionalCheckFailedException") {
-                        warn!(
-                            "put_handle: {} owned by another user — write refused",
-                            handle
-                        );
-                        return Err(DynamoDBError::LinkConflict);
-                    }
+                if let SdkError::ServiceError(ref se) = err
+                    && se.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    warn!(
+                        "put_handle: {} owned by another user — write refused",
+                        handle
+                    );
+                    return Err(DynamoDBError::LinkConflict);
                 }
                 Err(DynamoDBError::SdkError(err.to_string()))
             }
