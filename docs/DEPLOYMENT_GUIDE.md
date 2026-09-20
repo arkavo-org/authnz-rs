@@ -233,6 +233,12 @@ only — but log integrity still matters for incident response.
 
 ### Systemd Service Setup
 
+> **Not the live deployment.** `identity.arkavo.net` runs on macOS, where there
+> is no systemd and no `/etc/authnz-rs/`. It is started by `sudo ./start.sh`
+> from `production/`, in the foreground, with its environment set inside that
+> script. This section is a reference for a Linux host; do not follow it when
+> operating the current production box.
+
 Create a systemd service file for automatic startup and management:
 
 ```bash
