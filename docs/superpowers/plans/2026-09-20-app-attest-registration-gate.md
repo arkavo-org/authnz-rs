@@ -871,8 +871,22 @@ impl DynamoDBStore {
         &self,
         key_id: &str,
     ) -> Result<AttestKeyRecord, DynamoDBError>;
+
+    /// Read-only budget check for the preflight. Takes no slot; a key that
+    /// passes here can still be refused by `reserve_attest_registration`.
+    pub async fn check_attest_registration_budget(
+        &self,
+        key_id: &str,
+    ) -> Result<(), DynamoDBError>;
 }
 ```
+
+**Where the slot is spent.** `reserve_attest_registration` is called at
+account creation (Task 6's `finish_register`), not at attest time. The budget
+bounds accounts, so it must be charged when one is created — a client that
+attests and then fails the passkey ceremony must not burn a slot. The preflight
+calls the read-only check instead, so an already-exhausted device is still
+refused at `register-attest` where the client handles 429/403.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1060,7 +1074,7 @@ second account on one device."
 - Test: `src/device_check.rs`
 
 **Interfaces:**
-- Consumes: `verify_attestation`, `VerifyOptions` (Task 1); `reserve_attest_registration` (Task 4).
+- Consumes: `verify_attestation`, `VerifyOptions` (Task 1); `check_attest_registration_budget` (Task 4).
 - Produces: session key `SESSION_REG_TICKET_KEY = "reg_attest_ticket"` holding `RegistrationTicket`:
 
 ```rust
@@ -1170,9 +1184,14 @@ pub async fn register_attest(
         },
     )?;
 
+    // Advisory only: this takes no slot. The slot is taken in finish_register
+    // (Task 6), so a device that abandons the passkey ceremony is not charged
+    // for an account it never created. Checking here anyway keeps the 429/403
+    // on the preflight response, which is where ArkavoClient already handles
+    // them, rather than surfacing a budget refusal after a full ceremony.
     app_state
         .db_store
-        .reserve_attest_registration(&attested.key_id)
+        .check_attest_registration_budget(&attested.key_id)
         .await
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
 
@@ -1248,7 +1267,7 @@ what the gate exists to refuse."
 - Test: `src/authn.rs`
 
 **Interfaces:**
-- Consumes: `RegistrationTicket`, `ticket_is_valid`, `SESSION_REG_TICKET_KEY` (Task 5).
+- Consumes: `RegistrationTicket`, `ticket_is_valid`, `SESSION_REG_TICKET_KEY` (Task 5); `reserve_attest_registration` (Task 4).
 - Produces: `WebauthnError::AttestationRequired`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1324,12 +1343,33 @@ After the WebAuthn ceremony verifies and before the credential is stored, re-rea
         return Err(WebauthnError::AttestationRequired);
     }
 
+    // Charge the device's registration budget here, not at attest time: the
+    // slot pays for an account that is about to exist. A client that attests
+    // and then abandons the ceremony costs nothing, so three flaky attempts
+    // cannot lock a genuine user out for a day.
+    app_state
+        .db_store
+        .reserve_attest_registration(&ticket.key_id)
+        .await
+        .map_err(|e| match e {
+            DynamoDBError::RateLimited { .. } | DynamoDBError::AttestLifetimeCapExceeded => {
+                WebauthnError::AttestationRequired
+            }
+            other => WebauthnError::DynamoDBOperationError(Box::new(other)),
+        })?;
+
     // One ticket, one account.
     session
         .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
         .await
         .map_err(|e| WebauthnError::SessionError(e.to_string()))?;
 ```
+
+The preflight already refused an exhausted key, so reaching a budget refusal
+here means the budget was spent by a concurrent registration between attest and
+finish. 403 is the honest answer and the client's existing
+`registrationCapExceeded` path handles it; a distinct code is not worth a new
+client release.
 
 - [ ] **Step 6: Run the tests**
 
@@ -1680,7 +1720,7 @@ Not a task — the sequence the spec requires, to run once every task above has 
 
 ## Self-Review
 
-**Spec coverage.** Gate placement → Tasks 5, 6. Ticket mechanism → Task 5. Shared verifier → Task 1. The three verification gaps → Tasks 2 (nonce ext), 3 (chain), and the counter-reset gap, which Task 3's refusal of a leaf-only chain does not address — it is bounded instead by Task 4's registration budget, since a re-attest now consumes a slot. Mandatory `APP_ATTEST_APP_ID` → Tasks 1, 5. Rate policy → Task 4. Client → Task 8. Error handling → Tasks 5 (429), 6 (403), 8 (three distinct Swift errors). soft-webauthn test → Task 7. Deployment → checklist above.
+**Spec coverage.** Gate placement → Tasks 5, 6. Ticket mechanism → Task 5. Shared verifier → Task 1. The three verification gaps → Tasks 2 (nonce ext), 3 (chain), and the counter-reset gap, which Task 3's refusal of a leaf-only chain does not address — it is bounded instead by Task 4's registration budget, since each completed registration consumes a slot. Mandatory `APP_ATTEST_APP_ID` → Tasks 1, 5. Rate policy → Task 4. Client → Task 8. Error handling → Tasks 5 (429), 6 (403), 8 (three distinct Swift errors). soft-webauthn test → Task 7. Deployment → checklist above.
 
 **Type consistency.** `AttestedKey`, `VerifyOptions`, `verify_attestation` defined in Task 1 and used unchanged in Tasks 2 and 5. `RegistrationTicket`, `ticket_is_valid`, `SESSION_REG_TICKET_KEY` defined in Task 5 and used unchanged in Tasks 6 and 7. `AttestKeyRecord` gains `window_base` in Task 4 Step 1 and carries it through Step 4. `AppAttesting` defined and consumed within Task 8.
 

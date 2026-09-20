@@ -1410,6 +1410,26 @@ impl DynamoDBStore {
     /// first-ever create, or the conditional update below) -- a policy
     /// refusal (window or lifetime budget exhausted) returns immediately
     /// without retrying, since re-reading cannot change that answer.
+    /// Read-only budget check for the pre-registration preflight.
+    ///
+    /// Advisory: it takes no slot. The slot is taken by
+    /// [`Self::reserve_attest_registration`] at account creation, so a key that
+    /// passes here can still be refused there. Its job is to refuse an
+    /// exhausted device at attest time rather than after a full WebAuthn
+    /// ceremony, and to keep the 429/403 the client already handles on the
+    /// preflight response.
+    pub async fn check_attest_registration_budget(
+        &self,
+        key_id: &str,
+    ) -> Result<(), DynamoDBError> {
+        let now = chrono::Utc::now().timestamp();
+        match self.get_attest_key_record(key_id).await? {
+            None => Ok(()),
+            Some(record) if attest_slot_available(&record, now) => Ok(()),
+            Some(record) => Err(attest_refusal_error(&record, now)),
+        }
+    }
+
     pub async fn reserve_attest_registration(
         &self,
         key_id: &str,

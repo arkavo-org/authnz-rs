@@ -53,7 +53,7 @@ pending registration instead of a `user_id`.
 ```
 GET  /device-check/register-challenge   → 32-byte challenge, stored in session
 POST /device-check/register-attest      → {key_id, attestation_object}
-                                        → verify, apply rate policy,
+                                        → verify, check rate budget (no charge),
                                           issue one-shot session ticket (~5 min)
 GET  /register/:username                [ticket required]
 POST /register                          [ticket required, consumed here]
@@ -80,7 +80,8 @@ multi-instance arrives: a signed short-TTL ticket with its `jti` burned in
 DynamoDB. Not built unless one of those forces it.
 
 The ticket is one-shot. `start_register` requires an unconsumed ticket;
-`finish_register` consumes it.
+`finish_register` consumes it, and charges the device's registration budget at
+the same point — see "Rate policy".
 
 ### Shared verifier
 
@@ -147,10 +148,24 @@ Policy constants in `constants.rs`: on the order of 3 registrations per
 rolling 24 hours with a lifetime soft cap. Increment via DynamoDB conditional
 update, following the existing assertion-counter race pattern in this module.
 
+**The slot is spent at account creation, not at attestation.** `register-attest`
+checks the budget read-only; `finish_register` charges it as it consumes the
+ticket. The budget bounds accounts, so it must be paid by an account coming
+into existence — charging at attest time would let three flaky passkey
+ceremonies lock a genuine user out for a day while creating nothing. The
+preflight still refuses an already-exhausted device, so the client keeps
+receiving 429/403 from the endpoint that handles them. The residual is a race:
+a concurrent registration can spend the last slot between attest and finish, and
+that refusal surfaces as a 403 at `finish_register`.
+
 Rate-limited rather than capped at one: an app reinstall generates a fresh
 `key_id` so a hard cap is survivable, but a user wanting a second account on
-one device would be permanently blocked. The counter is also the abuse signal
-— a farm shows up as a key with an implausible registration history.
+one device would be permanently blocked.
+
+The lifetime cap is a speed bump, not a bound — a reinstall yields a fresh
+`key_id`, so a determined farm pays one reinstall per ten accounts. Its real
+value is as an abuse signal: a key that reaches the cap has a history no user
+produces.
 
 ### Client (`ArkavoKit`)
 
@@ -240,6 +255,9 @@ release:
   registration — hex SHA-256 of `<TeamID>.<BundleID>`. The gate fails closed
   without it, so an unset value in production takes registration down.
 - A captured attestation blob for the validator fixture.
+- The `device_attest_keys` table must exist in every environment that serves
+  registration before the gate goes live. Nothing provisions it; the table name
+  comes from an env var defaulting to `device_attest_keys`.
 
 ## The macOS hole
 
