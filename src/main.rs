@@ -534,6 +534,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/apple/nonce", get(apple_nonce_handler))
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
         .route("/oauth/apple/link", post(apple_link_handler))
+        // Google linking — the Apple pair's counterpart. Link-only identity
+        // resolution means this is the ONLY way a Google account becomes able
+        // to sign in; see google_signin.rs and src/identity.rs.
+        .route(
+            "/oauth/google/nonce",
+            get(google_signin::google_nonce_handler),
+        )
+        .route(
+            "/oauth/google/link",
+            post(google_signin::google_link_handler),
+        )
         .route("/oauth/apple/callback", post(apple_callback_handler))
         // Google sign-in return leg (see google_signin.rs): completes an
         // `idp=google` /oauth/authorize request parked in Redis.
