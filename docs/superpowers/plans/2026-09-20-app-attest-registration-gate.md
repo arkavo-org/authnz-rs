@@ -23,19 +23,33 @@
 
 ### Task 0: Capture a real attestation fixture
 
-Every later task's tests need a genuine App Attest blob. App Attest does not run in the Simulator, so this is a one-time manual capture on a real device. Nothing else can start until this lands.
+Every later task's tests need a genuine App Attest blob. App Attest does not run in the Simulator, so this is a one-time manual capture on real hardware. Nothing else can start until this lands.
+
+**Capture host: the Creator app** at `/Users/arkavo/Projects/Creator` (`ArkavoCreator.xcodeproj`). It is a macOS app on Apple silicon, so the Secure Enclave is present; it is already on team `M8GS7ZT95Y`, already carries the `com.arkavo.webauthn` keychain access group, and already links ArkavoKit. **No App Store or TestFlight release is required** — App Attest's `development` environment works from a locally signed build.
 
 **Files:**
+- Modify: `/Users/arkavo/Projects/Creator/ArkavoCreator/ArkavoCreator.entitlements`
 - Create: `tests/fixtures/appattest/README.md`
 - Create: `tests/fixtures/appattest/attestation.json`
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `tests/fixtures/appattest/attestation.json`, a JSON object with keys `key_id` (String), `attestation_object` (String, standard base64), `client_data_hash` (String, standard base64), `challenge` (String, the raw challenge whose SHA-256 is `client_data_hash`), `app_id_hash` (String, lowercase hex), `environment` (String, `"development"` or `"production"`).
+- Produces: `tests/fixtures/appattest/attestation.json`, a JSON object with keys `key_id` (String), `attestation_object` (String, standard base64), `client_data_hash` (String, standard base64), `challenge` (String, the raw challenge whose SHA-256 is `client_data_hash`), `app_id_hash` (String, lowercase hex), `environment` (String, `"development"` or `"production"`), and `verify_at` (Number, a Unix timestamp inside the leaf certificate's validity window — Task 3's tests check the chain against this instead of the wall clock, so the suite does not start failing the day the captured certificate expires).
 
-- [ ] **Step 1: Add a temporary capture hook to the app**
+- [ ] **Step 0: Add the App Attest entitlement to Creator**
 
-In a scratch build of the Arkavo app (do not commit this), run once on a real device:
+In `/Users/arkavo/Projects/Creator/ArkavoCreator/ArkavoCreator.entitlements`, add:
+
+```xml
+	<key>com.apple.developer.devicecheck.appattest-environment</key>
+	<string>development</string>
+```
+
+Then enable the App Attest capability on the `com.arkavo.ArkavoCreator` app ID in the Apple Developer portal, so the provisioning profile carries the entitlement. This is portal configuration, not a release.
+
+- [ ] **Step 1: Add a temporary capture hook to Creator**
+
+In a scratch build of Creator (do not commit this — a debug menu item or a `#if DEBUG` call on launch is enough), run once on the Mac:
 
 ```swift
 import DeviceCheck
@@ -54,15 +68,21 @@ print(#"{"key_id":"\#(keyId)","attestation_object":"\#(attestation.base64Encoded
 
 - [ ] **Step 2: Record the app id hash**
 
-On any machine, with the real Team ID and bundle ID:
+Already computed for Creator — verify rather than re-derive:
 
 ```bash
-printf '%s' 'TEAMID.com.arkavo.app' | shasum -a 256 | cut -d' ' -f1
+printf '%s' 'M8GS7ZT95Y.com.arkavo.ArkavoCreator' | shasum -a 256 | cut -d' ' -f1
+# ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01
 ```
+
+This is Creator's identity, not the app that will ultimately serve registration. That is fine: Tasks 1-3 read `app_id_hash` out of the fixture, so they pass self-consistently. Production sets `APP_ATTEST_APP_ID` to whichever app actually registers users.
 
 - [ ] **Step 3: Write the fixture file**
 
-Save the printed JSON to `tests/fixtures/appattest/attestation.json`, adding the `app_id_hash` from Step 2 and `environment` matching the build (`development` for a debug build, `production` for TestFlight/App Store).
+Save the printed JSON to `tests/fixtures/appattest/attestation.json`, adding:
+- `app_id_hash` from Step 2
+- `environment`: `"development"`
+- `verify_at`: the capture time as a Unix timestamp (`date +%s` at capture). It must fall inside the leaf certificate's validity window, which it does by construction if recorded at capture.
 
 - [ ] **Step 4: Write the README**
 
@@ -79,6 +99,15 @@ Fields:
 - `challenge`           the raw challenge string
 - `app_id_hash`         lowercase hex SHA-256 of `<TeamID>.<BundleID>`
 - `environment`         `development` or `production` — selects the expected aaguid
+- `verify_at`           Unix timestamp inside the leaf cert's validity window
+
+Captured from the Creator app (`com.arkavo.ArkavoCreator`, team M8GS7ZT95Y),
+a macOS build on Apple silicon. No release is needed: App Attest's
+`development` environment works from a locally signed build.
+
+Chain validation tests check against `verify_at`, not the wall clock. The
+leaf certificate has a finite validity window, so testing against `now`
+would make the suite start failing on a date unrelated to any code change.
 
 This blob contains no user data. The attested key is a throwaway generated
 solely for this fixture and is bound to no account.
@@ -98,6 +127,7 @@ d=json.load(open('tests/fixtures/appattest/attestation.json'))
 assert hashlib.sha256(d['challenge'].encode()).digest()==base64.b64decode(d['client_data_hash']), 'client_data_hash mismatch'
 assert base64.b64decode(d['attestation_object'])[:1]==b'\xa3', 'not a 3-key CBOR map'
 assert len(bytes.fromhex(d['app_id_hash']))==32, 'app_id_hash not 32 bytes'
+assert isinstance(d['verify_at'], int) and d['verify_at']>1_700_000_000, 'verify_at missing or implausible'
 print('fixture ok')
 "
 ```
@@ -574,8 +604,8 @@ Closes the second documented gap. Today `validate_certificate_chain` parses the 
 - Test: `src/device_check.rs`
 
 **Interfaces:**
-- Consumes: the `verify` feature enabled in Task 2.
-- Produces: `validate_certificate_chain` keeps its existing signature `fn(&[Vec<u8>]) -> Result<(), DeviceCheckError>` and now actually verifies.
+- Consumes: the `verify` feature enabled in Task 2; `verify_at` from the Task 0 fixture.
+- Produces: `validate_certificate_chain(&[Vec<u8>]) -> Result<(), DeviceCheckError>` keeps its signature and now actually verifies, delegating to a new `validate_certificate_chain_at(x5c: &[Vec<u8>], now: ASN1Time) -> Result<(), DeviceCheckError>`. Production calls the former, which passes `ASN1Time::now()`. Tests call the latter with the fixture's `verify_at`, so the suite does not start failing when the captured certificate expires.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -587,8 +617,34 @@ fn chain_validation_accepts_the_real_fixture() {
         .decode(f["attestation_object"].as_str().unwrap())
         .unwrap();
     let att: AttestationObject = ciborium::from_reader(&bytes[..]).unwrap();
-    validate_certificate_chain(&att.att_stmt.x5c)
+
+    // Checked against the fixture's capture time, not the wall clock: the leaf
+    // certificate expires, and a suite that fails on a calendar date rather
+    // than a code change teaches people to ignore it.
+    let at = ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap()).unwrap();
+    validate_certificate_chain_at(&att.att_stmt.x5c, at)
         .expect("a real Apple chain must validate to the embedded root");
+}
+
+#[test]
+fn chain_validation_rejects_an_expired_certificate() {
+    let f = load_fixture();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(f["attestation_object"].as_str().unwrap())
+        .unwrap();
+    let att: AttestationObject = ciborium::from_reader(&bytes[..]).unwrap();
+
+    // Ten years past capture, the leaf is certainly outside its window.
+    let long_after = ASN1Time::from_timestamp(
+        f["verify_at"].as_i64().unwrap() + 10 * 365 * 24 * 3600,
+    )
+    .unwrap();
+
+    let err = validate_certificate_chain_at(&att.att_stmt.x5c, long_after).unwrap_err();
+    assert!(
+        matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
+        "an expired chain must not validate, got {err:?}"
+    );
 }
 
 #[test]
@@ -608,7 +664,8 @@ fn chain_validation_rejects_a_forged_leaf() {
         *b ^= 0xff;
     }
 
-    let err = validate_certificate_chain(&forged).unwrap_err();
+    let at = ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap()).unwrap();
+    let err = validate_certificate_chain_at(&forged, at).unwrap_err();
     assert!(
         matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
         "got {err:?}"
@@ -623,7 +680,8 @@ fn chain_validation_rejects_a_leaf_only_chain() {
         .unwrap();
     let att: AttestationObject = ciborium::from_reader(&bytes[..]).unwrap();
 
-    let err = validate_certificate_chain(&att.att_stmt.x5c[..1]).unwrap_err();
+    let at = ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap()).unwrap();
+    let err = validate_certificate_chain_at(&att.att_stmt.x5c[..1], at).unwrap_err();
     assert!(
         matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
         "a chain with no intermediate must not validate, got {err:?}"
@@ -634,7 +692,7 @@ fn chain_validation_rejects_a_leaf_only_chain() {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib device_check::tests::chain_validation`
-Expected: FAIL — `chain_validation_rejects_a_forged_leaf` and `chain_validation_rejects_a_leaf_only_chain` both return `Ok(())` today.
+Expected: FAIL — `validate_certificate_chain_at` does not exist yet, so all four tests fail to compile.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -645,6 +703,18 @@ Expected: FAIL — `chain_validation_rejects_a_forged_leaf` and `chain_validatio
 /// the pinned root. Apple sends leaf + intermediate, so a one-element chain
 /// is refused rather than treated as self-signed.
 fn validate_certificate_chain(x5c: &[Vec<u8>]) -> Result<(), DeviceCheckError> {
+    validate_certificate_chain_at(x5c, ASN1Time::now())
+}
+
+/// As [`validate_certificate_chain`], but with the validity instant supplied.
+///
+/// Tests pin this to the fixture's capture time. The captured leaf certificate
+/// has a finite validity window, and a suite wired to the wall clock would
+/// start failing on a calendar date with no code change behind it.
+fn validate_certificate_chain_at(
+    x5c: &[Vec<u8>],
+    now: ASN1Time,
+) -> Result<(), DeviceCheckError> {
     if x5c.len() < 2 {
         return Err(DeviceCheckError::InvalidCertificateChain(format!(
             "expected leaf + intermediate, got {} certificate(s)",
@@ -667,7 +737,6 @@ fn validate_certificate_chain(x5c: &[Vec<u8>]) -> Result<(), DeviceCheckError> {
         parsed.push(cert);
     }
 
-    let now = ASN1Time::now();
     for cert in &parsed {
         if !cert.validity().is_valid_at(now) {
             return Err(DeviceCheckError::InvalidCertificateChain(format!(
@@ -734,6 +803,10 @@ In the `//! # Known Limitations` block, delete:
 ```
 //! - Certificate chain validation is incomplete (intermediate certs not verified)
 ```
+
+Note in the `validate_certificate_chain_at` doc comment that production always
+passes `ASN1Time::now()` and only tests pin the instant, so nobody later
+mistakes the parameter for a way to disable expiry checking.
 
 Do the same in `CLAUDE.md` under **Known Limitations** in the Apple DeviceCheck section, and remove the parenthetical `(TODO: implement full chain verification)`.
 
