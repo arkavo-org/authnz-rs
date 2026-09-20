@@ -207,6 +207,8 @@ pub const ATTEST_REG_PER_WINDOW: u32 = 3;
 /// Length of that rolling window, in seconds.
 pub const ATTEST_REG_WINDOW_SECONDS: i64 = 86_400;
 
-/// Absolute lifetime ceiling for one key, independent of the window. A key
-/// past this is a farm, not a user.
+/// Absolute lifetime ceiling for one key, independent of the window. This is a
+/// speed bump, not a bound: an app reinstall yields a fresh key_id, so a
+/// determined farm pays a reinstall per ten accounts. Its real value is as an
+/// abuse signal -- a key that reaches this has a history no user produces.
 pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;

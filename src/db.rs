@@ -91,7 +91,14 @@ pub fn attest_slot_available(record: &AttestKeyRecord, now: i64) -> bool {
         // successful reservation, so this key is unconditionally eligible.
         return true;
     }
-    record.registrations - record.window_base < ATTEST_REG_PER_WINDOW
+    // The write paths keep window_base <= registrations, but the row comes from
+    // DynamoDB. A malformed one has no meaningful in-window count, and this is
+    // admission control, so fail closed rather than wrap (or saturate to zero
+    // used, which would fail *open* and hand a corrupt row a fresh budget).
+    match record.registrations.checked_sub(record.window_base) {
+        Some(used) => used < ATTEST_REG_PER_WINDOW,
+        None => false,
+    }
 }
 
 /// Pure policy: which error should a reservation attempt on `record` return,
@@ -2374,6 +2381,23 @@ pub(crate) mod tests {
             DynamoDBError::AttestLifetimeCapExceeded => {}
             other => panic!("expected AttestLifetimeCapExceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_row_with_window_base_above_registrations_refuses() {
+        // The write paths never produce this, but the row comes from DynamoDB.
+        // A hand-edited or partially-written one must fail closed, not wrap the
+        // u32 subtraction (huge count) and not saturate to zero (fresh budget).
+        let now = 1_800_000_000i64;
+        let corrupt = AttestKeyRecord {
+            key_id: "k".into(),
+            registrations: 1,
+            window_base: 9,
+            window_started_at: now - 10,
+            first_seen_at: now - 10,
+            last_reg_at: now - 10,
+        };
+        assert!(!attest_slot_available(&corrupt, now));
     }
 
     #[test]
