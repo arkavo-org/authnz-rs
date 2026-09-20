@@ -359,7 +359,13 @@ aws dynamodb create-table \
 - `generate_challenge`: Issues random challenge for attestation (**requires a
   CWT bound to `:username`** — App Attest proves the device is genuine, never
   which account it belongs to)
-- `finish_attestation`: Validates attestation object, stores device binding
+- `verify_attestation(challenge, key_id, attestation_object_b64, client_data_hash_b64, &VerifyOptions)`:
+  the shared verifier. Returns `AttestedKey { key_id, public_key, rp_id_hash_str, counter }`.
+  `VerifyOptions.expected_app_ids` is a **set** (more than one app registers users);
+  `require_app_id` decides whether an empty set warns (bound-device path) or refuses with
+  `AppIdNotConfigured` (registration gate). Both paths share this one implementation — never
+  write a second copy.
+- `finish_attestation`: Calls `verify_attestation`, stores device binding
 - `generate_assertion_challenge`: Issues challenge for existing devices (requires CWT)
 - `finish_assertion`: Verifies assertion, enforces counter increment, issues CWT
 - CBOR attestation object parsing ("apple-appattest" format)
