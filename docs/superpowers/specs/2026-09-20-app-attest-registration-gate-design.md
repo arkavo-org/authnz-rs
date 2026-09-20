@@ -124,7 +124,9 @@ deny. `register-attest` fails closed when it is unset, rather than warning.
 The remaining checks should be confirmed present in the extracted validator:
 
 - `aaguid` matches the environment (`appattest` in production,
-  `appattestdevelop` in development)
+  `appattestdevelop` in development). If macOS clients are ever admitted this
+  must also cover whatever aaguid macOS emits — possibly `appattestsandbox`,
+  unconfirmed; see "The macOS hole"
 - counter is 0 at attestation time
 - `key_id == SHA256(publicKey)`
 

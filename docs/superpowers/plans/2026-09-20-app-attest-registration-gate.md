@@ -27,7 +27,11 @@ Every later task's tests need a genuine App Attest blob. App Attest does not run
 
 **Capture host: a real iOS device running the `com.arkavo.Arkavo` app.**
 
-**App Attest does not work on macOS.** Not a signing problem — Apple excludes Macs outright. The macOS SDK's own `DCAppAttestService.h` states that `supported` "from an app running on a Mac device" is `false`, "includ[ing] Mac Catalyst apps, and iOS or iPadOS apps running on Apple silicon", and the App Attest capability's portal tooltip lists Platform Support as iOS, visionOS, tvOS — no macOS. A Mac provisioning profile therefore never carries the entitlement, and Xcode strips it silently at signing: the build succeeds, and the `.xcent` handed to `codesign` simply lacks the key. The Creator app was tried as a host for exactly this reason and cannot work. Simulators are unsupported too.
+**Capture from iOS even though macOS also works.** macOS App Attest is reachable, but through a *second* capability: `com.apple.developer.devicecheck.app-attest-opt-in` (value `CDhash`), which unlike plain App Attest lists macOS in its platform support. A Mac build with it granted reports `isSupported = true` and generates real Secure Enclave keys.
+
+macOS is still the wrong host for this fixture. The entitlement's value is `CDhash`, which suggests macOS attestation may bind to the code directory hash rather than `SHA256("<TeamID>.<BundleID>")` — if so, a Mac-captured fixture is per-build and every rebuild invalidates it. The macOS aaguid may also be `appattestsandbox` rather than a value the verifier expects. Both are open (see the spec's "The macOS hole"), and the fixture should not be what discovers them.
+
+iOS carries neither uncertainty, and its `app_id_hash` is the production `APP_ATTEST_APP_ID` value. Simulators are unsupported, so a physical device is required regardless.
 
 `com.arkavo.Arkavo` already has App Attest enabled with an iOS profile carrying both `development` and `production`, so **no App Store or TestFlight release is required** — a locally signed development build on a physical device produces a genuine attestation. (`com.arkavo.AvatarMuse` is equally viable if more convenient.)
 
@@ -47,7 +51,7 @@ Every later task's tests need a genuine App Attest blob. App Attest does not run
 codesign -d --entitlements - --xml "$APP" | plutil -p - | grep appattest
 ```
 
-Expect `com.apple.developer.devicecheck.appattest-environment`. If it is absent, stop: the profile does not grant it and no capture will work. Do not judge by build success, and do not judge by the `.app` bundle's mtime — re-signing rewrites `Contents/_CodeSignature`, not the bundle directory.
+Expect `com.apple.developer.devicecheck.appattest-environment` on iOS (macOS grants the different `app-attest-opt-in` key instead). If it is absent, stop: the profile does not grant it and no capture will work. Do not judge by build success, and do not judge by the `.app` bundle's mtime — re-signing rewrites `Contents/_CodeSignature`, not the bundle directory.
 
 - [ ] **Step 1: Add a temporary capture hook to the iOS app**
 
