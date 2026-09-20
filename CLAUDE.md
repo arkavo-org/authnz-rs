@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WebAuthn-based authentication and authorization service built with Rust, Axum, and DynamoDB. The system provides passwordless authentication using FIDO2/WebAuthn passkeys, **CWT (COSE_Sign1, ES256) tokens for Arkavo-issued credentials, JWT for OIDC `id_token`**, and decentralized identity (DID) support.
 
-**Protocol Support**: HTTP/1.1, HTTP/2 with TLS 1.3 (HTTP/3 infrastructure ready but disabled due to dependency issues)
+**Protocol Support**: HTTP/1.1, HTTP/2 with TLS 1.3, and HTTP/3 (QUIC) when built with `--features http3`.
 
 ## Development Commands
 
@@ -27,162 +27,45 @@ cargo fmt
 
 ### Running the Server
 
-#### Development (HTTP)
 ```bash
-# Set required environment variables
 export SIGN_KEY_PATH=/path/to/signkey.pem
 export ENCODING_KEY_PATH=/path/to/encodekey.pem
 export DECODING_KEY_PATH=/path/to/decodekey.pem
-
-# Optional: Set DynamoDB table names
-export DYNAMODB_CREDENTIALS_TABLE=credentials
-export DYNAMODB_HANDLES_TABLE=handles
-export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
-export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
-export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
-export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
-export DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=device_attest_keys
-
-# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
-export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
-export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
-export AGENT_TOKEN_MINUTES=15   # hard cap 15
-# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
-# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
-export ADMIN_CLIENT_IDS=catalog-node
-# Optional override of the default entitlement FQNs written on new user rows
-# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
-# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
-
-# Optional: Set port (defaults to 8080)
-export PORT=8080
-
-# Optional: Apple App Attest App ID hash — hex SHA-256 of "<TeamID>.<BundleID>".
-# When set, POST /device-check/attest requires the attestation's rpIdHash to
-# match, so only the Arkavo app can create device bindings. Unset ⇒ the value
-# is recorded on the binding but not enforced (logged as a warning).
-export APP_ATTEST_APP_ID=<hex-sha256-of-teamid.bundleid>
-
-# Optional: OIDC provider configuration (required to act as an OIDC IdP).
-# Issuer URL appears in tokens and the discovery doc.
-export OIDC_ISSUER=https://identity.arkavo.net
-
-# Register one or more relying parties (RPs) using tagged env vars. <TAG> is
-# an operator-chosen identifier (typically the upper-cased client_id) used
-# only to group each RP's three vars together — it does not appear in tokens.
-# Each RP needs an _ID and _REDIRECT_URIS; _SECRET is optional (omit or
-# leave blank for public PKCE-only clients).
-export OIDC_CLIENT_OPENTDF_ID=opentdf
-export OIDC_CLIENT_OPENTDF_SECRET=<shared-secret-or-omit-for-public-PKCE-clients>
-export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/callback,https://opentdf.example/oauth/cb
-# Additional RPs follow the same pattern with a different tag:
-# export OIDC_CLIENT_ARKAVOIOS_ID=arkavo-ios
-# export OIDC_CLIENT_ARKAVOIOS_REDIRECT_URIS=arkavo://oauth/cb
-# CLI passkey login (arkavo-edge): PUBLIC client, no _SECRET, PKCE S256. One
-# client class for every install (RFC 8252); per-install state is the refresh
-# token on disk, not a registration. Loopback redirect URIs are exact-match,
-# so every port the CLI may bind is listed verbatim.
-# export OIDC_CLIENT_EDGE_ID=arkavo-edge
-# export OIDC_CLIENT_EDGE_REDIRECT_URIS=http://127.0.0.1:52171/cb,...,http://127.0.0.1:52178/cb
-# ClosureKB Android (closurekb/closurekb#40): PUBLIC client, PKCE S256,
-# custom-scheme redirect, signs in with idp=google, sends
-# resource=https://platform.arkavo.net (honoured because it equals
-# OIDC_PLATFORM_AUDIENCE). See docs/google-signin.md.
-# export OIDC_CLIENT_CLOSUREKB_ID=closurekb-android
-# export OIDC_CLIENT_CLOSUREKB_REDIRECT_URIS=com.closurekb:/oauth2redirect
-# AuthZEN PEPs (service CWT, client_credentials): see docs/pep-service-clients.md.
-# catalog-node and mcp-edge are registered in production (401 without secret).
-# Mint on the identity host with scripts/mint-pep-cwt.py — do not paste secrets.
-# _REDIRECT_URIS is required even for client_credentials (parser). Use a dummy URI.
-
-# Optional: shared resource audience appended to every OIDC access token
-# (RFC 8707-style). Set this to the OpenTDF platform's configured audience so
-# tokens minted for any RP (apps, service accounts) pass the platform's
-# single-audience CWT verification. Unset = single-audience tokens.
-export OIDC_PLATFORM_AUDIENCE=https://platform.arkavo.net
-
-# Optional: Sign in with Apple. Accepts a comma-separated list so the same
-# AuthNZ instance can serve an iOS bundle id + web Service ID.
-export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web
-
-# Optional: Sign in with Google as an upstream IdP for
-# /oauth/authorize?idp=google (server-side redirect; docs/google-signin.md).
-# Both must be set or idp=google fails closed with temporarily_unavailable.
-# GOOGLE_REDIRECT_URI defaults to <OIDC_ISSUER>/oauth/google/callback and
-# must be an authorized redirect URI on the Google OAuth client.
-export GOOGLE_CLIENT_ID=<...>.apps.googleusercontent.com
-export GOOGLE_CLIENT_SECRET=<...>
-# export GOOGLE_REDIRECT_URI=https://identity.arkavo.net/oauth/google/callback
-
-# Optional: Patreon linking + membership materialization. Patreon issues one
-# OAuth client per app, so clients are registered with tagged env vars
-# (mirroring OIDC_CLIENT_<TAG>_*). Each client needs _ID, _SECRET, and
-# _REDIRECT_URIS; the link request's redirect_uri selects which client's
-# credentials perform the code exchange, so a redirect URI may belong to only
-# one client. The legacy untagged trio (PATREON_CLIENT_ID/_SECRET/
-# PATREON_REDIRECT_URIS) still registers a single client and may be combined
-# with tagged ones. Any malformed/ambiguous registration, or a missing
-# PATREON_KMS_KEY_ID, disables all Patreon code paths (POST
-# /oauth/patreon/link returns HTTP 503 NotConfigured).
-export PATREON_CLIENT_ARKAVO_ID=<patreon-oauth-client-id>
-export PATREON_CLIENT_ARKAVO_SECRET=<patreon-oauth-client-secret>
-export PATREON_CLIENT_ARKAVO_REDIRECT_URIS=https://identity.arkavo.net/oauth/arkavo/patreon
-# export PATREON_CLIENT_ARKAVOCREATOR_ID=...
-# export PATREON_CLIENT_ARKAVOCREATOR_SECRET=...
-# export PATREON_CLIENT_ARKAVOCREATOR_REDIRECT_URIS=https://identity.arkavo.net/oauth/arkavocreator/patreon
-export PATREON_KMS_KEY_ID=alias/arkavo-patreon-token-key
-
-# Run the server
-cargo run
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net
+cargo run   # HTTP on :8080; set TLS_CERT_PATH + TLS_KEY_PATH for HTTPS
 ```
 
-#### Production (HTTPS)
-```bash
-# Set bind address and port
-export BIND_ADDRESS=192.0.2.6  # Specific IP to bind to (defaults to 0.0.0.0 if not set)
-export PORT=443
+Production runs from `production/start.sh` (the authoritative env for
+identity.arkavo.net) via `production/build.sh`; see
+[docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
 
-# Set TLS certificate paths
-export TLS_CERT_PATH=/etc/letsencrypt/live/identity.arkavo.net/fullchain.pem
-export TLS_KEY_PATH=/etc/letsencrypt/live/identity.arkavo.net/privkey.pem
+### Configuration Reference
 
-# Set required cryptographic keys
-export SIGN_KEY_PATH=/etc/authnz-rs/keys/signkey.pem
-export ENCODING_KEY_PATH=/etc/authnz-rs/keys/encodekey.pem
-export DECODING_KEY_PATH=/etc/authnz-rs/keys/decodekey.pem
+All configuration is via environment variables. Only the four above are
+required at boot; everything else is optional and its feature is disabled
+when unset.
 
-# DynamoDB configuration
-export DYNAMODB_CREDENTIALS_TABLE=credentials
-export DYNAMODB_HANDLES_TABLE=handles
-export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
-export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
-export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
-export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
-export DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=device_attest_keys
-export AWS_REGION=us-east-1
-
-# Optional: Apple App Attest App ID hash — hex SHA-256 of "<TeamID>.<BundleID>".
-# When set, POST /device-check/attest requires the attestation's rpIdHash to
-# match, so only the Arkavo app can create device bindings. Unset ⇒ the value
-# is recorded on the binding but not enforced (logged as a warning).
-export APP_ATTEST_APP_ID=<hex-sha256-of-teamid.bundleid>
-
-# Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
-export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
-export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
-export AGENT_TOKEN_MINUTES=15   # hard cap 15
-# Comma-separated OIDC client_ids allowed to PUT /admin/users/:id/entitlements
-# and GET /entities/:id. Empty ⇒ those routes 403. Service CWT sub is `client:<id>`.
-export ADMIN_CLIENT_IDS=catalog-node
-# Optional override of the default entitlement FQNs written on new user rows
-# (and used for legacy rows missing the attribute). Unset uses DEFAULT_USER_ENTITLEMENTS.
-# export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
-
-# Run the server
-cargo run --release
-```
-
-For complete production deployment instructions, see [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
+| Variable | Purpose |
+|---|---|
+| `SIGN_KEY_PATH`, `ENCODING_KEY_PATH`, `DECODING_KEY_PATH` | EC P-256 keys (attestation envelope; CWT/JWT sign + verify). Encode/decode must be the same key pair or boot fails. |
+| `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
+| `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
+| `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
+| `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. |
+| `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
+| `ENABLE_HTTP3` | QUIC listener on UDP/`PORT` (binary built with `--features http3`, TLS required). |
+| `DYNAMODB_*_TABLE` | `CREDENTIALS`, `HANDLES`, `DEVICE_BINDINGS`, `IDENTITY_LINKS`, `PATREON_TOKENS`, `AGENT_DELEGATIONS`, `DEVICE_ATTEST_KEYS`. Default to the unprefixed table names in the DynamoDB Schema section. |
+| `AWS_REGION`, `AWS_ENDPOINT_URL_DYNAMODB` | Standard AWS SDK settings (`load_defaults`); the endpoint override points at local DynamoDB. |
+| `REDIS_URL` | Cache for Patreon snapshots and pending Google logins; in-memory fallback when unset. |
+| `OIDC_ISSUER` | Issuer URL in tokens and the discovery doc. Required to act as an OIDC IdP. |
+| `OIDC_CLIENT_<TAG>_ID`, `_REDIRECT_URIS`, `_SECRET` | One relying party per tag. `<TAG>` is operator-chosen and never appears in tokens. Omit `_SECRET` for public PKCE-S256 clients. `_REDIRECT_URIS` is exact-match and required even for `client_credentials` service clients (use a dummy URI). See `docs/pep-service-clients.md`, `docs/google-signin.md`. |
+| `OIDC_PLATFORM_AUDIENCE` | Extra `aud` appended to every OIDC access token so any RP's token passes the OpenTDF platform's single-audience check. Also the only `resource` value (besides the client id) accepted under RFC 8707. |
+| `APPLE_CLIENT_ID` | Comma-separated iOS bundle ids / web Service IDs whose id_tokens are accepted. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Sign in with Google for `idp=google`. Both id and secret required or the flow fails closed. Redirect defaults to `<OIDC_ISSUER>/oauth/google/callback`. |
+| `PATREON_CLIENT_<TAG>_ID`, `_SECRET`, `_REDIRECT_URIS`; `PATREON_KMS_KEY_ID` | One Patreon OAuth client per tag (legacy untagged `PATREON_CLIENT_ID/_SECRET/_REDIRECT_URIS` still works). A redirect URI may belong to one client only. Any malformed registration or missing KMS key disables Patreon entirely (link endpoint ⇒ 503). |
+| `APP_ATTEST_APP_ID` | **Comma-separated set** of hex SHA-256 of `<TeamID>.<BundleID>`, one per app that registers users. An attestation is accepted when its `rpIdHash` matches any member; a single value is a one-element set. When non-empty, `POST /device-check/attest` enforces the match. Unset ⇒ recorded but not enforced (warns). **Mandatory on the registration-gate path**, where unset fails closed. |
+| `WEBVH_SIGN_KEY_PATH` | Ed25519 key file for the did:webvh log (`--features webvh`). Unset ⇒ DID doc only, no signed log. |
 
 ### Generate Required Cryptographic Keys
 ```bash

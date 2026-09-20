@@ -3,6 +3,7 @@
 **Audience:** whoever operates `identity.arkavo.net`.
 **Spec:** `docs/superpowers/specs/2026-09-20-app-attest-registration-gate-design.md`
 **Plan:** `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md`
+**Wire contract:** `docs/app-attest-preflight-contract.md` (what the client codes against)
 
 ## Do not deploy PR #66 on its own
 
@@ -87,10 +88,17 @@ export DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=prod-device-attest-keys
 export APP_ATTEST_APP_ID=543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8,ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01
 ```
 
-**The set form requires Task 1.** Until it ships, `APP_ATTEST_APP_ID` is parsed
-as a single value (`src/main.rs:453`) and a comma-separated string will match
-nothing. Set only the iOS hash before Task 1 lands, or leave it unset and add
-it during Phase 1.
+**The set form needs v0.9.0+.** Before it, `APP_ATTEST_APP_ID` was parsed as a
+single value: the whole string was lower-cased and compared whole, so
+`<64 hex>,<64 hex>` became one 129-character string matching no `rpIdHash` at
+all. Every attestation then failed `AppIdMismatch` — and on the fail-closed
+gate path that is registration down for everyone, from a value this runbook
+previously told you to write. Check the running version before setting a set;
+on an older binary set only the iOS hash, or leave it unset.
+
+(An earlier revision attributed the set form to Task 1. Task 1 declares
+`expected_app_id: Option<&str>` and never widens it — Task 5 is where the plan
+puts the set, and it shipped ahead of both.)
 
 **Setting it today is safe but not free.** It flips the existing authenticated
 device-binding path (`POST /device-check/attest`, `src/device_check.rs:269`)
