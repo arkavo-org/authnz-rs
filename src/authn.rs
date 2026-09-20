@@ -79,8 +79,13 @@ fn is_reserved_username(username: &str) -> bool {
 /// left over is not a clock difference we should extend trust to.
 fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
     let age = now - iat;
-    age >= -crate::cwt::DEFAULT_SKEW_SECS && age <= ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+    (-crate::cwt::DEFAULT_SKEW_SECS..=ENROLLMENT_TOKEN_MAX_AGE_SECONDS).contains(&age)
 }
+
+/// Enrollment freshness is only meaningful if it is stricter than the auth
+/// token's own lifetime — otherwise "freshly minted" and "not yet expired"
+/// would be the same test.
+const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
 
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
@@ -875,8 +880,9 @@ mod tests {
         // Enrollment freshness must stay well under the auth token lifetime,
         // otherwise a token that merely hasn't expired would pass for fresh
         // proof of control.
+        // The stricter-than-auth-lifetime relationship is asserted at compile
+        // time next to `is_fresh_enough_to_enroll`.
         assert_eq!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS, 300);
-        assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
     }
 
     #[test]

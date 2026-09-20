@@ -2652,6 +2652,7 @@ mod tests {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            app_attest_app_id: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -2768,6 +2769,7 @@ mod tests {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            app_attest_app_id: Arc::new(None),
         };
 
         let mut oidc = (*test_oidc_config()).clone();

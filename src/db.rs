@@ -86,6 +86,8 @@ pub enum DynamoDBError {
 
     #[error("Identity already linked to a different user")]
     LinkConflict,
+    #[error("Device is already bound to a different user")]
+    DeviceBindingConflict,
 
     /// A DynamoDB condition expression rejected the write (lost a race, or
     /// the row is in a state the caller may not overwrite).
@@ -874,6 +876,14 @@ impl DynamoDBStore {
                 "updated_at",
                 AttributeValue::N(binding.updated_at.to_string()),
             )
+            // Re-attesting the SAME device under the same account is allowed
+            // (it resets `counter` to 0, which is what a fresh attestation
+            // means); repointing an existing key_id at a different account is
+            // not. Note the allowed case reopens a replay window: assertions
+            // captured before the re-attest carry counters above 0 and become
+            // acceptable again.
+            .condition_expression("attribute_not_exists(device_id) OR user_id = :uid")
+            .expression_attribute_values(":uid", AttributeValue::S(binding.user_id.to_string()))
             .send()
             .await
         {
@@ -889,6 +899,14 @@ impl DynamoDBStore {
                     if service_error.err().meta().code() == Some("ResourceNotFoundException") {
                         error!("Device bindings table does not exist");
                         return Err(DynamoDBError::TableNotExists("device_bindings".to_string()));
+                    }
+                    if service_error.err().meta().code() == Some("ConditionalCheckFailedException")
+                    {
+                        warn!(
+                            "create_device_binding: {} is bound to another user — write refused",
+                            binding.device_id
+                        );
+                        return Err(DynamoDBError::DeviceBindingConflict);
                     }
                     error!("Failed to write to device bindings table: {:?}", err);
                     Err(DynamoDBError::SdkError(err.to_string()))
