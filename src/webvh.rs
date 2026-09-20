@@ -60,6 +60,10 @@ pub enum WebvhError {
     #[error("key format: {0}")]
     KeyFormat(String),
     #[error("webvh log error: {0}")]
+    /// Only constructed on the `webvh` feature path; without it the DID
+    /// document is still built, so the variant stays in the enum rather than
+    /// splitting the error type per feature.
+    #[cfg_attr(not(feature = "webvh"), allow(dead_code))]
     Log(String),
 }
 
@@ -638,10 +642,11 @@ mod tests {
                 carry >>= 8;
             }
         }
+        // Base58 encodes each leading zero byte as '1'. Re-add them as a run;
+        // `resize` rather than a push loop, which clippy reads as an
+        // accidental same-item push.
         let zeros = s.bytes().take_while(|&c| c == b'1').count();
-        for _ in 0..zeros {
-            bytes.push(0);
-        }
+        bytes.resize(bytes.len() + zeros, 0);
         bytes.reverse();
         bytes
     }

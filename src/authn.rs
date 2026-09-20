@@ -411,10 +411,10 @@ pub async fn start_authentication(
     };
 
     // If a token was provided, ensure it belongs to this user.
-    if let Some(tid) = inbound_user_id {
-        if tid != user.user_id {
-            return Err(UserNotFound);
-        }
+    if let Some(tid) = inbound_user_id
+        && tid != user.user_id
+    {
+        return Err(UserNotFound);
     }
 
     // Credentials come exclusively from DB (authoritative).
