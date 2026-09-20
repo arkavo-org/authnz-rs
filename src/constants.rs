@@ -199,16 +199,25 @@ pub const ENROLLMENT_TOKEN_MAX_AGE_SECONDS: i64 = 300;
 /// user cancelled". Every refusal surface uses this exact string.
 pub const IDENTITY_NOT_LINKED: &str = "identity_not_linked";
 
-/// Registrations one attested device key may perform per rolling window.
-/// A genuine device attesting repeatedly is the residual risk the gate does
-/// not cover; this bounds it without blocking reinstalls or a second account.
+/// Registrations one attested `key_id` may perform per rolling window.
+///
+/// Scope: this bounds a *key*, not a device. App Attest keys are free and
+/// carry no device identity -- `generateKey()` may be called in a loop -- so
+/// an attacker who mints a fresh key per attempt never meets this limit. It
+/// is defence in depth against a client that reuses its key, not admission
+/// control. The admission control is the attestation itself, which is what
+/// defeats a software authenticator.
 pub const ATTEST_REG_PER_WINDOW: u32 = 3;
 
 /// Length of that rolling window, in seconds.
 pub const ATTEST_REG_WINDOW_SECONDS: i64 = 86_400;
 
-/// Absolute lifetime ceiling for one key, independent of the window. This is a
-/// speed bump, not a bound: an app reinstall yields a fresh key_id, so a
-/// determined farm pays a reinstall per ten accounts. Its real value is as an
-/// abuse signal -- a key that reaches this has a history no user produces.
+/// Absolute lifetime ceiling for one key, independent of the window.
+///
+/// Carries the same caveat as [`ATTEST_REG_PER_WINDOW`], and more sharply: a
+/// farm does not even pay a reinstall to escape it, only another
+/// `generateKey()`. Its value is as an abuse *signal* rather than a limit --
+/// a key that reaches ten registrations has a history no real user produces,
+/// which is worth alerting on even though nothing forces an attacker to
+/// produce it.
 pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;

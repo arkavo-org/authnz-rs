@@ -60,6 +60,9 @@ pub struct TakenChallenge {
 
 /// Registration-rate-limiting state for one App Attest key (`key_id`).
 ///
+/// Bounds a key, not a device: see [`crate::constants::ATTEST_REG_PER_WINDOW`]
+/// for why those are not the same thing and what this is therefore worth.
+///
 /// `registrations` is a lifetime total, never reset. The rolling window is
 /// expressed relative to it via `window_base` (the lifetime total when the
 /// current window opened) rather than as its own counter, so a window

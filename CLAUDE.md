@@ -750,8 +750,13 @@ When modifying token lifetimes, update these in authn.rs:
   - window_started_at (Number) - Unix timestamp the current window opened
   - first_seen_at (Number) - Unix timestamp of first attestation
   - last_reg_at (Number) - Unix timestamp of most recent registration
-- **Purpose**: bounds how many accounts one genuine device can register. The
-  gate proves a real device; this bounds what a real device may do.
+- **Purpose**: rate-limits registrations per attested `key_id`, and records
+  the history that makes an abusive key visible.
+- **Scope — bounds a key, not a device**: App Attest keys are free and carry
+  no device identity, and `attestKey` is once-per-key, so a client mints a
+  fresh `key_id` per attestation. An attacker generating keys in a loop never
+  reaches these limits. Admission control is the attestation itself (genuine
+  device, genuine app); this table is defence in depth plus an abuse signal.
 - **Conditional updates**: slot reservation is conditional on the observed
   `registrations`, so concurrent attests cannot both take the last slot.
 
