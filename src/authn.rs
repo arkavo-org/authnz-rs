@@ -2,7 +2,10 @@ use crate::AppState;
 use crate::authn::WebauthnError::{
     CorruptSession, InvalidSessionState, MissingToken, Unknown, UserHasNoCredentials, UserNotFound,
 };
-use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
+use crate::constants::{
+    AUTH_TOKEN_HOURS, ENROLLMENT_TOKEN_MAX_AGE_SECONDS, REGISTRATION_TOKEN_WEEKS,
+    RESERVED_USERNAME_PREFIXES,
+};
 use crate::db::DynamoDBError;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
@@ -14,7 +17,7 @@ use axum::{
 };
 use ecdsa::Signature;
 use ecdsa::signature::Signer;
-use log::{error, info};
+use log::{error, info, warn};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,6 +60,33 @@ fn is_valid_username(username: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Is this username in the namespace reserved for IdP-provisioned rows?
+///
+/// See [`RESERVED_USERNAME_PREFIXES`] — those rows carry zero WebAuthn
+/// credentials, which would otherwise satisfy `start_register`'s
+/// zero-credential exemption.
+fn is_reserved_username(username: &str) -> bool {
+    RESERVED_USERNAME_PREFIXES
+        .iter()
+        .any(|prefix| username.starts_with(prefix))
+}
+
+/// Was the presented account token minted recently enough to authorize adding
+/// a passkey to an account that already has one?
+///
+/// `iat` in the future beyond the CWT skew allowance is treated as stale
+/// rather than fresh — `cwt::verify` already enforces the skew, so anything
+/// left over is not a clock difference we should extend trust to.
+fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
+    let age = now - iat;
+    (-crate::cwt::DEFAULT_SKEW_SECS..=ENROLLMENT_TOKEN_MAX_AGE_SECONDS).contains(&age)
+}
+
+/// Enrollment freshness is only meaningful if it is stricter than the auth
+/// token's own lifetime — otherwise "freshly minted" and "not yet expired"
+/// would be the same test.
+const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -74,6 +104,18 @@ pub async fn start_register(
             "must be 1-63 chars of [a-z0-9-] (lowercase) with no leading/trailing hyphen"
                 .to_string(),
         ));
+    }
+
+    // SECURITY: the `apple-` / `google-` namespace belongs to IdP-provisioned
+    // rows, which exist with zero WebAuthn credentials. Registering into it
+    // would hit the zero-credential exemption below and graft a passkey onto a
+    // federated account, so refuse before any lookup happens.
+    if is_reserved_username(&username) {
+        warn!(
+            "Rejected registration for reserved IdP username namespace: {}",
+            username
+        );
+        return Err(WebauthnError::ReservedUsername);
     }
 
     // Validate DID format
@@ -144,6 +186,19 @@ pub async fn start_register(
             Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
         if tid != user.user_id {
             return Err(WebauthnError::AccountExistsAuthRequired);
+        }
+        // SECURITY: possession of a still-valid token is not proof of *current*
+        // control. Registration tokens live ~99 years, so a single captured
+        // token would otherwise authorize passkey enrollment forever. Demand a
+        // recently minted one: `POST /authenticate` mints from a WebAuthn
+        // ceremony against an existing passkey, which is the fresh proof this
+        // operation actually needs.
+        if !is_fresh_enough_to_enroll(claims.iat, chrono::Utc::now().timestamp()) {
+            warn!(
+                "Rejected passkey enrollment for {}: token iat {} is older than {}s",
+                username, claims.iat, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+            );
+            return Err(WebauthnError::StaleAuthentication);
         }
     }
 
@@ -605,6 +660,10 @@ pub enum WebauthnError {
     AccountExistsAuthRequired,
     #[error("invalid username: {0}")]
     InvalidUsername(String),
+    #[error("username is reserved for federated identities")]
+    ReservedUsername,
+    #[error("authentication is too old; re-authenticate to add a passkey")]
+    StaleAuthentication,
 }
 
 impl IntoResponse for WebauthnError {
@@ -676,6 +735,15 @@ impl IntoResponse for WebauthnError {
                 StatusCode::BAD_REQUEST,
                 format!("Invalid username: {}", msg),
             ),
+            WebauthnError::ReservedUsername => (
+                StatusCode::FORBIDDEN,
+                "Username is reserved for federated identities".to_string(),
+            ),
+            WebauthnError::StaleAuthentication => (
+                StatusCode::UNAUTHORIZED,
+                "Authentication is too old; re-authenticate (POST /authenticate) to add a passkey"
+                    .to_string(),
+            ),
         };
         (status, body).into_response()
     }
@@ -709,6 +777,72 @@ mod tests {
     }
 
     #[test]
+    fn test_reserved_username_namespace_is_rejected() {
+        // IdP-provisioned rows (`apple-<sub>` / `google-<sub>`) carry zero
+        // WebAuthn credentials, so registering into their namespace would hit
+        // the zero-credential exemption in `start_register` and graft a passkey
+        // onto a federated account.
+        assert!(is_reserved_username("google-110248495921238986420"));
+        assert!(is_reserved_username("apple-000123"));
+        assert!(is_reserved_username("google-"));
+
+        // Google subs are all-digits, so they clear the DNS-label validator —
+        // which is exactly why the prefix check has to exist.
+        assert!(is_valid_username("google-110248495921238986420"));
+
+        // Ordinary usernames are untouched, including ones that merely
+        // contain (but do not start with) a reserved word.
+        assert!(!is_reserved_username("alice"));
+        assert!(!is_reserved_username("googler"));
+        assert!(!is_reserved_username("not-google-me"));
+        assert!(!is_reserved_username("apple"));
+    }
+
+    #[test]
+    fn test_enrollment_requires_a_freshly_minted_token() {
+        let now = 1_700_000_000i64;
+
+        // Just minted, and anywhere inside the window.
+        assert!(is_fresh_enough_to_enroll(now, now));
+        assert!(is_fresh_enough_to_enroll(
+            now - ENROLLMENT_TOKEN_MAX_AGE_SECONDS,
+            now
+        ));
+
+        // One second past the window, and the case that motivates the check:
+        // a ~99-year registration token issued long ago is still *valid* but
+        // is not proof of current control.
+        assert!(!is_fresh_enough_to_enroll(
+            now - ENROLLMENT_TOKEN_MAX_AGE_SECONDS - 1,
+            now
+        ));
+        assert!(!is_fresh_enough_to_enroll(now - 86_400, now));
+
+        // Clock skew is tolerated to the same bound `cwt::verify` uses; a
+        // token dated further into the future is not treated as fresh.
+        assert!(is_fresh_enough_to_enroll(
+            now + crate::cwt::DEFAULT_SKEW_SECS,
+            now
+        ));
+        assert!(!is_fresh_enough_to_enroll(
+            now + crate::cwt::DEFAULT_SKEW_SECS + 1,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_stale_authentication_error_is_unauthorized() {
+        let response = WebauthnError::StaleAuthentication.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_reserved_username_error_is_forbidden() {
+        let response = WebauthnError::ReservedUsername.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn test_did_validation_logic() {
         // Valid DID formats
         assert!("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".starts_with("did:key:"));
@@ -733,13 +867,22 @@ mod tests {
 
     #[test]
     fn test_token_expiration_constants() {
-        use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
+        use crate::constants::{
+            AUTH_TOKEN_HOURS, ENROLLMENT_TOKEN_MAX_AGE_SECONDS, REGISTRATION_TOKEN_WEEKS,
+        };
 
         // Verify registration token is long-lived (~99 years = ~5148 weeks)
         assert_eq!(REGISTRATION_TOKEN_WEEKS, 5148);
 
         // Verify auth token is short-lived (1 hour)
         assert_eq!(AUTH_TOKEN_HOURS, 1);
+
+        // Enrollment freshness must stay well under the auth token lifetime,
+        // otherwise a token that merely hasn't expired would pass for fresh
+        // proof of control.
+        // The stricter-than-auth-lifetime relationship is asserted at compile
+        // time next to `is_fresh_enough_to_enroll`.
+        assert_eq!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS, 300);
     }
 
     #[test]

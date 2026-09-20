@@ -56,6 +56,12 @@ export ADMIN_CLIENT_IDS=catalog-node
 # Optional: Set port (defaults to 8080)
 export PORT=8080
 
+# Optional: Apple App Attest App ID hash — hex SHA-256 of "<TeamID>.<BundleID>".
+# When set, POST /device-check/attest requires the attestation's rpIdHash to
+# match, so only the Arkavo app can create device bindings. Unset ⇒ the value
+# is recorded on the binding but not enforced (logged as a warning).
+export APP_ATTEST_APP_ID=<hex-sha256-of-teamid.bundleid>
+
 # Optional: OIDC provider configuration (required to act as an OIDC IdP).
 # Issuer URL appears in tokens and the discovery doc.
 export OIDC_ISSUER=https://identity.arkavo.net
@@ -152,6 +158,12 @@ export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 export AWS_REGION=us-east-1
+
+# Optional: Apple App Attest App ID hash — hex SHA-256 of "<TeamID>.<BundleID>".
+# When set, POST /device-check/attest requires the attestation's rpIdHash to
+# match, so only the Arkavo app can create device bindings. Unset ⇒ the value
+# is recorded on the binding but not enforced (logged as a warning).
+export APP_ATTEST_APP_ID=<hex-sha256-of-teamid.bundleid>
 
 # Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
@@ -430,7 +442,9 @@ aws dynamodb create-table \
   (#50) and the ERS surface (#48) are follow-ups
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
-- `generate_challenge`: Issues random challenge for attestation/assertion
+- `generate_challenge`: Issues random challenge for attestation (**requires a
+  CWT bound to `:username`** — App Attest proves the device is genuine, never
+  which account it belongs to)
 - `finish_attestation`: Validates attestation object, stores device binding
 - `generate_assertion_challenge`: Issues challenge for existing devices (requires CWT)
 - `finish_assertion`: Verifies assertion, enforces counter increment, issues CWT
@@ -452,6 +466,14 @@ aws dynamodb create-table \
 1. **Registration Flow**:
    - Client requests `/register/:username?handle=...&did=...`
    - Validates DID format and handle consistency
+   - Rejects the `apple-` / `google-` username namespace (HTTP 403): those rows
+     are IdP-provisioned with zero credentials, and the zero-credential
+     exemption below would otherwise let anyone knowing the IdP `sub` enroll a
+     passkey onto a federated account
+   - Adding a passkey to an account that already has one requires an
+     `X-Auth-Token` CWT minted within `ENROLLMENT_TOKEN_MAX_AGE_SECONDS`
+     (5 min) — i.e. fresh proof of control from `POST /authenticate`, not any
+     still-valid long-lived registration token (HTTP 401 otherwise)
    - Creates user in DynamoDB with retry logic (max 3 retries)
    - Generates WebAuthn challenge and stores registration state in session
    - Client completes WebAuthn ceremony
@@ -493,7 +515,10 @@ aws dynamodb create-table \
 4. **Apple DeviceCheck/App Attest Flow**:
    - **One-time Attestation**:
      - Client requests challenge: `GET /device-check/challenge/:username`
-     - Server generates random UUID challenge, stores in session
+       (**requires `X-Auth-Token`**: a CWT whose `sub` resolves to `:username`)
+     - Server generates random UUID challenge, stores it in session together
+       with the *authenticated* user_id — the binding is written against that,
+       never against the path parameter
      - Client generates Secure Enclave key via `DCAppAttestService.generateKey()`
      - Client computes clientDataHash = SHA256(challenge)
      - Client performs attestation: `DCAppAttestService.attestKey(keyId, clientDataHash)`
@@ -501,9 +526,9 @@ aws dynamodb create-table \
      - Server validates:
        - CBOR format is "apple-appattest"
        - Certificate chain anchors to Apple's root CA
+       - `rpIdHash` equals `APP_ATTEST_APP_ID` when that env var is set
        - Nonce = SHA256(authData || clientDataHash)
        - Counter is 0 (initial attestation)
-       - rpIdHash matches expected App ID
      - Server stores device binding: device_id, public_key, counter=0, user_id
    - **Ongoing Assertions**:
      - Client requests assertion challenge: `GET /device-check/assert-challenge/:username` (requires CWT)
@@ -511,10 +536,10 @@ aws dynamodb create-table \
      - Client signs challenge with device key
      - Client POSTs assertion to `/device-check/assert`
      - Server validates:
-       - Device binding exists
+       - Device binding exists **and belongs to the session's authenticated user**
        - Counter has incremented (counter > stored_counter)
        - Challenge matches expected hash
-       - Signature is valid (TODO: implement signature verification)
+       - Signature is valid (verified against the stored public key)
      - Server updates counter, issues new CWT (aud `arkavo:devicecheck`)
 
 ### Security Architecture
@@ -593,6 +618,9 @@ When modifying token lifetimes, update these in authn.rs:
 - Registration token: `chrono::Duration::weeks(5148)` (~99 years)
 - Authentication token: `chrono::Duration::hours(1)`
 - Session timeout: `Duration::seconds(600)` (10 minutes)
+- Passkey enrollment freshness: `ENROLLMENT_TOKEN_MAX_AGE_SECONDS` (300s).
+  Must stay below the auth token lifetime — asserted at compile time in
+  authn.rs — otherwise "freshly minted" degrades into "not yet expired".
 
 ## DynamoDB Schema
 
@@ -725,7 +753,10 @@ When modifying token lifetimes, update these in authn.rs:
 
 ### Known Limitations
 - Certificate chain validation is incomplete (TODO: implement full chain verification)
-- Signature verification not implemented (TODO: verify assertion signatures with stored public key)
+- Re-attesting an existing `key_id` under the same account resets `counter` to
+  0, which reopens a replay window for assertions captured before the
+  re-attest (bindings can no longer be repointed to a *different* account —
+  `create_device_binding` writes conditionally)
 - Does not validate certificate extension 1.2.840.113635.100.8.2 (nonce)
 
 ### Integration with NTDF

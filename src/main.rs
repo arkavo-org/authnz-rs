@@ -301,6 +301,12 @@ pub struct AppState {
     /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
     /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
     pub admin_client_ids: Arc<Vec<String>>,
+    /// Expected App Attest App ID hash (`APP_ATTEST_APP_ID`), hex-encoded
+    /// SHA-256 of "<TeamID>.<BundleID>". When set, `finish_attestation`
+    /// requires the attestation's `rpIdHash` to equal it, so only the Arkavo
+    /// app can create device bindings. None ⇒ the value is recorded on the
+    /// binding but not enforced (logged as a warning at attestation time).
+    pub app_attest_app_id: Arc<Option<String>>,
 }
 
 #[tokio::main]
@@ -441,6 +447,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
+        app_attest_app_id: Arc::new(
+            env::var("APP_ATTEST_APP_ID")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty()),
+        ),
     };
 
     // Set up Redis Client using fred
@@ -1376,6 +1388,7 @@ pub(crate) mod test_helpers {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            app_attest_app_id: Arc::new(None),
         }
     }
 }

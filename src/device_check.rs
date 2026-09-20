@@ -152,12 +152,23 @@ struct AttestationStatement {
 }
 
 /// Generate a challenge for attestation or assertion
+///
+/// SECURITY: requires a CWT bound to `:username`, exactly as
+/// [`generate_assertion_challenge`] does. App Attest proves the request comes
+/// from a genuine, unmodified Apple app — it says nothing about *which*
+/// account the device belongs to. Without this gate anyone could bind a
+/// device they control to an arbitrary username, and (because
+/// `finish_assertion` mints for the binding's user) trade it for a token
+/// carrying that user's identity and entitlements.
 pub async fn generate_challenge(
-    Extension(_app_state): Extension<AppState>,
+    Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, DeviceCheckError> {
     info!("Generating App Attest challenge for user: {}", username);
+
+    let user_id = authenticate_for_username(&app_state, &headers, &username).await?;
 
     // Generate a random challenge (32 bytes = 256 bits)
     let challenge = generate_random_challenge();
@@ -166,7 +177,7 @@ pub async fn generate_challenge(
     if let Err(err) = session
         .insert(
             SESSION_ATTEST_STATE_KEY,
-            (username.clone(), challenge.clone()),
+            (username.clone(), user_id, challenge.clone()),
         )
         .await
     {
@@ -189,8 +200,10 @@ pub async fn finish_attestation(
         request.key_id
     );
 
-    // Retrieve challenge from session
-    let (username, challenge): (String, String) = session
+    // Retrieve challenge from session. `user_id` was resolved from the CWT at
+    // challenge time, so the binding below cannot name an account the caller
+    // never authenticated as.
+    let (username, user_id, challenge): (String, Uuid, String) = session
         .get(SESSION_ATTEST_STATE_KEY)
         .await?
         .ok_or_else(|| {
@@ -249,6 +262,25 @@ pub async fn finish_attestation(
         )));
     }
 
+    // SECURITY: `rpIdHash` identifies the app that produced the attestation.
+    // Unenforced, any App Attest-capable app — not just ours — can mint
+    // bindings. Enforced only when `APP_ATTEST_APP_ID` is configured, so
+    // deployments that have not set it keep today's behaviour and a warning.
+    match app_state.app_attest_app_id.as_deref() {
+        Some(expected) if !auth_data.rp_id_hash_str.eq_ignore_ascii_case(expected) => {
+            warn!(
+                "App Attest rpIdHash mismatch for key_id {}: got {}, expected {}",
+                request.key_id, auth_data.rp_id_hash_str, expected
+            );
+            return Err(DeviceCheckError::AppIdMismatch);
+        }
+        Some(_) => {}
+        None => warn!(
+            "APP_ATTEST_APP_ID is unset; accepting attestation with unverified rpIdHash {}",
+            auth_data.rp_id_hash_str
+        ),
+    }
+
     // Calculate nonce: SHA256(authData || clientDataHash)
     let mut nonce_data = Vec::new();
     nonce_data.extend_from_slice(&attestation.auth_data);
@@ -278,18 +310,12 @@ pub async fn finish_attestation(
         hex::encode(calculated_nonce)
     );
 
-    // Get user from database
-    let user = app_state
-        .db_store
-        .get_user_by_name(&username)
-        .await
-        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
-        .ok_or(DeviceCheckError::UserNotFound)?;
+    info!("Binding device {} to user {}", request.key_id, username);
 
     // Create device binding
     let binding = DeviceBinding {
         device_id: request.key_id.clone(),
-        user_id: user.user_id,
+        user_id,
         public_key: public_key.clone(),
         counter: 0,
         app_id: auth_data.rp_id_hash_str.clone(),
@@ -297,12 +323,16 @@ pub async fn finish_attestation(
         updated_at: Utc::now().timestamp(),
     };
 
-    // Store device binding in database
+    // Store device binding in database. A key_id already bound to a different
+    // account is refused rather than silently repointed.
     app_state
         .db_store
         .create_device_binding(&binding)
         .await
-        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?;
+        .map_err(|e| match e {
+            DynamoDBError::DeviceBindingConflict => DeviceCheckError::DeviceBindingConflict,
+            other => DeviceCheckError::DynamoDBOperationError(Box::new(other)),
+        })?;
 
     info!("Device binding created for key_id: {}", request.key_id);
 
@@ -325,24 +355,7 @@ pub async fn generate_assertion_challenge(
     // must resolve to the same user_id we look up by `username`; otherwise any
     // holder of a valid Arkavo CWT could request assertion challenges (and burn
     // session state) for arbitrary users.
-    let Some(token_header) = headers.get("X-Auth-Token") else {
-        return Err(DeviceCheckError::MissingToken);
-    };
-    let token = token_header
-        .to_str()
-        .map_err(|_| DeviceCheckError::InvalidToken)?;
-    let claims = verify_inbound_token(&app_state, token)?;
-    let token_user_id = Uuid::parse_str(&claims.sub).map_err(|_| DeviceCheckError::UserNotFound)?;
-
-    let user = app_state
-        .db_store
-        .get_user_by_name(&username)
-        .await
-        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
-        .ok_or(DeviceCheckError::UserNotFound)?;
-    if token_user_id != user.user_id {
-        return Err(DeviceCheckError::UserNotFound);
-    }
+    let user_id = authenticate_for_username(&app_state, &headers, &username).await?;
 
     // Generate challenge
     let challenge = generate_random_challenge();
@@ -351,7 +364,7 @@ pub async fn generate_assertion_challenge(
     if let Err(err) = session
         .insert(
             SESSION_ASSERT_STATE_KEY,
-            (username.clone(), challenge.clone()),
+            (username.clone(), user_id, challenge.clone()),
         )
         .await
     {
@@ -373,7 +386,7 @@ pub async fn finish_assertion(
     info!("Finishing assertion for key_id: {}", request.key_id);
 
     // Retrieve challenge from session
-    let (_username, challenge): (String, String) = session
+    let (username, session_user_id, challenge): (String, Uuid, String) = session
         .get(SESSION_ASSERT_STATE_KEY)
         .await?
         .ok_or_else(|| {
@@ -394,6 +407,19 @@ pub async fn finish_assertion(
         .await
         .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
         .ok_or(DeviceCheckError::DeviceNotFound)?;
+
+    // SECURITY: the token minted below carries `binding.user_id`, so the
+    // binding must belong to the account this session authenticated as.
+    // Without this the challenge's username is decorative: any caller holding
+    // a device key could assert against a binding owned by someone else and
+    // receive that user's identity and entitlements.
+    if binding.user_id != session_user_id {
+        warn!(
+            "Assertion key_id {} is bound to {} but the session authenticated as {} ({})",
+            request.key_id, binding.user_id, session_user_id, username
+        );
+        return Err(DeviceCheckError::DeviceNotFound);
+    }
 
     // Decode assertion
     let assertion_bytes = base64::engine::general_purpose::STANDARD
@@ -658,6 +684,38 @@ pub fn mint_assertion_token(
     Ok(crate::cwt::encode_for_header(&bytes))
 }
 
+/// Verify the caller's `X-Auth-Token` and confirm it belongs to `username`.
+///
+/// Returns the authenticated `user_id`. Both device-check challenge endpoints
+/// go through this: App Attest establishes that a request comes from a genuine
+/// Apple device, never which Arkavo account that device belongs to, so account
+/// ownership has to be proven separately before a binding is created or used.
+async fn authenticate_for_username(
+    app_state: &AppState,
+    headers: &HeaderMap,
+    username: &str,
+) -> Result<Uuid, DeviceCheckError> {
+    let Some(token_header) = headers.get("X-Auth-Token") else {
+        return Err(DeviceCheckError::MissingToken);
+    };
+    let token = token_header
+        .to_str()
+        .map_err(|_| DeviceCheckError::InvalidToken)?;
+    let claims = verify_inbound_token(app_state, token)?;
+    let token_user_id = Uuid::parse_str(&claims.sub).map_err(|_| DeviceCheckError::UserNotFound)?;
+
+    let user = app_state
+        .db_store
+        .get_user_by_name(username)
+        .await
+        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
+        .ok_or(DeviceCheckError::UserNotFound)?;
+    if token_user_id != user.user_id {
+        return Err(DeviceCheckError::UserNotFound);
+    }
+    Ok(user.user_id)
+}
+
 /// Verify an inbound CWT X-Auth-Token at the assertion challenge endpoint.
 ///
 /// Accepts only tokens with `aud = "arkavo"` (standard Arkavo auth tokens).
@@ -734,6 +792,12 @@ pub enum DeviceCheckError {
 
     #[error("Invalid assertion: {0}")]
     InvalidAssertion(String),
+
+    #[error("App ID mismatch")]
+    AppIdMismatch,
+
+    #[error("Device is already bound to a different account")]
+    DeviceBindingConflict,
 }
 
 impl IntoResponse for DeviceCheckError {
@@ -752,6 +816,14 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::DeviceNotFound => {
                 (StatusCode::BAD_REQUEST, "Device Not Found".to_string())
             }
+            DeviceCheckError::AppIdMismatch => (
+                StatusCode::BAD_REQUEST,
+                "Attestation was produced by an unexpected app".to_string(),
+            ),
+            DeviceCheckError::DeviceBindingConflict => (
+                StatusCode::CONFLICT,
+                "Device is already bound to a different account".to_string(),
+            ),
             DeviceCheckError::InvalidSessionState(_) => (
                 StatusCode::BAD_REQUEST,
                 "Deserializing Session failed".to_string(),
@@ -860,12 +932,21 @@ mod tests {
             DeviceCheckError::UserNotFound,
             DeviceCheckError::DeviceNotFound,
             DeviceCheckError::ChallengeMismatch,
+            DeviceCheckError::AppIdMismatch,
         ];
 
         for error in bad_request_errors {
             let response = error.into_response();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+
+        // A key_id already bound elsewhere is a conflict, not a bad request.
+        assert_eq!(
+            DeviceCheckError::DeviceBindingConflict
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
 
         // UNAUTHORIZED errors — token-related failures
         let unauthorized_errors = vec![
@@ -878,6 +959,17 @@ mod tests {
             let response = error.into_response();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[test]
+    fn test_app_id_comparison_is_case_insensitive_hex() {
+        // `APP_ATTEST_APP_ID` is operator-supplied hex; AppState lower-cases it
+        // at startup, but the parsed rpIdHash is formatted independently, so
+        // the comparison must not be case-sensitive.
+        let expected = "8a1b2c3d";
+        assert!("8A1B2C3D".eq_ignore_ascii_case(expected));
+        assert!("8a1b2c3d".eq_ignore_ascii_case(expected));
+        assert!(!"8a1b2c3e".eq_ignore_ascii_case(expected));
     }
 
     #[test]

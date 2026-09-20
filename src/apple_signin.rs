@@ -426,6 +426,11 @@ pub async fn map_apple_user(
     app_state: &AppState,
     claims: &AppleIdTokenClaims,
 ) -> Result<AuthenticatedUser, DynamoDBError> {
+    // SECURITY: the `apple-` prefix is load-bearing. These rows are created
+    // with an empty credential list, and `authn::is_reserved_username` relies on
+    // the prefix to keep `start_register`'s zero-credential exemption away from
+    // them. Changing this format requires changing
+    // `constants::RESERVED_USERNAME_PREFIXES` in the same commit.
     let username = format!("apple-{}", sanitize_for_username(&claims.sub));
     let did = format!("did:key:apple-{}", &sha256_hex(&claims.sub)[..32]);
 
