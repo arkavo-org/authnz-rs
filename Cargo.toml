@@ -1,6 +1,6 @@
 [package]
 name = "authnz-rs"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 license = "BSD-2"
 rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)

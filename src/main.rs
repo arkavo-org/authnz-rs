@@ -603,6 +603,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/authenticate/:username", get(start_authentication))
         .route("/authenticate", post(finish_authentication))
         // Apple DeviceCheck / App Attest endpoints
+        // Unauthenticated registration preflight (Task 5). These issue a
+        // ticket; they do NOT gate /register — that is Task 6. A 200 from
+        // register-attest is not evidence that registration is protected.
+        .route(
+            "/device-check/register-challenge",
+            get(device_check::register_challenge),
+        )
+        .route(
+            "/device-check/register-attest",
+            post(device_check::register_attest),
+        )
         .route("/device-check/challenge/:username", get(generate_challenge))
         .route("/device-check/attest", post(finish_attestation))
         .route(
