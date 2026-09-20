@@ -71,6 +71,17 @@ fn is_reserved_username(username: &str) -> bool {
         .any(|prefix| username.starts_with(prefix))
 }
 
+/// Was the presented account token minted recently enough to authorize adding
+/// a passkey to an account that already has one?
+///
+/// `iat` in the future beyond the CWT skew allowance is treated as stale
+/// rather than fresh — `cwt::verify` already enforces the skew, so anything
+/// left over is not a clock difference we should extend trust to.
+fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
+    let age = now - iat;
+    age >= -crate::cwt::DEFAULT_SKEW_SECS && age <= ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -170,6 +181,19 @@ pub async fn start_register(
             Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
         if tid != user.user_id {
             return Err(WebauthnError::AccountExistsAuthRequired);
+        }
+        // SECURITY: possession of a still-valid token is not proof of *current*
+        // control. Registration tokens live ~99 years, so a single captured
+        // token would otherwise authorize passkey enrollment forever. Demand a
+        // recently minted one: `POST /authenticate` mints from a WebAuthn
+        // ceremony against an existing passkey, which is the fresh proof this
+        // operation actually needs.
+        if !is_fresh_enough_to_enroll(claims.iat, chrono::Utc::now().timestamp()) {
+            warn!(
+                "Rejected passkey enrollment for {}: token iat {} is older than {}s",
+                username, claims.iat, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+            );
+            return Err(WebauthnError::StaleAuthentication);
         }
     }
 
@@ -770,6 +794,44 @@ mod tests {
     }
 
     #[test]
+    fn test_enrollment_requires_a_freshly_minted_token() {
+        let now = 1_700_000_000i64;
+
+        // Just minted, and anywhere inside the window.
+        assert!(is_fresh_enough_to_enroll(now, now));
+        assert!(is_fresh_enough_to_enroll(
+            now - ENROLLMENT_TOKEN_MAX_AGE_SECONDS,
+            now
+        ));
+
+        // One second past the window, and the case that motivates the check:
+        // a ~99-year registration token issued long ago is still *valid* but
+        // is not proof of current control.
+        assert!(!is_fresh_enough_to_enroll(
+            now - ENROLLMENT_TOKEN_MAX_AGE_SECONDS - 1,
+            now
+        ));
+        assert!(!is_fresh_enough_to_enroll(now - 86_400, now));
+
+        // Clock skew is tolerated to the same bound `cwt::verify` uses; a
+        // token dated further into the future is not treated as fresh.
+        assert!(is_fresh_enough_to_enroll(
+            now + crate::cwt::DEFAULT_SKEW_SECS,
+            now
+        ));
+        assert!(!is_fresh_enough_to_enroll(
+            now + crate::cwt::DEFAULT_SKEW_SECS + 1,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_stale_authentication_error_is_unauthorized() {
+        let response = WebauthnError::StaleAuthentication.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
     fn test_reserved_username_error_is_forbidden() {
         let response = WebauthnError::ReservedUsername.into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -800,13 +862,21 @@ mod tests {
 
     #[test]
     fn test_token_expiration_constants() {
-        use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
+        use crate::constants::{
+            AUTH_TOKEN_HOURS, ENROLLMENT_TOKEN_MAX_AGE_SECONDS, REGISTRATION_TOKEN_WEEKS,
+        };
 
         // Verify registration token is long-lived (~99 years = ~5148 weeks)
         assert_eq!(REGISTRATION_TOKEN_WEEKS, 5148);
 
         // Verify auth token is short-lived (1 hour)
         assert_eq!(AUTH_TOKEN_HOURS, 1);
+
+        // Enrollment freshness must stay well under the auth token lifetime,
+        // otherwise a token that merely hasn't expired would pass for fresh
+        // proof of control.
+        assert_eq!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS, 300);
+        assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
     }
 
     #[test]
