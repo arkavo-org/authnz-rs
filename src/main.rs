@@ -396,6 +396,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("DYNAMODB_PATREON_TOKENS_TABLE").unwrap_or_else(|_| "patreon_tokens".to_string()),
         env::var("DYNAMODB_AGENT_DELEGATIONS_TABLE")
             .unwrap_or_else(|_| "agent_delegations".to_string()),
+        env::var("DYNAMODB_DEVICE_ATTEST_KEYS_TABLE")
+            .unwrap_or_else(|_| "device_attest_keys".to_string()),
         default_entitlements,
     )
     .await
@@ -1373,6 +1375,7 @@ pub(crate) mod test_helpers {
                 "identity_links".to_string(),
                 "patreon_tokens".to_string(),
                 "agent_delegations".to_string(),
+                "device_attest_keys".to_string(),
                 crate::constants::DEFAULT_USER_ENTITLEMENTS
                     .iter()
                     .map(|s| (*s).to_string())

@@ -58,6 +58,42 @@ pub struct TakenChallenge {
     pub issued_at: i64,
 }
 
+/// Registration-rate-limiting state for one App Attest key (`key_id`).
+///
+/// `registrations` is a lifetime total, never reset. The rolling window is
+/// expressed relative to it via `window_base` (the lifetime total when the
+/// current window opened) rather than as its own counter, so a window
+/// rollover is a cheap re-baseline instead of a second read-modify-write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestKeyRecord {
+    pub key_id: String,
+    pub registrations: u32,
+    pub window_base: u32,
+    pub window_started_at: i64,
+    pub first_seen_at: i64,
+    pub last_reg_at: i64,
+}
+
+/// Pure policy: may `record` take one more registration slot at `now`?
+///
+/// Kept free of I/O so the window-rollover and lifetime-cap rules are
+/// testable without DynamoDB Local.
+pub fn attest_slot_available(record: &AttestKeyRecord, now: i64) -> bool {
+    use crate::constants::{
+        ATTEST_REG_LIFETIME_CAP, ATTEST_REG_PER_WINDOW, ATTEST_REG_WINDOW_SECONDS,
+    };
+
+    if record.registrations >= ATTEST_REG_LIFETIME_CAP {
+        return false;
+    }
+    if now - record.window_started_at >= ATTEST_REG_WINDOW_SECONDS {
+        // The window has aged out; a fresh one starts at the next
+        // successful reservation, so this key is unconditionally eligible.
+        return true;
+    }
+    record.registrations - record.window_base < ATTEST_REG_PER_WINDOW
+}
+
 #[derive(Error, Debug)]
 pub enum DynamoDBError {
     #[error("AWS SDK error: {0}")]
@@ -93,6 +129,12 @@ pub enum DynamoDBError {
     /// the row is in a state the caller may not overwrite).
     #[error("conditional write rejected")]
     ConditionalConflict,
+
+    /// The attested key has exhausted its rolling-window or lifetime
+    /// registration budget (see [`crate::constants::ATTEST_REG_PER_WINDOW`]
+    /// / [`crate::constants::ATTEST_REG_LIFETIME_CAP`]).
+    #[error("Rate limited; retry after {retry_after}s")]
+    RateLimited { retry_after: i64 },
 }
 
 impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
@@ -118,10 +160,12 @@ pub struct DynamoDBStore {
     identity_links_table: String,
     patreon_tokens_table: String,
     agent_delegations_table: String,
+    device_attest_keys_table: String,
     default_entitlements: Vec<String>,
 }
 
 impl DynamoDBStore {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         credentials_table: String,
         handles_table: String,
@@ -129,6 +173,7 @@ impl DynamoDBStore {
         identity_links_table: String,
         patreon_tokens_table: String,
         agent_delegations_table: String,
+        device_attest_keys_table: String,
         default_entitlements: Vec<String>,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -140,6 +185,7 @@ impl DynamoDBStore {
             identity_links_table,
             patreon_tokens_table,
             agent_delegations_table,
+            device_attest_keys_table,
             default_entitlements,
         ))
     }
@@ -160,6 +206,7 @@ impl DynamoDBStore {
         identity_links_table: String,
         patreon_tokens_table: String,
         agent_delegations_table: String,
+        device_attest_keys_table: String,
         default_entitlements: Vec<String>,
     ) -> Self {
         Self {
@@ -170,6 +217,7 @@ impl DynamoDBStore {
             identity_links_table,
             patreon_tokens_table,
             agent_delegations_table,
+            device_attest_keys_table,
             default_entitlements,
         }
     }
@@ -1105,6 +1153,305 @@ impl DynamoDBStore {
     }
 
     // ------------------------------------------------------------------
+    // App Attest registration rate limiting
+    // ------------------------------------------------------------------
+
+    fn item_to_attest_key_record(
+        &self,
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<AttestKeyRecord, DynamoDBError> {
+        let key_id = item
+            .get("key_id")
+            .ok_or_else(|| DynamoDBError::Internal("No key_id found".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("Invalid key_id format".into()))?
+            .to_string();
+
+        let registrations = item
+            .get("registrations")
+            .ok_or_else(|| DynamoDBError::Internal("No registrations found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid registrations format".into()))?
+            .parse::<u32>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse registrations".into()))?;
+
+        let window_base = item
+            .get("window_base")
+            .ok_or_else(|| DynamoDBError::Internal("No window_base found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid window_base format".into()))?
+            .parse::<u32>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse window_base".into()))?;
+
+        let window_started_at = item
+            .get("window_started_at")
+            .ok_or_else(|| DynamoDBError::Internal("No window_started_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid window_started_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse window_started_at".into()))?;
+
+        let first_seen_at = item
+            .get("first_seen_at")
+            .ok_or_else(|| DynamoDBError::Internal("No first_seen_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid first_seen_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse first_seen_at".into()))?;
+
+        let last_reg_at = item
+            .get("last_reg_at")
+            .ok_or_else(|| DynamoDBError::Internal("No last_reg_at found".into()))?
+            .as_n()
+            .map_err(|_| DynamoDBError::Internal("Invalid last_reg_at format".into()))?
+            .parse::<i64>()
+            .map_err(|_| DynamoDBError::Internal("Failed to parse last_reg_at".into()))?;
+
+        Ok(AttestKeyRecord {
+            key_id,
+            registrations,
+            window_base,
+            window_started_at,
+            first_seen_at,
+            last_reg_at,
+        })
+    }
+
+    async fn get_attest_key_record(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<AttestKeyRecord>, DynamoDBError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.device_attest_keys_table)
+            .key("key_id", AttributeValue::S(key_id.to_string()))
+            .send()
+            .await
+            .map_err(|err| self.map_get_item_err(&self.device_attest_keys_table, err))?;
+
+        match result.item {
+            Some(item) => Ok(Some(self.item_to_attest_key_record(&item)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Create the rate-limit row for a key seen for the first time. The
+    /// condition guards the same race `create_device_binding` guards against
+    /// on its own table: two attestations for a brand-new `key_id` arriving
+    /// concurrently must not both believe they created (and thus own) the
+    /// first slot.
+    async fn put_attest_key_record_if_absent(
+        &self,
+        record: &AttestKeyRecord,
+    ) -> Result<(), DynamoDBError> {
+        match self
+            .client
+            .put_item()
+            .table_name(&self.device_attest_keys_table)
+            .item("key_id", AttributeValue::S(record.key_id.clone()))
+            .item(
+                "registrations",
+                AttributeValue::N(record.registrations.to_string()),
+            )
+            .item(
+                "window_base",
+                AttributeValue::N(record.window_base.to_string()),
+            )
+            .item(
+                "window_started_at",
+                AttributeValue::N(record.window_started_at.to_string()),
+            )
+            .item(
+                "first_seen_at",
+                AttributeValue::N(record.first_seen_at.to_string()),
+            )
+            .item(
+                "last_reg_at",
+                AttributeValue::N(record.last_reg_at.to_string()),
+            )
+            .condition_expression("attribute_not_exists(key_id)")
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err {
+                    match service_error.err().meta().code() {
+                        Some("ConditionalCheckFailedException") => {
+                            return Err(DynamoDBError::ConditionalConflict);
+                        }
+                        Some("ResourceNotFoundException") => {
+                            error!(
+                                "device_attest_keys table {} does not exist",
+                                self.device_attest_keys_table
+                            );
+                            return Err(DynamoDBError::TableNotExists(
+                                self.device_attest_keys_table.clone(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                error!("Failed to create attest key record: {:?}", err);
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    /// Advance an existing rate-limit row to `next`, conditional on the
+    /// `registrations` value it was computed from — the same
+    /// read-compute-conditional-write shape as [`Self::update_device_counter`],
+    /// so two concurrent attests for the same key cannot both take the last
+    /// slot.
+    async fn update_attest_key_record(
+        &self,
+        next: &AttestKeyRecord,
+        expected_registrations: u32,
+    ) -> Result<(), DynamoDBError> {
+        match self
+            .client
+            .update_item()
+            .table_name(&self.device_attest_keys_table)
+            .key("key_id", AttributeValue::S(next.key_id.clone()))
+            .update_expression(
+                "SET registrations = :registrations, window_base = :window_base, \
+                 window_started_at = :window_started_at, last_reg_at = :last_reg_at",
+            )
+            .condition_expression("registrations = :expected_registrations")
+            .expression_attribute_values(
+                ":registrations",
+                AttributeValue::N(next.registrations.to_string()),
+            )
+            .expression_attribute_values(
+                ":window_base",
+                AttributeValue::N(next.window_base.to_string()),
+            )
+            .expression_attribute_values(
+                ":window_started_at",
+                AttributeValue::N(next.window_started_at.to_string()),
+            )
+            .expression_attribute_values(
+                ":last_reg_at",
+                AttributeValue::N(next.last_reg_at.to_string()),
+            )
+            .expression_attribute_values(
+                ":expected_registrations",
+                AttributeValue::N(expected_registrations.to_string()),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if let SdkError::ServiceError(ref service_error) = err {
+                    match service_error.err().meta().code() {
+                        Some("ConditionalCheckFailedException") => {
+                            return Err(DynamoDBError::ConditionalConflict);
+                        }
+                        Some("ResourceNotFoundException") => {
+                            error!(
+                                "device_attest_keys table {} does not exist",
+                                self.device_attest_keys_table
+                            );
+                            return Err(DynamoDBError::TableNotExists(
+                                self.device_attest_keys_table.clone(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                error!("Failed to update attest key record: {:?}", err);
+                Err(DynamoDBError::SdkError(err.to_string()))
+            }
+        }
+    }
+
+    /// Reserve one registration slot for `key_id`, creating its rate-limit
+    /// row on first use.
+    ///
+    /// Two attempts total: the retry exists only to absorb a lost race
+    /// against a concurrent reservation for the *same* key (either the
+    /// first-ever create, or the conditional update below) -- a policy
+    /// refusal (window or lifetime budget exhausted) returns immediately
+    /// without retrying, since re-reading cannot change that answer.
+    pub async fn reserve_attest_registration(
+        &self,
+        key_id: &str,
+    ) -> Result<AttestKeyRecord, DynamoDBError> {
+        use crate::constants::ATTEST_REG_WINDOW_SECONDS;
+
+        let now = chrono::Utc::now().timestamp();
+
+        for _attempt in 0..2 {
+            match self.get_attest_key_record(key_id).await? {
+                None => {
+                    let record = AttestKeyRecord {
+                        key_id: key_id.to_string(),
+                        registrations: 1,
+                        window_base: 0,
+                        window_started_at: now,
+                        first_seen_at: now,
+                        last_reg_at: now,
+                    };
+                    match self.put_attest_key_record_if_absent(&record).await {
+                        Ok(()) => return Ok(record),
+                        Err(DynamoDBError::ConditionalConflict) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Some(record) => {
+                    if !attest_slot_available(&record, now) {
+                        // Retry-After for the caller: time left in the
+                        // current window. A key refused on the lifetime cap
+                        // rather than the window has no window left to wait
+                        // out; this still reports the window remainder
+                        // (0 once it has long since rolled over) since there
+                        // is no other meaningful value to give a client that
+                        // will only ever retry, not un-cap the key.
+                        let retry_after =
+                            (record.window_started_at + ATTEST_REG_WINDOW_SECONDS - now).max(0);
+                        return Err(DynamoDBError::RateLimited { retry_after });
+                    }
+
+                    let rolled_over = now - record.window_started_at >= ATTEST_REG_WINDOW_SECONDS;
+                    let next = AttestKeyRecord {
+                        key_id: record.key_id.clone(),
+                        registrations: record.registrations + 1,
+                        window_base: if rolled_over {
+                            record.registrations
+                        } else {
+                            record.window_base
+                        },
+                        window_started_at: if rolled_over {
+                            now
+                        } else {
+                            record.window_started_at
+                        },
+                        first_seen_at: record.first_seen_at,
+                        last_reg_at: now,
+                    };
+
+                    match self
+                        .update_attest_key_record(&next, record.registrations)
+                        .await
+                    {
+                        Ok(()) => return Ok(next),
+                        Err(DynamoDBError::ConditionalConflict) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        // Lost the race twice in a row: another attest for this key won
+        // both attempts. This is contention, not exhaustion, so a short
+        // retry_after is appropriate rather than the window-remainder value
+        // used for a genuine policy refusal above.
+        Err(DynamoDBError::RateLimited { retry_after: 1 })
+    }
+
+    // ------------------------------------------------------------------
     // Agent delegation (PE → agent NPE)
     // ------------------------------------------------------------------
 
@@ -1878,6 +2225,7 @@ pub(crate) mod tests {
             "identity_links".into(),
             "patreon_tokens".into(),
             "agent_delegations".into(),
+            "device_attest_keys".into(),
             vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()],
         ))
     }
@@ -1930,6 +2278,54 @@ pub(crate) mod tests {
         assert_eq!(
             store.get_identity_link("apple", &subject).await.unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn rate_limited_error_carries_a_retry_after() {
+        let e = DynamoDBError::RateLimited { retry_after: 3600 };
+        assert_eq!(e.to_string(), "Rate limited; retry after 3600s");
+    }
+
+    #[test]
+    fn window_rolls_over_after_the_configured_period() {
+        use crate::constants::{ATTEST_REG_PER_WINDOW, ATTEST_REG_WINDOW_SECONDS};
+        let now = 1_800_000_000i64;
+
+        // Window still open and exhausted -> refuse.
+        let exhausted = AttestKeyRecord {
+            key_id: "k".into(),
+            registrations: ATTEST_REG_PER_WINDOW,
+            window_base: 0,
+            window_started_at: now - 10,
+            first_seen_at: now - 10,
+            last_reg_at: now - 10,
+        };
+        assert!(!attest_slot_available(&exhausted, now));
+
+        // Same counts, but the window has rolled over -> allow.
+        let rolled = AttestKeyRecord {
+            window_started_at: now - ATTEST_REG_WINDOW_SECONDS - 1,
+            ..exhausted.clone()
+        };
+        assert!(attest_slot_available(&rolled, now));
+    }
+
+    #[test]
+    fn lifetime_cap_is_absolute() {
+        use crate::constants::ATTEST_REG_LIFETIME_CAP;
+        let now = 1_800_000_000i64;
+        let maxed = AttestKeyRecord {
+            key_id: "k".into(),
+            registrations: ATTEST_REG_LIFETIME_CAP,
+            window_base: 0,
+            window_started_at: now - 10_000_000,
+            first_seen_at: now - 10_000_000,
+            last_reg_at: now - 10_000_000,
+        };
+        assert!(
+            !attest_slot_available(&maxed, now),
+            "the lifetime cap must hold even with a long-expired window"
         );
     }
 }

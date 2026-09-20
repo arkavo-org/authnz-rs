@@ -198,3 +198,15 @@ pub const ENROLLMENT_TOKEN_MAX_AGE_SECONDS: i64 = 300;
 /// "you have no account here, register a passkey and link" apart from "the
 /// user cancelled". Every refusal surface uses this exact string.
 pub const IDENTITY_NOT_LINKED: &str = "identity_not_linked";
+
+/// Registrations one attested device key may perform per rolling window.
+/// A genuine device attesting repeatedly is the residual risk the gate does
+/// not cover; this bounds it without blocking reinstalls or a second account.
+pub const ATTEST_REG_PER_WINDOW: u32 = 3;
+
+/// Length of that rolling window, in seconds.
+pub const ATTEST_REG_WINDOW_SECONDS: i64 = 86_400;
+
+/// Absolute lifetime ceiling for one key, independent of the window. A key
+/// past this is a farm, not a user.
+pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;

@@ -41,6 +41,7 @@ export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
+export DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=device_attest_keys
 
 # Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
@@ -157,6 +158,7 @@ export DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 export DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 export DYNAMODB_PATREON_TOKENS_TABLE=patreon_tokens
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
+export DYNAMODB_DEVICE_ATTEST_KEYS_TABLE=device_attest_keys
 export AWS_REGION=us-east-1
 
 # Optional: Apple App Attest App ID hash — hex SHA-256 of "<TeamID>.<BundleID>".
@@ -256,6 +258,14 @@ aws dynamodb create-table \
             \"KeySchema\": [{\"AttributeName\":\"root_user_id\",\"KeyType\":\"HASH\"}],
             \"Projection\":{\"ProjectionType\":\"ALL\"}
         }]" \
+    --billing-mode PAY_PER_REQUEST
+
+# Create device_attest_keys table (App Attest registration rate limiting)
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name device_attest_keys \
+    --attribute-definitions AttributeName=key_id,AttributeType=S \
+    --key-schema AttributeName=key_id,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST
 ```
 
@@ -731,6 +741,19 @@ When modifying token lifetimes, update these in authn.rs:
   `identity_links` row (`patreon#<patreon_user_id>`), not via a secondary
   index here. The forward `user_id → patreon` lookup uses the table's
   primary key directly.
+
+### device_attest_keys table
+- **Primary Key**: key_id (String) - App Attest key identifier
+- **Attributes**:
+  - registrations (Number) - Lifetime count of registrations by this key
+  - window_base (Number) - `registrations` when the current window opened
+  - window_started_at (Number) - Unix timestamp the current window opened
+  - first_seen_at (Number) - Unix timestamp of first attestation
+  - last_reg_at (Number) - Unix timestamp of most recent registration
+- **Purpose**: bounds how many accounts one genuine device can register. The
+  gate proves a real device; this bounds what a real device may do.
+- **Conditional updates**: slot reservation is conditional on the observed
+  `registrations`, so concurrent attests cannot both take the last slot.
 
 ## Common Development Patterns
 

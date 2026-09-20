@@ -65,4 +65,5 @@ mk --table-name patreon_tokens --attribute-definitions AttributeName=user_id,Att
 mk --table-name agent_delegations --attribute-definitions AttributeName=agent_did,AttributeType=S AttributeName=root_user_id,AttributeType=S \
    --key-schema AttributeName=agent_did,KeyType=HASH \
    --global-secondary-indexes '[{"IndexName":"root_user_id-index","KeySchema":[{"AttributeName":"root_user_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]'
+mk --table-name device_attest_keys --attribute-definitions AttributeName=key_id,AttributeType=S --key-schema AttributeName=key_id,KeyType=HASH
 echo "tables ready at $EP"
