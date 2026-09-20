@@ -151,6 +151,161 @@ struct AttestationStatement {
     receipt: Option<Vec<u8>>,
 }
 
+/// An attestation that passed [`verify_attestation`].
+///
+/// `key_id` and `counter` are unread on the bound-device path, which takes
+/// them from the request and has already enforced `counter == 0`. Task 5's
+/// unauthenticated path consumes both: `key_id` keys the registration budget,
+/// and the caller has no trusted request field to fall back on.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AttestedKey {
+    pub key_id: String,
+    pub public_key: Vec<u8>,
+    pub rp_id_hash_str: String,
+    pub counter: u32,
+}
+
+/// How strictly [`verify_attestation`] treats the app-id configuration.
+pub struct VerifyOptions<'a> {
+    /// Accepted `rpIdHash` values, lowercase hex. A **set**: more than one app
+    /// registers users, so a single value would refuse the others. Empty means
+    /// unset, and `require_app_id` decides whether that warns or refuses.
+    pub expected_app_ids: &'a [String],
+    /// When true, an empty `expected_app_ids` is an error rather than a
+    /// warning. The registration gate sets this; the bound-device path does not.
+    pub require_app_id: bool,
+}
+
+/// Verify an App Attest attestation and return the attested key.
+///
+/// Extracted from [`finish_attestation`] so the unauthenticated registration
+/// path (Task 5) shares one implementation rather than growing a second copy
+/// that can drift from this one.
+///
+/// Behaviour is unchanged for the bound-device path: pass
+/// `require_app_id: false` and an unset `expected_app_ids` still warns and
+/// continues. The gate passes `true`, where an unset value is refused.
+///
+/// The three verification gaps this carries forward — unvalidated nonce
+/// extension, incomplete chain validation, and counter reset on re-attest —
+/// are Tasks 2 and 3. They are not closed here; this is a pure move.
+pub fn verify_attestation(
+    challenge: &str,
+    key_id: &str,
+    attestation_object_b64: &str,
+    client_data_hash_b64: &str,
+    opts: &VerifyOptions<'_>,
+) -> Result<AttestedKey, DeviceCheckError> {
+    // Decode the attestation object from base64
+    let attestation_bytes = base64::engine::general_purpose::STANDARD
+        .decode(attestation_object_b64)
+        .map_err(|e| DeviceCheckError::InvalidAttestationObject(e.to_string()))?;
+
+    // Parse CBOR attestation object
+    let attestation: AttestationObject = ciborium::from_reader(&attestation_bytes[..])
+        .map_err(|e| DeviceCheckError::InvalidAttestationObject(e.to_string()))?;
+
+    // Verify format is "apple-appattest"
+    if attestation.fmt != "apple-appattest" {
+        return Err(DeviceCheckError::InvalidFormat(format!(
+            "Expected 'apple-appattest', got '{}'",
+            attestation.fmt
+        )));
+    }
+
+    // Decode client data hash
+    let client_data_hash = base64::engine::general_purpose::STANDARD
+        .decode(client_data_hash_b64)
+        .map_err(|e| DeviceCheckError::InvalidClientData(e.to_string()))?;
+
+    // Verify the challenge matches
+    let expected_hash = Sha256::digest(challenge.as_bytes());
+    if client_data_hash.as_slice() != &expected_hash[..] {
+        return Err(DeviceCheckError::ChallengeMismatch);
+    }
+
+    // Validate certificate chain
+    validate_certificate_chain(&attestation.att_stmt.x5c)?;
+
+    // Extract public key from certificate
+    let public_key = extract_public_key_from_cert(&attestation.att_stmt.x5c[0])?;
+
+    // Parse authenticator data
+    let auth_data = parse_authenticator_data(&attestation.auth_data)?;
+
+    // Verify counter is 0 for initial attestation
+    if auth_data.counter != 0 {
+        return Err(DeviceCheckError::InvalidCounter(format!(
+            "Expected counter 0 for attestation, got {}",
+            auth_data.counter
+        )));
+    }
+
+    // SECURITY: `rpIdHash` identifies the app that produced the attestation.
+    // Unenforced, any App Attest-capable app — not just ours — can mint
+    // bindings. Enforced only when `APP_ATTEST_APP_ID` is configured, so
+    // deployments that have not set it keep today's behaviour and a warning.
+    let expected_app_ids = opts.expected_app_ids;
+    if expected_app_ids.is_empty() {
+        if opts.require_app_id {
+            // Admission control: an unset value would admit an attestation
+            // from any App Attest-capable app at all, so the gate refuses
+            // rather than warns.
+            error!("APP_ATTEST_APP_ID is unset and this path requires it; refusing");
+            return Err(DeviceCheckError::AppIdNotConfigured);
+        }
+        warn!(
+            "APP_ATTEST_APP_ID is unset; accepting attestation with unverified rpIdHash {}",
+            auth_data.rp_id_hash_str
+        );
+    } else if !app_id_is_accepted(&auth_data.rp_id_hash_str, expected_app_ids) {
+        warn!(
+            "App Attest rpIdHash mismatch for key_id {}: got {}, expected one of [{}]",
+            key_id,
+            auth_data.rp_id_hash_str,
+            expected_app_ids.join(", ")
+        );
+        return Err(DeviceCheckError::AppIdMismatch);
+    }
+
+    // Calculate nonce: SHA256(authData || clientDataHash)
+    let mut nonce_data = Vec::new();
+    nonce_data.extend_from_slice(&attestation.auth_data);
+    nonce_data.extend_from_slice(&client_data_hash);
+    let calculated_nonce = Sha256::digest(&nonce_data);
+
+    // SECURITY GAP: Nonce validation against certificate extension not implemented
+    //
+    // According to Apple's App Attest specification, the credCert (leaf certificate)
+    // contains a custom extension with OID 1.2.840.113635.100.8.2 that holds the nonce.
+    // We should verify that the calculated_nonce matches this extension value.
+    //
+    // Risk Assessment:
+    // - Without this check, an attacker could potentially present a valid attestation
+    //   for a different challenge, though they would still need a genuine Apple device
+    // - The rpIdHash, certificate chain, and counter checks provide defense-in-depth
+    // - This validation should be implemented before production deployment
+    //
+    // Implementation Required:
+    // 1. Parse the X.509 certificate extension 1.2.840.113635.100.8.2
+    // 2. Extract the nonce value from the extension
+    // 3. Compare with calculated_nonce
+    // 4. Reject attestation if they don't match
+    warn!(
+        "SECURITY: Nonce validation against certificate extension not implemented. \
+         Calculated nonce: {}. This check should be added before production use.",
+        hex::encode(calculated_nonce)
+    );
+
+    Ok(AttestedKey {
+        key_id: key_id.to_string(),
+        public_key,
+        rp_id_hash_str: auth_data.rp_id_hash_str,
+        counter: auth_data.counter,
+    })
+}
+
 /// Is `rp_id_hash` one of the configured app-id hashes?
 ///
 /// Membership, not equality: more than one app registers users, so a single
@@ -228,99 +383,20 @@ pub async fn finish_attestation(
         return Err(DeviceCheckError::SessionError(e.to_string()));
     }
 
-    // Decode the attestation object from base64
-    let attestation_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&request.attestation_object)
-        .map_err(|e| DeviceCheckError::InvalidAttestationObject(e.to_string()))?;
+    let attested = verify_attestation(
+        &challenge,
+        &request.key_id,
+        &request.attestation_object,
+        &request.client_data_hash,
+        &VerifyOptions {
+            expected_app_ids: app_state.app_attest_app_id.as_slice(),
+            // Legacy bound-device path keeps warn-and-continue on an unset
+            // APP_ATTEST_APP_ID; the registration gate (Task 5) passes true.
+            require_app_id: false,
+        },
+    )?;
 
-    // Parse CBOR attestation object
-    let attestation: AttestationObject = ciborium::from_reader(&attestation_bytes[..])
-        .map_err(|e| DeviceCheckError::InvalidAttestationObject(e.to_string()))?;
-
-    // Verify format is "apple-appattest"
-    if attestation.fmt != "apple-appattest" {
-        return Err(DeviceCheckError::InvalidFormat(format!(
-            "Expected 'apple-appattest', got '{}'",
-            attestation.fmt
-        )));
-    }
-
-    // Decode client data hash
-    let client_data_hash = base64::engine::general_purpose::STANDARD
-        .decode(&request.client_data_hash)
-        .map_err(|e| DeviceCheckError::InvalidClientData(e.to_string()))?;
-
-    // Verify the challenge matches
-    let expected_hash = Sha256::digest(challenge.as_bytes());
-    if client_data_hash.as_slice() != &expected_hash[..] {
-        return Err(DeviceCheckError::ChallengeMismatch);
-    }
-
-    // Validate certificate chain
-    validate_certificate_chain(&attestation.att_stmt.x5c)?;
-
-    // Extract public key from certificate
-    let public_key = extract_public_key_from_cert(&attestation.att_stmt.x5c[0])?;
-
-    // Parse authenticator data
-    let auth_data = parse_authenticator_data(&attestation.auth_data)?;
-
-    // Verify counter is 0 for initial attestation
-    if auth_data.counter != 0 {
-        return Err(DeviceCheckError::InvalidCounter(format!(
-            "Expected counter 0 for attestation, got {}",
-            auth_data.counter
-        )));
-    }
-
-    // SECURITY: `rpIdHash` identifies the app that produced the attestation.
-    // Unenforced, any App Attest-capable app — not just ours — can mint
-    // bindings. Enforced only when `APP_ATTEST_APP_ID` is configured, so
-    // deployments that have not set it keep today's behaviour and a warning.
-    let expected_app_ids = app_state.app_attest_app_id.as_slice();
-    if expected_app_ids.is_empty() {
-        warn!(
-            "APP_ATTEST_APP_ID is unset; accepting attestation with unverified rpIdHash {}",
-            auth_data.rp_id_hash_str
-        );
-    } else if !app_id_is_accepted(&auth_data.rp_id_hash_str, expected_app_ids) {
-        warn!(
-            "App Attest rpIdHash mismatch for key_id {}: got {}, expected one of [{}]",
-            request.key_id,
-            auth_data.rp_id_hash_str,
-            expected_app_ids.join(", ")
-        );
-        return Err(DeviceCheckError::AppIdMismatch);
-    }
-
-    // Calculate nonce: SHA256(authData || clientDataHash)
-    let mut nonce_data = Vec::new();
-    nonce_data.extend_from_slice(&attestation.auth_data);
-    nonce_data.extend_from_slice(&client_data_hash);
-    let calculated_nonce = Sha256::digest(&nonce_data);
-
-    // SECURITY GAP: Nonce validation against certificate extension not implemented
-    //
-    // According to Apple's App Attest specification, the credCert (leaf certificate)
-    // contains a custom extension with OID 1.2.840.113635.100.8.2 that holds the nonce.
-    // We should verify that the calculated_nonce matches this extension value.
-    //
-    // Risk Assessment:
-    // - Without this check, an attacker could potentially present a valid attestation
-    //   for a different challenge, though they would still need a genuine Apple device
-    // - The rpIdHash, certificate chain, and counter checks provide defense-in-depth
-    // - This validation should be implemented before production deployment
-    //
-    // Implementation Required:
-    // 1. Parse the X.509 certificate extension 1.2.840.113635.100.8.2
-    // 2. Extract the nonce value from the extension
-    // 3. Compare with calculated_nonce
-    // 4. Reject attestation if they don't match
-    warn!(
-        "SECURITY: Nonce validation against certificate extension not implemented. \
-         Calculated nonce: {}. This check should be added before production use.",
-        hex::encode(calculated_nonce)
-    );
+    let public_key = attested.public_key.clone();
 
     info!("Binding device {} to user {}", request.key_id, username);
 
@@ -330,7 +406,7 @@ pub async fn finish_attestation(
         user_id,
         public_key: public_key.clone(),
         counter: 0,
-        app_id: auth_data.rp_id_hash_str.clone(),
+        app_id: attested.rp_id_hash_str.clone(),
         created_at: Utc::now().timestamp(),
         updated_at: Utc::now().timestamp(),
     };
@@ -808,6 +884,16 @@ pub enum DeviceCheckError {
     #[error("App ID mismatch")]
     AppIdMismatch,
 
+    /// `APP_ATTEST_APP_ID` is unset on a path that requires it.
+    ///
+    /// Distinct from [`Self::AppIdMismatch`]: that is a client presenting the
+    /// wrong app, this is the server unable to decide. It is a server
+    /// misconfiguration, so it must never reach a client as a permanent
+    /// "this device is barred" verdict — see
+    /// `docs/app-attest-preflight-contract.md`.
+    #[error("App Attest app id is not configured")]
+    AppIdNotConfigured,
+
     #[error("Device is already bound to a different account")]
     DeviceBindingConflict,
 }
@@ -831,6 +917,15 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::AppIdMismatch => (
                 StatusCode::BAD_REQUEST,
                 "Attestation was produced by an unexpected app".to_string(),
+            ),
+            // 503, deliberately not 403: the server cannot decide, which is an
+            // operator problem and is retryable. A 403 here would be
+            // indistinguishable from a genuine permanent refusal at the first
+            // enforcing deploy, where an unset value fails closed for every
+            // user at once.
+            DeviceCheckError::AppIdNotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "App Attest is not configured on this server".to_string(),
             ),
             DeviceCheckError::DeviceBindingConflict => (
                 StatusCode::CONFLICT,
@@ -896,6 +991,97 @@ impl IntoResponse for DeviceCheckError {
 
 #[cfg(test)]
 mod tests {
+
+    use super::{AttestedKey, VerifyOptions, verify_attestation};
+
+    #[test]
+    fn app_id_not_configured_is_503_not_403() {
+        // Contract: a server that cannot decide must not look like a permanent
+        // refusal. At the first enforcing deploy an unset APP_ATTEST_APP_ID
+        // fails closed for every user at once; as a 403 next to the genuine
+        // lifetime-cap refusal, a client would tell the whole user base their
+        // hardware is barred. See docs/app-attest-preflight-contract.md.
+        let resp = DeviceCheckError::AppIdNotConfigured.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn app_id_mismatch_and_not_configured_are_distinct_statuses() {
+        // A client discriminating on status alone must still separate "wrong
+        // app" from "server not configured".
+        assert_ne!(
+            DeviceCheckError::AppIdMismatch.into_response().status(),
+            DeviceCheckError::AppIdNotConfigured
+                .into_response()
+                .status()
+        );
+    }
+
+    #[test]
+    fn verify_attestation_rejects_non_base64_attestation() {
+        let err = verify_attestation(
+            "challenge",
+            "key",
+            "!!!not base64!!!",
+            "",
+            &VerifyOptions {
+                expected_app_ids: &[],
+                require_app_id: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAttestationObject(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_attestation_rejects_non_cbor_payload() {
+        use base64::Engine as _;
+        let garbage = base64::engine::general_purpose::STANDARD.encode(b"not cbor at all");
+        let err = verify_attestation(
+            "challenge",
+            "key",
+            &garbage,
+            "",
+            &VerifyOptions {
+                expected_app_ids: &[],
+                require_app_id: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAttestationObject(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_options_carries_a_set_not_a_single_value() {
+        // Guards the Task 1 / Task 5 contradiction: the plan declared
+        // expected_app_id as Option<&str>, which cannot hold both apps.
+        let ids = vec!["aaa".to_string(), "bbb".to_string()];
+        let opts = VerifyOptions {
+            expected_app_ids: &ids,
+            require_app_id: true,
+        };
+        assert_eq!(opts.expected_app_ids.len(), 2);
+        assert!(opts.require_app_id);
+    }
+
+    #[test]
+    fn attested_key_round_trips_the_verified_fields() {
+        let k = AttestedKey {
+            key_id: "k".into(),
+            public_key: vec![1, 2, 3],
+            rp_id_hash_str: "ea2d".into(),
+            counter: 0,
+        };
+        assert_eq!(k.key_id, "k");
+        assert_eq!(k.counter, 0);
+        assert_eq!(k.rp_id_hash_str, "ea2d");
+    }
 
     use super::app_id_is_accepted;
 
