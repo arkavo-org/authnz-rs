@@ -1075,6 +1075,12 @@ second account on one device."
 
 **Interfaces:**
 - Consumes: `verify_attestation`, `VerifyOptions` (Task 1); `check_attest_registration_budget` (Task 4).
+
+**`expected_app_id` is a set.** Arkavo (iOS, `543398d8…`) and Arkavo Creator
+(macOS, `ea2defc9…`) both call `registerUser`, so a single value refuses one of
+them with `AppIdMismatch`. `APP_ATTEST_APP_ID` parses as comma-separated and
+`VerifyOptions.expected_app_id` takes the set; `require_app_id: true` means the
+set must be non-empty.
 - Produces: session key `SESSION_REG_TICKET_KEY = "reg_attest_ticket"` holding `RegistrationTicket`:
 
 ```rust

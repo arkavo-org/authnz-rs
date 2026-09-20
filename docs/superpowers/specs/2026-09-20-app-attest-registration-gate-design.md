@@ -122,6 +122,21 @@ default. For admission control it is fatal: an unset value admits an
 attestation from *any* app, which is precisely the property the gate exists to
 deny. `register-attest` fails closed when it is unset, rather than warning.
 
+**It must also become a set, not a value.** Two apps register users, and they
+are different bundles with different hashes:
+
+| App | Bundle | `SHA256(<TeamID>.<BundleID>)` |
+|---|---|---|
+| Arkavo (iOS) | `com.arkavo.Arkavo` | `543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8` |
+| Arkavo Creator (macOS) | `com.arkavo.ArkavoCreator` | `ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01` |
+
+`AppState.app_attest_app_id` is `Arc<Option<String>>` and `device_check.rs:269`
+compares against that one value, so whichever app is not configured is refused
+with `AppIdMismatch`. The field becomes a non-empty set parsed from a
+comma-separated `APP_ATTEST_APP_ID`, and the check becomes membership. The
+existing bound path keeps its current single-value warn-only behaviour; only
+the gate fails closed on an empty set.
+
 The remaining checks should be confirmed present in the extracted validator:
 
 - `aaguid` matches the environment (`appattest` in production,
@@ -301,6 +316,20 @@ be made until they are:
 2. **Which aaguid does macOS emit?** Possibly `appattestsandbox` rather than
    `appattest` / `appattestdevelop`. The verifier's environment check must
    cover whatever it actually is.
+
+Both are being answered from a released Creator build attesting in the
+**production** environment. That also settles the environment question the
+verifier faces either way: a shipped build emits `appattest` while a local
+developer build emits `appattestdevelop`, so the check must accept the set
+appropriate to the deployment rather than one hardcoded value, or local builds
+fail against a production-configured server.
+
+Capture from the released build: the whole attestation object for the fixture,
+and from `authData`, bytes 0..32 (`rpIdHash`) and 37..53 (`aaguid`). If
+`rpIdHash` equals `ea2defc9…` above, macOS behaves like iOS and joins the
+guarantee. If it does not, it is the CDhash: **per-build**, changing with every
+Creator release, so no static `APP_ATTEST_APP_ID` entry can pin it and macOS
+needs a different app-identity check.
 
 Until those are answered, the gate's guarantee must be stated as
 "registration from iOS requires an attested device", never as "registration
