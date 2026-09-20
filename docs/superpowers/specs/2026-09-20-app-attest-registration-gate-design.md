@@ -309,7 +309,7 @@ be made until they are.
 
 > **These are now cheap to settle.** macOS attestation is confirmed working,
 > so both questions are a decode of bytes already in hand rather than a
-> discovery. **Task 0 Step 3** of the plan produces the answer and is where it
+> discovery. **Task 0 Step 5** of the plan produces the answer and is where it
 > should be recorded; this section is the place to write the conclusion back.
 
 1. **What does `rpIdHash` contain on macOS?** The entitlement's value is

@@ -31,13 +31,14 @@ Every later task's tests need a genuine App Attest blob. App Attest does not run
 
 iOS remains the host for the *fixture of record*: its `app_id_hash` is the production `APP_ATTEST_APP_ID` value, and Tasks 1-3 load that file. Simulators are unsupported, so a physical device is required regardless.
 
-**But take a macOS capture in the same session (Step 3).** The plan previously deferred two macOS unknowns — whether `rpIdHash` binds to the code directory hash rather than `SHA256("<TeamID>.<BundleID>")`, and whether the aaguid differs — on the grounds that "the fixture should not be what discovers them." That reasoning held while macOS attestation was untested. It no longer does: a working macOS build makes both questions a *decode* of bytes already in hand, not a discovery. Settling them costs one extra `attestKey` call and answers the spec's open "macOS hole", which otherwise has to be resolved before the enforcing deploy anyway (the runbook's pre-flight check is exactly this question, asked at the worst possible time).
+**But take a macOS capture in the same session (Step 5).** The plan previously deferred two macOS unknowns — whether `rpIdHash` binds to the code directory hash rather than `SHA256("<TeamID>.<BundleID>")`, and whether the aaguid differs — on the grounds that "the fixture should not be what discovers them." That reasoning held while macOS attestation was untested. It no longer does: a working macOS build makes both questions a *decode* of bytes already in hand, not a discovery. Settling them costs one extra `attestKey` call and answers the spec's open "macOS hole", which otherwise has to be resolved before the enforcing deploy anyway (the runbook's pre-flight check is exactly this question, asked at the worst possible time).
 
 `com.arkavo.Arkavo` already has App Attest enabled with an iOS profile carrying both `development` and `production`, so **no App Store or TestFlight release is required** — a locally signed development build on a physical device produces a genuine attestation. (`com.arkavo.AvatarMuse` is equally viable if more convenient.)
 
 **Files:**
 - Create: `tests/fixtures/appattest/README.md`
 - Create: `tests/fixtures/appattest/attestation.json`
+- Create: `tests/fixtures/appattest/receipt-exchange.md` (Step 4 findings — not a fixture, not loaded by any test)
 
 **Interfaces:**
 - Consumes: nothing
@@ -72,50 +73,82 @@ let attestation = try await service.attestKey(keyId, clientDataHash: clientDataH
 print(#"{"key_id":"\#(keyId)","attestation_object":"\#(attestation.base64EncodedString())","client_data_hash":"\#(clientDataHash.base64EncodedString())","challenge":"\#(challenge)"}"#)
 ```
 
-- [ ] **Step 2: Exchange the attestation receipt — same session, before anything else**
+- [ ] **Step 2: Record the app id hash**
 
-**Time-critical. Do this immediately after Step 1, not later.**
-
-The attestation object's CBOR `attStmt` carries a `receipt` alongside `x5c`, so Step 1 already captured it — no extra device call is needed. But receipts carry ASN.1 `Not Before` and `Expiration Time` fields, so the exchange only works while the captured receipt is still valid. Against a checked-in fixture weeks later it simply fails, and the question below goes unanswered until someone books another device session.
-
-This step exists to answer one open design question: **can Apple supply a per-device bound that the server-side `device_attest_keys` counter cannot?** That counter bounds a `key_id`, and `attestKey` is once-per-key, so a client mints a fresh key per attestation and never meets the limit (see `ATTEST_REG_PER_WINDOW`'s doc comment). Apple's risk metric is reportedly computed per *device*, where minting fresh keys cannot evade it.
-
-Extract the receipt:
+Already computed — verify rather than re-derive:
 
 ```bash
-python3 -c "
-import json,base64,sys
-try:
-    import cbor2
-except ImportError:
-    sys.exit('pip install cbor2')
-d=json.load(open('tests/fixtures/appattest/attestation.json'))
-att=cbor2.loads(base64.b64decode(d['attestation_object']))
-open('receipt.p7','wb').write(att['attStmt']['receipt'])
-print('receipt bytes:', len(att['attStmt']['receipt']))
-"
+printf '%s' 'M8GS7ZT95Y.com.arkavo.Arkavo' | shasum -a 256 | cut -d' ' -f1
+# 543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8
 ```
 
-Exchange it at Apple's attestation data endpoint (`https://data-development.appattest.apple.com/v1/attestationData` for a development build; drop `-development` for production), authenticated with an ES256 JWT signed by a DeviceCheck-enabled key (`.p8`) from the developer portal. The body is the base64 receipt.
+Capturing from the app that actually registers users means this is also the value `APP_ATTEST_APP_ID` takes in deployment. If you capture from `com.arkavo.AvatarMuse` instead, recompute — Tasks 1-3 read `app_id_hash` out of the fixture, so they pass self-consistently either way.
 
-**Record all four fields from the returned receipt, not just the metric:**
+- [ ] **Step 3: Write the fixture file**
+
+Save the printed JSON to `tests/fixtures/appattest/attestation.json`, adding:
+- `app_id_hash` from Step 2
+- `environment`: `"development"`
+- `verify_at`: the capture time as a Unix timestamp (`date +%s` at capture). It must fall inside the leaf certificate's validity window, which it does by construction if recorded at capture.
+
+- [ ] **Step 4: Extract the receipt and exchange it for a risk metric**
+
+**Same session as the capture — not deferred.** Receipts carry `Not Before` and `Expiration Time`, so the exchange only works while the captured receipt is live. Deferring to "after Task 3" means re-capturing on a device, which is exactly the cost this step avoids.
+
+This answers one open design question: **can Apple supply a per-device bound that the server-side `device_attest_keys` counter cannot?** That counter bounds a `key_id`, and `attestKey` is once-per-key, so a client mints a fresh key per attestation and never meets the limit (see `ATTEST_REG_PER_WINDOW`'s doc comment). The risk metric is reportedly computed per *device*, where minting fresh keys cannot evade it.
+
+**Files:** create `tests/fixtures/appattest/receipt-exchange.md` — findings, **not** a fixture. The exchange response is time-bound and must not be committed as a test input.
+
+**4a. Extract the receipt.** Two things make this nearly free: `device_check.rs:151` already declares `receipt: Option<Vec<u8>>` on `AttestationStatement` and `ciborium` already parses it at `device_check.rs:226` (the struct is `#[allow(dead_code)]`, so the field is decoded and discarded today). And Step 3's fixture already records `environment`, which is exactly what selects the endpoint in 4b.
+
+```rust
+let bytes = base64_standard.decode(fixture["attestation_object"].as_str().unwrap())?;
+let att: AttestationObject = ciborium::from_reader(&bytes[..])?;
+let receipt = att.att_stmt.receipt.expect("no receipt in attStmt");
+println!("{}", base64_standard.encode(&receipt));
+```
+
+> **Stop condition.** If `receipt` is `None`, stop and record it. That would mean the attestation shape assumed here does not hold, which Task 1 depends on — far better discovered at capture time than in Task 1.
+
+**4b. Exchange it.** Requires a DeviceCheck private key (`.p8`) from the developer portal, its key ID, and the Team ID. Auth is a short-lived ES256 JWT (`{alg: ES256, kid: <key-id>}` / `{iss: <team-id>, iat: <now>}`) as a bearer token; the body is the base64 receipt from 4a.
+
+The endpoint follows the fixture's `environment`:
+
+- `development` → `https://data-development.appattest.apple.com/v1/attestationData`
+- `production` → `https://data.appattest.apple.com/v1/attestationData`
+
+A development-signed build produces a development receipt and the production endpoint will reject it. Task 0 captures from a locally signed development build, so expect the development endpoint.
+
+**4c. Read the fields.** The response is a base64 PKCS#7 receipt:
+
+```bash
+base64 -d < response.b64 > response.der
+openssl asn1parse -inform DER -in response.der -i | head -60
+```
+
+**Record all four fields, not just the metric:**
 
 | Field | Why it matters |
 |---|---|
 | `Receipt Type` | `RECEIPT` confirms the exchange succeeded (the captured one is `ATTEST`) |
-| `Risk Metric` | The count of attested keys for this device — the candidate per-device bound |
+| `Risk Metric` | The count of attested keys — **and whether it is scoped to the device or the key** |
 | `Not Before` | **Governs how often you may exchange for a device.** If coarse, the metric cannot be a per-registration gate at all |
 | `Expiration Time` | How long a receipt stays exchangeable |
 
-`Not Before` is the field that decides the design, and it is the one most likely to be skipped. A risk metric that exists but can only be refreshed on a slow cadence is an *after-the-fact abuse signal*, not admission control — a different thing from what Task 4 was reaching for, and it would not replace the counter.
+`Not Before` is what decides the design and is the field most likely to be skipped. A risk metric that exists but refreshes on a coarse cadence is an *after-the-fact abuse signal*, not admission control — a different thing from what Task 4 was reaching for, and it would not replace the counter.
 
-**Also price the cost, so the comparison is honest.** A receipt exchange on the registration path is an Apple HTTPS round-trip: it adds latency, adds an availability dependency, and forces a fail-open/fail-closed choice. Fail-closed means an Apple outage takes registration down; fail-open means the bound disappears exactly when someone is attacking. `device_attest_keys` has neither property because it never leaves DynamoDB. Whichever way the metric lands, record this trade-off alongside it.
+**Price the cost too, so the comparison is honest.** A receipt exchange on the registration path is an Apple HTTPS round-trip: latency, an availability dependency, and a forced fail-open/fail-closed choice. Fail-closed hands Apple an outage switch over registration; fail-open drops the bound exactly when someone is attacking. `device_attest_keys` has neither property because it never leaves DynamoDB.
 
-Write the findings into `tests/fixtures/appattest/README.md` (Step 6) — this is a design input, not a test fixture, so nothing in Tasks 1-7 should load it.
+**What each outcome implies:**
 
-> **Verify against current docs before building on any of this.** Apple's "Assessing fraud risk" page is JS-rendered and resisted automated fetch; the description above is from recall and must be confirmed. If the risk metric turns out not to count per-device attested keys, say so in the README and the question is closed the other way.
+- **Per-device, counting attested keys** → a real bound exists and it is not `device_attest_keys`. Tasks 5-6 gate on the metric; the per-`key_id` counter becomes redundant, or at best a cheap local pre-filter.
+- **Per-key, or absent** → no Apple-side device bound is available. Drop the per-device claim from Task 4's framing rather than keep implying it, and keep the budget as explicit defence in depth.
 
-- [ ] **Step 3: Settle the macOS binding question**
+Either way this converts an assumption into a fact before Tasks 5 and 6 rest on it. It does **not** answer whether a per-device bound is *required* — that stays a product call about whether "genuine device + genuine app" is sufficient admission control.
+
+> **Calibration.** 4a is verified against this repo's own code. **4b and 4c are from recall and must be checked against Apple's current documentation before anyone follows them literally** — the "Assessing fraud risk" page is JS-rendered and would not load, so field numbering, exact request framing, and whether a minimum interval exists between exchanges are the parts most likely to be wrong.
+
+- [ ] **Step 5: Settle the macOS binding question**
 
 One extra `attestKey` call from the working macOS build (Creator), then a decode. This answers the spec's "macOS hole" and does not produce a fixture — `attestation.json` stays the iOS one.
 
@@ -142,24 +175,6 @@ Two outcomes, both worth having:
 
 Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since Task 1's verifier checks it.
 
-- [ ] **Step 4: Record the app id hash**
-
-Already computed — verify rather than re-derive:
-
-```bash
-printf '%s' 'M8GS7ZT95Y.com.arkavo.Arkavo' | shasum -a 256 | cut -d' ' -f1
-# 543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8
-```
-
-Capturing from the app that actually registers users means this is also the value `APP_ATTEST_APP_ID` takes in deployment. If you capture from `com.arkavo.AvatarMuse` instead, recompute — Tasks 1-3 read `app_id_hash` out of the fixture, so they pass self-consistently either way.
-
-- [ ] **Step 5: Write the fixture file**
-
-Save the printed JSON to `tests/fixtures/appattest/attestation.json`, adding:
-- `app_id_hash` from Step 4
-- `environment`: `"development"`
-- `verify_at`: the capture time as a Unix timestamp (`date +%s` at capture). It must fall inside the leaf certificate's validity window, which it does by construction if recorded at capture.
-
 - [ ] **Step 6: Write the README**
 
 ```markdown
@@ -185,7 +200,7 @@ needs physical hardware.
 macOS *can* attest, via the separate
 `com.apple.developer.devicecheck.app-attest-opt-in` entitlement — but
 iOS is the host of record here because its app id hash is the
-production `APP_ATTEST_APP_ID` value. See Task 0 Step 3 for the macOS
+production `APP_ATTEST_APP_ID` value. See Task 0 Step 5 for the macOS
 binding question and its answer.
 
 Chain validation tests check against `verify_at`, not the wall clock. The
