@@ -281,18 +281,15 @@ impl AuthorizationCodeStore {
     pub async fn take(&self, code: &str) -> Result<Option<AuthorizationCodeRecord>, String> {
         let key = format!("oidc:code:{}", code);
         if self.redis.is_connected() {
+            // GETDEL so two concurrent token requests presenting the same code
+            // cannot both win the race between a separate GET and DEL — an
+            // authorization code must be redeemable exactly once.
             let val: Option<String> = self
                 .redis
-                .get(&key)
+                .getdel(&key)
                 .await
-                .map_err(|e| format!("Redis get failed: {}", e))?;
+                .map_err(|e| format!("Redis getdel failed: {}", e))?;
             if let Some(json_str) = val {
-                // Delete immediately on retrieval (single-use)
-                let _: () = self
-                    .redis
-                    .del(&key)
-                    .await
-                    .map_err(|e| format!("Redis del failed: {}", e))?;
                 let record: AuthorizationCodeRecord = serde_json::from_str(&json_str)
                     .map_err(|e| format!("Deserialization failed: {}", e))?;
                 if record.expires_at < Utc::now().timestamp() {
@@ -375,18 +372,15 @@ impl RefreshTokenStore {
         let key = format!("oidc:refresh:{}", token_hash);
 
         if self.redis.is_connected() {
+            // GETDEL so refresh token rotation is actually single-use: a
+            // separate GET and DEL let two concurrent refreshes both consume
+            // the same token.
             let val: Option<String> = self
                 .redis
-                .get(&key)
+                .getdel(&key)
                 .await
-                .map_err(|e| format!("Redis get failed: {}", e))?;
+                .map_err(|e| format!("Redis getdel failed: {}", e))?;
             if let Some(json_str) = val {
-                // Delete immediately on retrieval (Refresh Token Rotation)
-                let _: () = self
-                    .redis
-                    .del(&key)
-                    .await
-                    .map_err(|e| format!("Redis del failed: {}", e))?;
                 let record: RefreshTokenRecord = serde_json::from_str(&json_str)
                     .map_err(|e| format!("Deserialization failed: {}", e))?;
                 if record.expires_at < Utc::now().timestamp() {
