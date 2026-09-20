@@ -3,6 +3,7 @@
 **Audience:** whoever operates `identity.arkavo.net`.
 **Spec:** `docs/superpowers/specs/2026-09-20-app-attest-registration-gate-design.md`
 **Plan:** `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md`
+**Wire contract:** `docs/app-attest-preflight-contract.md` (what the client codes against)
 
 ## Do not deploy PR #66 on its own
 
