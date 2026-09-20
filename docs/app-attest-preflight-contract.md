@@ -106,8 +106,20 @@ enforcing deploy, an unset `APP_ATTEST_APP_ID` fails closed for *every* user sim
 client that maps that to "this device can never register" tells the entire user base their hardware
 is permanently rejected. The status code and the token both have to make that impossible.
 
-ArkavoKit `138a82c` already matches loosely on the distinguishing word pending this document —
-that match can now be tightened to exactly `attest_registration_cap`.
+ArkavoKit is aligned to this contract as of `561fd60`: `attest_registration_cap`, matched exactly,
+is the only path to a permanent verdict. Unrecognized or absent tokens stay retryable.
+
+### Acceptance criterion for Task 5 — the JSON body is not optional
+
+**A Task 5 that ships without JSON error bodies silently disables the client's discrimination.**
+With a plain-text body the client reads no token, falls back to "retryable", and the permanent case
+becomes unreachable — so a genuinely spent `key_id` is told to retry, forever, with no signal that
+anything is wrong. That failure is silent on both sides: the server looks correct, the client looks
+correct, and only the user is stuck.
+
+So Task 5 is not complete when the endpoints return the right status codes. It is complete when
+they return the right `error` token in a JSON body. Test it by asserting on the parsed `error`
+field, never on the status alone.
 
 ---
 
