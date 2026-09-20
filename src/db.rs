@@ -94,6 +94,24 @@ pub fn attest_slot_available(record: &AttestKeyRecord, now: i64) -> bool {
     record.registrations - record.window_base < ATTEST_REG_PER_WINDOW
 }
 
+/// Pure policy: which error should a reservation attempt on `record` return,
+/// given [`attest_slot_available`] already refused it at `now`?
+///
+/// Split out from [`DynamoDBStore::reserve_attest_registration`] so the
+/// window-vs-lifetime distinction — the difference between "retry later"
+/// and "this key_id is permanently spent" — is unit-testable without
+/// DynamoDB Local. Kept in lockstep with `attest_slot_available`'s own
+/// lifetime-cap check.
+pub fn attest_refusal_error(record: &AttestKeyRecord, now: i64) -> DynamoDBError {
+    use crate::constants::{ATTEST_REG_LIFETIME_CAP, ATTEST_REG_WINDOW_SECONDS};
+
+    if record.registrations >= ATTEST_REG_LIFETIME_CAP {
+        return DynamoDBError::AttestLifetimeCapExceeded;
+    }
+    let retry_after = (record.window_started_at + ATTEST_REG_WINDOW_SECONDS - now).max(0);
+    DynamoDBError::RateLimited { retry_after }
+}
+
 #[derive(Error, Debug)]
 pub enum DynamoDBError {
     #[error("AWS SDK error: {0}")]
@@ -130,11 +148,21 @@ pub enum DynamoDBError {
     #[error("conditional write rejected")]
     ConditionalConflict,
 
-    /// The attested key has exhausted its rolling-window or lifetime
-    /// registration budget (see [`crate::constants::ATTEST_REG_PER_WINDOW`]
-    /// / [`crate::constants::ATTEST_REG_LIFETIME_CAP`]).
+    /// The attested key has exhausted its rolling-window registration
+    /// budget ([`crate::constants::ATTEST_REG_PER_WINDOW`]). Transient: the
+    /// window rolls over, so `retry_after` (seconds) is a meaningful
+    /// instruction to try again later.
     #[error("Rate limited; retry after {retry_after}s")]
     RateLimited { retry_after: i64 },
+
+    /// The attested key has reached its absolute lifetime registration cap
+    /// ([`crate::constants::ATTEST_REG_LIFETIME_CAP`]). Unlike
+    /// `RateLimited`, this never clears for this `key_id` — `registrations`
+    /// only ever increases — so there is deliberately no `retry_after`
+    /// here: a caller must not attach one (e.g. a `Retry-After` header) to
+    /// this refusal, since no delay makes it succeed.
+    #[error("Attested key has reached its lifetime registration cap")]
+    AttestLifetimeCapExceeded,
 }
 
 impl From<aws_sdk_dynamodb::Error> for DynamoDBError {
@@ -1402,16 +1430,10 @@ impl DynamoDBStore {
                 }
                 Some(record) => {
                     if !attest_slot_available(&record, now) {
-                        // Retry-After for the caller: time left in the
-                        // current window. A key refused on the lifetime cap
-                        // rather than the window has no window left to wait
-                        // out; this still reports the window remainder
-                        // (0 once it has long since rolled over) since there
-                        // is no other meaningful value to give a client that
-                        // will only ever retry, not un-cap the key.
-                        let retry_after =
-                            (record.window_started_at + ATTEST_REG_WINDOW_SECONDS - now).max(0);
-                        return Err(DynamoDBError::RateLimited { retry_after });
+                        // attest_refusal_error tells window-exhausted (retry
+                        // later) apart from lifetime-capped (never retry) --
+                        // see its doc comment and AttestLifetimeCapExceeded.
+                        return Err(attest_refusal_error(&record, now));
                     }
 
                     let rolled_over = now - record.window_started_at >= ATTEST_REG_WINDOW_SECONDS;
@@ -2327,5 +2349,50 @@ pub(crate) mod tests {
             !attest_slot_available(&maxed, now),
             "the lifetime cap must hold even with a long-expired window"
         );
+    }
+
+    #[test]
+    fn lifetime_cap_refusal_does_not_say_retry_now() {
+        // Regression for a review finding: the window-remainder formula
+        // (window_started_at + WINDOW - now) evaluates to 0 for a key whose
+        // window rolled over long ago, which is exactly the shape of a
+        // lifetime-capped key. That must never surface as `RateLimited { 0
+        // }` -- a caller (Task 5's HTTP layer) needs to be able to tell "try
+        // again shortly" apart from "this key_id is permanently spent"
+        // without re-reading the record.
+        use crate::constants::ATTEST_REG_LIFETIME_CAP;
+        let now = 1_800_000_000i64;
+        let maxed = AttestKeyRecord {
+            key_id: "k".into(),
+            registrations: ATTEST_REG_LIFETIME_CAP,
+            window_base: 0,
+            window_started_at: now - 10_000_000,
+            first_seen_at: now - 10_000_000,
+            last_reg_at: now - 10_000_000,
+        };
+        match attest_refusal_error(&maxed, now) {
+            DynamoDBError::AttestLifetimeCapExceeded => {}
+            other => panic!("expected AttestLifetimeCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_refusal_reports_the_remaining_window_as_retry_after() {
+        use crate::constants::{ATTEST_REG_PER_WINDOW, ATTEST_REG_WINDOW_SECONDS};
+        let now = 1_800_000_000i64;
+        let exhausted = AttestKeyRecord {
+            key_id: "k".into(),
+            registrations: ATTEST_REG_PER_WINDOW,
+            window_base: 0,
+            window_started_at: now - 10,
+            first_seen_at: now - 10,
+            last_reg_at: now - 10,
+        };
+        match attest_refusal_error(&exhausted, now) {
+            DynamoDBError::RateLimited { retry_after } => {
+                assert_eq!(retry_after, ATTEST_REG_WINDOW_SECONDS - 10);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 }
