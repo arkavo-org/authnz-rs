@@ -241,36 +241,54 @@ release:
 
 ## The macOS hole
 
-App Attest does not work on macOS. This is not a configuration problem and
-there is no entitlement that fixes it. Apple's own macOS SDK header for
-`DCAppAttestService` states that `supported` read "from an app running on a
-Mac device" is `false`, "includ[ing] Mac Catalyst apps, and iOS or iPadOS apps
-running on Apple silicon". The App Attest capability's portal tooltip lists
-Platform Support as iOS, visionOS and tvOS. A Mac provisioning profile never
-carries the entitlement, and Xcode strips it at signing without an error — the
-build succeeds and the signed binary simply lacks the key.
+There are **two** App Attest capabilities, and only one of them covers macOS.
 
-Secure Enclave presence is not the gate. Apple excludes Macs outright.
+- **App Attest** — entitlement `com.apple.developer.devicecheck.appattest-environment`,
+  values `development` / `production`. Platform Support: iOS, visionOS, tvOS.
+  **Not macOS.**
+- **App Attest Opt-In** — entitlement `com.apple.developer.devicecheck.app-attest-opt-in`,
+  value `CDhash`. Platform Support: iOS, tvOS, watchOS, macOS, visionOS.
 
-So the gate as designed covers iOS registrations and cannot cover macOS ones.
-That leaves three options, and the choice is not made here:
+An earlier draft of this section said App Attest could not work on macOS and
+no entitlement fixed it, citing the macOS SDK header's statement that
+`supported` is `false` on a Mac. That was wrong: the header does not account
+for the opt-in entitlement. With `app-attest-opt-in` granted, a Mac build
+reports `isSupported = true` and `generateKey` returns a real Secure Enclave
+key — observed on this hardware in both Debug and Release.
 
-1. **Gate iOS, drop macOS registration.** The guarantee holds, at the cost of
-   the platform. Existing macOS accounts are unaffected; only new ones are
-   refused.
-2. **Gate iOS, leave macOS ungated.** The cheapest option and the weakest:
-   an ungated path is the path an attacker takes, so the gate would stop
-   only attackers who decline to change one client. This is close to
-   equivalent to not shipping the gate, and should not be chosen by default
-   just because it requires no work.
-3. **Find a different macOS attestation.** DeviceCheck's `DCDevice` is also
-   iOS-only, and managed device attestation assumes MDM enrollment, so
-   nothing obvious fits a consumer Mac app. Worth a search before option 1 is
-   accepted, not worth blocking on.
+The trap that produced the wrong conclusion is worth keeping: the two
+capabilities look alike in the portal, and Xcode strips an entitlement the
+profile does not grant **silently**. The build succeeds and the signed binary
+simply lacks the key. Never judge this from build success — read the signed
+binary:
 
-Until this is decided, the gate's guarantee must be stated as "registration
-from iOS requires an attested device", never as "registration requires an
-attested device".
+```bash
+codesign -d --entitlements - --xml "$APP" | plutil -p - | grep -i attest
+```
+
+### What is still unknown about the macOS path
+
+Two questions remain, both answerable by one `attestKey` call and parsing
+what comes back. Neither is answered here, and the macOS decision should not
+be made until they are:
+
+1. **What does `rpIdHash` contain on macOS?** The entitlement's value is
+   `CDhash`, which suggests attestation binds to the code directory hash
+   rather than `SHA256("<TeamID>.<BundleID>")`. If so, two things follow: the
+   server's `APP_ATTEST_APP_ID` comparison needs a macOS-specific form, and a
+   Mac-captured fixture is per-build rather than per-app — every rebuild
+   invalidates it.
+2. **Which aaguid does macOS emit?** Possibly `appattestsandbox` rather than
+   `appattest` / `appattestdevelop`. The verifier's environment check must
+   cover whatever it actually is.
+
+Until those are answered, the gate's guarantee must be stated as
+"registration from iOS requires an attested device", never as "registration
+requires an attested device". If the answers are favourable, macOS joins the
+guarantee; if `rpIdHash` turns out to be per-build, macOS needs a different
+app-identity check and the choice narrows to dropping macOS registration or
+leaving it ungated — the latter being the weakest option, since an ungated
+path is the path an attacker takes.
 
 ## Out of scope
 
