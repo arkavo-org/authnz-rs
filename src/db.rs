@@ -1402,14 +1402,6 @@ impl DynamoDBStore {
         }
     }
 
-    /// Reserve one registration slot for `key_id`, creating its rate-limit
-    /// row on first use.
-    ///
-    /// Two attempts total: the retry exists only to absorb a lost race
-    /// against a concurrent reservation for the *same* key (either the
-    /// first-ever create, or the conditional update below) -- a policy
-    /// refusal (window or lifetime budget exhausted) returns immediately
-    /// without retrying, since re-reading cannot change that answer.
     /// Read-only budget check for the pre-registration preflight.
     ///
     /// Advisory: it takes no slot. The slot is taken by
@@ -1430,6 +1422,14 @@ impl DynamoDBStore {
         }
     }
 
+    /// Reserve one registration slot for `key_id`, creating its rate-limit
+    /// row on first use.
+    ///
+    /// Two attempts total: the retry exists only to absorb a lost race
+    /// against a concurrent reservation for the *same* key (either the
+    /// first-ever create, or the conditional update below) -- a policy
+    /// refusal (window or lifetime budget exhausted) returns immediately
+    /// without retrying, since re-reading cannot change that answer.
     pub async fn reserve_attest_registration(
         &self,
         key_id: &str,
