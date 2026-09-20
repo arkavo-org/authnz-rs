@@ -2,7 +2,10 @@ use crate::AppState;
 use crate::authn::WebauthnError::{
     CorruptSession, InvalidSessionState, MissingToken, Unknown, UserHasNoCredentials, UserNotFound,
 };
-use crate::constants::{AUTH_TOKEN_HOURS, REGISTRATION_TOKEN_WEEKS};
+use crate::constants::{
+    AUTH_TOKEN_HOURS, ENROLLMENT_TOKEN_MAX_AGE_SECONDS, REGISTRATION_TOKEN_WEEKS,
+    RESERVED_USERNAME_PREFIXES,
+};
 use crate::db::DynamoDBError;
 use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderValue};
@@ -14,7 +17,7 @@ use axum::{
 };
 use ecdsa::Signature;
 use ecdsa::signature::Signer;
-use log::{error, info};
+use log::{error, info, warn};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,6 +60,17 @@ fn is_valid_username(username: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Is this username in the namespace reserved for IdP-provisioned rows?
+///
+/// See [`RESERVED_USERNAME_PREFIXES`] — those rows carry zero WebAuthn
+/// credentials, which would otherwise satisfy `start_register`'s
+/// zero-credential exemption.
+fn is_reserved_username(username: &str) -> bool {
+    RESERVED_USERNAME_PREFIXES
+        .iter()
+        .any(|prefix| username.starts_with(prefix))
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -74,6 +88,18 @@ pub async fn start_register(
             "must be 1-63 chars of [a-z0-9-] (lowercase) with no leading/trailing hyphen"
                 .to_string(),
         ));
+    }
+
+    // SECURITY: the `apple-` / `google-` namespace belongs to IdP-provisioned
+    // rows, which exist with zero WebAuthn credentials. Registering into it
+    // would hit the zero-credential exemption below and graft a passkey onto a
+    // federated account, so refuse before any lookup happens.
+    if is_reserved_username(&username) {
+        warn!(
+            "Rejected registration for reserved IdP username namespace: {}",
+            username
+        );
+        return Err(WebauthnError::ReservedUsername);
     }
 
     // Validate DID format
@@ -605,6 +631,10 @@ pub enum WebauthnError {
     AccountExistsAuthRequired,
     #[error("invalid username: {0}")]
     InvalidUsername(String),
+    #[error("username is reserved for federated identities")]
+    ReservedUsername,
+    #[error("authentication is too old; re-authenticate to add a passkey")]
+    StaleAuthentication,
 }
 
 impl IntoResponse for WebauthnError {
@@ -676,6 +706,15 @@ impl IntoResponse for WebauthnError {
                 StatusCode::BAD_REQUEST,
                 format!("Invalid username: {}", msg),
             ),
+            WebauthnError::ReservedUsername => (
+                StatusCode::FORBIDDEN,
+                "Username is reserved for federated identities".to_string(),
+            ),
+            WebauthnError::StaleAuthentication => (
+                StatusCode::UNAUTHORIZED,
+                "Authentication is too old; re-authenticate (POST /authenticate) to add a passkey"
+                    .to_string(),
+            ),
         };
         (status, body).into_response()
     }
@@ -706,6 +745,34 @@ mod tests {
         assert!(!is_valid_username("Alice")); // uppercase (ATProto handles are lowercase)
         assert!(!is_valid_username("aliceBob")); // uppercase
         assert!(!is_valid_username(&"a".repeat(64))); // too long
+    }
+
+    #[test]
+    fn test_reserved_username_namespace_is_rejected() {
+        // IdP-provisioned rows (`apple-<sub>` / `google-<sub>`) carry zero
+        // WebAuthn credentials, so registering into their namespace would hit
+        // the zero-credential exemption in `start_register` and graft a passkey
+        // onto a federated account.
+        assert!(is_reserved_username("google-110248495921238986420"));
+        assert!(is_reserved_username("apple-000123"));
+        assert!(is_reserved_username("google-"));
+
+        // Google subs are all-digits, so they clear the DNS-label validator —
+        // which is exactly why the prefix check has to exist.
+        assert!(is_valid_username("google-110248495921238986420"));
+
+        // Ordinary usernames are untouched, including ones that merely
+        // contain (but do not start with) a reserved word.
+        assert!(!is_reserved_username("alice"));
+        assert!(!is_reserved_username("googler"));
+        assert!(!is_reserved_username("not-google-me"));
+        assert!(!is_reserved_username("apple"));
+    }
+
+    #[test]
+    fn test_reserved_username_error_is_forbidden() {
+        let response = WebauthnError::ReservedUsername.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

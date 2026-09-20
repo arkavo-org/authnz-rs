@@ -160,3 +160,32 @@ pub const DEFAULT_USER_ENTITLEMENTS: &[&str] = &[
     "https://arkavo.ai/attr/action/value/execute",
     "https://arkavo.ai/attr/action/value/delegate",
 ];
+
+/// Username prefixes reserved for IdP-provisioned account rows.
+///
+/// SECURITY (load-bearing): `apple_signin::map_apple_user` and
+/// `google_signin::map_google_user` provision accounts as
+/// `apple-<sanitized_sub>` / `google-<sanitized_sub>` with an EMPTY
+/// credential list. `authn::start_register` waives its `X-Auth-Token`
+/// requirement for accounts that hold zero credentials (so an interrupted
+/// first registration can be retried), which would otherwise let anyone who
+/// knows the IdP `sub` — it is published as the OIDC `sub` in every
+/// `id_token` — enroll their own passkey onto a federated account and
+/// receive a registration token for it. These prefixes are therefore
+/// rejected outright as registration usernames.
+///
+/// If the synthetic-username scheme in `apple_signin.rs` / `google_signin.rs`
+/// ever changes, this list must change with it.
+pub const RESERVED_USERNAME_PREFIXES: &[&str] = &["apple-", "google-"];
+
+/// Maximum age (seconds) of the `X-Auth-Token` CWT accepted by
+/// `authn::start_register` when adding a passkey to an account that already
+/// has credentials.
+///
+/// SECURITY: enrollment is an account-takeover-grade operation, so it
+/// requires *fresh* proof of control rather than any still-valid bearer
+/// token — registration tokens live [`REGISTRATION_TOKEN_WEEKS`] (~99
+/// years). A token minted moments ago by `POST /authenticate` (which needs a
+/// WebAuthn ceremony against an existing passkey) passes; a long-lived
+/// registration token captured at any point in the past does not.
+pub const ENROLLMENT_TOKEN_MAX_AGE_SECONDS: i64 = 300;
