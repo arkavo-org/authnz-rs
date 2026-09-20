@@ -151,6 +151,17 @@ struct AttestationStatement {
     receipt: Option<Vec<u8>>,
 }
 
+/// Is `rp_id_hash` one of the configured app-id hashes?
+///
+/// Membership, not equality: more than one app registers users, so a single
+/// accepted value would refuse every other app with `AppIdMismatch`. Callers
+/// must treat an empty `expected` as "not configured" and decide separately
+/// whether that warns or refuses — this returns `false` for it, which is the
+/// safe answer but not the whole policy.
+pub fn app_id_is_accepted(rp_id_hash: &str, expected: &[String]) -> bool {
+    expected.iter().any(|e| rp_id_hash.eq_ignore_ascii_case(e))
+}
+
 /// Generate a challenge for attestation or assertion
 ///
 /// SECURITY: requires a CWT bound to `:username`, exactly as
@@ -266,19 +277,20 @@ pub async fn finish_attestation(
     // Unenforced, any App Attest-capable app — not just ours — can mint
     // bindings. Enforced only when `APP_ATTEST_APP_ID` is configured, so
     // deployments that have not set it keep today's behaviour and a warning.
-    match app_state.app_attest_app_id.as_deref() {
-        Some(expected) if !auth_data.rp_id_hash_str.eq_ignore_ascii_case(expected) => {
-            warn!(
-                "App Attest rpIdHash mismatch for key_id {}: got {}, expected {}",
-                request.key_id, auth_data.rp_id_hash_str, expected
-            );
-            return Err(DeviceCheckError::AppIdMismatch);
-        }
-        Some(_) => {}
-        None => warn!(
+    let expected_app_ids = app_state.app_attest_app_id.as_slice();
+    if expected_app_ids.is_empty() {
+        warn!(
             "APP_ATTEST_APP_ID is unset; accepting attestation with unverified rpIdHash {}",
             auth_data.rp_id_hash_str
-        ),
+        );
+    } else if !app_id_is_accepted(&auth_data.rp_id_hash_str, expected_app_ids) {
+        warn!(
+            "App Attest rpIdHash mismatch for key_id {}: got {}, expected one of [{}]",
+            request.key_id,
+            auth_data.rp_id_hash_str,
+            expected_app_ids.join(", ")
+        );
+        return Err(DeviceCheckError::AppIdMismatch);
     }
 
     // Calculate nonce: SHA256(authData || clientDataHash)
@@ -884,6 +896,32 @@ impl IntoResponse for DeviceCheckError {
 
 #[cfg(test)]
 mod tests {
+
+    use super::app_id_is_accepted;
+
+    #[test]
+    fn app_id_accepts_any_member_of_the_set() {
+        let set = vec!["aaa".to_string(), "bbb".to_string()];
+        assert!(app_id_is_accepted("aaa", &set));
+        assert!(
+            app_id_is_accepted("bbb", &set),
+            "the second app must not be refused; both register users"
+        );
+        assert!(!app_id_is_accepted("ccc", &set));
+    }
+
+    #[test]
+    fn app_id_comparison_is_case_insensitive() {
+        assert!(app_id_is_accepted("AAA", &["aaa".to_string()]));
+    }
+
+    #[test]
+    fn app_id_is_refused_when_the_set_is_empty() {
+        // Empty means "not configured". This returns false; the caller decides
+        // whether that warns (bound device path) or refuses (gate path).
+        assert!(!app_id_is_accepted("aaa", &[]));
+    }
+
     use super::*;
 
     #[test]

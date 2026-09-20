@@ -302,12 +302,34 @@ pub struct AppState {
     /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
     /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
     pub admin_client_ids: Arc<Vec<String>>,
-    /// Expected App Attest App ID hash (`APP_ATTEST_APP_ID`), hex-encoded
-    /// SHA-256 of "<TeamID>.<BundleID>". When set, `finish_attestation`
-    /// requires the attestation's `rpIdHash` to equal it, so only the Arkavo
-    /// app can create device bindings. None ⇒ the value is recorded on the
-    /// binding but not enforced (logged as a warning at attestation time).
-    pub app_attest_app_id: Arc<Option<String>>,
+    /// Expected App Attest App ID hashes (`APP_ATTEST_APP_ID`), each the
+    /// hex-encoded SHA-256 of "<TeamID>.<BundleID>", lower-cased.
+    ///
+    /// A **set**, because more than one app registers users: an attestation is
+    /// accepted when its `rpIdHash` matches any member. Parsed from a
+    /// comma-separated list — a single value is simply a one-element set.
+    /// Empty ⇒ unset: the value is recorded on the binding but not enforced
+    /// (logged as a warning at attestation time).
+    pub app_attest_app_id: Arc<Vec<String>>,
+}
+
+/// Parse `APP_ATTEST_APP_ID` into the set of accepted app-id hashes.
+///
+/// Comma-separated because more than one app registers users, and a gate that
+/// accepts only one of them refuses the others outright. Entries are trimmed
+/// and lower-cased (the comparison against `rpIdHash` is on lowercase hex) and
+/// blanks are dropped, so `"a,,b,"` is `["a", "b"]` and `""` is empty.
+///
+/// An empty result means unset — enforcement is off and attestation logs an
+/// unverified `rpIdHash` instead.
+pub fn parse_app_attest_app_ids(raw: Option<&str>) -> Vec<String> {
+    raw.map(|v| {
+        v.split(',')
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[tokio::main]
@@ -450,12 +472,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
-        app_attest_app_id: Arc::new(
-            env::var("APP_ATTEST_APP_ID")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .filter(|v| !v.is_empty()),
-        ),
+        app_attest_app_id: Arc::new(parse_app_attest_app_ids(
+            env::var("APP_ATTEST_APP_ID").ok().as_deref(),
+        )),
     };
 
     // Set up Redis Client using fred
@@ -1118,6 +1137,59 @@ enum LoadKeysError {
 
 #[cfg(test)]
 mod tests {
+
+    use super::parse_app_attest_app_ids;
+
+    #[test]
+    fn app_attest_app_id_parses_a_comma_separated_set() {
+        assert_eq!(
+            parse_app_attest_app_ids(Some("aaa,bbb")),
+            vec!["aaa".to_string(), "bbb".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_attest_app_id_single_value_is_a_one_element_set() {
+        // The pre-set behaviour must survive: deployments configuring one app
+        // keep working without touching their config.
+        assert_eq!(
+            parse_app_attest_app_ids(Some("  AAA  ")),
+            vec!["aaa".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_attest_app_id_trims_lowercases_and_drops_blanks() {
+        assert_eq!(
+            parse_app_attest_app_ids(Some(" AAA , ,bBb,, ")),
+            vec!["aaa".to_string(), "bbb".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_attest_app_id_unset_or_blank_is_empty() {
+        assert!(parse_app_attest_app_ids(None).is_empty());
+        assert!(parse_app_attest_app_ids(Some("")).is_empty());
+        assert!(parse_app_attest_app_ids(Some("  ,  , ")).is_empty());
+    }
+
+    #[test]
+    fn comma_separated_value_is_not_treated_as_one_string() {
+        // Regression for a configuration that took registration down: the old
+        // parser lower-cased the whole value and compared it whole, so
+        // "<64 hex>,<64 hex>" became one 129-char string that matched no
+        // rpIdHash at all. On the fail-closed gate path that refuses every
+        // attestation — and the deployment runbook instructed exactly this.
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let parsed = parse_app_attest_app_ids(Some(&format!("{a},{b}")));
+        assert_eq!(parsed, vec![a.clone(), b.clone()]);
+        assert!(
+            parsed.iter().all(|e| e.len() == 64),
+            "each entry must be one hash, never the joined string"
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -1403,7 +1475,7 @@ pub(crate) mod test_helpers {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
-            app_attest_app_id: Arc::new(None),
+            app_attest_app_id: Arc::new(Vec::new()),
         }
     }
 }
