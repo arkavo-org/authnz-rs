@@ -189,3 +189,12 @@ pub const RESERVED_USERNAME_PREFIXES: &[&str] = &["apple-", "google-"];
 /// WebAuthn ceremony against an existing passkey) passes; a long-lived
 /// registration token captured at any point in the past does not.
 pub const ENROLLMENT_TOKEN_MAX_AGE_SECONDS: i64 = 300;
+
+/// `error_description` marker returned when a federated sign-in presents an
+/// identity that is not linked to any Arkavo account.
+///
+/// The `error` code stays the standard OAuth2 `access_denied` so existing RP
+/// error handling keeps working; this marker is what lets a client tell
+/// "you have no account here, register a passkey and link" apart from "the
+/// user cancelled". Every refusal surface uses this exact string.
+pub const IDENTITY_NOT_LINKED: &str = "identity_not_linked";

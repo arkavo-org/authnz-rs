@@ -57,6 +57,7 @@ mod device_check;
 mod entities;
 mod entitlements;
 mod google_signin;
+mod identity;
 mod oidc;
 mod patreon;
 mod webvh;

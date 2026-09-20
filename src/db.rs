@@ -132,9 +132,37 @@ impl DynamoDBStore {
         default_entitlements: Vec<String>,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Client::new(&config);
+        Ok(Self::with_client(
+            Client::new(&config),
+            credentials_table,
+            handles_table,
+            device_bindings_table,
+            identity_links_table,
+            patreon_tokens_table,
+            agent_delegations_table,
+            default_entitlements,
+        ))
+    }
 
-        Ok(Self {
+    /// Build a store around an already-configured client.
+    ///
+    /// [`Self::new`] resolves its client from the ambient environment, which
+    /// tests cannot rely on: the suite runs in one process and several tests
+    /// mutate `AWS_ACCESS_KEY_ID` / `AWS_REGION`, and DynamoDB Local
+    /// partitions tables by credentials + region — so an env-derived client
+    /// sees a different, empty table namespace depending on test ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_client(
+        client: Client,
+        credentials_table: String,
+        handles_table: String,
+        device_bindings_table: String,
+        identity_links_table: String,
+        patreon_tokens_table: String,
+        agent_delegations_table: String,
+        default_entitlements: Vec<String>,
+    ) -> Self {
+        Self {
             client,
             credentials_table,
             handles_table,
@@ -143,7 +171,7 @@ impl DynamoDBStore {
             patreon_tokens_table,
             agent_delegations_table,
             default_entitlements,
-        })
+        }
     }
 
     fn map_get_item_err(
@@ -331,6 +359,38 @@ impl DynamoDBStore {
     ///
     /// Minimum-PII: only the join key is persisted. No email, display name,
     /// relay address, or other identity metadata is stored here.
+    /// Resolve a third-party identity to the Arkavo account it is linked to.
+    ///
+    /// This is the read side of [`Self::link_identity`] and the only way a
+    /// federated sign-in reaches an account: identities are linked to accounts
+    /// that already exist, never used to provision new ones.
+    pub async fn get_identity_link(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<Uuid>, DynamoDBError> {
+        let link_pk = format!("{}#{}", provider, subject);
+
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.identity_links_table)
+            .key("link_pk", AttributeValue::S(link_pk))
+            .send()
+            .await
+            .map_err(|e| self.map_get_item_err(&self.identity_links_table, e))?;
+
+        let Some(item) = result.item else {
+            return Ok(None);
+        };
+        let user_id = item
+            .get("user_id")
+            .ok_or_else(|| DynamoDBError::Internal("identity link has no user_id".into()))?
+            .as_s()
+            .map_err(|_| DynamoDBError::Internal("identity link user_id is not a string".into()))?;
+        Ok(Some(Uuid::parse_str(user_id)?))
+    }
+
     pub async fn link_identity(
         &self,
         user_id: Uuid,
@@ -1590,7 +1650,7 @@ fn log_subject_prefix(subject: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1777,6 +1837,99 @@ mod tests {
         assert_eq!(
             parsed.entitlements,
             vec!["https://arkavo.ai/attr/action/value/read".to_string()]
+        );
+    }
+
+    // ---- DynamoDB Local integration tests ----
+    //
+    // Skipped unless AWS_ENDPOINT_URL_DYNAMODB points at a DynamoDB Local (or
+    // equivalent) instance with the tables from
+    // `scripts/dynamodb-local-tables.sh` created. Same gating style as
+    // `tests/agent_flow.rs`: absent endpoint => the test returns early rather
+    // than failing, so `cargo test` stays green without Docker.
+    pub(crate) fn local_store() -> Option<DynamoDBStore> {
+        // Deliberately NOT `AWS_ENDPOINT_URL_DYNAMODB`: a test elsewhere in this
+        // binary sets that to a dead `http://127.0.0.1:1` to exercise failure
+        // handling, and the whole suite shares one process environment. This
+        // dedicated variable mirrors `AUTHNZ_TEST_BASE_URL` in
+        // `tests/agent_flow.rs` and nothing else touches it.
+        let endpoint = std::env::var("AUTHNZ_TEST_DYNAMODB_ENDPOINT").ok()?;
+        // Credentials and region are pinned, NOT read from the environment:
+        // other tests in this process mutate AWS_* vars, and DynamoDB Local
+        // keys its table namespace off them. These must match
+        // `scripts/dynamodb-local-tables.sh`, which creates the tables.
+        let conf = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "local",
+                "local",
+                None,
+                None,
+                "authnz-tests",
+            ))
+            .endpoint_url(endpoint)
+            .build();
+        Some(DynamoDBStore::with_client(
+            Client::from_conf(conf),
+            "credentials".into(),
+            "handles".into(),
+            "device_bindings".into(),
+            "identity_links".into(),
+            "patreon_tokens".into(),
+            "agent_delegations".into(),
+            vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()],
+        ))
+    }
+
+    #[tokio::test]
+    async fn get_identity_link_returns_the_linked_user() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let subject = format!("sub-{}", Uuid::new_v4());
+
+        store
+            .link_identity(user_id, "google", &subject)
+            .await
+            .expect("link write should succeed");
+
+        let resolved = store
+            .get_identity_link("google", &subject)
+            .await
+            .expect("link read should succeed");
+        assert_eq!(resolved, Some(user_id));
+    }
+
+    #[tokio::test]
+    async fn get_identity_link_is_absent_for_an_unlinked_subject() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let resolved = store
+            .get_identity_link("google", &format!("never-linked-{}", Uuid::new_v4()))
+            .await
+            .expect("link read should succeed");
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn get_identity_link_does_not_confuse_providers() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let subject = format!("shared-{}", Uuid::new_v4());
+        store
+            .link_identity(user_id, "google", &subject)
+            .await
+            .expect("link write should succeed");
+
+        // Same subject string under a different provider is a different link.
+        assert_eq!(
+            store.get_identity_link("apple", &subject).await.unwrap(),
+            None
         );
     }
 }

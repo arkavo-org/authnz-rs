@@ -50,7 +50,6 @@ use crate::constants::{
     GOOGLE_AUTHORIZE_URL, GOOGLE_HTTP_TIMEOUT_SECS, GOOGLE_ISSUERS, GOOGLE_JWKS_CACHE_TTL_SECONDS,
     GOOGLE_JWKS_URL, GOOGLE_PENDING_AUTHORIZE_TTL_SECONDS, GOOGLE_TOKEN_URL,
 };
-use crate::db::DynamoDBError;
 use crate::oidc::{
     AuthenticatedUser, AuthorizationCodeStore, AuthorizeRequest, complete_authorization,
     oidc_error_response, redirect_error_to_client,
@@ -65,7 +64,6 @@ use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -549,12 +547,6 @@ fn random_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn sha256_hex(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 /// Lower-case and trim an email address. Google addresses are
 /// case-insensitive, and downstream policy (the OpenTDF platform's recipient
 /// mapping) hashes the lower-cased address, so the CWT must carry the
@@ -563,44 +555,29 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-fn sanitize_for_username(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .take(128)
-        .collect()
-}
-
-/// Map verified Google claims to an Arkavo account, provisioning one on
-/// first sight. Keyed by Google `sub` (never by email).
-pub async fn map_google_user(
-    app_state: &AppState,
+/// Resolve verified Google claims to the Arkavo account they are linked to.
+///
+/// Link-only: an account is reached through its `identity_links` row, written
+/// by an authenticated `POST /oauth/google/link`. An unlinked `sub` is
+/// refused, never provisioned — see [`crate::identity`].
+pub async fn resolve_google_user(
+    db: &crate::db::DynamoDBStore,
     claims: &GoogleIdTokenClaims,
-) -> Result<AuthenticatedUser, DynamoDBError> {
-    // SECURITY: the `google-` prefix is load-bearing. These rows are created
-    // with an empty credential list, and `authn::is_reserved_username` relies on
-    // the prefix to keep `start_register`'s zero-credential exemption away from
-    // them. Changing this format requires changing
-    // `constants::RESERVED_USERNAME_PREFIXES` in the same commit.
-    let username = format!("google-{}", sanitize_for_username(&claims.sub));
-    let did = format!("did:key:google-{}", &sha256_hex(&claims.sub)[..32]);
-
-    let user = match app_state.db_store.get_user_by_name(&username).await? {
-        Some(existing) => existing,
-        None => {
-            info!("Provisioning Arkavo account for Google sub {}", claims.sub);
-            app_state.db_store.create_user(&username, &did).await?
-        }
-    };
+) -> Result<AuthenticatedUser, crate::identity::IdentityResolveError> {
+    let account = crate::identity::resolve_linked_account(db, "google", &claims.sub).await?;
 
     Ok(AuthenticatedUser {
-        subject: format!("google:{}", claims.sub),
-        arkavo_account_id: user.user_id.to_string(),
+        // The Arkavo UUID, not `google:<sub>`: one human has one account under
+        // link-only, so an RP must see one stable subject however they signed
+        // in. `idp` below still records which IdP was used.
+        subject: format!("arkavo:{}", account.user_id),
+        arkavo_account_id: account.user_id.to_string(),
         email: claims.email.as_deref().map(normalize_email),
         email_verified: claims.email_verified.as_ref().map(|v| v.as_bool()),
         name: claims.name.clone(),
         idp: "google".to_string(),
         roles: vec!["user".to_string()],
-        entitlements: user.entitlements.clone(),
+        entitlements: account.entitlements.clone(),
     })
 }
 
@@ -723,10 +700,15 @@ pub async fn google_callback_handler(
         }
     };
 
-    let user = match map_google_user(&app_state, &claims).await {
+    let user = match resolve_google_user(&app_state.db_store, &claims).await {
         Ok(u) => u,
+        Err(crate::identity::IdentityResolveError::NotLinked) => {
+            // Link-only: Google authenticated the user, but no Arkavo account
+            // is bound to this `sub`. Never provision one here.
+            return crate::oidc::identity_not_linked_redirect(&request.redirect_uri, rp_state);
+        }
         Err(e) => {
-            error!("Google user mapping failed: {}", e);
+            error!("Google user resolution failed: {}", e);
             return redirect_error_to_client(
                 &request.redirect_uri,
                 rp_state,
