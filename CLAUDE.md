@@ -376,7 +376,10 @@ aws dynamodb create-table \
 - `finish_attestation`: Calls `verify_attestation`, stores device binding
 - `generate_assertion_challenge`: Issues challenge for existing devices (requires CWT)
 - `finish_assertion`: Verifies assertion, enforces counter increment, issues CWT
-- CBOR attestation object parsing ("apple-appattest" format)
+- CBOR attestation object parsing ("apple-appattest" format). Apple sends **camelCase** keys
+  (`attStmt`, `authData`), so the deserialization structs carry
+  `#[serde(rename_all = "camelCase")]` — without it every genuine attestation fails at CBOR
+  decode with `missing field att_stmt`, before any verification runs.
 - Certificate chain validation to Apple's root CA
 - Nonce calculation: SHA256(authData || SHA256(clientData))
 - Monotonic counter enforcement for replay protection
