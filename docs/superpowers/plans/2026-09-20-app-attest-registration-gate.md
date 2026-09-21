@@ -148,7 +148,14 @@ Either way this converts an assumption into a fact before Tasks 5 and 6 rest on 
 
 > **Calibration.** 4a is verified against this repo's own code. **4b and 4c are from recall and must be checked against Apple's current documentation before anyone follows them literally** — the "Assessing fraud risk" page is JS-rendered and would not load, so field numbering, exact request framing, and whether a minimum interval exists between exchanges are the parts most likely to be wrong.
 
-- [ ] **Step 5: Settle the macOS binding question**
+- [x] **Step 5: Settle the macOS binding question** — **DONE 2026-09-20.**
+      `rpIdHash` = `ea2defc9…bc01` = `SHA256("M8GS7ZT95Y.com.arkavo.ArkavoCreator")`,
+      so binding is per App ID and **the macOS hole is closed**; a static
+      `APP_ATTEST_APP_ID` pins Creator. aaguid = `appattest` (production, not
+      sandbox — macOS has no `appattest-environment` entitlement, so there is no
+      sandbox to select). Tasks 2/3 must accept `appattest` from a Mac even for a
+      locally signed developer build, and must not assume macOS keys are
+      resettable. Recorded in the spec's "The macOS hole".
 
 Answers the spec's "macOS hole". Does **not** produce a fixture — `attestation.json` stays the iOS one.
 

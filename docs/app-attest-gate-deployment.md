@@ -160,13 +160,16 @@ release.
   closed when it is unset, so an unset value in production takes registration
   down — this is intentional; an unset value would otherwise admit an
   attestation from any App Attest-capable app.
-- The aaguid environment check accepts what your clients actually emit: a
-  shipped build emits `appattest`, a local developer build `appattestdevelop`.
-- Confirm the macOS answer. If a released Creator's `rpIdHash` does not equal
-  `ea2defc9…`, it is the CDhash — per-build, changing every Creator release,
-  and no static `APP_ATTEST_APP_ID` entry can pin it. In that case macOS must
-  be resolved (dropped, or given a different identity check) **before** this
-  deploy, not after.
+- The aaguid environment check accepts what your clients actually emit. On iOS
+  a shipped build emits `appattest` and a local developer build
+  `appattestdevelop`. **On macOS it is always `appattest`**, even for a locally
+  signed build — there is no `appattest-environment` entitlement there, so no
+  sandbox exists. A check that infers the environment from build type refuses
+  every Mac client.
+- ~~Confirm the macOS answer.~~ **Answered 2026-09-20:** Creator's `rpIdHash`
+  *is* `ea2defc9…`, i.e. `SHA256("<TeamID>.<BundleID>")`. Binding is per App ID,
+  not per build, so a static `APP_ATTEST_APP_ID` entry pins Creator and macOS is
+  gateable. Both hashes belong in the set.
 
 ### Deploy
 

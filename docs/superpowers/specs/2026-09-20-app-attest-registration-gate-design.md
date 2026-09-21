@@ -301,11 +301,46 @@ binary:
 codesign -d --entitlements - --xml "$APP" | plutil -p - | grep -i attest
 ```
 
-### What is still unknown about the macOS path
+### ANSWERED — the macOS hole is closed
 
-Two questions remain, both answerable by one `attestKey` call and parsing
-what comes back. Neither is answered here, and the macOS decision should not
-be made until they are.
+Captured from `com.arkavo.ArkavoCreator` on macOS, 2026-09-20. Both questions
+are settled, and both answers are favourable.
+
+**1. `rpIdHash` binds to the App ID, not the code directory hash.**
+
+```
+rpIdHash                                  = ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01
+SHA256("M8GS7ZT95Y.com.arkavo.ArkavoCreator") = ea2defc9e7bf14b832b0fb5e4ada8f0af0e114dca9fc7741cda17d875cf1bc01
+```
+
+The `CDhash` value on the `app-attest-opt-in` entitlement does **not** make
+attestations per-build. A static `APP_ATTEST_APP_ID` entry pins Creator exactly
+as it pins the iOS app, so macOS joins the guarantee and the three options
+below collapse to "do nothing special". The gate's guarantee may now be stated
+as covering registration, not only iOS registration.
+
+**2. macOS attests in the PRODUCTION environment — there is no sandbox.**
+
+```
+aaguid hex   = 61707061747465737400000000000000
+aaguid ascii = "appattest" + 7 bytes of zero padding
+```
+
+Not `appattestdevelop`, not `appattestsandbox`. This follows from there being
+no `appattest-environment` entitlement on macOS: without it there is no
+environment to select, so every Mac attestation is a production one.
+
+Two consequences, both for Tasks 2 and 3, which own the environment check the
+verifier does not yet have (`AuthenticatorData` currently parses only
+`rp_id_hash`, `flags` and `counter` — no aaguid at all):
+
+- The check must accept `appattest` from a Mac **even for a locally signed
+  developer build**. An implementation that maps "development build ⇒
+  `appattestdevelop`" refuses every Mac client.
+- Production App Attest keys carry per-device counts that **cannot be reset**,
+  unlike sandbox keys. Every macOS test attestation permanently consumes real
+  budget against that device, which matters for the attestation receipt's risk
+  metric (Task 0 Step 4) and for anyone iterating against a Mac build.
 
 > **These are now cheap to settle.** macOS attestation is confirmed working,
 > so both questions are a decode of bytes already in hand rather than a
@@ -336,9 +371,10 @@ guarantee. If it does not, it is the CDhash: **per-build**, changing with every
 Creator release, so no static `APP_ATTEST_APP_ID` entry can pin it and macOS
 needs a different app-identity check.
 
-Until those are answered, the gate's guarantee must be stated as
+~~Until those are answered, the gate's guarantee must be stated as
 "registration from iOS requires an attested device", never as "registration
-requires an attested device". If the answers are favourable, macOS joins the
+requires an attested device".~~ **Superseded:** `rpIdHash` binds per App ID on
+macOS, so both platforms are gateable and the guarantee covers registration. If the answers are favourable, macOS joins the
 guarantee; if `rpIdHash` turns out to be per-build, macOS needs a different
 app-identity check and the choice narrows to dropping macOS registration or
 leaving it ungated — the latter being the weakest option, since an ungated
