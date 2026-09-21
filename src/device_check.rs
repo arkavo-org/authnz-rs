@@ -1296,6 +1296,86 @@ mod tests {
         assert!(parsed.is_err(), "snake_case is not Apple's wire format");
     }
 
+    fn load_fixture() -> serde_json::Value {
+        let raw = std::fs::read_to_string("tests/fixtures/appattest/attestation.json")
+            .expect("Task 0 fixture missing: tests/fixtures/appattest/attestation.json");
+        serde_json::from_str(&raw).expect("fixture is not valid JSON")
+    }
+
+    /// The first test in this codebase to run a **genuine** Apple attestation
+    /// through the parser. Everything before it round-tripped hand-built
+    /// structs through the same field names, which is precisely the test that
+    /// cannot catch a wire-format mismatch — and did not, for the whole life
+    /// of this module.
+    #[test]
+    fn real_attestation_parses_and_matches_its_recorded_fields() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(f["attestation_object"].as_str().unwrap())
+            .unwrap();
+
+        let att: AttestationObject =
+            ciborium::from_reader(&bytes[..]).expect("a real attestation must deserialize");
+
+        assert_eq!(att.fmt, "apple-appattest");
+        assert_eq!(
+            att.att_stmt.x5c.len(),
+            2,
+            "leaf + Apple App Attestation CA 1"
+        );
+        assert!(
+            att.att_stmt.receipt.as_ref().is_some_and(|r| !r.is_empty()),
+            "the receipt is Task 0 Step 4's input and must survive parsing"
+        );
+
+        let auth = parse_authenticator_data(&att.auth_data).expect("authData must parse");
+        assert_eq!(
+            auth.rp_id_hash_str,
+            f["rp_id_hash"].as_str().unwrap(),
+            "rpIdHash must equal SHA256(TeamID.BundleID) — macOS binds per App ID"
+        );
+        assert_eq!(auth.counter, 0, "attestation counter is always 0");
+    }
+
+    #[test]
+    fn real_attestation_challenge_hashes_to_its_client_data_hash() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let want = base64::engine::general_purpose::STANDARD
+            .decode(f["client_data_hash"].as_str().unwrap())
+            .unwrap();
+        let got = Sha256::digest(f["challenge"].as_str().unwrap().as_bytes());
+        assert_eq!(got.as_slice(), want.as_slice());
+    }
+
+    #[test]
+    fn real_attestation_app_id_is_accepted_by_the_configured_set() {
+        // The macOS hash must pass app_id_is_accepted alongside the iOS one —
+        // both apps register users, so the set has to admit either.
+        let f = load_fixture();
+        let macos = f["app_id_hash"].as_str().unwrap().to_string();
+        let ios = "543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8".to_string();
+        let set = vec![ios, macos.clone()];
+        assert!(app_id_is_accepted(&macos, &set));
+    }
+
+    #[test]
+    fn fixture_verify_at_sits_inside_the_leaf_certificate_window() {
+        // The leaf is valid ~3 days. Task 3 checks the chain against verify_at
+        // rather than the wall clock, so if this drifts outside the window the
+        // suite starts failing on a date unrelated to any code change.
+        let f = load_fixture();
+        let at = f["verify_at"].as_i64().unwrap();
+        let nb = chrono::DateTime::parse_from_rfc3339(f["leaf_cert_not_before"].as_str().unwrap())
+            .unwrap()
+            .timestamp();
+        let na = chrono::DateTime::parse_from_rfc3339(f["leaf_cert_not_after"].as_str().unwrap())
+            .unwrap()
+            .timestamp();
+        assert!(nb <= at && at <= na, "verify_at {at} outside [{nb}, {na}]");
+    }
+
     #[test]
     fn ticket_expiry_is_enforced() {
         let now = 1_800_000_000i64;
