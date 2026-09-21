@@ -5,14 +5,22 @@
 **Plan:** `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md`
 **Wire contract:** `docs/app-attest-preflight-contract.md` (what the client codes against)
 
-## Do not deploy PR #66 on its own
+## Status
 
-PR #66 (`feat/app-attest-registration-gate`) adds a per-device registration
-budget to `src/db.rs` and nothing that calls it. There are no new routes, no
-ticket type, and no gate on `start_register` / `finish_register`. Deploying it
-changes no runtime behaviour, so it buys nothing and costs a restart.
+| Version | What it does to registration |
+|---|---|
+| ≤ v0.10.x | Open. Any well-formed WebAuthn ceremony registers. |
+| v0.11.0 – v0.11.2 | Still open. The preflight endpoints exist and issue tickets; `/register` ignores them. |
+| **v0.12.0** | **Enforcing.** `/register` requires a ticket. This is the one-way deploy. |
 
-Registration stays exactly as open as it is today until Tasks 1–7 land. Wait.
+Production is on **v0.11.0** at the time of writing, which is behind `main` in
+two ways that matter:
+
+- **v0.11.2 carries the camelCase CBOR fix.** Without it every genuine
+  attestation fails at decode with `missing field att_stmt`, so
+  `register-attest` cannot issue a ticket to anyone. Deploy it before
+  v0.12.0 or the gate is a lockout.
+- **v0.12.0 is the gate itself.** Read Phase 1 before deploying it.
 
 ## Host reality — read before either phase
 
@@ -132,13 +140,20 @@ at all after this deploy.
 
 So the deploy order is fixed, and it is the client that goes first:
 
-1. **ArkavoKit tags a release carrying the preflight** (`df3fa36`, currently on
-   the unmerged branch `feat/app-attest-registration-preflight`).
+1. **ArkavoKit tags a release carrying the preflight.** The code is merged
+   (`c2ef150`); confirm a *tag* exists, not just a merge — Creator resolves
+   against tags.
 2. **Arkavo and Arkavo Creator ship builds** resolved against that tag.
-3. **Only then** deploy the server with Tasks 1–7.
+3. **Only then** deploy the server at v0.12.0.
 
 Reversing 2 and 3 breaks registration for every user on a shipped build until
-they update.
+they update. Step 1 without step 2 is not enough: a tag nobody has shipped
+protects nobody.
+
+Deploy **v0.11.2 first** and leave it running long enough to see a real
+`register-attest` succeed. That proves the verifier parses what your clients
+actually send — which it could not do before the camelCase fix — while
+registration is still open and a failure is not an outage.
 
 ### Release-order hazard, both directions
 
@@ -155,6 +170,12 @@ release.
 
 ### Pre-flight checks
 
+- **A real client has completed `register-attest` against v0.11.2 and got a
+  200.** This is the check that matters most: it proves the whole verifier —
+  CBOR decode, nonce extension, certificate chain, app-id match — accepts what
+  your clients emit. Everything else on this list is configuration; this one is
+  evidence. Do not skip it because the tests pass, and do not run it for the
+  first time at v0.12.0, where a failure is an outage rather than a log line.
 - `prod-device-attest-keys` is `ACTIVE` (Phase 0 step 1)
 - `APP_ATTEST_APP_ID` is set and contains **both** hashes. The gate fails
   closed when it is unset, so an unset value in production takes registration
@@ -199,6 +220,12 @@ curl -si https://identity.arkavo.net/register/some-unused-handle | head -1
 
 Expect `200` on the first and `403` on the second. A `200` on the second means
 the gate is not engaged — roll back.
+
+Check the 403 body too, not just the status: it must name the preflight
+(`Device attestation required: call GET /device-check/register-challenge …`).
+A 403 reading "Username is reserved for federated identities" is the
+reserved-namespace refusal and says nothing about the gate — pick a handle
+that does not start with `apple-` or `google-`.
 
 Then register once from a real device build, end to end, and confirm a row
 appears:

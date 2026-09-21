@@ -529,7 +529,16 @@ keeps today's warn-and-continue on an unset APP_ATTEST_APP_ID."
 
 ---
 
-### Task 2: Validate the credCert nonce extension
+### Task 2: Validate the credCert nonce extension — **DONE** (v0.11.3)
+
+> Landed with Task 3 in one commit: both needed the same supplied-validity-instant
+> plumbing (`verify_attestation_at`, `validate_certificate_chain_at`), and splitting
+> them would have meant writing time-unstable tests and then rewriting them.
+> Implementation differs from Step 4 below: the extension is read with a strict
+> hand-rolled DER walk (`der_tlv`) rather than `parse_ber_*`, because BER's
+> permissiveness is not wanted here — an indefinite length in an attestation is a
+> malformed attestation. Errors map to 401, not the drafted 401-via-`IntoResponse`
+> only: `preflight_error_mapping` also groups them under `attestation_invalid`.
 
 Closes the gap the code documents at `src/device_check.rs:288-310`. Without it the attestation is not bound to the issued challenge, which is the whole replay property the gate depends on.
 
@@ -723,7 +732,11 @@ SHA256(authData || clientDataHash)."
 
 ---
 
-### Task 3: Complete the certificate chain validation
+### Task 3: Complete the certificate chain validation — **DONE** (v0.11.3)
+
+> As drafted, plus one extra test: a leaf+leaf chain that parses but does not reach
+> the pinned root. `validate_certificate_chain` was removed rather than kept as a
+> `now()` wrapper — `verify_attestation` is the single place the wall clock enters.
 
 Closes the second documented gap. Today `validate_certificate_chain` parses the leaf and the root, logs, and returns `Ok(())` without verifying a single signature.
 
@@ -1386,7 +1399,11 @@ what the gate exists to refuse."
 
 ---
 
-### Task 6: Gate registration on the ticket
+### Task 6: Gate registration on the ticket — **DONE** (v0.12.0)
+
+> The ticket read is shared between `start_register` and `finish_register` as
+> `require_registration_ticket`, so the two cannot drift. Drafting it twice inline
+> (Steps 4 and 5) invited exactly that.
 
 **Files:**
 - Modify: `src/authn.rs:90` area (`start_register`), and `finish_register`
@@ -1532,7 +1549,13 @@ The ticket is consumed in finish_register: one attestation, one account."
 
 ---
 
-### Task 7: End-to-end proof the gate holds
+### Task 7: End-to-end proof the gate holds — **DONE** (v0.12.0)
+
+> In `src/registration_gate_tests.rs`, not `tests/registration_gate.rs`: `AppState`
+> is bin-local by design (see `src/lib.rs`), and moving it into the library to suit
+> a test file's location would drag `db`, `patreon` and `device_check` with it.
+> Adds a test the draft did not have: the refusal must be **byte-identical** for a
+> handle that exists and one that does not, or `/register` is a handle oracle.
 
 The load-bearing test. A software authenticator must be able to complete the WebAuthn ceremony and still be refused, because that is exactly the attack.
 
@@ -1668,7 +1691,7 @@ caller, since the challenge response would otherwise confirm a handle."
 
 ---
 
-### Task 8: Client preflight in ArkavoKit
+### Task 8: Client preflight in ArkavoKit — **DONE** (ArkavoKit `c2ef150`, separate repo)
 
 **Repo:** `/Users/arkavo/Projects/ArkavoKit` — a separate repository. Branch and commit there, not in `authnz-rs`.
 
@@ -1839,9 +1862,10 @@ from a network blip."
 
 Not a task — the sequence the spec requires, to run once every task above has landed.
 
-- [ ] `APP_ATTEST_APP_ID` is set in every environment that serves registration. The gate fails closed without it, so an unset value takes registration down.
-- [ ] `device_attest_keys` table created in each environment.
-- [ ] `DYNAMODB_DEVICE_ATTEST_KEYS_TABLE` set, or the default `device_attest_keys` matches the created table.
+- [ ] **Deploy v0.11.2 (the camelCase fix) before v0.12.0, and see one real `register-attest` succeed on it.** Without the fix no genuine attestation decodes at all, so the gate would refuse everyone. Proving the verifier accepts real client bytes while registration is still open turns a potential outage into a log line.
+- [x] `device_attest_keys` table created — `prod-device-attest-keys`, ACTIVE, PK `key_id`, PAY_PER_REQUEST (2026-09-20).
+- [x] `DYNAMODB_DEVICE_ATTEST_KEYS_TABLE` staged in `production/start.sh`.
+- [ ] `APP_ATTEST_APP_ID` is set in every environment that serves registration, with **both** app-id hashes. The gate fails closed without it, so an unset value takes registration down. Staged in `production/start.sh`; not yet live — the running process has only the iOS hash.
 - [ ] If any ArkavoKit build is already in users' hands: deploy the endpoints first, release the app build, and only then flip enforcement. Enforcing on deploy kills registration for every shipped client, since none of them call App Attest.
 - [ ] If nothing is shipped yet: enforce from the first deploy.
 
