@@ -363,7 +363,8 @@ aws dynamodb create-table \
   Errors on these two routes are **JSON with a stable `error` token**, unlike the rest of
   `DeviceCheckError`, so a client can tell a permanent refusal (`attest_registration_cap`) from a
   retryable one. See [docs/app-attest-preflight-contract.md](docs/app-attest-preflight-contract.md).
-  **These do not gate registration** — `/register` ignores the ticket until Task 6.
+  **The ticket gates registration** (Task 6): `start_register` refuses without one and
+  `finish_register` consumes it, so one attestation buys exactly one account.
 - `generate_challenge`: Issues random challenge for attestation (**requires a
   CWT bound to `:username`** — App Attest proves the device is genuine, never
   which account it belongs to)
@@ -380,8 +381,14 @@ aws dynamodb create-table \
   (`attStmt`, `authData`), so the deserialization structs carry
   `#[serde(rename_all = "camelCase")]` — without it every genuine attestation fails at CBOR
   decode with `missing field att_stmt`, before any verification runs.
-- Certificate chain validation to Apple's root CA
-- Nonce calculation: SHA256(authData || SHA256(clientData))
+- Certificate chain validation: every signature from the leaf up to the pinned Apple
+  App Attest root is verified, validity windows are enforced, and a leaf-only chain is
+  refused (Apple always sends an intermediate). `validate_certificate_chain_at` takes the
+  validity instant so the fixture tests pin the capture time; **production always passes
+  `ASN1Time::now()`** — the parameter is not a way to disable expiry checking.
+- Nonce binding: `SHA256(authData || clientDataHash)` is compared against the credCert's
+  `1.2.840.113635.100.8.2` extension. This is what binds an attestation to the challenge
+  the server issued; without it a captured attestation replays against any later one.
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
 
@@ -395,6 +402,11 @@ aws dynamodb create-table \
 ### Key Data Flow
 
 1. **Registration Flow**:
+   - **Requires a verified App Attest registration ticket in the session**
+     (`GET /device-check/register-challenge` → `POST /device-check/register-attest`).
+     Checked before any lookup, so an unattested caller cannot probe which handles
+     exist (HTTP 403 otherwise). `finish_register` re-checks it, charges the
+     `device_attest_keys` budget, and removes it: one attestation, one account.
    - Client requests `/register/:username?handle=...&did=...`
    - Validates DID format and handle consistency
    - Rejects the `apple-` / `google-` username namespace (HTTP 403): those rows
@@ -703,15 +715,17 @@ When modifying token lifetimes, update these in authn.rs:
 ### Requirements
 - iOS 14+ with Secure Enclave support
 - Entitlement: `com.apple.developer.devicecheck.appattest-environment` (development or production)
+  on iOS/visionOS/tvOS; macOS grants `com.apple.developer.devicecheck.app-attest-opt-in`
+  instead and has **no sandbox** — every Mac attestation is a production one
 - Not available in iOS Simulator
 
 ### Known Limitations
-- Certificate chain validation is incomplete (TODO: implement full chain verification)
 - Re-attesting an existing `key_id` under the same account resets `counter` to
   0, which reopens a replay window for assertions captured before the
   re-attest (bindings can no longer be repointed to a *different* account —
   `create_device_binding` writes conditionally)
-- Does not validate certificate extension 1.2.840.113635.100.8.2 (nonce)
+- The per-`key_id` registration budget bounds a **key, not a device** — see the
+  `device_attest_keys` schema note. Admission control is the attestation itself.
 
 ### Integration with NTDF
 The device binding can be used as the NPE (non-person entity) device/app proof key, enabling:
