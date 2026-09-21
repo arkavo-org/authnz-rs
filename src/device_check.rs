@@ -136,8 +136,16 @@ pub struct AssertionResponse {
     pub token: String,
 }
 
-// CBOR structures for App Attest
+// CBOR structures for App Attest.
+//
+// Apple's attestation object uses camelCase keys — `attStmt`, `authData` —
+// per the WebAuthn attestation-object format App Attest follows. Without the
+// rename these fields never match and ciborium fails with
+// `missing field att_stmt` on every genuine attestation, so nothing Apple
+// produces could ever be parsed. `fmt`, `x5c` and `receipt` are unaffected,
+// having no case difference.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AttestationObject {
     fmt: String,
     att_stmt: AttestationStatement,
@@ -145,6 +153,7 @@ struct AttestationObject {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct AttestationStatement {
     x5c: Vec<Vec<u8>>,
@@ -1247,6 +1256,44 @@ mod tests {
             v["challenge"].as_str().is_some_and(|c| !c.is_empty()),
             "challenge must be present and non-empty"
         );
+    }
+
+    /// Regression: Apple sends camelCase keys, so the snake_case struct
+    /// matched nothing and every genuine attestation died at CBOR decode with
+    /// `missing field att_stmt` — long before any verification ran. The bug
+    /// survived because no test ever fed the parser Apple's actual shape, and
+    /// the only caller (the bound-device path) had no clients.
+    #[test]
+    fn attestation_object_parses_apples_camelcase_keys() {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("o2NmbXRvYXBwbGUtYXBwYXR0ZXN0Z2F0dFN0bXSiY3g1Y4JIbGVhZmNlcnRMaW50ZXJtZWRpYXRlZ3JlY2VpcHRMcmVjZWlwdGJ5dGVzaGF1dGhEYXRhWDnqLe/J578UuDKw+15K2o8K8OEU3Kn8d0HNoX2HXPG8AUAAAAAAYXBwYXR0ZXN0AAAAAAAAAHRhaWw=")
+            .unwrap();
+        let att: AttestationObject = ciborium::from_reader(&bytes[..])
+            .expect("Apple's camelCase attestation object must deserialize");
+        assert_eq!(att.fmt, "apple-appattest");
+        assert_eq!(att.att_stmt.x5c.len(), 2, "x5c must survive the rename");
+        assert!(
+            att.att_stmt.receipt.is_some(),
+            "receipt is Task 0 Step 4's input"
+        );
+        assert!(
+            !att.auth_data.is_empty(),
+            "authData must survive the rename"
+        );
+    }
+
+    #[test]
+    fn attestation_object_rejects_snake_case_keys() {
+        // Pins the direction of the fix: the shape the old struct expected is
+        // not a shape Apple produces, so accepting it would mean the rename
+        // had been applied the wrong way round.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("o2NmbXRvYXBwbGUtYXBwYXR0ZXN0aGF0dF9zdG10omN4NWOBSGxlYWZjZXJ0Z3JlY2VpcHRBcmlhdXRoX2RhdGFYOeot78nnvxS4MrD7Xkrajwrw4RTcqfx3Qc2hfYdc8bwBQAAAAABhcHBhdHRlc3QAAAAAAAAAdGFpbA==")
+            .unwrap();
+        let parsed: Result<AttestationObject, _> = ciborium::from_reader(&bytes[..]);
+        assert!(parsed.is_err(), "snake_case is not Apple's wire format");
     }
 
     #[test]
