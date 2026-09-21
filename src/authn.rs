@@ -92,7 +92,7 @@ const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600
 /// Shared by `start_register` and `finish_register` so the two cannot drift:
 /// a gate checked only at the start would admit a ceremony begun with a valid
 /// ticket and finished long after it expired.
-async fn require_registration_ticket(
+pub(crate) async fn require_registration_ticket(
     session: &Session,
 ) -> Result<crate::device_check::RegistrationTicket, WebauthnError> {
     let ticket: crate::device_check::RegistrationTicket = session

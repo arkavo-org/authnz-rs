@@ -60,6 +60,8 @@ mod google_signin;
 mod identity;
 mod oidc;
 mod patreon;
+#[cfg(test)]
+mod registration_gate_tests;
 mod webvh;
 
 // HTTP/3 server function (feature-gated)
