@@ -136,8 +136,16 @@ pub struct AssertionResponse {
     pub token: String,
 }
 
-// CBOR structures for App Attest
+// CBOR structures for App Attest.
+//
+// Apple's attestation object uses camelCase keys — `attStmt`, `authData` —
+// per the WebAuthn attestation-object format App Attest follows. Without the
+// rename these fields never match and ciborium fails with
+// `missing field att_stmt` on every genuine attestation, so nothing Apple
+// produces could ever be parsed. `fmt`, `x5c` and `receipt` are unaffected,
+// having no case difference.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AttestationObject {
     fmt: String,
     att_stmt: AttestationStatement,
@@ -145,6 +153,7 @@ struct AttestationObject {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct AttestationStatement {
     x5c: Vec<Vec<u8>>,
@@ -1247,6 +1256,124 @@ mod tests {
             v["challenge"].as_str().is_some_and(|c| !c.is_empty()),
             "challenge must be present and non-empty"
         );
+    }
+
+    /// Regression: Apple sends camelCase keys, so the snake_case struct
+    /// matched nothing and every genuine attestation died at CBOR decode with
+    /// `missing field att_stmt` — long before any verification ran. The bug
+    /// survived because no test ever fed the parser Apple's actual shape, and
+    /// the only caller (the bound-device path) had no clients.
+    #[test]
+    fn attestation_object_parses_apples_camelcase_keys() {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("o2NmbXRvYXBwbGUtYXBwYXR0ZXN0Z2F0dFN0bXSiY3g1Y4JIbGVhZmNlcnRMaW50ZXJtZWRpYXRlZ3JlY2VpcHRMcmVjZWlwdGJ5dGVzaGF1dGhEYXRhWDnqLe/J578UuDKw+15K2o8K8OEU3Kn8d0HNoX2HXPG8AUAAAAAAYXBwYXR0ZXN0AAAAAAAAAHRhaWw=")
+            .unwrap();
+        let att: AttestationObject = ciborium::from_reader(&bytes[..])
+            .expect("Apple's camelCase attestation object must deserialize");
+        assert_eq!(att.fmt, "apple-appattest");
+        assert_eq!(att.att_stmt.x5c.len(), 2, "x5c must survive the rename");
+        assert!(
+            att.att_stmt.receipt.is_some(),
+            "receipt is Task 0 Step 4's input"
+        );
+        assert!(
+            !att.auth_data.is_empty(),
+            "authData must survive the rename"
+        );
+    }
+
+    #[test]
+    fn attestation_object_rejects_snake_case_keys() {
+        // Pins the direction of the fix: the shape the old struct expected is
+        // not a shape Apple produces, so accepting it would mean the rename
+        // had been applied the wrong way round.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("o2NmbXRvYXBwbGUtYXBwYXR0ZXN0aGF0dF9zdG10omN4NWOBSGxlYWZjZXJ0Z3JlY2VpcHRBcmlhdXRoX2RhdGFYOeot78nnvxS4MrD7Xkrajwrw4RTcqfx3Qc2hfYdc8bwBQAAAAABhcHBhdHRlc3QAAAAAAAAAdGFpbA==")
+            .unwrap();
+        let parsed: Result<AttestationObject, _> = ciborium::from_reader(&bytes[..]);
+        assert!(parsed.is_err(), "snake_case is not Apple's wire format");
+    }
+
+    fn load_fixture() -> serde_json::Value {
+        let raw = std::fs::read_to_string("tests/fixtures/appattest/attestation.json")
+            .expect("Task 0 fixture missing: tests/fixtures/appattest/attestation.json");
+        serde_json::from_str(&raw).expect("fixture is not valid JSON")
+    }
+
+    /// The first test in this codebase to run a **genuine** Apple attestation
+    /// through the parser. Everything before it round-tripped hand-built
+    /// structs through the same field names, which is precisely the test that
+    /// cannot catch a wire-format mismatch — and did not, for the whole life
+    /// of this module.
+    #[test]
+    fn real_attestation_parses_and_matches_its_recorded_fields() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(f["attestation_object"].as_str().unwrap())
+            .unwrap();
+
+        let att: AttestationObject =
+            ciborium::from_reader(&bytes[..]).expect("a real attestation must deserialize");
+
+        assert_eq!(att.fmt, "apple-appattest");
+        assert_eq!(
+            att.att_stmt.x5c.len(),
+            2,
+            "leaf + Apple App Attestation CA 1"
+        );
+        assert!(
+            att.att_stmt.receipt.as_ref().is_some_and(|r| !r.is_empty()),
+            "the receipt is Task 0 Step 4's input and must survive parsing"
+        );
+
+        let auth = parse_authenticator_data(&att.auth_data).expect("authData must parse");
+        assert_eq!(
+            auth.rp_id_hash_str,
+            f["rp_id_hash"].as_str().unwrap(),
+            "rpIdHash must equal SHA256(TeamID.BundleID) — macOS binds per App ID"
+        );
+        assert_eq!(auth.counter, 0, "attestation counter is always 0");
+    }
+
+    #[test]
+    fn real_attestation_challenge_hashes_to_its_client_data_hash() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let want = base64::engine::general_purpose::STANDARD
+            .decode(f["client_data_hash"].as_str().unwrap())
+            .unwrap();
+        let got = Sha256::digest(f["challenge"].as_str().unwrap().as_bytes());
+        assert_eq!(got.as_slice(), want.as_slice());
+    }
+
+    #[test]
+    fn real_attestation_app_id_is_accepted_by_the_configured_set() {
+        // The macOS hash must pass app_id_is_accepted alongside the iOS one —
+        // both apps register users, so the set has to admit either.
+        let f = load_fixture();
+        let macos = f["app_id_hash"].as_str().unwrap().to_string();
+        let ios = "543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8".to_string();
+        let set = vec![ios, macos.clone()];
+        assert!(app_id_is_accepted(&macos, &set));
+    }
+
+    #[test]
+    fn fixture_verify_at_sits_inside_the_leaf_certificate_window() {
+        // The leaf is valid ~3 days. Task 3 checks the chain against verify_at
+        // rather than the wall clock, so if this drifts outside the window the
+        // suite starts failing on a date unrelated to any code change.
+        let f = load_fixture();
+        let at = f["verify_at"].as_i64().unwrap();
+        let nb = chrono::DateTime::parse_from_rfc3339(f["leaf_cert_not_before"].as_str().unwrap())
+            .unwrap()
+            .timestamp();
+        let na = chrono::DateTime::parse_from_rfc3339(f["leaf_cert_not_after"].as_str().unwrap())
+            .unwrap()
+            .timestamp();
+        assert!(nb <= at && at <= na, "verify_at {at} outside [{nb}, {na}]");
     }
 
     #[test]
