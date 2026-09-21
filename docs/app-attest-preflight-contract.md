@@ -1,17 +1,17 @@
 # App Attest registration preflight — wire contract
 
-**Status: specified, not implemented.** `POST /device-check/register-challenge` and
-`/device-check/register-attest` return **404** today. This document pins the wire format so
-ArkavoKit can code against exact values instead of guessing, and so Task 5 has one definition to
-implement rather than inventing one at the keyboard.
+**Status: implemented and enforcing.** `GET /device-check/register-challenge` and
+`POST /device-check/register-attest` exist (Task 5, v0.11.0), and `/register` **requires** the
+ticket they issue (Task 6, v0.12.0). The wire format below is what the server does, not what it
+intends to do.
 
-**Audience:** ArkavoKit, and whoever implements Task 5.
-**Plan:** `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md` (Task 5)
+**Audience:** ArkavoKit, and anyone else registering users against this server.
+**Plan:** `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md` (Tasks 5 and 6)
 **Runbook:** `docs/app-attest-gate-deployment.md`
 
-> **This contract is the client's dependency, not the gate.** Task 5 makes these endpoints exist
-> and issue a ticket. **Task 6** is what makes `/register` *require* one. They ship separately and
-> Task 5 may land first — see "What this does not do".
+> **The deploy is one-way for clients.** A build that does not run this preflight cannot register
+> once the enforcing version is live — there is no shadow mode. Sequence the client release
+> first; see the runbook.
 
 ---
 
@@ -123,25 +123,32 @@ field, never on the status alone.
 
 ---
 
-## What this does not do
+## What a 200 from `register-attest` now means
 
-Task 5 alone changes **nothing** about who may register. `/register` does not check for a ticket
-until **Task 6**. In between:
+The ticket lives in the session for **300 seconds** and is spent by exactly one `/register`
+ceremony. Consequences a client must handle:
 
-- These endpoints exist and issue tickets.
-- Registration remains exactly as open as it is today.
-- A 200 from `register-attest` is **not** evidence that registration is protected.
+- **`GET /register/:username` answers 403** (`Device attestation required: …`) with no ticket, or
+  with an expired one. It is checked before any database lookup, so the refusal is identical for
+  a handle that exists and one that does not — do not read a 403 as "this handle is free".
+- **The ticket must outlive the ceremony.** `POST /register` re-checks it. A user who leaves the
+  passkey sheet open for more than 300s gets a 403 at the end; re-run the preflight and the
+  ceremony together, not the ceremony alone.
+- **One ticket, one account.** It is removed at `finish_register`, so a second registration needs
+  a second attestation — and `attestKey` is once-per-key, so that means a fresh `key_id`.
+- **A 403 at finish can also mean the budget was spent** by a concurrent registration between
+  attest and finish. The remedy is the same: attest again. The `registrationCapExceeded` path
+  already handles it.
 
-That gap is deliberate — it unblocks client integration without shipping a gate whose verifier is
-still missing the hardening in Tasks 1–3. Do not read it as the gate being live, and do not set
-`APP_ATTEST_APP_ID` in production on the strength of Task 5 landing.
+`APP_ATTEST_APP_ID` is now **mandatory in production**: unset, `register-attest` answers
+`app_id_not_configured` (503) and nobody can register at all.
 
 ## Open, and not settled by this document
 
-- **Whether macOS can be gated at all.** If Creator's `rpIdHash` is a CDhash it is per-build and no
-  static `APP_ATTEST_APP_ID` entry pins it. Since all apps share this host and the gate is
-  server-side on `/register`, the outcomes are: macOS registration stops, or a path is exempted and
-  the gate provides no admission control at all. There is no third option. Decide before Task 6.
+- ~~**Whether macOS can be gated at all.**~~ **Settled 2026-09-20.** Creator's `rpIdHash` is
+  `SHA256("M8GS7ZT95Y.com.arkavo.ArkavoCreator")`, not a CDhash: binding is per App ID, so a static
+  `APP_ATTEST_APP_ID` entry pins it and both platforms are gateable. Both hashes must be in the
+  set — a single value would refuse the other app outright.
 - **Whether the per-key budget means anything.** `attestKey` is once-per-key, so a client mints a
   fresh `key_id` per attestation and never meets the limit. `attest_rate_limited` and
   `attest_registration_cap` are therefore near-unreachable through the normal client path today.

@@ -17,7 +17,7 @@ use axum::{
 };
 use ecdsa::Signature;
 use ecdsa::signature::Signer;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use p256::NistP256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -87,6 +87,30 @@ fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
 /// would be the same test.
 const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
 
+/// Read and validate the session's App Attest registration ticket.
+///
+/// Shared by `start_register` and `finish_register` so the two cannot drift:
+/// a gate checked only at the start would admit a ceremony begun with a valid
+/// ticket and finished long after it expired.
+async fn require_registration_ticket(
+    session: &Session,
+) -> Result<crate::device_check::RegistrationTicket, WebauthnError> {
+    let ticket: crate::device_check::RegistrationTicket = session
+        .get(crate::device_check::SESSION_REG_TICKET_KEY)
+        .await
+        .map_err(WebauthnError::InvalidSessionState)?
+        .ok_or(WebauthnError::AttestationRequired)?;
+
+    if !crate::device_check::ticket_is_valid(&ticket, chrono::Utc::now().timestamp()) {
+        warn!(
+            "Registration ticket for key {} expired at {}",
+            ticket.key_id, ticket.expires_at
+        );
+        return Err(WebauthnError::AttestationRequired);
+    }
+    Ok(ticket)
+}
+
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -117,6 +141,22 @@ pub async fn start_register(
         );
         return Err(WebauthnError::ReservedUsername);
     }
+
+    // ADMISSION CONTROL: registration requires a verified App Attest ticket.
+    //
+    // This is the change that closes open registration. A software WebAuthn
+    // authenticator (soft-webauthn, Chrome's virtual authenticator) produces a
+    // ceremony indistinguishable from a real one, so nothing downstream can
+    // tell it apart — the only thing that can is hardware attestation, which
+    // happened before this request.
+    //
+    // Checked before any DB lookup so an unattested caller learns nothing
+    // about which handles exist: the refusal must not depend on the username.
+    let ticket = require_registration_ticket(&session).await?;
+    debug!(
+        "Registration admitted for attested key {} (ticket expires {})",
+        ticket.key_id, ticket.expires_at
+    );
 
     // Validate DID format
     if !params.did.starts_with("did:key:") {
@@ -280,6 +320,49 @@ pub async fn finish_register(
                 "WebAuthn registration successful for user: {}. Adding credential to database...",
                 username
             );
+
+            // Re-check the ticket. start_register only proves the ceremony
+            // *began* under a valid one; without this a session could hold a
+            // ceremony open past the ticket's expiry.
+            let ticket = require_registration_ticket(&session).await?;
+
+            // Charge the registration budget here, not at attest time: the
+            // slot pays for an account that is about to exist. A client that
+            // attests and then abandons the ceremony costs nothing, so three
+            // flaky attempts cannot lock a genuine user out for a day.
+            //
+            // The preflight already refused an exhausted key, so a refusal
+            // here means the budget was spent by a concurrent registration in
+            // between. 403 is the honest answer and the client's existing
+            // registrationCapExceeded path handles it; a distinct code is not
+            // worth a new client release.
+            if let Err(e) = app_state
+                .db_store
+                .reserve_attest_registration(&ticket.key_id)
+                .await
+            {
+                return Err(match e {
+                    DynamoDBError::RateLimited { .. }
+                    | DynamoDBError::AttestLifetimeCapExceeded => {
+                        warn!(
+                            "Registration budget exhausted for key {} between attest and finish",
+                            ticket.key_id
+                        );
+                        WebauthnError::AttestationRequired
+                    }
+                    other => WebauthnError::DynamoDBOperationError(Box::new(other)),
+                });
+            }
+
+            // One ticket, one account. Removed before the credential is
+            // written so a replayed finish_register cannot mint a second.
+            if let Err(e) = session
+                .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
+                .await
+            {
+                error!("Failed to remove registration ticket from session: {}", e);
+                return Err(WebauthnError::SessionError(e.to_string()));
+            }
 
             // Store the credential in DynamoDB
             match app_state
@@ -664,6 +747,14 @@ pub enum WebauthnError {
     ReservedUsername,
     #[error("authentication is too old; re-authenticate to add a passkey")]
     StaleAuthentication,
+    /// No valid App Attest registration ticket in the session.
+    ///
+    /// Covers both "never attested" and "attested too long ago", deliberately:
+    /// distinguishing them would tell an unattested caller something about
+    /// server state, and the client's remedy is identical either way — run the
+    /// preflight again.
+    #[error("device attestation required before registration")]
+    AttestationRequired,
 }
 
 impl IntoResponse for WebauthnError {
@@ -742,6 +833,15 @@ impl IntoResponse for WebauthnError {
             WebauthnError::StaleAuthentication => (
                 StatusCode::UNAUTHORIZED,
                 "Authentication is too old; re-authenticate (POST /authenticate) to add a passkey"
+                    .to_string(),
+            ),
+            // 403, not 401: no credential the caller could present on this
+            // request would change the answer. The remedy is the preflight,
+            // not a token.
+            WebauthnError::AttestationRequired => (
+                StatusCode::FORBIDDEN,
+                "Device attestation required: call GET /device-check/register-challenge then \
+                 POST /device-check/register-attest before registering"
                     .to_string(),
             ),
         };
@@ -1162,5 +1262,104 @@ mod tests {
         assert!(claims.custom.arkavo_roles.is_none());
         assert!(claims.custom.arkavo_entitlements.is_none());
         assert!(claims.custom.arkavo_patreon.is_none());
+    }
+
+    /// A detached session backed by an empty in-memory store.
+    fn empty_session() -> tower_sessions::Session {
+        tower_sessions::Session::new(
+            None,
+            std::sync::Arc::new(tower_sessions::MemoryStore::default()),
+            None,
+        )
+    }
+
+    #[test]
+    fn attestation_required_maps_to_forbidden() {
+        // 403, not 401: no token the caller could attach would change this.
+        // The client's remedy is the attest preflight, and the status is what
+        // tells it so.
+        let response = WebauthnError::AttestationRequired.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn attestation_required_is_not_confusable_with_the_other_refusals() {
+        // ReservedUsername is also 403, but it names a username. A client must
+        // not treat "this handle is reserved" as "attest again", so the bodies
+        // have to differ even though the statuses match.
+        let a = WebauthnError::AttestationRequired.into_response();
+        let b = WebauthnError::ReservedUsername.into_response();
+        assert_eq!(a.status(), b.status());
+        assert_ne!(
+            format!("{}", WebauthnError::AttestationRequired),
+            format!("{}", WebauthnError::ReservedUsername)
+        );
+    }
+
+    #[test]
+    fn an_expired_ticket_does_not_admit() {
+        use crate::device_check::{RegistrationTicket, ticket_is_valid};
+        let now = 1_800_000_000i64;
+        let stale = RegistrationTicket {
+            key_id: "k".into(),
+            issued_at: now - 600,
+            expires_at: now - 300,
+        };
+        assert!(!ticket_is_valid(&stale, now));
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_ticket_is_refused() {
+        let session = empty_session();
+
+        let err = require_registration_ticket(&session).await.unwrap_err();
+        assert!(matches!(err, WebauthnError::AttestationRequired));
+    }
+
+    #[tokio::test]
+    async fn a_session_holding_an_expired_ticket_is_refused() {
+        use crate::device_check::{RegistrationTicket, SESSION_REG_TICKET_KEY};
+        let session = empty_session();
+
+        let now = chrono::Utc::now().timestamp();
+        session
+            .insert(
+                SESSION_REG_TICKET_KEY,
+                RegistrationTicket {
+                    key_id: "spent".into(),
+                    issued_at: now - 3600,
+                    expires_at: now - 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = require_registration_ticket(&session).await.unwrap_err();
+        assert!(
+            matches!(err, WebauthnError::AttestationRequired),
+            "a ceremony must not outlive its ticket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_ticket_is_returned() {
+        use crate::device_check::{RegistrationTicket, SESSION_REG_TICKET_KEY};
+        let session = empty_session();
+
+        let now = chrono::Utc::now().timestamp();
+        session
+            .insert(
+                SESSION_REG_TICKET_KEY,
+                RegistrationTicket {
+                    key_id: "live".into(),
+                    issued_at: now,
+                    expires_at: now + 300,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ticket = require_registration_ticket(&session).await.unwrap();
+        assert_eq!(ticket.key_id, "live");
     }
 }

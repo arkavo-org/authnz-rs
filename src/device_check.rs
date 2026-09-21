@@ -363,9 +363,9 @@ pub struct RegistrationTicket {
     pub expires_at: i64,
 }
 
-/// Spent by Task 6, which is the change that makes `/register` require a
-/// ticket. Defined here with the type it validates so the two cannot drift.
-#[allow(dead_code)]
+/// Spent by `authn::require_registration_ticket`, which is what makes
+/// `/register` require a ticket. Defined here with the type it validates so
+/// the two cannot drift.
 pub fn ticket_is_valid(ticket: &RegistrationTicket, now: i64) -> bool {
     now <= ticket.expires_at
 }
