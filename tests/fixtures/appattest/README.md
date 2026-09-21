@@ -48,14 +48,29 @@ code change, which is how people learn to ignore a red suite.
 `fixture_verify_at_sits_inside_the_leaf_certificate_window` guards the
 invariant.
 
+## The receipt has its own clock
+
+`attStmt.receipt` (3982 bytes) expires **2026-12-20**, not with the leaf on
+2026-09-23. They are separate objects with separate lifetimes, and conflating
+them makes the receipt exchange look perishable when it is not.
+`receipt-exchange.md` records what it carries and what the exchange is still
+waiting on. Decode it with:
+
+```bash
+python3 scripts/appattest-receipt.py decode
+```
+
 ## What it does and does not prove
 
 It proves the attestation object **parses** and that its recorded fields are
 self-consistent — which is what caught the `attStmt`/`att_stmt` mismatch that
 made every genuine attestation fail at CBOR decode.
 
-It does not yet exercise nonce-extension validation or full chain verification.
-Those are Tasks 2 and 3, and they load this file.
+It also proves the nonce extension (`1.2.840.113635.100.8.2`) matches
+`SHA256(authData || clientDataHash)` and that the chain verifies to the pinned
+Apple root — Tasks 2 and 3, which load this file. The tamper tests mutate it
+and require a refusal, so the fixture carries both the positive and the
+negative case.
 
 ## Privacy
 
