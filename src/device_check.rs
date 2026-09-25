@@ -1517,7 +1517,7 @@ mod tests {
             .decode(f["client_data_hash"].as_str().unwrap())
             .unwrap();
         let got = Sha256::digest(f["challenge"].as_str().unwrap().as_bytes());
-        assert_eq!(got.as_slice(), want.as_slice());
+        assert_eq!(&got[..], want.as_slice());
     }
 
     #[test]
