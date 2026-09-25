@@ -199,8 +199,10 @@ pub struct VerifyOptions<'a> {
 /// `require_app_id: false` and an unset `expected_app_ids` still warns and
 /// continues. The gate passes `true`, where an unset value is refused.
 ///
-/// The nonce extension (Task 2) and the full certificate chain (Task 3) are
-/// verified here. The remaining documented gap — `counter` resetting to 0 when
+/// The nonce extension (Task 2), the full certificate chain (Task 3), the
+/// aaguid, and the binding of `key_id` to the attested key are verified here.
+/// The app-id relaxation above is the only behaviour that differs by path;
+/// the aaguid and key_id checks refuse on both. The remaining documented gap — `counter` resetting to 0 when
 /// an existing `key_id` re-attests — is a property of the bound-device
 /// assertion path, not of this function.
 pub fn verify_attestation(
@@ -306,6 +308,33 @@ pub fn verify_attestation_at(
             expected_app_ids.join(", ")
         );
         return Err(DeviceCheckError::AppIdMismatch);
+    }
+
+    // SECURITY: bind the claimed key_id to the key Apple actually attested.
+    //
+    // key_id is caller-supplied and keys the registration budget. Without
+    // this, one genuine attestation could be presented under any key_id, and
+    // the per-key budget would bound nothing. Apple defines key_id as
+    // SHA256 of the credCert's public key, and authData's credentialId as
+    // that same hash. The key_id string must be its canonical (padded
+    // standard base64) encoding so one key cannot own two budget rows.
+    //
+    // Runs before the nonce compare: every tamper here also changes the
+    // nonce, and a check shadowed by NonceMismatch is a check nobody can test.
+    let credential = parse_attested_credential(&attestation.auth_data)?;
+    if !ACCEPTED_AAGUIDS.contains(&credential.aaguid) {
+        return Err(DeviceCheckError::InvalidAaguid(hex::encode(
+            credential.aaguid,
+        )));
+    }
+    let key_hash = attested_key_hash(&attestation.att_stmt.x5c[0])?;
+    let canonical_key_id = base64::engine::general_purpose::STANDARD.encode(key_hash);
+    if key_id != canonical_key_id || credential.credential_id != key_hash.as_slice() {
+        warn!(
+            "App Attest key_id mismatch: claimed {}, attested key is {}",
+            key_id, canonical_key_id
+        );
+        return Err(DeviceCheckError::KeyIdMismatch);
     }
 
     // Calculate nonce: SHA256(authData || clientDataHash)
@@ -425,6 +454,8 @@ pub fn preflight_error_mapping(err: &DeviceCheckError) -> (StatusCode, &'static 
         | DeviceCheckError::InvalidCertificateChain(_)
         | DeviceCheckError::NonceExtensionMissing
         | DeviceCheckError::NonceMismatch
+        | DeviceCheckError::KeyIdMismatch
+        | DeviceCheckError::InvalidAaguid(_)
         | DeviceCheckError::InvalidAuthenticatorData(_)
         | DeviceCheckError::InvalidCounter(_)
         | DeviceCheckError::InvalidClientData(_)
@@ -1006,6 +1037,63 @@ struct AuthenticatorData {
     counter: u32,
 }
 
+/// The two App Attest environments. iOS release builds emit `appattest` and
+/// developer builds `appattestdevelop`; macOS always emits `appattest`, even
+/// for a locally signed build. `rpIdHash` already pins Team + Bundle ID, so a
+/// development key still needs our signing identity — the check exists to
+/// refuse anything that is not App Attest at all.
+const ACCEPTED_AAGUIDS: [[u8; 16]; 2] = [*b"appattest\0\0\0\0\0\0\0", *b"appattestdevelop"];
+
+/// authData's attested credential data, present only in an attestation.
+struct AttestedCredential<'a> {
+    aaguid: [u8; 16],
+    credential_id: &'a [u8],
+}
+
+/// Read aaguid and credentialId from attestation authData.
+///
+/// Separate from [`parse_authenticator_data`] because the assertion path parses
+/// 37-byte authData that has no attested credential data.
+///
+/// Layout after the 37-byte header: aaguid (16), credentialId length (2, BE),
+/// credentialId.
+fn parse_attested_credential(data: &[u8]) -> Result<AttestedCredential<'_>, DeviceCheckError> {
+    let bad = |m: &str| DeviceCheckError::InvalidAuthenticatorData(m.to_string());
+    let aaguid: [u8; 16] = data
+        .get(37..53)
+        .ok_or_else(|| bad("attestation authData has no attested credential data"))?
+        .try_into()
+        .expect("slice is 16 bytes");
+    let len_bytes = data
+        .get(53..55)
+        .ok_or_else(|| bad("attestation authData is missing the credentialId length"))?;
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let credential_id = data
+        .get(55..55 + len)
+        .ok_or_else(|| bad("credentialId runs past the end of authData"))?;
+    Ok(AttestedCredential {
+        aaguid,
+        credential_id,
+    })
+}
+
+/// SHA256 of the credCert's public key as an X9.62 uncompressed point.
+///
+/// This is Apple's key identifier. It is the 65-byte point, not the DER
+/// SubjectPublicKeyInfo that [`extract_public_key_from_cert`] returns.
+fn attested_key_hash(cert_der: &[u8]) -> Result<[u8; 32], DeviceCheckError> {
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
+    let point = &cert.public_key().subject_public_key.data;
+    if point.len() != 65 || point[0] != 0x04 {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "credCert key is not an uncompressed P-256 point ({} bytes)",
+            point.len()
+        )));
+    }
+    Ok(Sha256::digest(point).into())
+}
+
 fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, DeviceCheckError> {
     if data.len() < 37 {
         return Err(DeviceCheckError::InvalidAuthenticatorData(
@@ -1260,6 +1348,15 @@ pub enum DeviceCheckError {
     #[error("Attestation nonce does not match the issued challenge")]
     NonceMismatch,
 
+    /// The claimed `key_id` is not the attested key: it is not
+    /// `SHA256(publicKey)`, or authData's `credentialId` disagrees with it.
+    #[error("key_id does not identify the attested key")]
+    KeyIdMismatch,
+
+    /// authData's aaguid is neither App Attest environment.
+    #[error("Invalid App Attest aaguid: {0}")]
+    InvalidAaguid(String),
+
     #[error("App ID mismatch")]
     AppIdMismatch,
 
@@ -1307,6 +1404,14 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::NonceMismatch => (
                 StatusCode::UNAUTHORIZED,
                 "Attestation nonce does not match the issued challenge".to_string(),
+            ),
+            DeviceCheckError::KeyIdMismatch => (
+                StatusCode::UNAUTHORIZED,
+                "key_id does not identify the attested key".to_string(),
+            ),
+            DeviceCheckError::InvalidAaguid(err) => (
+                StatusCode::UNAUTHORIZED,
+                format!("Invalid App Attest aaguid: {}", err),
             ),
             // 503, deliberately not 403: the server cannot decide, which is an
             // operator problem and is retryable. A 403 here would be
@@ -2293,6 +2398,134 @@ mod tests {
             let (status, token, _) = preflight_error_mapping(&e);
             assert_eq!(token, "attestation_invalid");
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // key_id binding and aaguid
+    //
+    // Tampers land in authData bytes 37..87, which also changes the computed
+    // nonce. These checks therefore have to run *before* the nonce compare, or
+    // every one of these tests would pass on NonceMismatch and prove nothing.
+    // -----------------------------------------------------------------------
+
+    /// Run the fixture through the verifier with `att` and `key_id` swapped in.
+    fn verify_modified(
+        f: &serde_json::Value,
+        att: &AttestationObject,
+        key_id: &str,
+    ) -> Result<AttestedKey, DeviceCheckError> {
+        use base64::Engine as _;
+        let mut encoded = Vec::new();
+        ciborium::into_writer(att, &mut encoded).unwrap();
+        let app_id = f["app_id_hash"].as_str().unwrap().to_string();
+        verify_attestation_at(
+            f["challenge"].as_str().unwrap(),
+            key_id,
+            &base64::engine::general_purpose::STANDARD.encode(&encoded),
+            f["client_data_hash"].as_str().unwrap(),
+            &VerifyOptions {
+                expected_app_ids: std::slice::from_ref(&app_id),
+                require_app_id: true,
+            },
+            fixture_instant(f),
+        )
+    }
+
+    #[test]
+    fn a_key_id_that_is_not_the_attested_key_is_refused() {
+        // key_id names the budget row and, on the bound path, the device
+        // binding. Accepted unbound, a genuine attestation could be filed
+        // under a key_id the caller does not hold — someone else's — charging
+        // or squatting a row it has no claim to.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let err =
+            verify_modified(&f, &att, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_key_id_encoding_is_refused() {
+        // Same 32 bytes, padding stripped. Accepting both spellings would give
+        // one device two budget rows.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let unpadded = f["key_id"].as_str().unwrap().trim_end_matches('=');
+        let err = verify_modified(&f, &att, unpadded).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_id_that_disagrees_with_key_id_is_refused() {
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        // credentialId: 2-byte length at 53..55, then 32 bytes.
+        att.auth_data[55..87].fill(0);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_aaguid_is_refused() {
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data[37..53].fill(0);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAaguid(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_development_aaguid_is_accepted() {
+        // iOS developer builds emit `appattestdevelop`. There is no second
+        // fixture, so prove acceptance by the refusal moving on: the swapped
+        // aaguid breaks the nonce, and that must be what refuses it.
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data[37..53].copy_from_slice(b"appattestdevelop");
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::NonceMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn authdata_without_attested_credential_data_is_refused() {
+        // 37 bytes is a valid *assertion* authData, but an attestation must
+        // carry aaguid and credentialId.
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data.truncate(37);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAuthenticatorData(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn key_binding_errors_are_401_and_retryable_on_the_preflight() {
+        for e in [
+            DeviceCheckError::KeyIdMismatch,
+            DeviceCheckError::InvalidAaguid("x".into()),
+        ] {
+            let (status, token, _) = preflight_error_mapping(&e);
+            assert_eq!(token, "attestation_invalid", "{e:?}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{e:?}");
+            assert_eq!(e.into_response().status(), StatusCode::UNAUTHORIZED);
         }
     }
 

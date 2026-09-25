@@ -186,7 +186,9 @@ release.
   `appattestdevelop`. **On macOS it is always `appattest`**, even for a locally
   signed build — there is no `appattest-environment` entitlement there, so no
   sandbox exists. A check that infers the environment from build type refuses
-  every Mac client.
+  every Mac client. **As built, the verifier accepts exactly those two values
+  on every server** and refuses anything else, so this item needs no action —
+  it is here so nobody "tightens" it into an environment check.
 - ~~Confirm the macOS answer.~~ **Answered 2026-09-20:** Creator's `rpIdHash`
   *is* `ea2defc9…`, i.e. `SHA256("<TeamID>.<BundleID>")`. Binding is per App ID,
   not per build, so a static `APP_ATTEST_APP_ID` entry pins Creator and macOS is

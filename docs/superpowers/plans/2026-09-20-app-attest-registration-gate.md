@@ -203,7 +203,7 @@ else:           print('=> MATCHES NEITHER  -- do not conclude; suspect wrong bun
 
 That third branch is the point of comparing against both. Concluding "it's the CDhash" from non-equality alone lets one fat-fingered input close the macOS hole in the wrong direction — and this decision is meant to be the one made *before* the enforcing deploy.
 
-Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since Task 1's verifier checks it. The value is NUL-padded to 16 bytes, so the hex is printed alongside the text form — trailing `00`s are padding, not part of the value.
+Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since the verifier checks it. (Task 1 as landed did not — see the Self-Review note below.) The value is NUL-padded to 16 bytes, so the hex is printed alongside the text form — trailing `00`s are padding, not part of the value.
 
 - [ ] **Step 6: Write the README**
 
@@ -1872,6 +1872,8 @@ Not a task — the sequence the spec requires, to run once every task above has 
 ## Self-Review
 
 **Spec coverage.** Gate placement → Tasks 5, 6. Ticket mechanism → Task 5. Shared verifier → Task 1. The three verification gaps → Tasks 2 (nonce ext), 3 (chain), and the counter-reset gap, which Task 3's refusal of a leaf-only chain does not address — it is bounded instead by Task 4's registration budget, since each completed registration consumes a slot. Mandatory `APP_ATTEST_APP_ID` → Tasks 1, 5. Rate policy → Task 4. Client → Task 8. Error handling → Tasks 5 (429), 6 (403), 8 (three distinct Swift errors). soft-webauthn test → Task 7. Deployment → checklist above.
+
+**Checks Task 1 missed (found in review of #80).** The spec's "confirm present" list — aaguid, counter = 0, `key_id == SHA256(publicKey)` — was one-third present: only the counter. The aaguid and key_id/credentialId checks were added in #80, before the nonce compare so a tamper test can reach them. See the spec's status note under that list for the accepted aaguid values and why they are not environment-selected.
 
 **Type consistency.** `AttestedKey`, `VerifyOptions`, `verify_attestation` defined in Task 1 and used unchanged in Tasks 2 and 5. `RegistrationTicket`, `ticket_is_valid`, `SESSION_REG_TICKET_KEY` defined in Task 5 and used unchanged in Tasks 6 and 7. `AttestKeyRecord` gains `window_base` in Task 4 Step 1 and carries it through Step 4. `AppAttesting` defined and consumed within Task 8.
 

@@ -389,6 +389,14 @@ aws dynamodb create-table \
 - Nonce binding: `SHA256(authData || clientDataHash)` is compared against the credCert's
   `1.2.840.113635.100.8.2` extension. This is what binds an attestation to the challenge
   the server issued; without it a captured attestation replays against any later one.
+- Key binding: the caller-supplied `key_id` must be exactly the padded standard base64 of
+  SHA256 of the credCert's **uncompressed EC point** (not the DER SPKI), and authData's
+  `credentialId` must equal that hash. `key_id` keys the registration budget and the device
+  binding, so an unbound one would let a genuine attestation be filed under any key.
+- aaguid must be `appattest` or `appattestdevelop` on every server — not environment-selected,
+  since macOS emits `appattest` even from a dev build and `rpIdHash` already pins the app.
+  These checks run **before** the nonce compare: any tamper to them also breaks the nonce, and
+  a check shadowed by `NonceMismatch` cannot be tested.
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
 
@@ -470,6 +478,8 @@ aws dynamodb create-table \
        - CBOR format is "apple-appattest"
        - Certificate chain anchors to Apple's root CA
        - `rpIdHash` equals `APP_ATTEST_APP_ID` when that env var is set
+       - aaguid is `appattest` or `appattestdevelop`
+       - `key_id` and authData `credentialId` both equal SHA256(credCert public key)
        - Nonce = SHA256(authData || clientDataHash)
        - Counter is 0 (initial attestation)
      - Server stores device binding: device_id, public_key, counter=0, user_id
