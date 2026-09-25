@@ -1255,7 +1255,7 @@ impl DynamoDBStore {
         })
     }
 
-    async fn get_attest_key_record(
+    pub(crate) async fn get_attest_key_record(
         &self,
         key_id: &str,
     ) -> Result<Option<AttestKeyRecord>, DynamoDBError> {

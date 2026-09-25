@@ -1556,6 +1556,18 @@ The ticket is consumed in finish_register: one attestation, one account."
 > a test file's location would drag `db`, `patreon` and `device_check` with it.
 > Adds a test the draft did not have: the refusal must be **byte-identical** for a
 > handle that exists and one that does not, or `/register` is a handle oracle.
+>
+> **Correction (found in review of #80).** As first landed, Task 7 had no
+> authenticator at all and never called `POST /register`, so nothing covered the
+> finish side. It now drives `webauthn-authenticator-rs` `SoftPasskey` through
+> the whole ceremony against DynamoDB Local: a ticketed ceremony registers,
+> charges one slot and consumes the ticket; a ticket expiring mid-ceremony, a
+> replayed finish, and a budget spent between attest and finish are each
+> refused with no credential stored. These skip without
+> `AUTHNZ_TEST_DYNAMODB_ENDPOINT`, which CI's `test` job sets. Each was checked
+> by removing the guard it covers and watching it fail. The unticketed case
+> stays start-side: without a ticket there are no creation options for an
+> authenticator to answer.
 
 The load-bearing test. A software authenticator must be able to complete the WebAuthn ceremony and still be refused, because that is exactly the attack.
 

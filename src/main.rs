@@ -1406,6 +1406,29 @@ pub(crate) mod test_helpers {
     /// so signatures are reproducible. Requires AWS env vars to be set
     /// (fake values are fine) before calling, as DynamoDBStore::new is async.
     pub async fn build_test_app_state() -> AppState {
+        let db_store = Arc::new(
+            crate::db::DynamoDBStore::new(
+                "credentials".to_string(),
+                "handles".to_string(),
+                "device_bindings".to_string(),
+                "identity_links".to_string(),
+                "patreon_tokens".to_string(),
+                "agent_delegations".to_string(),
+                "device_attest_keys".to_string(),
+                crate::constants::DEFAULT_USER_ENTITLEMENTS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            )
+            .await
+            .unwrap(),
+        );
+        build_test_app_state_with_store(db_store)
+    }
+
+    /// As [`build_test_app_state`], over a caller-supplied store — normally
+    /// `crate::db::tests::local_store()`, for tests that need real writes.
+    pub fn build_test_app_state_with_store(db_store: Arc<crate::db::DynamoDBStore>) -> AppState {
         use base64::Engine;
         use p256::pkcs8::EncodePrivateKey;
 
@@ -1450,24 +1473,6 @@ pub(crate) mod test_helpers {
             )
             .unwrap()
             .build()
-            .unwrap(),
-        );
-
-        let db_store = Arc::new(
-            crate::db::DynamoDBStore::new(
-                "credentials".to_string(),
-                "handles".to_string(),
-                "device_bindings".to_string(),
-                "identity_links".to_string(),
-                "patreon_tokens".to_string(),
-                "agent_delegations".to_string(),
-                "device_attest_keys".to_string(),
-                crate::constants::DEFAULT_USER_ENTITLEMENTS
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect(),
-            )
-            .await
             .unwrap(),
         );
 
