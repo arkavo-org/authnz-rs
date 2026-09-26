@@ -3705,6 +3705,13 @@ mod tests {
             .map(|(_, v)| v.into_owned())
     }
 
+    fn redirect_error_description(resp: &Response) -> Option<String> {
+        let loc = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        loc.query_pairs()
+            .find(|(k, _)| k == "error_description")
+            .map(|(_, v)| v.into_owned())
+    }
+
     #[tokio::test]
     async fn authorize_refuses_agents_delegate_for_unlisted_or_federated_clients() {
         unsafe {
@@ -3712,16 +3719,36 @@ mod tests {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
         }
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = Arc::new(store);
         // test_helpers allowlists only "arkavo-edge".
-        let app_state = crate::test_helpers::build_test_app_state().await;
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
         let codes = AuthorizationCodeStore::new(test_redis());
 
-        // An RP that is not on AGENT_DELEGATE_CLIENT_IDS cannot obtain the scope.
+        // An RP that is not on AGENT_DELEGATE_CLIENT_IDS cannot obtain the
+        // scope, even over a genuine passkey sign-in: idp is unset (so the
+        // federated-idp check can't be what refuses it) and the credential
+        // is a real 1-hour auth CWT (so resolve_user succeeds and auth_time
+        // is set). Only the allowlist check can produce this refusal.
+        let user = store
+            .create_user(
+                &format!("ul-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                "did:key:z6Mkunlisted",
+            )
+            .await
+            .unwrap();
+        let auth = crate::authn::mint_auth_token(&app_state, &user.user_id, None, None).unwrap();
         let mut unlisted = closurekb_authorize_query();
         unlisted.scope = Some("openid agents:delegate".into());
-        // build_test_app_state has no platform audience, so drop `resource`
-        // or check_resource answers invalid_target before the scope check.
+        unlisted.idp = None;
+        // build_test_app_state_with_store has no platform audience, so drop
+        // `resource` or check_resource answers invalid_target before the
+        // scope check.
         unlisted.resource = None;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", auth.parse().unwrap());
         let resp = authorize(
             Extension(app_state.clone()),
             Extension(closurekb_oidc_config()),
@@ -3732,11 +3759,15 @@ mod tests {
                 std::time::Duration::from_secs(1),
             ))),
             Extension(codes.clone()),
-            HeaderMap::new(),
+            headers,
             Query(unlisted),
         )
         .await;
         assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
+        assert_eq!(
+            redirect_error_description(&resp).as_deref(),
+            Some("agents:delegate is not available to this client")
+        );
 
         // The allowlisted client still cannot get it through Google.
         let mut google = edge_delegate_query();
