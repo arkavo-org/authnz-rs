@@ -895,14 +895,14 @@ mod tests {
     #[test]
     fn agent_token_config_from_env_strings() {
         let cfg = AgentTokenConfig::parse(
-            Some("https://platform.arkavo.net, https://kas.arkavo.net".into()),
+            Some("https://platform.arkavo.net, https://kg.arkavo.net".into()),
             Some("https://kg.arkavo.net".into()),
             Some("60".into()),
         )
         .unwrap();
         assert_eq!(
             cfg.audiences,
-            vec!["https://platform.arkavo.net", "https://kas.arkavo.net"]
+            vec!["https://platform.arkavo.net", "https://kg.arkavo.net"]
         );
         assert_eq!(cfg.authorized_actors, vec!["https://kg.arkavo.net"]);
         assert_eq!(cfg.minutes, 15, "values above the cap clamp to 15");
