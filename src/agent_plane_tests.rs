@@ -869,3 +869,64 @@ async fn a_legacy_delegation_cannot_mint() {
     p.store.create_agent_delegation(&legacy).await.unwrap();
     assert_eq!(p.mint(&a).await.0, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn the_token_stage_also_refuses_a_did_that_is_not_current() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a3) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // a3 holds a delegation naming "fleet", but the workload is bound to a1,
+    // not a3. Write a challenge straight into storage — bypassing
+    // GET /agents/challenge, whose own `eligible_workload` call would also
+    // catch this — so only the token-stage check in `issue_agent_token` is
+    // exercised.
+    let stray = crate::db::workloads_test_support::delegation(
+        &did_key(&a3),
+        owner,
+        Some(workload_id_for(&owner, "fleet")),
+    );
+    p.store.create_agent_delegation(&stray).await.unwrap();
+
+    let mut challenge_bytes = [0u8; 32];
+    getrandom::getrandom(&mut challenge_bytes).unwrap();
+    let challenge = base64::engine::general_purpose::STANDARD.encode(challenge_bytes);
+    let nonce = Uuid::new_v4().to_string();
+    p.store
+        .put_agent_challenge(&did_key(&a3), &challenge, &nonce, Utc::now().timestamp())
+        .await
+        .unwrap();
+    let sig =
+        base64::engine::general_purpose::STANDARD.encode(a3.sign(&challenge_bytes).to_bytes());
+
+    let (st, body) = p
+        .send(
+            Request::post("/agents/token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "did": did_key(&a3),
+                        "challenge": challenge,
+                        "signature": sig,
+                        "nonce": nonce,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        (st, body),
+        (
+            StatusCode::FORBIDDEN,
+            json!("Forbidden: agent DID is not the workload's current binding")
+        )
+    );
+}

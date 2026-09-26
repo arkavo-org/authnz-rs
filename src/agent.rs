@@ -861,10 +861,10 @@ pub(crate) fn agent_cwt_claims(
     workload: &AgentWorkload,
 ) -> Result<cwt::ArkavoClaims, AgentError> {
     let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
-    // Structural cap (independent of AGENT_TOKEN_MINUTES_MAX, which bounds
-    // config parsing, not what a single mint may hand out): a short_lived
-    // delegation never outlives AGENT_SHORT_LIVED_TOKEN_MINUTES, whatever the
-    // configured minutes are.
+    // The 15-minute cap is applied in `ArkavoClaims::agent` itself, on every
+    // mint; this code only adds the 5-minute cap for short_lived, so it never
+    // outlives AGENT_SHORT_LIVED_TOKEN_MINUTES whatever the configured
+    // minutes are.
     let minutes = if delegation.short_lived {
         cfg.minutes.min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
     } else {
@@ -1264,6 +1264,20 @@ mod tests {
             life(&cfg(3), &d),
             180,
             "a shorter configured lifetime still wins"
+        );
+        // `cfg(60)` is built directly, bypassing `AgentTokenConfig::parse`'s
+        // own clamp to AGENT_TOKEN_MINUTES_MAX: this exercises the cap that
+        // `cwt::ArkavoClaims::agent` applies on every mint, not the one
+        // `parse` applies to config at startup.
+        assert_eq!(
+            life(&cfg(60), &sample_delegation(TEST_DID)),
+            900,
+            "the mint path itself caps at 15 minutes, not just config parsing"
+        );
+        assert_eq!(
+            life(&cfg(60), &d),
+            300,
+            "short_lived still wins over an oversized config minutes"
         );
     }
 
