@@ -76,6 +76,16 @@ pub struct CustomClaims {
     pub arkavo_patreon: Option<ArkavoPatreon>,
     pub act: Option<Vec<Actor>>,
     pub arkavo_npe: Option<ArkavoNpe>,
+    /// Workload the agent token is bound to (agent CWTs only). The KAS
+    /// matches it against the workload status it fetches.
+    pub arkavo_workload: Option<String>,
+    /// SwarmKit `kit_id` the agent's delegation is bound to (agent CWTs
+    /// only). Omitted (not `Some("")`) when the workload has no swarm.
+    pub arkavo_swarm: Option<String>,
+    /// Space-separated OAuth scopes granted to an OIDC access token.
+    pub scope: Option<String>,
+    /// Unix time of the WebAuthn assertion behind an OIDC access token.
+    pub auth_time: Option<i64>,
 }
 
 /// The Arkavo custom claims derived from one user record, shared by every
@@ -288,6 +298,31 @@ impl ArkavoClaims {
 
     pub fn with_arkavo_patreon(mut self, p: ArkavoPatreon) -> Self {
         self.custom.arkavo_patreon = Some(p);
+        self
+    }
+
+    pub fn with_arkavo_workload(mut self, workload_id: &str) -> Self {
+        self.custom.arkavo_workload = Some(workload_id.into());
+        self
+    }
+
+    /// Separate from the workload: a workload has no swarm until its agent is
+    /// specialized into a kit, so an empty value omits the claim entirely
+    /// rather than round-tripping as `Some("")`.
+    pub fn with_arkavo_swarm(mut self, swarm: &str) -> Self {
+        if !swarm.is_empty() {
+            self.custom.arkavo_swarm = Some(swarm.into());
+        }
+        self
+    }
+
+    pub fn with_scope(mut self, scope: &str) -> Self {
+        self.custom.scope = Some(scope.into());
+        self
+    }
+
+    pub fn with_auth_time(mut self, auth_time: i64) -> Self {
+        self.custom.auth_time = Some(auth_time);
         self
     }
 
@@ -554,6 +589,21 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
             ));
         }
         entries.push((Value::Text("arkavo_npe".into()), Value::Map(m)));
+    }
+    if let Some(v) = &c.custom.arkavo_workload {
+        entries.push((
+            Value::Text("arkavo_workload".into()),
+            Value::Text(v.clone()),
+        ));
+    }
+    if let Some(v) = &c.custom.arkavo_swarm {
+        entries.push((Value::Text("arkavo_swarm".into()), Value::Text(v.clone())));
+    }
+    if let Some(v) = &c.custom.scope {
+        entries.push((Value::Text("scope".into()), Value::Text(v.clone())));
+    }
+    if let Some(v) = c.custom.auth_time {
+        entries.push((Value::Text("auth_time".into()), Value::Integer(v.into())));
     }
 
     let mut bytes = Vec::new();
@@ -934,6 +984,21 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 custom.arkavo_npe = Some(n);
             }
             (Value::Text(s), _) if s == "arkavo_npe" => return Err(CwtError::Malformed),
+            (Value::Text(s), Value::Text(t)) if s == "arkavo_workload" => {
+                custom.arkavo_workload = Some(t)
+            }
+            (Value::Text(s), _) if s == "arkavo_workload" => return Err(CwtError::Malformed),
+            (Value::Text(s), Value::Text(t)) if s == "arkavo_swarm" => {
+                custom.arkavo_swarm = Some(t)
+            }
+            (Value::Text(s), _) if s == "arkavo_swarm" => return Err(CwtError::Malformed),
+            (Value::Text(s), Value::Text(t)) if s == "scope" => custom.scope = Some(t),
+            (Value::Text(s), _) if s == "scope" => return Err(CwtError::Malformed),
+            (Value::Text(s), Value::Integer(n)) if s == "auth_time" => {
+                custom.auth_time =
+                    Some(i64::try_from(i128::from(n)).map_err(|_| CwtError::Malformed)?)
+            }
+            (Value::Text(s), _) if s == "auth_time" => return Err(CwtError::Malformed),
             _ => {} // Ignore unknown claims (forward-compat).
         }
     }
@@ -1777,10 +1842,10 @@ mod tests {
     }
 
     /// Hand-craft a minimal well-formed claims map (iss/sub/aud/exp/iat/cti)
-    /// plus an `arkavo_npe` entry set to `npe_value`, so an out-of-range or
+    /// plus one extra top-level `(key, value)` entry, so an out-of-range or
     /// wrongly-typed field can be injected without going through the
-    /// type-safe `ArkavoNpe`/`claims_to_cbor` path.
-    fn claims_bytes_with_npe(npe_value: Value) -> Vec<u8> {
+    /// type-safe claim-builder / `claims_to_cbor` path.
+    fn claims_bytes_with_npe(extra: (Value, Value)) -> Vec<u8> {
         let entries = vec![
             (Value::Integer(1.into()), Value::Text("iss-1".into())),
             (Value::Integer(2.into()), Value::Text("sub-1".into())),
@@ -1788,7 +1853,7 @@ mod tests {
             (Value::Integer(4.into()), Value::Integer(1.into())),
             (Value::Integer(6.into()), Value::Integer(0.into())),
             (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
-            (Value::Text("arkavo_npe".into()), npe_value),
+            extra,
         ];
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
@@ -1801,7 +1866,10 @@ mod tests {
             (Value::Text("type".into()), Value::Text("agent".into())),
             (Value::Text("depth".into()), Value::Integer(256.into())),
         ]);
-        let result = claims_from_cbor(&claims_bytes_with_npe(too_big));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            too_big,
+        )));
         assert!(
             matches!(result, Err(CwtError::Malformed)),
             "got {:?}",
@@ -1812,7 +1880,10 @@ mod tests {
             (Value::Text("type".into()), Value::Text("agent".into())),
             (Value::Text("depth".into()), Value::Integer((-1).into())),
         ]);
-        let result = claims_from_cbor(&claims_bytes_with_npe(negative));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            negative,
+        )));
         assert!(
             matches!(result, Err(CwtError::Malformed)),
             "got {:?}",
@@ -1832,7 +1903,10 @@ mod tests {
                 Value::Integer(Integer::try_from(too_big).expect("fits CBOR uint range")),
             ),
         ]);
-        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            npe,
+        )));
         assert!(
             matches!(result, Err(CwtError::Malformed)),
             "got {:?}",
@@ -1849,7 +1923,10 @@ mod tests {
                 Value::Array(vec![Value::Text("ok".into()), Value::Integer(1.into())]),
             ),
         ]);
-        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            npe,
+        )));
         assert!(
             matches!(result, Err(CwtError::Malformed)),
             "got {:?}",
@@ -1878,14 +1955,109 @@ mod tests {
 
     #[test]
     fn npe_non_map_is_malformed() {
-        let result = claims_from_cbor(&claims_bytes_with_npe(Value::Text("nope".into())));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            Value::Text("nope".into()),
+        )));
         assert!(matches!(result, Err(CwtError::Malformed)));
     }
 
     #[test]
     fn npe_wrongly_typed_known_field_is_malformed() {
         let npe = Value::Map(vec![(Value::Text("type".into()), Value::Integer(1.into()))]);
-        let result = claims_from_cbor(&claims_bytes_with_npe(npe));
+        let result = claims_from_cbor(&claims_bytes_with_npe((
+            Value::Text("arkavo_npe".into()),
+            npe,
+        )));
         assert!(matches!(result, Err(CwtError::Malformed)));
+    }
+
+    #[test]
+    fn workload_swarm_scope_and_auth_time_round_trip() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::agent(
+            "https://identity.arkavo.net",
+            "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            vec!["https://platform.arkavo.net".into()],
+            crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES,
+        )
+        .with_arkavo_workload("wl-00112233445566778899aabbccddeeff")
+        .with_arkavo_swarm("kit-alpha")
+        .with_scope("openid agents:delegate")
+        .with_auth_time(1_790_000_000);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let back = verify(
+            &bytes,
+            &vk,
+            &VerifyOptions {
+                expected_iss: Some("https://identity.arkavo.net"),
+                expected_aud: Some("https://platform.arkavo.net"),
+                now: claims.iat + 1,
+                skew_secs: DEFAULT_SKEW_SECS,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            back.custom.arkavo_workload.as_deref(),
+            Some("wl-00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(back.custom.arkavo_swarm.as_deref(), Some("kit-alpha"));
+        assert_eq!(back.custom.scope.as_deref(), Some("openid agents:delegate"));
+        assert_eq!(back.custom.auth_time, Some(1_790_000_000));
+        assert_eq!(back.exp - back.iat, 300);
+    }
+
+    #[test]
+    fn tokens_without_the_new_claims_decode_them_as_absent() {
+        let (sk, vk) = test_keypair();
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        let bytes = mint(&claims, &sk, &test_kid()).unwrap();
+        let back = verify(
+            &bytes,
+            &vk,
+            &VerifyOptions {
+                expected_iss: None,
+                expected_aud: None,
+                now: claims.iat,
+                skew_secs: DEFAULT_SKEW_SECS,
+            },
+        )
+        .unwrap();
+        assert_eq!(back.custom.arkavo_workload, None);
+        assert_eq!(back.custom.arkavo_swarm, None);
+        assert_eq!(back.custom.scope, None);
+        assert_eq!(back.custom.auth_time, None);
+    }
+
+    #[test]
+    fn mistyped_workload_swarm_scope_or_auth_time_is_malformed() {
+        let cases = [
+            ("arkavo_workload", Value::Integer(1.into())),
+            ("arkavo_swarm", Value::Bool(true)),
+            ("scope", Value::Array(vec![])),
+            ("auth_time", Value::Text("1790000000".into())),
+            ("auth_time", Value::Integer(u64::MAX.into())),
+        ];
+        for (key, bad) in cases {
+            assert!(
+                matches!(
+                    claims_from_cbor(&claims_bytes_with_npe((Value::Text(key.into()), bad))),
+                    Err(CwtError::Malformed)
+                ),
+                "{key} with the wrong type must be refused, not ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn with_arkavo_swarm_empty_is_omitted() {
+        // A workload has no swarm until its agent is specialized into a kit;
+        // the claim must be omitted (not `Some("")`) in that case.
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None).with_arkavo_swarm("");
+        assert_eq!(claims.custom.arkavo_swarm, None);
+
+        let bytes = claims_to_cbor(&claims).expect("encode");
+        let decoded = claims_from_cbor(&bytes).expect("decode");
+        assert_eq!(decoded.custom.arkavo_swarm, None);
     }
 }

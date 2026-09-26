@@ -140,6 +140,42 @@ pub const MAX_DELEGATION_DEPTH: u8 = 5;
 /// Maximum number of active agents delegated by a single root user
 pub const MAX_AGENTS_PER_USER: u32 = 640;
 
+/// Lifetime cap, in minutes, of an agent CWT whose delegation was authorized
+/// with `short_lived` (the operator sets it for sealed-knowledge work). Five
+/// minutes bounds how long a stolen token is useful even before the KAS's
+/// status check sees a quarantine.
+pub const AGENT_SHORT_LIVED_TOKEN_MINUTES: i64 = 5;
+
+/// OAuth scope that lets an OIDC access token authorize agents at
+/// `POST /agents/authorize`, so `arkavo agent authorize` can run on the
+/// operator's `arkavo-identity` session instead of a raw passkey CWT.
+pub const AGENTS_DELEGATE_SCOPE: &str = "agents:delegate";
+
+/// Maximum age (seconds) of the WebAuthn assertion (`auth_time`) behind an
+/// `agents:delegate` access token. Refresh carries `auth_time` forward
+/// unchanged, so a refresh-token renewal can never satisfy this on its own.
+pub const AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS: i64 = 3600;
+
+/// Lease on a workload status answer: `valid_until = now + this`. The KAS
+/// caches no longer, so a quarantine reaches every rewrap within it.
+pub const WORKLOAD_STATUS_LEASE_SECONDS: i64 = 5;
+
+/// Maximum age (seconds) of the passkey auth CWT that recovers a quarantined
+/// workload. Lifting a quarantine needs a fresh assertion, not any token
+/// that has not expired yet.
+pub const RECOVERY_TOKEN_MAX_AGE_SECONDS: i64 = 300;
+
+/// Allowed clock difference (seconds) on an `X-Guardian-Signature` timestamp.
+pub const GUARDIAN_SIGNATURE_SKEW_SECONDS: u64 = 60;
+
+/// Length limits (characters) on operator- and Guardian-supplied labels that
+/// end up in storage and token claims.
+pub const WORKLOAD_NAME_MAX_LEN: usize = 128;
+pub const SWARM_ID_MAX_LEN: usize = 128;
+pub const INCIDENT_MAX_LEN: usize = 256;
+pub const EVIDENCE_REF_MAX_LEN: usize = 1024;
+pub const GUARDIAN_NAME_MAX_LEN: usize = 64;
+
 /// Attribute FQN for the "create a TDF" entitlement.
 pub const ENTITLEMENT_TDF_CREATE: &str = "https://arkavo.ai/attr/tdf/value/create";
 
