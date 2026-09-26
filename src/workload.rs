@@ -99,11 +99,19 @@ pub(crate) async fn bind_workload(
                     let outcome = db.commit_binding(Binding::Keep(w), delegation, now).await;
                     (w.clone(), outcome)
                 } else {
+                    // Not a liveness question: an expired delegation of the
+                    // previous DID is revoked too, so it reads (and is
+                    // refused) as revoked rather than merely expired.
                     let revoke_previous = !w.current_did.is_empty()
                         && w.current_did != did
-                        && live_delegation(app_state, &w.current_did, now)
-                            .await?
-                            .is_some_and(|d| d.workload_id.as_deref() == Some(workload_id));
+                        && db
+                            .get_agent_delegation(&w.current_did)
+                            .await
+                            .map_err(db_err)?
+                            .is_some_and(|d| {
+                                d.revoked_at.is_none()
+                                    && d.workload_id.as_deref() == Some(workload_id)
+                            });
                     let binding = Binding::Rebind {
                         from: w,
                         did,

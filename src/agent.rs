@@ -631,7 +631,7 @@ async fn active_delegation(
 
 /// The DID's delegation if it can still mint: present, not revoked, not
 /// expired at `now`. The one liveness probe: authorize asks it whether a DID
-/// is taken and whether a rebind has a previous delegation to revoke.
+/// is already taken.
 pub(crate) async fn live_delegation(
     app_state: &AppState,
     agent_did: &str,

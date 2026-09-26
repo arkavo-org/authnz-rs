@@ -1685,7 +1685,7 @@ impl DynamoDBStore {
         // with a filter reports what survived the filter *on the scanned
         // page*, so a single call under-reports once the index spans pages.
         // Expired-but-unrevoked rows are excluded because they are now
-        // replaceable (see `create_agent_delegation`); counting them would
+        // replaceable (see `agent_delegation_put`); counting them would
         // let dead rows accumulate against MAX_AGENTS_PER_USER forever.
         let now = chrono::Utc::now().timestamp();
         let mut total = 0u32;

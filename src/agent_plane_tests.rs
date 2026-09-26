@@ -689,3 +689,43 @@ async fn x_auth_token_wins_over_a_bearer_token() {
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["workload_id"], json!(workload_id_for(&owner, "fleet")));
 }
+
+#[tokio::test]
+async fn a_rebind_revokes_the_previous_dids_expired_delegation_too() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a2) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // a1's delegation ages out while "fleet" is still bound to it.
+    let expired = AgentDelegation {
+        expires_at: Some(Utc::now().timestamp() - 60),
+        ..crate::db::workloads_test_support::delegation(
+            &did_key(&a1),
+            owner,
+            Some(workload_id_for(&owner, "fleet")),
+        )
+    };
+    p.store.create_agent_delegation(&expired).await.unwrap();
+    let (st, body) = p
+        .authorize(auth, authorize_body(&a2, "fleet", "kit-1", false))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let d1 = p
+        .store
+        .get_agent_delegation(&did_key(&a1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(d1.revoked_at.is_some(), "the previous DID reads as revoked");
+    let (st, body) = p.mint(&a1).await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Delegation revoked"))
+    );
+}
