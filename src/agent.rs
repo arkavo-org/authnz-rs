@@ -33,12 +33,13 @@
 
 use crate::AppState;
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_MINUTES_MAX,
-    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
-    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN, WORKLOAD_NAME_MAX_LEN,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_SHORT_LIVED_TOKEN_MINUTES,
+    AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE,
+    AUTH_TOKEN_HOURS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
+    WORKLOAD_NAME_MAX_LEN,
 };
 use crate::cwt;
-use crate::db::{AgentDelegation, DynamoDBError, workload_id_for};
+use crate::db::{AgentDelegation, AgentWorkload, DynamoDBError, WorkloadState, workload_id_for};
 use crate::workload::{bind_workload, validate_label};
 use axum::http::HeaderMap;
 use axum::{
@@ -629,6 +630,46 @@ async fn active_delegation(
     Ok(delegation)
 }
 
+/// The workload a delegation mints under, checked for its DID: it must
+/// exist, belong to the delegation's owner, be eligible, and be bound to
+/// this DID now. Quarantine and rebinding are enforced here, at issuance,
+/// as well as at the KAS through the status lease.
+async fn eligible_workload(
+    app_state: &AppState,
+    delegation: &AgentDelegation,
+) -> Result<AgentWorkload, AgentError> {
+    let workload_id = delegation
+        .workload_id
+        .as_deref()
+        .ok_or_else(|| AgentError::Forbidden(REFUSE_LEGACY_DELEGATION.into()))?;
+    let w = app_state
+        .db_store
+        .get_workload(workload_id)
+        .await
+        .map_err(db_err)?
+        .ok_or(AgentError::WorkloadNotFound)?;
+    if w.owner != delegation.root_user_id {
+        return Err(AgentError::Forbidden(
+            "workload belongs to a different owner".into(),
+        ));
+    }
+    if w.state == WorkloadState::Quarantined {
+        return Err(AgentError::WorkloadQuarantined);
+    }
+    if w.current_did != delegation.agent_did {
+        return Err(AgentError::Forbidden(REFUSE_NOT_CURRENT_DID.into()));
+    }
+    Ok(w)
+}
+
+/// Contract v1 refusal texts (docs/agent-credentials-contract.md, "Refusal
+/// bodies"). arkavo-edge sorts 403s by these; changing one is a contract
+/// change. The other two pinned bodies are the `Display` of
+/// `AgentError::WorkloadQuarantined` and `AgentError::DelegationRevoked`.
+pub(crate) const REFUSE_LEGACY_DELEGATION: &str =
+    "delegation predates workloads; authorize again with workload_name and swarm";
+pub(crate) const REFUSE_NOT_CURRENT_DID: &str = "agent DID is not the workload's current binding";
+
 /// The DID's delegation if it can still mint: present, not revoked, not
 /// expired at `now`. The one liveness probe: authorize asks it whether a DID
 /// is already taken.
@@ -657,7 +698,8 @@ pub async fn generate_agent_challenge(
     Query(params): Query<ChallengeQueryParams>,
 ) -> Result<impl IntoResponse, AgentError> {
     validate_did_key(&params.did)?;
-    active_delegation(&app_state, &params.did).await?;
+    let delegation = active_delegation(&app_state, &params.did).await?;
+    eligible_workload(&app_state, &delegation).await?;
 
     let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
     let nonce = Uuid::new_v4().to_string();
@@ -714,6 +756,8 @@ pub async fn issue_agent_token(
         .verify(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
+    let workload = eligible_workload(&app_state, &delegation).await?;
+
     // Agents keep stale entitlements for the whole delegation lifetime
     // otherwise: mint against what the delegator currently holds, not what
     // was captured at authorize time.
@@ -730,11 +774,11 @@ pub async fn issue_agent_token(
     }
     delegation.entitlements = effective;
 
-    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
+    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation, &workload)?;
 
     info!(
-        "Agent token issued for {} (depth {})",
-        request.did, delegation.depth
+        "Agent token issued for {} in workload {}",
+        request.did, workload.workload_id
     );
     Ok(Json(TokenResponse {
         token,
@@ -814,13 +858,23 @@ pub(crate) fn agent_cwt_claims(
     issuer: &str,
     cfg: &AgentTokenConfig,
     delegation: &AgentDelegation,
+    workload: &AgentWorkload,
 ) -> Result<cwt::ArkavoClaims, AgentError> {
     let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
+    // Structural cap (independent of AGENT_TOKEN_MINUTES_MAX, which bounds
+    // config parsing, not what a single mint may hand out): a short_lived
+    // delegation never outlives AGENT_SHORT_LIVED_TOKEN_MINUTES, whatever the
+    // configured minutes are.
+    let minutes = if delegation.short_lived {
+        cfg.minutes.min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
+    } else {
+        cfg.minutes
+    };
     let mut claims = cwt::ArkavoClaims::agent(
         issuer,
         &delegation.agent_did,
         cfg.audiences.clone(),
-        cfg.minutes,
+        minutes,
     );
     if !cfg.authorized_actors.is_empty() {
         claims = claims.with_act(
@@ -830,7 +884,7 @@ pub(crate) fn agent_cwt_claims(
                 .collect(),
         );
     }
-    Ok(claims
+    claims = claims
         .with_arkavo_account_id(&delegation.root_user_id.to_string())
         .with_arkavo_roles(vec!["agent".to_string()])
         .with_arkavo_entitlements(delegation.entitlements.clone())
@@ -843,10 +897,17 @@ pub(crate) fn agent_cwt_claims(
             depth: Some(delegation.depth),
             chain: Some(delegation.chain.clone()),
         })
+        .with_arkavo_workload(&workload.workload_id)
         .with_cnf(cwt::cnf_from_ed25519(
             &pubkey,
             delegation.agent_did.as_bytes(),
-        )))
+        ));
+    // No kit yet: omit the claim rather than send an empty one, so the
+    // platform's "token lacks arkavo_swarm" denial applies.
+    if !workload.swarm.is_empty() {
+        claims = claims.with_arkavo_swarm(&workload.swarm);
+    }
+    Ok(claims)
 }
 
 pub(crate) fn db_err(e: DynamoDBError) -> AgentError {
@@ -856,8 +917,14 @@ pub(crate) fn db_err(e: DynamoDBError) -> AgentError {
 fn mint_agent_cwt(
     app_state: &AppState,
     delegation: &AgentDelegation,
+    workload: &AgentWorkload,
 ) -> Result<(String, i64), AgentError> {
-    let claims = agent_cwt_claims(&app_state.issuer, &app_state.agent_tokens, delegation)?;
+    let claims = agent_cwt_claims(
+        &app_state.issuer,
+        &app_state.agent_tokens,
+        delegation,
+        workload,
+    )?;
     let expires_at = claims.exp;
     let bytes = cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)
         .map_err(|e| AgentError::TokenGenerationError(e.to_string()))?;
@@ -908,6 +975,8 @@ pub enum AgentError {
     Forbidden(String),
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Workload not found")]
+    WorkloadNotFound,
     /// Body is contract v1 text (docs/agent-credentials-contract.md).
     #[error("Workload quarantined")]
     WorkloadQuarantined,
@@ -940,6 +1009,7 @@ impl IntoResponse for AgentError {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
             AgentError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
+            AgentError::WorkloadNotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -992,6 +1062,25 @@ mod tests {
             revoked_at: None,
             workload_id: Some("wl-00112233445566778899aabbccddeeff".into()),
             short_lived: false,
+        }
+    }
+
+    fn sample_workload(did: &str) -> AgentWorkload {
+        AgentWorkload {
+            workload_id: "wl-00112233445566778899aabbccddeeff".into(),
+            owner: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            name: "fleet".into(),
+            current_did: did.into(),
+            swarm: "kit-alpha".into(),
+            state: WorkloadState::Eligible,
+            generation: 1,
+            incident: None,
+            evidence_ref: None,
+            quarantined_by: None,
+            quarantined_at: None,
+            last_cleared_incident: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
         }
     }
 
@@ -1071,7 +1160,13 @@ mod tests {
             minutes: 15,
         };
         let d = sample_delegation(TEST_DID);
-        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        let claims = agent_cwt_claims(
+            "https://identity.arkavo.net",
+            &cfg,
+            &d,
+            &sample_workload(TEST_DID),
+        )
+        .unwrap();
         assert_eq!(claims.sub, TEST_DID);
         assert_eq!(
             claims.aud,
@@ -1104,8 +1199,72 @@ mod tests {
             minutes: 15,
         };
         let d = sample_delegation(TEST_DID);
-        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        let claims = agent_cwt_claims(
+            "https://identity.arkavo.net",
+            &cfg,
+            &d,
+            &sample_workload(TEST_DID),
+        )
+        .unwrap();
         assert_eq!(claims.custom.act, None);
+    }
+
+    #[test]
+    fn agent_claims_carry_workload_and_swarm() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let claims = agent_cwt_claims(
+            "https://identity.arkavo.net",
+            &cfg,
+            &sample_delegation(TEST_DID),
+            &sample_workload(TEST_DID),
+        )
+        .unwrap();
+        assert_eq!(
+            claims.custom.arkavo_workload.as_deref(),
+            Some("wl-00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-alpha"));
+
+        let no_kit = AgentWorkload {
+            swarm: String::new(),
+            ..sample_workload(TEST_DID)
+        };
+        let claims = agent_cwt_claims(
+            "https://identity.arkavo.net",
+            &cfg,
+            &sample_delegation(TEST_DID),
+            &no_kit,
+        )
+        .unwrap();
+        assert!(claims.custom.arkavo_workload.is_some());
+        assert_eq!(claims.custom.arkavo_swarm, None, "omitted, not empty");
+    }
+
+    #[test]
+    fn short_lived_delegations_mint_tokens_of_at_most_five_minutes() {
+        let cfg = |minutes| AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes,
+        };
+        let w = sample_workload(TEST_DID);
+        let mut d = sample_delegation(TEST_DID);
+        let life = |c: &AgentTokenConfig, d: &AgentDelegation| {
+            let claims = agent_cwt_claims("https://identity.arkavo.net", c, d, &w).unwrap();
+            claims.exp - claims.iat
+        };
+        assert_eq!(life(&cfg(15), &d), 900);
+        d.short_lived = true;
+        assert_eq!(life(&cfg(15), &d), 300);
+        assert_eq!(
+            life(&cfg(3), &d),
+            180,
+            "a shorter configured lifetime still wins"
+        );
     }
 
     #[test]
@@ -1307,6 +1466,7 @@ mod tests {
             ),
             (AgentError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (AgentError::Conflict("x".into()), StatusCode::CONFLICT),
+            (AgentError::WorkloadNotFound, StatusCode::NOT_FOUND),
             (AgentError::WorkloadQuarantined, StatusCode::FORBIDDEN),
             (
                 AgentError::DatabaseError(Box::new(DynamoDBError::TableNotExists(

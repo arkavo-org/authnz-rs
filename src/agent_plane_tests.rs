@@ -195,6 +195,21 @@ pub(crate) fn authorize_body(
     body
 }
 
+pub(crate) fn verify_token(p: &Plane, token: &str) -> crate::cwt::ArkavoClaims {
+    let bytes = crate::cwt::decode_from_header(token).unwrap();
+    crate::cwt::verify(
+        &bytes,
+        &p.state.cwt_verifying_key,
+        &crate::cwt::VerifyOptions {
+            expected_iss: Some(&p.state.issuer),
+            expected_aud: Some("https://platform.arkavo.net"),
+            now: Utc::now().timestamp(),
+            skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+        },
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn authorize_creates_then_selects_the_owners_workload() {
     let Some(p) = Plane::new().await else { return };
@@ -728,4 +743,129 @@ async fn a_rebind_revokes_the_previous_dids_expired_delegation_too() {
         (st, body),
         (StatusCode::FORBIDDEN, json!("Delegation revoked"))
     );
+}
+
+#[tokio::test]
+async fn minted_tokens_carry_the_workload_swarm_and_short_lifetime() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (short, long) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&short, "sealed", "kit-1", true))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&long, "chat", "kit-2", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let (st, body) = p.mint(&short).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    assert_eq!(
+        claims.custom.arkavo_workload,
+        Some(workload_id_for(&owner, "sealed"))
+    );
+    assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-1"));
+    assert_eq!(claims.exp - claims.iat, 300);
+    assert!(body["expires_at"].as_i64().unwrap() - Utc::now().timestamp() <= 300);
+
+    let (st, body) = p.mint(&long).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-2"));
+    assert_eq!(claims.exp - claims.iat, 900);
+}
+
+#[tokio::test]
+async fn only_the_current_did_of_a_workload_can_mint() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a2, a3) = (fresh_agent(), fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a2, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.mint(&a1).await.0,
+        StatusCode::FORBIDDEN,
+        "rebound-away DID"
+    );
+    assert_eq!(p.mint(&a2).await.0, StatusCode::OK);
+
+    // A delegation row naming the workload for a DID it is not bound to —
+    // written straight to storage, bypassing authorize — is refused by the
+    // issuance check itself, not only by revocation.
+    let stray = crate::db::workloads_test_support::delegation(
+        &did_key(&a3),
+        owner,
+        Some(workload_id_for(&owner, "fleet")),
+    );
+    p.store.create_agent_delegation(&stray).await.unwrap();
+    assert_eq!(p.mint(&a3).await.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_workload_without_a_swarm_mints_without_the_swarm_claim() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let wid = workload_id_for(&owner, "onboarded");
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "onboarded", "", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, body) = p.mint(&a).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    assert_eq!(claims.custom.arkavo_workload, Some(wid.clone()));
+    assert_eq!(claims.custom.arkavo_swarm, None);
+
+    // Specialized: the same DID re-authorized with its kit.
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "onboarded", "kit-7", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.store
+            .get_workload(&wid)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        2
+    );
+    let (st, body) = p.mint(&a).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-7"));
+}
+
+#[tokio::test]
+async fn a_legacy_delegation_cannot_mint() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, _) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let legacy = crate::db::workloads_test_support::delegation(&did_key(&a), owner, None);
+    p.store.create_agent_delegation(&legacy).await.unwrap();
+    assert_eq!(p.mint(&a).await.0, StatusCode::FORBIDDEN);
 }
