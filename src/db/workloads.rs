@@ -80,6 +80,8 @@ pub enum Binding<'a> {
     /// (`""` = no swarm), generation + 1. With `revoke_previous`, also revoke
     /// the delegation of `from.current_did` — only while that row still
     /// names this workload, so a DID since authorized elsewhere keeps it.
+    /// Without it, the write instead requires that DID to hold no unrevoked
+    /// delegation for this workload, so a stale "nothing to revoke" fails.
     Rebind {
         from: &'a AgentWorkload,
         did: &'a str,
@@ -291,11 +293,18 @@ impl DynamoDBStore {
         );
         if let Binding::Rebind {
             from,
-            revoke_previous: true,
+            did,
+            revoke_previous,
             ..
         } = binding
+            && !from.current_did.is_empty()
+            && from.current_did != did
         {
-            items.push(self.revoke_delegation_item(&from.current_did, &from.workload_id, now)?);
+            items.push(if revoke_previous {
+                self.revoke_delegation_item(&from.current_did, &from.workload_id, now)?
+            } else {
+                self.nothing_to_revoke_item(&from.current_did, &from.workload_id)?
+            });
         }
         self.transact(items).await?;
         info!(
@@ -366,6 +375,32 @@ impl DynamoDBStore {
         Ok(TransactWriteItem::builder()
             .update(built(bind.build())?)
             .build())
+    }
+
+    /// The negation of [`Self::revoke_delegation_item`]'s precondition: a
+    /// rebind that decided not to revoke the previous DID commits only while
+    /// that DID still holds no unrevoked delegation for `workload_id`. A
+    /// re-authorization of it for the same workload leaves the generation
+    /// alone, so the workload's own condition cannot catch it.
+    /// `attribute_not_exists(workload_id)` is needed because a comparison on a
+    /// missing attribute is false.
+    fn nothing_to_revoke_item(
+        &self,
+        agent_did: &str,
+        workload_id: &str,
+    ) -> Result<TransactWriteItem, DynamoDBError> {
+        let check = built(
+            ConditionCheck::builder()
+                .table_name(&self.agent_delegations_table)
+                .key("agent_did", s(agent_did))
+                .condition_expression(
+                    "attribute_not_exists(agent_did) OR attribute_exists(revoked_at) \
+                     OR attribute_not_exists(workload_id) OR workload_id <> :wid",
+                )
+                .expression_attribute_values(":wid", s(workload_id))
+                .build(),
+        )?;
+        Ok(TransactWriteItem::builder().condition_check(check).build())
     }
 
     /// Revoke `agent_did`'s delegation inside a transaction, conditional on
@@ -723,6 +758,102 @@ pub(crate) mod tests {
             .unwrap();
         let old = store.get_agent_delegation(&old_did).await.unwrap().unwrap();
         assert!(old.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stale_no_revoke_rebind_fails_once_the_previous_did_is_live_again() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let owner = Uuid::new_v4();
+        let old_did = unique_did("Relive");
+        let w = sample(owner, "fleet", &old_did);
+        store.create_workload(&w).await.unwrap();
+        // Decided while the old DID read as revoked: nothing to revoke.
+        let mut revoked = delegation(&old_did, owner, Some(w.workload_id.clone()));
+        revoked.revoked_at = Some(1_790_000_000);
+        store.create_agent_delegation(&revoked).await.unwrap();
+        // Before the rebind commits, the old DID is re-authorized for the
+        // same workload (a Keep: no generation bump), so it is live again.
+        store
+            .commit_binding(
+                Binding::Keep(&w),
+                &delegation(&old_did, owner, Some(w.workload_id.clone())),
+                1_790_000_050,
+            )
+            .await
+            .unwrap();
+        let new_did = unique_did("New");
+        assert!(matches!(
+            rebind(&store, &w, &new_did, "kit-1", false, 1_790_000_100).await,
+            Err(DynamoDBError::ConditionalConflict)
+        ));
+        assert_eq!(
+            store.get_workload(&w.workload_id).await.unwrap(),
+            Some(w.clone())
+        );
+        assert!(
+            store
+                .get_agent_delegation(&new_did)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Decided afresh, the rebind revokes it.
+        rebind(&store, &w, &new_did, "kit-1", true, 1_790_000_100)
+            .await
+            .unwrap();
+        let old = store.get_agent_delegation(&old_did).await.unwrap().unwrap();
+        assert!(old.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_no_revoke_rebind_still_commits_when_the_previous_did_is_gone_or_elsewhere() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let owner = Uuid::new_v4();
+        // No row at all for the previous DID.
+        let w = sample(owner, "gone", &unique_did("Gone"));
+        store.create_workload(&w).await.unwrap();
+        rebind(
+            &store,
+            &w,
+            &unique_did("New"),
+            "kit-1",
+            false,
+            1_790_000_100,
+        )
+        .await
+        .unwrap();
+        // A legacy row (no workload_id) and a row for another workload.
+        for (name, wid) in [
+            ("legacy", None),
+            ("moved", Some(workload_id_for(&owner, "x"))),
+        ] {
+            let old_did = unique_did("Prev");
+            let w = sample(owner, name, &old_did);
+            store.create_workload(&w).await.unwrap();
+            store
+                .create_agent_delegation(&delegation(&old_did, owner, wid))
+                .await
+                .unwrap();
+            rebind(
+                &store,
+                &w,
+                &unique_did("New"),
+                "kit-1",
+                false,
+                1_790_000_100,
+            )
+            .await
+            .unwrap();
+            let prev = store.get_agent_delegation(&old_did).await.unwrap().unwrap();
+            assert!(
+                prev.revoked_at.is_none(),
+                "{name}: not this workload's to revoke"
+            );
+        }
     }
 
     #[tokio::test]

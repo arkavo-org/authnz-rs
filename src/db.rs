@@ -1610,7 +1610,8 @@ impl DynamoDBStore {
         .await
     }
 
-    /// Get an agent delegation by agent DID.
+    /// Get an agent delegation by agent DID. Strongly consistent: authorize,
+    /// challenge and token issuance all decide on what it returns.
     pub async fn get_agent_delegation(
         &self,
         agent_did: &str,
@@ -1620,6 +1621,7 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|err| {

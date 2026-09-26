@@ -145,6 +145,37 @@ pub(crate) async fn bind_workload(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bind_workload_revokes_a_previous_did_that_became_live_again() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let owner = Uuid::new_v4();
+        let wid = crate::db::workload_id_for(&owner, "fleet");
+        let x = format!("did:key:z6MkX{}", Uuid::new_v4().simple());
+        let y = format!("did:key:z6MkY{}", Uuid::new_v4().simple());
+        let for_did = |did: &str| {
+            crate::db::workloads_test_support::delegation(did, owner, Some(wid.clone()))
+        };
+        bind_workload(&app_state, owner, "fleet", Some("kit-1"), &for_did(&x), 1)
+            .await
+            .unwrap();
+        store.revoke_delegation(&x).await.unwrap();
+        // X is re-authorized into the same workload: live again, same generation.
+        let w = bind_workload(&app_state, owner, "fleet", None, &for_did(&x), 2)
+            .await
+            .unwrap();
+        assert_eq!(w.generation, 1);
+        let w = bind_workload(&app_state, owner, "fleet", None, &for_did(&y), 3)
+            .await
+            .unwrap();
+        assert_eq!((w.current_did.as_str(), w.generation), (y.as_str(), 2));
+        let old = store.get_agent_delegation(&x).await.unwrap().unwrap();
+        assert!(old.revoked_at.is_some(), "the rebind must revoke X");
+    }
+
     #[test]
     fn validate_label_bounds_and_control_characters() {
         assert!(validate_label("swarm", "kit-1", 128).is_ok());
