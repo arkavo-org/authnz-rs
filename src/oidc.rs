@@ -3713,7 +3713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_refuses_agents_delegate_for_unlisted_or_federated_clients() {
+    async fn authorize_refuses_agents_delegate_for_an_unlisted_client() {
         unsafe {
             std::env::set_var("AWS_REGION", "us-east-1");
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
@@ -3768,12 +3768,31 @@ mod tests {
             redirect_error_description(&resp).as_deref(),
             Some("agents:delegate is not available to this client")
         );
+    }
 
-        // The allowlisted client still cannot get it through Google.
+    /// Unlike the unlisted-client case above, this needs no DynamoDB Local
+    /// backend: the `idp=google` branch returns before `resolve_user` is
+    /// ever called, so it must run (not skip) in a plain `cargo test`.
+    #[tokio::test]
+    async fn authorize_refuses_agents_delegate_through_a_federated_provider() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        // test_helpers allowlists "arkavo-edge" itself, so only the
+        // passkey-only rule can be what refuses this request.
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let codes = AuthorizationCodeStore::new(test_redis());
+
         let mut google = edge_delegate_query();
         google.idp = Some("google".into());
         let resp = call_authorize(&app_state, HeaderMap::new(), google, &codes).await;
         assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
+        assert_eq!(
+            redirect_error_description(&resp).as_deref(),
+            Some("agents:delegate requires a passkey sign-in")
+        );
     }
 
     #[tokio::test]
