@@ -304,6 +304,10 @@ pub struct AppState {
     /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
     /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
     pub admin_client_ids: Arc<Vec<String>>,
+    /// OIDC client_ids that may request the `agents:delegate` scope and whose
+    /// access tokens `POST /agents/authorize` accepts
+    /// (`AGENT_DELEGATE_CLIENT_IDS`). Empty ⇒ the scope is refused everywhere.
+    pub agent_delegate_client_ids: Arc<Vec<String>>,
     /// Expected App Attest App ID hashes (`APP_ATTEST_APP_ID`), each the
     /// hex-encoded SHA-256 of "<TeamID>.<BundleID>", lower-cased.
     ///
@@ -343,6 +347,15 @@ pub fn parse_app_attest_app_ids(raw: Option<&str>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// A comma-separated client id list from an env var, blanks dropped.
+fn parse_id_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[tokio::main]
@@ -454,15 +467,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("agent token config: {e}"))?;
 
-    let admin_client_ids: Vec<String> = env::var("ADMIN_CLIENT_IDS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let admin_client_ids = parse_id_list(env::var("ADMIN_CLIENT_IDS").ok());
     if admin_client_ids.is_empty() {
         log::warn!(
             "ADMIN_CLIENT_IDS is empty: PUT /admin/users/:id/entitlements and GET /entities/:id will 403"
+        );
+    }
+    let agent_delegate_client_ids = parse_id_list(env::var("AGENT_DELEGATE_CLIENT_IDS").ok());
+    if agent_delegate_client_ids.is_empty() {
+        log::warn!(
+            "AGENT_DELEGATE_CLIENT_IDS is empty: the agents:delegate scope is refused for every client"
         );
     }
 
@@ -485,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
+        agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
         )),
@@ -1188,6 +1203,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_id_list_trims_and_drops_blanks() {
+        assert_eq!(
+            super::parse_id_list(Some(" arkavo-edge, ,platform-status ".into())),
+            vec!["arkavo-edge".to_string(), "platform-status".to_string()]
+        );
+        assert!(super::parse_id_list(None).is_empty());
+        assert!(super::parse_id_list(Some("".into())).is_empty());
+    }
+
+    #[test]
     fn comma_separated_value_is_not_treated_as_one_string() {
         // Regression for a configuration that took registration down: the old
         // parser lower-cased the whole value and compared it whole, so
@@ -1494,6 +1519,7 @@ pub(crate) mod test_helpers {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             app_attest_app_id: Arc::new(Vec::new()),
         }
     }

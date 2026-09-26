@@ -454,6 +454,7 @@ pub async fn resolve_apple_user(
         idp: "apple".to_string(),
         roles: vec!["user".to_string()],
         entitlements: account.entitlements.clone(),
+        auth_time: None,
     })
 }
 

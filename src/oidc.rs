@@ -21,9 +21,9 @@
 use crate::AppState;
 use crate::apple_signin;
 use crate::constants::{
-    ACCESS_TOKEN_LIFETIME_SECONDS, AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER,
-    DEFAULT_USER_ENTITLEMENTS, ENTITLEMENT_TDF_CREATE, ENTITLEMENT_TDF_DECRYPT,
-    ID_TOKEN_LIFETIME_SECONDS,
+    ACCESS_TOKEN_LIFETIME_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
+    AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER, DEFAULT_USER_ENTITLEMENTS,
+    ENTITLEMENT_TDF_CREATE, ENTITLEMENT_TDF_DECRYPT, ID_TOKEN_LIFETIME_SECONDS,
 };
 use axum::Json;
 use axum::extract::{Extension, Form, Query};
@@ -147,6 +147,11 @@ pub struct AuthenticatedUser {
     pub idp: String,
     pub roles: Vec<String>,
     pub entitlements: Vec<String>,
+    /// Unix time of the WebAuthn assertion that authenticated this user, set
+    /// only when the upstream credential was the 1-hour passkey auth CWT.
+    /// `default` so codes parked in Redis across a deploy still decode.
+    #[serde(default)]
+    pub auth_time: Option<i64>,
 }
 
 impl AuthenticatedUser {
@@ -165,7 +170,13 @@ impl AuthenticatedUser {
             idp: "webauthn".to_string(),
             roles: vec!["user".to_string()],
             entitlements,
+            auth_time: None,
         }
+    }
+
+    pub fn with_auth_time(mut self, auth_time: Option<i64>) -> Self {
+        self.auth_time = auth_time;
+        self
     }
 }
 
@@ -213,6 +224,11 @@ pub struct RefreshTokenRecord {
     pub email_verified: Option<bool>,
     #[serde(default)]
     pub name: Option<String>,
+    /// WebAuthn assertion time from the original sign-in. Carried unchanged
+    /// through rotation so a refreshed `agents:delegate` token still ages
+    /// from the passkey ceremony, not from the refresh.
+    #[serde(default)]
+    pub auth_time: Option<i64>,
 }
 
 /// The relying-party-facing parameters of a validated authorize request —
@@ -564,7 +580,13 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
         response_types_supported: vec!["code"],
         subject_types_supported: vec!["public"],
         id_token_signing_alg_values_supported: vec!["ES256"],
-        scopes_supported: vec!["openid", "email", "profile", "offline_access"],
+        scopes_supported: vec![
+            "openid",
+            "email",
+            "profile",
+            "offline_access",
+            AGENTS_DELEGATE_SCOPE,
+        ],
         token_endpoint_auth_methods_supported: vec![
             "client_secret_post",
             "client_secret_basic",
@@ -584,6 +606,8 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
             "arkavo_account_id",
             "arkavo_roles",
             "arkavo_entitlements",
+            "scope",
+            "auth_time",
         ],
         grant_types_supported: vec!["authorization_code", "client_credentials", "refresh_token"],
         code_challenge_methods_supported: vec!["S256"],
@@ -660,6 +684,10 @@ pub struct AuthorizeQuery {
     /// this server already issues for (the client itself or the configured
     /// `OIDC_PLATFORM_AUDIENCE`); anything else is `invalid_target`.
     pub resource: Option<String>,
+    /// OIDC `max_age`: the longest acceptable age, in seconds, of the passkey
+    /// assertion behind this sign-in. Clients that need a fresh assertion
+    /// (recovery needs `auth_time` ≤ 300 s) send `max_age=300`.
+    pub max_age: Option<i64>,
 }
 
 /// Authorization endpoint.
@@ -775,6 +803,49 @@ pub async fn authorize(
         );
     }
 
+    if let Some(max_age) = params.max_age {
+        // max_age ages a passkey assertion; a federated sign-in has none.
+        let federated = params.idp.as_deref().is_some_and(|idp| idp != "webauthn")
+            || params.id_token.is_some()
+            || headers.contains_key("X-Apple-Id-Token");
+        if max_age < 0 || federated {
+            return redirect_error_to_client(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                "invalid_request",
+                "max_age is supported only for passkey sign-in",
+            );
+        }
+    }
+
+    // agents:delegate authorizes agents on the user's behalf. Only
+    // allowlisted clients may ask for it, and only over a passkey sign-in:
+    // there is no consent screen here, so an unlisted RP must not be able to
+    // obtain it silently.
+    let wants_delegate = has_scope(&scope, AGENTS_DELEGATE_SCOPE);
+    if wants_delegate {
+        if !app_state
+            .agent_delegate_client_ids
+            .iter()
+            .any(|c| c == &client.client_id)
+        {
+            return redirect_error_to_client(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                "invalid_scope",
+                "agents:delegate is not available to this client",
+            );
+        }
+        if params.idp.as_deref().is_some_and(|idp| idp != "webauthn") {
+            return redirect_error_to_client(
+                &params.redirect_uri,
+                params.state.as_deref(),
+                "invalid_scope",
+                "agents:delegate requires a passkey sign-in",
+            );
+        }
+    }
+
     let request = AuthorizeRequest {
         client_id: client.client_id.clone(),
         redirect_uri: params.redirect_uri.clone(),
@@ -802,6 +873,26 @@ pub async fn authorize(
         }
         Err(e) => return e.into_response(),
     };
+
+    // Federated requests were refused above; a registration CWT has no
+    // `auth_time`, so it gets `login_required` here.
+    if let Some(max_age) = params.max_age {
+        let fresh = user
+            .auth_time
+            .is_some_and(|t| within_age(t, Utc::now().timestamp(), max_age));
+        if !fresh {
+            return AuthorizeError::StaleAuthentication(max_age).into_response();
+        }
+    }
+
+    if wants_delegate && user.auth_time.is_none() {
+        return redirect_error_to_client(
+            &params.redirect_uri,
+            params.state.as_deref(),
+            "invalid_scope",
+            "agents:delegate requires a passkey sign-in",
+        );
+    }
 
     complete_authorization(&code_store, request, user).await
 }
@@ -1153,6 +1244,8 @@ async fn handle_authorization_code_grant(
             email: record.user.email.clone(),
             email_verified: record.user.email_verified,
             arkavo_user: Some(arkavo_user),
+            scope: Some(record.scope.clone()),
+            auth_time: record.user.auth_time,
         };
         match mint_access_token(
             &app_state,
@@ -1199,6 +1292,7 @@ async fn handle_authorization_code_grant(
             email: record.user.email.clone(),
             email_verified: record.user.email_verified,
             name: record.user.name.clone(),
+            auth_time: record.user.auth_time,
         };
         if let Err(err) = refresh_store.insert(&r_token, refresh_record).await {
             error!("Failed to store refresh token: {}", err);
@@ -1336,6 +1430,8 @@ async fn handle_client_credentials_grant(
                 // Service accounts (client_credentials) have no Patreon link.
                 patreon: None,
             }),
+            scope: None,
+            auth_time: None,
         };
         match mint_access_token(
             &app_state,
@@ -1612,6 +1708,8 @@ async fn handle_refresh_token_grant(
                 entitlements: id_claims.arkavo_entitlements.clone(),
                 patreon: arkavo_patreon,
             }),
+            scope: Some(record.scopes.clone()),
+            auth_time: record.auth_time,
         };
         match mint_access_token(
             &app_state,
@@ -1646,6 +1744,7 @@ async fn handle_refresh_token_grant(
         email: record.email.clone(),
         email_verified: record.email_verified,
         name: record.name.clone(),
+        auth_time: record.auth_time,
     };
     if let Err(err) = refresh_store
         .insert(&new_refresh_token, new_refresh_record)
@@ -1813,6 +1912,10 @@ pub enum AuthorizeError {
     /// response on this origin — see [`identity_not_linked_redirect`].
     #[error("{}", crate::constants::IDENTITY_NOT_LINKED)]
     IdentityNotLinked,
+    /// The passkey assertion behind the presented auth CWT is older than the
+    /// request's `max_age`: the client must authenticate again.
+    #[error("login_required: passkey assertion is older than max_age={0} s; authenticate again")]
+    StaleAuthentication(i64),
 }
 
 impl IntoResponse for AuthorizeError {
@@ -1831,6 +1934,9 @@ impl IntoResponse for AuthorizeError {
             // Normally redirected to the RP before reaching here; this is the
             // fallback shape if it ever isn't.
             AuthorizeError::IdentityNotLinked => (StatusCode::FORBIDDEN, "access_denied"),
+            // Same 401 `login_required` shape a missing credential gets — the
+            // path Arkavo Creator already answers with a passkey ceremony.
+            AuthorizeError::StaleAuthentication(_) => (StatusCode::UNAUTHORIZED, "login_required"),
         };
         oidc_error_response(status, code, &self.to_string())
     }
@@ -1892,6 +1998,30 @@ async fn resolve_user(
     Err(AuthorizeError::LoginRequired)
 }
 
+/// The WebAuthn assertion time behind an Arkavo CWT: its `iat`, but only for
+/// the 1-hour auth CWT that `POST /authenticate` mints straight after an
+/// assertion. The ~99-year registration CWT is also `aud = "arkavo"` and
+/// `idp = "webauthn"`; its `iat` is not a recent assertion.
+pub(crate) fn webauthn_auth_time(claims: &crate::cwt::ArkavoClaims) -> Option<i64> {
+    let lifetime = claims.exp.saturating_sub(claims.iat);
+    (claims.custom.idp.as_deref() == Some("webauthn") && lifetime <= AUTH_TOKEN_HOURS * 3600)
+        .then_some(claims.iat)
+}
+
+/// Whether a space-separated OAuth scope string grants `want`.
+pub(crate) fn has_scope(scope: &str, want: &str) -> bool {
+    scope.split_whitespace().any(|s| s == want)
+}
+
+/// Whether an event timestamped `issued_at` is within `max_age` seconds of
+/// `now`, allowing [`crate::cwt::DEFAULT_SKEW_SECS`] of clock skew for an
+/// `issued_at` that is slightly in the future. The single freshness check for
+/// every `auth_time` / auth-age comparison in this module; later tasks
+/// (`agents:delegate` at `/agents/authorize`, quarantine, recover) reuse it.
+pub(crate) fn within_age(issued_at: i64, now: i64, max_age: i64) -> bool {
+    (-crate::cwt::DEFAULT_SKEW_SECS..=max_age).contains(&(now - issued_at))
+}
+
 /// Validates an Arkavo CWT from the `X-Auth-Token` header and returns the
 /// authenticated user. Legacy JWT tokens are rejected with
 /// [`AuthorizeError::InvalidArkavoJwt`].
@@ -1922,7 +2052,8 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         .get_user_entitlements(&user_id)
         .await
         .map_err(|e| AuthorizeError::Database(e.to_string()))?;
-    Ok(AuthenticatedUser::webauthn(user_id, entitlements))
+    Ok(AuthenticatedUser::webauthn(user_id, entitlements)
+        .with_auth_time(webauthn_auth_time(&claims)))
 }
 
 fn extract_client_credentials(
@@ -2059,6 +2190,12 @@ pub struct AccessTokenExtras {
     /// `None` when the user is unlinked, Patreon support is disabled, or
     /// materialization failed (fail-closed posture per the plan).
     pub arkavo_user: Option<crate::cwt::ArkavoUserClaims>,
+    /// Granted scope string → `scope` claim. User grants only; service
+    /// (client_credentials) tokens carry none, so they never hold
+    /// `agents:delegate`.
+    pub scope: Option<String>,
+    /// WebAuthn assertion time → `auth_time` claim.
+    pub auth_time: Option<i64>,
 }
 
 impl AccessTokenExtras {
@@ -2102,6 +2239,12 @@ pub fn mint_access_token(
         }
         if let Some(user) = &e.arkavo_user {
             claims = claims.with_arkavo_user(user);
+        }
+        if let Some(scope) = &e.scope {
+            claims = claims.with_scope(scope);
+        }
+        if let Some(t) = e.auth_time {
+            claims = claims.with_auth_time(t);
         }
     }
     if let Some(c) = cnf {
@@ -2363,6 +2506,7 @@ mod tests {
             idp: "apple".into(),
             roles: vec!["user".into()],
             entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
+            auth_time: None,
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2393,6 +2537,7 @@ mod tests {
             idp: "apple".into(),
             roles: vec![],
             entitlements: vec![],
+            auth_time: None,
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2421,6 +2566,7 @@ mod tests {
             email: Some("a@b".into()),
             email_verified: Some(true),
             name: None,
+            auth_time: None,
             expires_at: Utc::now().timestamp() + 600,
             created_at: Utc::now().timestamp(),
         };
@@ -2502,6 +2648,20 @@ mod tests {
             cose_uri.ends_with("/.well-known/cose-keys"),
             "unexpected cose_uri: {}",
             cose_uri
+        );
+        assert!(
+            v["scopes_supported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "agents:delegate")
+        );
+        assert!(
+            v["claims_supported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "auth_time")
         );
     }
 
@@ -2699,6 +2859,7 @@ mod tests {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             app_attest_app_id: Arc::new(Vec::new()),
         };
 
@@ -2817,6 +2978,7 @@ mod tests {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             app_attest_app_id: Arc::new(Vec::new()),
         };
 
@@ -2843,11 +3005,12 @@ mod tests {
             subject: "apple:123".into(),
             arkavo_account_id: "legacy-record-without-uuid".into(),
             client_id: "test-client".into(),
-            scopes: "openid offline_access".into(),
+            scopes: "openid offline_access agents:delegate".into(),
             idp: Some("apple".into()),
             email: Some("a@b".into()),
             email_verified: Some(true),
             name: None,
+            auth_time: Some(1_790_000_000),
             expires_at: Utc::now().timestamp() + 3600,
             created_at: Utc::now().timestamp(),
         };
@@ -2907,6 +3070,12 @@ mod tests {
                 claims.custom.arkavo_account_id.as_deref(),
                 Some("legacy-record-without-uuid")
             );
+            // Refresh carries the original assertion time; it never renews it.
+            assert_eq!(claims.custom.auth_time, Some(1_790_000_000));
+            assert_eq!(
+                claims.custom.scope.as_deref(),
+                Some("openid offline_access agents:delegate")
+            );
         }
         {
             let id_token = body["id_token"].as_str().unwrap();
@@ -2929,6 +3098,7 @@ mod tests {
         assert_eq!(next.idp.as_deref(), Some("apple"));
         assert_eq!(next.email.as_deref(), Some("a@b"));
         assert_eq!(next.email_verified, Some(true));
+        assert_eq!(next.auth_time, Some(1_790_000_000));
     }
 
     #[test]
@@ -2946,6 +3116,7 @@ mod tests {
         let rec: RefreshTokenRecord = serde_json::from_value(legacy).unwrap();
         assert!(rec.idp.is_none());
         assert!(rec.email.is_none());
+        assert!(rec.auth_time.is_none());
         assert_eq!(idp_from_subject(&rec.subject), "google");
         assert_eq!(idp_from_subject("apple:1"), "apple");
         assert_eq!(idp_from_subject("arkavo:1"), "webauthn");
@@ -3035,6 +3206,7 @@ mod tests {
             idp: Some("google".into()),
             id_token: None,
             resource: Some("https://platform.arkavo.net".into()),
+            max_age: None,
         }
     }
 
@@ -3181,6 +3353,7 @@ mod tests {
                     email: None,
                     email_verified: None,
                     name: None,
+                    auth_time: None,
                     expires_at: Utc::now().timestamp() + 3600,
                     created_at: Utc::now().timestamp(),
                 },
@@ -3413,5 +3586,356 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn webauthn_auth_time_only_for_short_lived_auth_cwts() {
+        let auth = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None)
+            .with_idp("webauthn");
+        assert_eq!(webauthn_auth_time(&auth), Some(auth.iat));
+
+        // The ~99-year registration CWT is also aud="arkavo" and idp=webauthn,
+        // but its iat is registration time, not a recent assertion.
+        let registration =
+            crate::cwt::ArkavoClaims::registration("https://identity.arkavo.net", "u", 5148)
+                .with_idp("webauthn");
+        assert_eq!(webauthn_auth_time(&registration), None);
+
+        // A 1-hour token that is not from the passkey ceremony.
+        let other = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None)
+            .with_idp("apple");
+        assert_eq!(webauthn_auth_time(&other), None);
+    }
+
+    #[test]
+    fn has_scope_matches_whole_tokens_only() {
+        assert!(has_scope("openid agents:delegate", "agents:delegate"));
+        assert!(!has_scope("openid agents:delegatex", "agents:delegate"));
+        assert!(!has_scope("openid", "agents:delegate"));
+    }
+
+    #[tokio::test]
+    async fn access_token_carries_scope_and_auth_time() {
+        use coset::CborSerializable;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let token = mint_access_token(
+            &app_state,
+            "arkavo:00000000-0000-0000-0000-000000000001",
+            "arkavo-edge",
+            Some(AccessTokenExtras {
+                idp: "webauthn".into(),
+                scope: Some("openid agents:delegate".into()),
+                auth_time: Some(1_790_000_000),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let raw = crate::cwt::decode_from_header(&token).unwrap();
+        let sign1 = coset::CoseSign1::from_slice(crate::cwt::strip_cwt_tag(&raw).unwrap()).unwrap();
+        let claims = crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claims.custom.scope.as_deref(),
+            Some("openid agents:delegate")
+        );
+        assert_eq!(claims.custom.auth_time, Some(1_790_000_000));
+    }
+
+    fn edge_oidc_config() -> Arc<OidcConfig> {
+        let mut cfg = (*closurekb_oidc_config()).clone();
+        cfg.clients.insert(
+            "arkavo-edge".into(),
+            OidcClient {
+                client_id: "arkavo-edge".into(),
+                client_secret: None,
+                redirect_uris: vec!["http://127.0.0.1:52171/cb".into()],
+            },
+        );
+        Arc::new(cfg)
+    }
+
+    fn edge_delegate_query() -> AuthorizeQuery {
+        AuthorizeQuery {
+            response_type: "code".into(),
+            client_id: "arkavo-edge".into(),
+            redirect_uri: "http://127.0.0.1:52171/cb".into(),
+            scope: Some("openid offline_access agents:delegate".into()),
+            state: Some("st".into()),
+            nonce: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            idp: None,
+            id_token: None,
+            resource: None,
+            max_age: None,
+        }
+    }
+
+    async fn call_authorize(
+        app_state: &AppState,
+        headers: HeaderMap,
+        query: AuthorizeQuery,
+        codes: &AuthorizationCodeStore,
+    ) -> Response {
+        authorize(
+            Extension(app_state.clone()),
+            Extension(edge_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(Arc::new(crate::google_signin::GoogleSignin::new(
+                None,
+                test_redis(),
+                std::time::Duration::from_secs(1),
+            ))),
+            Extension(codes.clone()),
+            headers,
+            Query(query),
+        )
+        .await
+    }
+
+    fn redirect_error(resp: &Response) -> Option<String> {
+        let loc = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        loc.query_pairs()
+            .find(|(k, _)| k == "error")
+            .map(|(_, v)| v.into_owned())
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_agents_delegate_for_unlisted_or_federated_clients() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        // test_helpers allowlists only "arkavo-edge".
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let codes = AuthorizationCodeStore::new(test_redis());
+
+        // An RP that is not on AGENT_DELEGATE_CLIENT_IDS cannot obtain the scope.
+        let mut unlisted = closurekb_authorize_query();
+        unlisted.scope = Some("openid agents:delegate".into());
+        // build_test_app_state has no platform audience, so drop `resource`
+        // or check_resource answers invalid_target before the scope check.
+        unlisted.resource = None;
+        let resp = authorize(
+            Extension(app_state.clone()),
+            Extension(closurekb_oidc_config()),
+            Extension(Arc::new(apple_signin::AppleJwksCache::new())),
+            Extension(Arc::new(crate::google_signin::GoogleSignin::new(
+                None,
+                test_redis(),
+                std::time::Duration::from_secs(1),
+            ))),
+            Extension(codes.clone()),
+            HeaderMap::new(),
+            Query(unlisted),
+        )
+        .await;
+        assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
+
+        // The allowlisted client still cannot get it through Google.
+        let mut google = edge_delegate_query();
+        google.idp = Some("google".into());
+        let resp = call_authorize(&app_state, HeaderMap::new(), google, &codes).await;
+        assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
+    }
+
+    #[tokio::test]
+    async fn agents_delegate_code_records_the_passkey_assertion_time() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let user = store
+            .create_user(
+                &format!("ad-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                "did:key:z6Mkdelegate",
+            )
+            .await
+            .unwrap();
+        let codes = AuthorizationCodeStore::new(test_redis());
+
+        // A registration CWT is a WebAuthn token too, but not an assertion.
+        let cnf = crate::cwt::cnf_from_ed25519(&[7u8; 32], b"kid");
+        let registration =
+            crate::authn::mint_registration_token(&app_state, &user.user_id, None, cnf).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", registration.parse().unwrap());
+        let resp = call_authorize(&app_state, headers, edge_delegate_query(), &codes).await;
+        assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
+
+        // The 1-hour auth CWT from POST /authenticate is.
+        let auth = crate::authn::mint_auth_token(&app_state, &user.user_id, None, None).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", auth.parse().unwrap());
+        let resp = call_authorize(&app_state, headers, edge_delegate_query(), &codes).await;
+        assert_eq!(redirect_error(&resp), None);
+        let loc = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        let code = loc
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let record = codes.take(&code).await.unwrap().unwrap();
+        let auth_iat = {
+            let bytes = crate::cwt::decode_from_header(&auth).unwrap();
+            crate::cwt::verify(
+                &bytes,
+                &app_state.cwt_verifying_key,
+                &crate::cwt::VerifyOptions {
+                    expected_iss: None,
+                    expected_aud: None,
+                    now: Utc::now().timestamp(),
+                    skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+                },
+            )
+            .unwrap()
+            .iat
+        };
+        assert_eq!(record.user.auth_time, Some(auth_iat));
+    }
+
+    /// A passkey auth CWT for `user` whose assertion happened `age` seconds ago.
+    fn auth_cwt_aged(app_state: &AppState, user: Uuid, age: i64) -> String {
+        let mut claims = crate::cwt::ArkavoClaims::auth(
+            &app_state.issuer,
+            &user.to_string(),
+            AUTH_TOKEN_HOURS,
+            None,
+        )
+        .with_idp("webauthn");
+        claims.iat = Utc::now().timestamp() - age;
+        claims.exp = claims.iat + AUTH_TOKEN_HOURS * 3600;
+        crate::cwt::encode_for_header(
+            &crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn max_age_forces_a_fresh_passkey_assertion() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let user = store
+            .create_user(
+                &format!("ma-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                "did:key:z6Mkmaxage",
+            )
+            .await
+            .unwrap();
+        let codes = AuthorizationCodeStore::new(test_redis());
+        // AuthorizeQuery is not Clone; build one per request.
+        let query = || AuthorizeQuery {
+            max_age: Some(300),
+            ..edge_delegate_query()
+        };
+
+        // A still-valid auth CWT from 400 s ago: refused with the same
+        // login_required answer as no credential, so the client re-runs the
+        // passkey ceremony.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Auth-Token",
+            auth_cwt_aged(&app_state, user.user_id, 400)
+                .parse()
+                .unwrap(),
+        );
+        let resp = call_authorize(&app_state, headers, query(), &codes).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "login_required");
+
+        // Without max_age the same token is accepted (the default is unchanged).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Auth-Token",
+            auth_cwt_aged(&app_state, user.user_id, 400)
+                .parse()
+                .unwrap(),
+        );
+        let resp = call_authorize(&app_state, headers, edge_delegate_query(), &codes).await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(redirect_error(&resp), None);
+
+        // A fresh one mints a code, and the exchanged access token's
+        // auth_time is within max_age.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Auth-Token",
+            auth_cwt_aged(&app_state, user.user_id, 10).parse().unwrap(),
+        );
+        let resp = call_authorize(&app_state, headers, query(), &codes).await;
+        assert_eq!(redirect_error(&resp), None);
+        let loc = url::Url::parse(resp.headers()["location"].to_str().unwrap()).unwrap();
+        let code = loc
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let form = TokenForm {
+            grant_type: "authorization_code".into(),
+            code: Some(code),
+            redirect_uri: Some("http://127.0.0.1:52171/cb".into()),
+            client_id: Some("arkavo-edge".into()),
+            client_secret: None,
+            // RFC 7636 appendix B verifier for the challenge in edge_delegate_query.
+            code_verifier: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into()),
+            refresh_token: None,
+            scope: None,
+            resource: None,
+        };
+        let resp = handle_authorization_code_grant(
+            app_state.clone(),
+            edge_oidc_config(),
+            codes.clone(),
+            RefreshTokenStore::new(test_redis()),
+            test_patreon_state(),
+            HeaderMap::new(),
+            form,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let claims = {
+            let bytes =
+                crate::cwt::decode_from_header(body["access_token"].as_str().unwrap()).unwrap();
+            crate::cwt::verify(
+                &bytes,
+                &app_state.cwt_verifying_key,
+                &crate::cwt::VerifyOptions {
+                    expected_iss: Some(&app_state.issuer),
+                    expected_aud: Some("arkavo-edge"),
+                    now: Utc::now().timestamp(),
+                    skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
+                },
+            )
+            .unwrap()
+        };
+        let age = Utc::now().timestamp() - claims.custom.auth_time.unwrap();
+        assert!((0..=300).contains(&age), "auth_time is {age} s old");
+        assert!(has_scope(
+            claims.custom.scope.as_deref().unwrap(),
+            "agents:delegate"
+        ));
+
+        // max_age cannot be satisfied through Google (no passkey assertion to age).
+        let mut google = query();
+        google.idp = Some("google".into());
+        let resp = call_authorize(&app_state, HeaderMap::new(), google, &codes).await;
+        assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_request"));
     }
 }
