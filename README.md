@@ -280,7 +280,7 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/cb,https://open
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS bundle + web Service ID
 
 # Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
-export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kas.arkavo.net,https://kg.arkavo.net
+export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
 export ADMIN_CLIENT_IDS=catalog-node

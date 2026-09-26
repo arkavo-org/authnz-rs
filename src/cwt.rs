@@ -1690,7 +1690,7 @@ mod tests {
             "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
             vec![
                 "https://platform.arkavo.net".into(),
-                "https://kas.arkavo.net".into(),
+                "https://kg.arkavo.net".into(),
             ],
             15,
         )
@@ -1706,7 +1706,7 @@ mod tests {
         let bytes = mint(&claims, &sk, &kid).unwrap();
         let opts = VerifyOptions {
             expected_iss: Some("https://identity.arkavo.net"),
-            expected_aud: Some("https://kas.arkavo.net"),
+            expected_aud: Some("https://kg.arkavo.net"),
             now: claims.iat + 1,
             skew_secs: DEFAULT_SKEW_SECS,
         };
