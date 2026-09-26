@@ -37,8 +37,8 @@
 //!
 //! # Known Limitations
 //!
-//! - Certificate chain validation is incomplete (intermediate certs not verified)
-//! - Certificate extension 1.2.840.113635.100.8.2 (nonce) validation not implemented
+//! - Re-attesting an existing `key_id` under the same account resets `counter`
+//!   to 0, reopening a replay window for assertions captured before it
 //!
 //! # Requirements
 //!
@@ -144,7 +144,10 @@ pub struct AssertionResponse {
 // `missing field att_stmt` on every genuine attestation, so nothing Apple
 // produces could ever be parsed. `fmt`, `x5c` and `receipt` are unaffected,
 // having no case difference.
-#[derive(Debug, Deserialize)]
+// `Serialize` exists for the tamper tests, which re-encode a modified
+// attestation to prove a mutated authData is refused. Nothing in production
+// writes an attestation object.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AttestationObject {
     fmt: String,
@@ -152,7 +155,7 @@ struct AttestationObject {
     auth_data: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct AttestationStatement {
@@ -196,15 +199,44 @@ pub struct VerifyOptions<'a> {
 /// `require_app_id: false` and an unset `expected_app_ids` still warns and
 /// continues. The gate passes `true`, where an unset value is refused.
 ///
-/// The three verification gaps this carries forward — unvalidated nonce
-/// extension, incomplete chain validation, and counter reset on re-attest —
-/// are Tasks 2 and 3. They are not closed here; this is a pure move.
+/// The nonce extension (Task 2), the full certificate chain (Task 3), the
+/// aaguid, and the binding of `key_id` to the attested key are verified here.
+/// The app-id relaxation above is the only behaviour that differs by path;
+/// the aaguid and key_id checks refuse on both. The remaining documented gap — `counter` resetting to 0 when
+/// an existing `key_id` re-attests — is a property of the bound-device
+/// assertion path, not of this function.
 pub fn verify_attestation(
     challenge: &str,
     key_id: &str,
     attestation_object_b64: &str,
     client_data_hash_b64: &str,
     opts: &VerifyOptions<'_>,
+) -> Result<AttestedKey, DeviceCheckError> {
+    verify_attestation_at(
+        challenge,
+        key_id,
+        attestation_object_b64,
+        client_data_hash_b64,
+        opts,
+        ASN1Time::now(),
+    )
+}
+
+/// As [`verify_attestation`], but with the certificate-validity instant
+/// supplied.
+///
+/// **Production always passes `ASN1Time::now()`** — [`verify_attestation`] is
+/// the only non-test caller. See [`validate_certificate_chain_at`] for why the
+/// parameter exists: the captured fixture's leaf is valid for about three
+/// days, and tests that drive the whole verifier would otherwise start failing
+/// on a calendar date rather than a code change.
+pub fn verify_attestation_at(
+    challenge: &str,
+    key_id: &str,
+    attestation_object_b64: &str,
+    client_data_hash_b64: &str,
+    opts: &VerifyOptions<'_>,
+    now: ASN1Time,
 ) -> Result<AttestedKey, DeviceCheckError> {
     // Decode the attestation object from base64
     let attestation_bytes = base64::engine::general_purpose::STANDARD
@@ -235,7 +267,7 @@ pub fn verify_attestation(
     }
 
     // Validate certificate chain
-    validate_certificate_chain(&attestation.att_stmt.x5c)?;
+    validate_certificate_chain_at(&attestation.att_stmt.x5c, now)?;
 
     // Extract public key from certificate
     let public_key = extract_public_key_from_cert(&attestation.att_stmt.x5c[0])?;
@@ -278,34 +310,56 @@ pub fn verify_attestation(
         return Err(DeviceCheckError::AppIdMismatch);
     }
 
+    // SECURITY: bind the claimed key_id to the key Apple actually attested.
+    //
+    // key_id is caller-supplied and keys the registration budget. Without
+    // this, one genuine attestation could be presented under any key_id, and
+    // the per-key budget would bound nothing. Apple defines key_id as
+    // SHA256 of the credCert's public key, and authData's credentialId as
+    // that same hash. The key_id string must be its canonical (padded
+    // standard base64) encoding so one key cannot own two budget rows.
+    //
+    // Runs before the nonce compare: every tamper here also changes the
+    // nonce, and a check shadowed by NonceMismatch is a check nobody can test.
+    let credential = parse_attested_credential(&attestation.auth_data)?;
+    if !ACCEPTED_AAGUIDS.contains(&credential.aaguid) {
+        return Err(DeviceCheckError::InvalidAaguid(hex::encode(
+            credential.aaguid,
+        )));
+    }
+    let key_hash = attested_key_hash(&attestation.att_stmt.x5c[0])?;
+    let canonical_key_id = base64::engine::general_purpose::STANDARD.encode(key_hash);
+    if key_id != canonical_key_id || credential.credential_id != key_hash.as_slice() {
+        warn!(
+            "App Attest key_id mismatch: claimed {}, attested key is {}",
+            key_id, canonical_key_id
+        );
+        return Err(DeviceCheckError::KeyIdMismatch);
+    }
+
     // Calculate nonce: SHA256(authData || clientDataHash)
     let mut nonce_data = Vec::new();
     nonce_data.extend_from_slice(&attestation.auth_data);
     nonce_data.extend_from_slice(&client_data_hash);
     let calculated_nonce = Sha256::digest(&nonce_data);
 
-    // SECURITY GAP: Nonce validation against certificate extension not implemented
+    // SECURITY: bind the attestation to the challenge this server issued.
     //
-    // According to Apple's App Attest specification, the credCert (leaf certificate)
-    // contains a custom extension with OID 1.2.840.113635.100.8.2 that holds the nonce.
-    // We should verify that the calculated_nonce matches this extension value.
-    //
-    // Risk Assessment:
-    // - Without this check, an attacker could potentially present a valid attestation
-    //   for a different challenge, though they would still need a genuine Apple device
-    // - The rpIdHash, certificate chain, and counter checks provide defense-in-depth
-    // - This validation should be implemented before production deployment
-    //
-    // Implementation Required:
-    // 1. Parse the X.509 certificate extension 1.2.840.113635.100.8.2
-    // 2. Extract the nonce value from the extension
-    // 3. Compare with calculated_nonce
-    // 4. Reject attestation if they don't match
-    warn!(
-        "SECURITY: Nonce validation against certificate extension not implemented. \
-         Calculated nonce: {}. This check should be added before production use.",
-        hex::encode(calculated_nonce)
-    );
+    // The credCert carries the nonce Apple computed at attestation time in
+    // extension 1.2.840.113635.100.8.2, and the Secure Enclave signs the cert
+    // over it. Comparing it against our own SHA256(authData || clientDataHash)
+    // is what makes a captured attestation useless against a later challenge —
+    // every other check (chain, rpIdHash, counter) is satisfied by a replay.
+    let cert_nonce = extract_attestation_nonce(&attestation.att_stmt.x5c[0])?;
+    if cert_nonce.as_slice() != &calculated_nonce[..] {
+        warn!(
+            "App Attest nonce mismatch for key_id {}: credCert has {}, computed {}",
+            key_id,
+            hex::encode(&cert_nonce),
+            hex::encode(calculated_nonce)
+        );
+        return Err(DeviceCheckError::NonceMismatch);
+    }
 
     Ok(AttestedKey {
         key_id: key_id.to_string(),
@@ -338,9 +392,9 @@ pub struct RegistrationTicket {
     pub expires_at: i64,
 }
 
-/// Spent by Task 6, which is the change that makes `/register` require a
-/// ticket. Defined here with the type it validates so the two cannot drift.
-#[allow(dead_code)]
+/// Spent by `authn::require_registration_ticket`, which is what makes
+/// `/register` require a ticket. Defined here with the type it validates so
+/// the two cannot drift.
 pub fn ticket_is_valid(ticket: &RegistrationTicket, now: i64) -> bool {
     now <= ticket.expires_at
 }
@@ -398,6 +452,10 @@ pub fn preflight_error_mapping(err: &DeviceCheckError) -> (StatusCode, &'static 
         DeviceCheckError::InvalidAttestationObject(_)
         | DeviceCheckError::InvalidFormat(_)
         | DeviceCheckError::InvalidCertificateChain(_)
+        | DeviceCheckError::NonceExtensionMissing
+        | DeviceCheckError::NonceMismatch
+        | DeviceCheckError::KeyIdMismatch
+        | DeviceCheckError::InvalidAaguid(_)
         | DeviceCheckError::InvalidAuthenticatorData(_)
         | DeviceCheckError::InvalidCounter(_)
         | DeviceCheckError::InvalidClientData(_)
@@ -801,38 +859,165 @@ fn generate_random_challenge() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn validate_certificate_chain(x5c: &[Vec<u8>]) -> Result<(), DeviceCheckError> {
-    if x5c.is_empty() {
-        return Err(DeviceCheckError::InvalidCertificateChain(
-            "Empty certificate chain".to_string(),
-        ));
+/// Verify the App Attest chain: leaf -> intermediate(s) -> Apple's pinned root.
+///
+/// Every signature in the chain is checked and the chain must terminate at the
+/// embedded root. Apple sends leaf + intermediate, so a one-element chain is
+/// refused rather than treated as self-signed.
+///
+/// `now` is the instant validity windows are checked against.
+/// **Production always passes `ASN1Time::now()`**: the only non-test caller is
+/// [`verify_attestation_at`], and the only non-test caller of *that* is
+/// [`verify_attestation`], which supplies the wall clock. The parameter is not
+/// a way to disable expiry checking. It exists because the Task 0 fixture's
+/// leaf is valid for about three days, and a suite wired to the wall clock
+/// would start failing on a calendar date with no code change behind it —
+/// which is how people learn to ignore a red suite.
+fn validate_certificate_chain_at(x5c: &[Vec<u8>], now: ASN1Time) -> Result<(), DeviceCheckError> {
+    if x5c.len() < 2 {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "expected leaf + intermediate, got {} certificate(s)",
+            x5c.len()
+        )));
     }
 
-    // Parse leaf certificate
-    let (_, leaf_cert) = X509Certificate::from_der(&x5c[0])
-        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
-
-    info!("Leaf certificate subject: {}", leaf_cert.subject());
-    info!("Leaf certificate issuer: {}", leaf_cert.issuer());
-
-    // Get cached Apple root CA DER (parsed once on first use)
+    // Cached Apple root CA DER, parsed once on first use.
     let root_cert_der = APPLE_ROOT_CERT_DER.get_or_init(|| {
         let root_pem = ::pem::parse(APPLE_APP_ATTEST_ROOT_CA.as_bytes())
             .expect("Failed to parse embedded Apple root CA PEM");
         root_pem.contents().to_vec()
     });
-
-    // Parse the cached DER to get the certificate for validation
     let (_, root_cert) = X509Certificate::from_der(root_cert_der)
         .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
 
-    info!("Root certificate subject: {}", root_cert.subject());
+    let mut parsed = Vec::with_capacity(x5c.len());
+    for der in x5c {
+        let (_, cert) = X509Certificate::from_der(der)
+            .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
+        parsed.push(cert);
+    }
 
-    // In production, we would verify the full chain here
-    // For now, we just validate that we can parse the certificates
-    warn!("Certificate chain validation is incomplete - implement full chain verification");
+    for cert in &parsed {
+        if !cert.validity().is_valid_at(now) {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "certificate expired or not yet valid: {}",
+                cert.subject()
+            )));
+        }
+    }
+
+    // Each certificate must be signed by the next one along.
+    for pair in parsed.windows(2) {
+        let (child, issuer) = (&pair[0], &pair[1]);
+        if child.issuer() != issuer.subject() {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "issuer mismatch: {} is not issued by {}",
+                child.subject(),
+                issuer.subject()
+            )));
+        }
+        child
+            .verify_signature(Some(issuer.public_key()))
+            .map_err(|e| {
+                DeviceCheckError::InvalidCertificateChain(format!(
+                    "signature check failed for {}: {e}",
+                    child.subject()
+                ))
+            })?;
+    }
+
+    // The topmost certificate we were sent must chain to the pinned root.
+    let top = parsed.last().expect("length checked above");
+    if top.issuer() != root_cert.subject() {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "chain does not terminate at Apple's App Attest root: top issuer is {}",
+            top.issuer()
+        )));
+    }
+    top.verify_signature(Some(root_cert.public_key()))
+        .map_err(|e| {
+            DeviceCheckError::InvalidCertificateChain(format!("root signature check failed: {e}"))
+        })?;
 
     Ok(())
+}
+
+/// Apple's App Attest nonce extension on the credCert.
+///
+/// The value is `SEQUENCE { [1] EXPLICIT OCTET STRING }` holding the 32 bytes
+/// of `SHA256(authData || clientDataHash)` as Apple computed them.
+const APPLE_NONCE_OID: [u64; 7] = [1, 2, 840, 113635, 100, 8, 2];
+
+/// Read one definite-length DER TLV, checking the tag.
+///
+/// Hand-rolled rather than routed through a BER parser because the shape here
+/// is fixed and three levels deep, and because BER's permissiveness is not
+/// wanted: an indefinite length or a non-minimal tag in an attestation is a
+/// malformed attestation, not something to accept and normalise. Returns the
+/// contents and whatever follows the TLV.
+fn der_tlv(input: &[u8], expect_tag: u8) -> Result<(&[u8], &[u8]), String> {
+    let tag = *input.first().ok_or("truncated DER: no tag")?;
+    if tag != expect_tag {
+        return Err(format!(
+            "expected DER tag 0x{expect_tag:02x}, got 0x{tag:02x}"
+        ));
+    }
+    let first = *input.get(1).ok_or("truncated DER: no length")?;
+    let (len, header) = if first < 0x80 {
+        (first as usize, 2usize)
+    } else {
+        // Long form. 0x80 alone is BER's indefinite length, which DER forbids.
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return Err(format!("unsupported DER length form 0x{first:02x}"));
+        }
+        let bytes = input
+            .get(2..2 + n)
+            .ok_or("truncated DER: short length bytes")?;
+        let len = bytes.iter().fold(0usize, |acc, b| (acc << 8) | *b as usize);
+        (len, 2 + n)
+    };
+    let end = header
+        .checked_add(len)
+        .ok_or("DER length overflows the address space")?;
+    let contents = input
+        .get(header..end)
+        .ok_or("DER length runs past the end of the buffer")?;
+    Ok((contents, &input[end..]))
+}
+
+/// Pull the 32 nonce bytes out of the credCert's App Attest extension.
+///
+/// A certificate with no such extension is not an App Attest credCert, so it
+/// is refused rather than treated as "nothing to check".
+fn extract_attestation_nonce(cert_der: &[u8]) -> Result<Vec<u8>, DeviceCheckError> {
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
+
+    let oid = x509_parser::der_parser::Oid::from(&APPLE_NONCE_OID).map_err(|e| {
+        DeviceCheckError::InvalidCertificateChain(format!("bad nonce OID constant: {e:?}"))
+    })?;
+
+    let ext = cert
+        .get_extension_unique(&oid)
+        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?
+        .ok_or(DeviceCheckError::NonceExtensionMissing)?;
+
+    let bad =
+        |e: String| DeviceCheckError::InvalidCertificateChain(format!("nonce extension: {e}"));
+
+    // SEQUENCE { [1] EXPLICIT { OCTET STRING } }
+    let (seq, _) = der_tlv(ext.value, 0x30).map_err(bad)?;
+    let (tagged, _) = der_tlv(seq, 0xa1).map_err(bad)?;
+    let (nonce, _) = der_tlv(tagged, 0x04).map_err(bad)?;
+
+    if nonce.len() != 32 {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "nonce extension is {} bytes, expected 32",
+            nonce.len()
+        )));
+    }
+    Ok(nonce.to_vec())
 }
 
 fn extract_public_key_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, DeviceCheckError> {
@@ -850,6 +1035,63 @@ struct AuthenticatorData {
     rp_id_hash_str: String,
     flags: u8,
     counter: u32,
+}
+
+/// The two App Attest environments. iOS release builds emit `appattest` and
+/// developer builds `appattestdevelop`; macOS always emits `appattest`, even
+/// for a locally signed build. `rpIdHash` already pins Team + Bundle ID, so a
+/// development key still needs our signing identity — the check exists to
+/// refuse anything that is not App Attest at all.
+const ACCEPTED_AAGUIDS: [[u8; 16]; 2] = [*b"appattest\0\0\0\0\0\0\0", *b"appattestdevelop"];
+
+/// authData's attested credential data, present only in an attestation.
+struct AttestedCredential<'a> {
+    aaguid: [u8; 16],
+    credential_id: &'a [u8],
+}
+
+/// Read aaguid and credentialId from attestation authData.
+///
+/// Separate from [`parse_authenticator_data`] because the assertion path parses
+/// 37-byte authData that has no attested credential data.
+///
+/// Layout after the 37-byte header: aaguid (16), credentialId length (2, BE),
+/// credentialId.
+fn parse_attested_credential(data: &[u8]) -> Result<AttestedCredential<'_>, DeviceCheckError> {
+    let bad = |m: &str| DeviceCheckError::InvalidAuthenticatorData(m.to_string());
+    let aaguid: [u8; 16] = data
+        .get(37..53)
+        .ok_or_else(|| bad("attestation authData has no attested credential data"))?
+        .try_into()
+        .expect("slice is 16 bytes");
+    let len_bytes = data
+        .get(53..55)
+        .ok_or_else(|| bad("attestation authData is missing the credentialId length"))?;
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let credential_id = data
+        .get(55..55 + len)
+        .ok_or_else(|| bad("credentialId runs past the end of authData"))?;
+    Ok(AttestedCredential {
+        aaguid,
+        credential_id,
+    })
+}
+
+/// SHA256 of the credCert's public key as an X9.62 uncompressed point.
+///
+/// This is Apple's key identifier. It is the 65-byte point, not the DER
+/// SubjectPublicKeyInfo that [`extract_public_key_from_cert`] returns.
+fn attested_key_hash(cert_der: &[u8]) -> Result<[u8; 32], DeviceCheckError> {
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?;
+    let point = &cert.public_key().subject_public_key.data;
+    if point.len() != 65 || point[0] != 0x04 {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "credCert key is not an uncompressed P-256 point ({} bytes)",
+            point.len()
+        )));
+    }
+    Ok(Sha256::digest(point).into())
 }
 
 fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, DeviceCheckError> {
@@ -1100,6 +1342,21 @@ pub enum DeviceCheckError {
     #[error("Invalid assertion: {0}")]
     InvalidAssertion(String),
 
+    #[error("credCert is missing the App Attest nonce extension")]
+    NonceExtensionMissing,
+
+    #[error("Attestation nonce does not match the issued challenge")]
+    NonceMismatch,
+
+    /// The claimed `key_id` is not the attested key: it is not
+    /// `SHA256(publicKey)`, or authData's `credentialId` disagrees with it.
+    #[error("key_id does not identify the attested key")]
+    KeyIdMismatch,
+
+    /// authData's aaguid is neither App Attest environment.
+    #[error("Invalid App Attest aaguid: {0}")]
+    InvalidAaguid(String),
+
     #[error("App ID mismatch")]
     AppIdMismatch,
 
@@ -1136,6 +1393,25 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::AppIdMismatch => (
                 StatusCode::BAD_REQUEST,
                 "Attestation was produced by an unexpected app".to_string(),
+            ),
+            // 401, not 400: both are a rejected attestation — the caller
+            // failed to prove it holds an attestation for *this* challenge —
+            // rather than a malformed request the client could reshape.
+            DeviceCheckError::NonceExtensionMissing => (
+                StatusCode::UNAUTHORIZED,
+                "credCert is missing the App Attest nonce extension".to_string(),
+            ),
+            DeviceCheckError::NonceMismatch => (
+                StatusCode::UNAUTHORIZED,
+                "Attestation nonce does not match the issued challenge".to_string(),
+            ),
+            DeviceCheckError::KeyIdMismatch => (
+                StatusCode::UNAUTHORIZED,
+                "key_id does not identify the attested key".to_string(),
+            ),
+            DeviceCheckError::InvalidAaguid(err) => (
+                StatusCode::UNAUTHORIZED,
+                format!("Invalid App Attest aaguid: {}", err),
             ),
             // 503, deliberately not 403: the server cannot decide, which is an
             // operator problem and is retryable. A 403 here would be
@@ -1346,7 +1622,7 @@ mod tests {
             .decode(f["client_data_hash"].as_str().unwrap())
             .unwrap();
         let got = Sha256::digest(f["challenge"].as_str().unwrap().as_bytes());
-        assert_eq!(got.as_slice(), want.as_slice());
+        assert_eq!(&got[..], want.as_slice());
     }
 
     #[test]
@@ -1907,5 +2183,373 @@ mod tests {
             c.aud,
             crate::cwt::Audience::Single("arkavo:devicecheck".into())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks 2 and 3: nonce extension + full chain verification
+    //
+    // Every one of these drives the *real* captured attestation. Hand-built
+    // structs cannot catch a wire-format mismatch — that is exactly how the
+    // camelCase bug survived the module's whole life.
+    // -----------------------------------------------------------------------
+
+    /// Decode the fixture's attestation object.
+    fn fixture_attestation(f: &serde_json::Value) -> AttestationObject {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(f["attestation_object"].as_str().unwrap())
+            .unwrap();
+        ciborium::from_reader(&bytes[..]).expect("a real attestation must deserialize")
+    }
+
+    /// The fixture's capture time, as an ASN.1 instant.
+    fn fixture_instant(f: &serde_json::Value) -> ASN1Time {
+        ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn credcert_nonce_matches_the_computed_nonce() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let client_data_hash = base64::engine::general_purpose::STANDARD
+            .decode(f["client_data_hash"].as_str().unwrap())
+            .unwrap();
+
+        let mut nonce_data = att.auth_data.clone();
+        nonce_data.extend_from_slice(&client_data_hash);
+        let computed = Sha256::digest(&nonce_data);
+
+        let from_cert = extract_attestation_nonce(&att.att_stmt.x5c[0])
+            .expect("credCert must carry the 1.2.840.113635.100.8.2 extension");
+
+        assert_eq!(
+            from_cert.as_slice(),
+            &computed[..],
+            "Apple's recorded nonce must equal SHA256(authData || clientDataHash)"
+        );
+    }
+
+    #[test]
+    fn a_certificate_without_the_extension_is_refused() {
+        // The Apple intermediate is a real, valid certificate with no App
+        // Attest nonce extension. Absence must refuse, not pass silently.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let err = extract_attestation_nonce(&att.att_stmt.x5c[1]).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::NonceExtensionMissing),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_attestation_accepts_the_real_fixture() {
+        let f = load_fixture();
+        let app_id = f["app_id_hash"].as_str().unwrap().to_string();
+        let attested = verify_attestation_at(
+            f["challenge"].as_str().unwrap(),
+            f["key_id"].as_str().unwrap(),
+            f["attestation_object"].as_str().unwrap(),
+            f["client_data_hash"].as_str().unwrap(),
+            &VerifyOptions {
+                expected_app_ids: std::slice::from_ref(&app_id),
+                require_app_id: true,
+            },
+            fixture_instant(&f),
+        )
+        .expect("a genuine Apple attestation must verify end to end");
+
+        assert_eq!(attested.rp_id_hash_str, app_id);
+        assert_eq!(attested.counter, 0);
+        assert!(!attested.public_key.is_empty());
+    }
+
+    #[test]
+    fn verify_attestation_rejects_a_tampered_nonce() {
+        use base64::Engine as _;
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+
+        // Flip a byte of authData, which changes the computed nonce while
+        // leaving the certificate's recorded nonce untouched. The last byte is
+        // past rpIdHash (0..32) and past the counter (33..37), so every other
+        // check still passes and only the nonce comparison can refuse this.
+        let last = att.auth_data.len() - 1;
+        att.auth_data[last] ^= 0xff;
+
+        let mut tampered = Vec::new();
+        ciborium::into_writer(&att, &mut tampered).unwrap();
+        let tampered_b64 = base64::engine::general_purpose::STANDARD.encode(&tampered);
+
+        let app_id = f["app_id_hash"].as_str().unwrap().to_string();
+        let err = verify_attestation_at(
+            f["challenge"].as_str().unwrap(),
+            f["key_id"].as_str().unwrap(),
+            &tampered_b64,
+            f["client_data_hash"].as_str().unwrap(),
+            &VerifyOptions {
+                expected_app_ids: std::slice::from_ref(&app_id),
+                require_app_id: true,
+            },
+            fixture_instant(&f),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DeviceCheckError::NonceMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chain_validation_accepts_the_real_fixture() {
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        validate_certificate_chain_at(&att.att_stmt.x5c, fixture_instant(&f))
+            .expect("a real Apple chain must validate to the embedded root");
+    }
+
+    #[test]
+    fn chain_validation_rejects_an_expired_certificate() {
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+
+        // Ten years past capture the leaf is certainly outside its window.
+        let long_after =
+            ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap() + 10 * 365 * 24 * 3600)
+                .unwrap();
+
+        let err = validate_certificate_chain_at(&att.att_stmt.x5c, long_after).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
+            "an expired chain must not validate, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chain_validation_rejects_a_forged_leaf() {
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+
+        // The last bytes of a DER certificate are inside the signature value,
+        // so flipping them leaves a structurally valid certificate whose
+        // signature no longer verifies — which is the only thing separating a
+        // real credCert from one an attacker minted.
+        let mut forged = att.att_stmt.x5c.clone();
+        let leaf = &mut forged[0];
+        let n = leaf.len();
+        for b in leaf[n - 8..].iter_mut() {
+            *b ^= 0xff;
+        }
+
+        let err = validate_certificate_chain_at(&forged, fixture_instant(&f)).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chain_validation_rejects_a_leaf_only_chain() {
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let err =
+            validate_certificate_chain_at(&att.att_stmt.x5c[..1], fixture_instant(&f)).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
+            "a chain with no intermediate must not validate, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chain_validation_rejects_a_chain_that_misses_the_pinned_root() {
+        // Leaf + leaf: two parseable certificates that do not chain to Apple's
+        // root. A verifier that only checked "did it parse" would accept this.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let bogus = vec![att.att_stmt.x5c[0].clone(), att.att_stmt.x5c[0].clone()];
+        let err = validate_certificate_chain_at(&bogus, fixture_instant(&f)).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidCertificateChain(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nonce_errors_are_401_and_retryable_on_the_preflight() {
+        // A rejected attestation is not a permanent verdict on the device: the
+        // client mints a fresh key and tries again. Only attest_registration_cap
+        // is permanent. See docs/app-attest-preflight-contract.md.
+        assert_eq!(
+            DeviceCheckError::NonceMismatch.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            DeviceCheckError::NonceExtensionMissing
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for e in [
+            DeviceCheckError::NonceMismatch,
+            DeviceCheckError::NonceExtensionMissing,
+        ] {
+            let (status, token, _) = preflight_error_mapping(&e);
+            assert_eq!(token, "attestation_invalid");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // key_id binding and aaguid
+    //
+    // Tampers land in authData bytes 37..87, which also changes the computed
+    // nonce. These checks therefore have to run *before* the nonce compare, or
+    // every one of these tests would pass on NonceMismatch and prove nothing.
+    // -----------------------------------------------------------------------
+
+    /// Run the fixture through the verifier with `att` and `key_id` swapped in.
+    fn verify_modified(
+        f: &serde_json::Value,
+        att: &AttestationObject,
+        key_id: &str,
+    ) -> Result<AttestedKey, DeviceCheckError> {
+        use base64::Engine as _;
+        let mut encoded = Vec::new();
+        ciborium::into_writer(att, &mut encoded).unwrap();
+        let app_id = f["app_id_hash"].as_str().unwrap().to_string();
+        verify_attestation_at(
+            f["challenge"].as_str().unwrap(),
+            key_id,
+            &base64::engine::general_purpose::STANDARD.encode(&encoded),
+            f["client_data_hash"].as_str().unwrap(),
+            &VerifyOptions {
+                expected_app_ids: std::slice::from_ref(&app_id),
+                require_app_id: true,
+            },
+            fixture_instant(f),
+        )
+    }
+
+    #[test]
+    fn a_key_id_that_is_not_the_attested_key_is_refused() {
+        // key_id names the budget row and, on the bound path, the device
+        // binding. Accepted unbound, a genuine attestation could be filed
+        // under a key_id the caller does not hold — someone else's — charging
+        // or squatting a row it has no claim to.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let err =
+            verify_modified(&f, &att, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_key_id_encoding_is_refused() {
+        // Same 32 bytes, padding stripped. Accepting both spellings would give
+        // one device two budget rows.
+        let f = load_fixture();
+        let att = fixture_attestation(&f);
+        let unpadded = f["key_id"].as_str().unwrap().trim_end_matches('=');
+        let err = verify_modified(&f, &att, unpadded).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_id_that_disagrees_with_key_id_is_refused() {
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        // credentialId: 2-byte length at 53..55, then 32 bytes.
+        att.auth_data[55..87].fill(0);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::KeyIdMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_aaguid_is_refused() {
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data[37..53].fill(0);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAaguid(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_development_aaguid_is_accepted() {
+        // iOS developer builds emit `appattestdevelop`. There is no second
+        // fixture, so prove acceptance by the refusal moving on: the swapped
+        // aaguid breaks the nonce, and that must be what refuses it.
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data[37..53].copy_from_slice(b"appattestdevelop");
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::NonceMismatch),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn authdata_without_attested_credential_data_is_refused() {
+        // 37 bytes is a valid *assertion* authData, but an attestation must
+        // carry aaguid and credentialId.
+        let f = load_fixture();
+        let mut att = fixture_attestation(&f);
+        att.auth_data.truncate(37);
+        let err = verify_modified(&f, &att, f["key_id"].as_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAuthenticatorData(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn key_binding_errors_are_401_and_retryable_on_the_preflight() {
+        for e in [
+            DeviceCheckError::KeyIdMismatch,
+            DeviceCheckError::InvalidAaguid("x".into()),
+        ] {
+            let (status, token, _) = preflight_error_mapping(&e);
+            assert_eq!(token, "attestation_invalid", "{e:?}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{e:?}");
+            assert_eq!(e.into_response().status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[test]
+    fn der_tlv_refuses_indefinite_length() {
+        // BER's indefinite length is 0x80. DER forbids it, and an attestation
+        // carrying one is malformed rather than something to normalise.
+        let err = der_tlv(&[0x30, 0x80, 0x00, 0x00], 0x30).unwrap_err();
+        assert!(err.contains("unsupported DER length form"), "{err}");
+    }
+
+    #[test]
+    fn der_tlv_refuses_a_length_past_the_buffer() {
+        let err = der_tlv(&[0x04, 0x20, 0x01, 0x02], 0x04).unwrap_err();
+        assert!(err.contains("runs past the end"), "{err}");
+    }
+
+    #[test]
+    fn der_tlv_reads_a_long_form_length() {
+        let mut buf = vec![0x04, 0x81, 0x80];
+        buf.extend(std::iter::repeat_n(0xAAu8, 0x80));
+        buf.push(0xFF); // trailing byte, must come back as the remainder
+        let (contents, rest) = der_tlv(&buf, 0x04).unwrap();
+        assert_eq!(contents.len(), 0x80);
+        assert_eq!(rest, &[0xFF]);
     }
 }

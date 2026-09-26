@@ -203,7 +203,7 @@ else:           print('=> MATCHES NEITHER  -- do not conclude; suspect wrong bun
 
 That third branch is the point of comparing against both. Concluding "it's the CDhash" from non-equality alone lets one fat-fingered input close the macOS hole in the wrong direction — and this decision is meant to be the one made *before* the enforcing deploy.
 
-Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since Task 1's verifier checks it. The value is NUL-padded to 16 bytes, so the hex is printed alongside the text form — trailing `00`s are padding, not part of the value.
+Record the answer in the spec's "The macOS hole" section either way, and note the aaguid (`appattest`, `appattestdevelop`, or something else) since the verifier checks it. (Task 1 as landed did not — see the Self-Review note below.) The value is NUL-padded to 16 bytes, so the hex is printed alongside the text form — trailing `00`s are padding, not part of the value.
 
 - [ ] **Step 6: Write the README**
 
@@ -529,7 +529,16 @@ keeps today's warn-and-continue on an unset APP_ATTEST_APP_ID."
 
 ---
 
-### Task 2: Validate the credCert nonce extension
+### Task 2: Validate the credCert nonce extension — **DONE** (v0.11.3)
+
+> Landed with Task 3 in one commit: both needed the same supplied-validity-instant
+> plumbing (`verify_attestation_at`, `validate_certificate_chain_at`), and splitting
+> them would have meant writing time-unstable tests and then rewriting them.
+> Implementation differs from Step 4 below: the extension is read with a strict
+> hand-rolled DER walk (`der_tlv`) rather than `parse_ber_*`, because BER's
+> permissiveness is not wanted here — an indefinite length in an attestation is a
+> malformed attestation. Errors map to 401, not the drafted 401-via-`IntoResponse`
+> only: `preflight_error_mapping` also groups them under `attestation_invalid`.
 
 Closes the gap the code documents at `src/device_check.rs:288-310`. Without it the attestation is not bound to the issued challenge, which is the whole replay property the gate depends on.
 
@@ -723,7 +732,11 @@ SHA256(authData || clientDataHash)."
 
 ---
 
-### Task 3: Complete the certificate chain validation
+### Task 3: Complete the certificate chain validation — **DONE** (v0.11.3)
+
+> As drafted, plus one extra test: a leaf+leaf chain that parses but does not reach
+> the pinned root. `validate_certificate_chain` was removed rather than kept as a
+> `now()` wrapper — `verify_attestation` is the single place the wall clock enters.
 
 Closes the second documented gap. Today `validate_certificate_chain` parses the leaf and the root, logs, and returns `Ok(())` without verifying a single signature.
 
@@ -1386,7 +1399,11 @@ what the gate exists to refuse."
 
 ---
 
-### Task 6: Gate registration on the ticket
+### Task 6: Gate registration on the ticket — **DONE** (v0.12.0)
+
+> The ticket read is shared between `start_register` and `finish_register` as
+> `require_registration_ticket`, so the two cannot drift. Drafting it twice inline
+> (Steps 4 and 5) invited exactly that.
 
 **Files:**
 - Modify: `src/authn.rs:90` area (`start_register`), and `finish_register`
@@ -1532,7 +1549,25 @@ The ticket is consumed in finish_register: one attestation, one account."
 
 ---
 
-### Task 7: End-to-end proof the gate holds
+### Task 7: End-to-end proof the gate holds — **DONE** (v0.12.0)
+
+> In `src/registration_gate_tests.rs`, not `tests/registration_gate.rs`: `AppState`
+> is bin-local by design (see `src/lib.rs`), and moving it into the library to suit
+> a test file's location would drag `db`, `patreon` and `device_check` with it.
+> Adds a test the draft did not have: the refusal must be **byte-identical** for a
+> handle that exists and one that does not, or `/register` is a handle oracle.
+>
+> **Correction (found in review of #80).** As first landed, Task 7 had no
+> authenticator at all and never called `POST /register`, so nothing covered the
+> finish side. It now drives `webauthn-authenticator-rs` `SoftPasskey` through
+> the whole ceremony against DynamoDB Local: a ticketed ceremony registers,
+> charges one slot and consumes the ticket; a ticket expiring mid-ceremony, a
+> replayed finish, and a budget spent between attest and finish are each
+> refused with no credential stored. These skip without
+> `AUTHNZ_TEST_DYNAMODB_ENDPOINT`, which CI's `test` job sets. Each was checked
+> by removing the guard it covers and watching it fail. The unticketed case
+> stays start-side: without a ticket there are no creation options for an
+> authenticator to answer.
 
 The load-bearing test. A software authenticator must be able to complete the WebAuthn ceremony and still be refused, because that is exactly the attack.
 
@@ -1668,7 +1703,7 @@ caller, since the challenge response would otherwise confirm a handle."
 
 ---
 
-### Task 8: Client preflight in ArkavoKit
+### Task 8: Client preflight in ArkavoKit — **DONE** (ArkavoKit `c2ef150`, separate repo)
 
 **Repo:** `/Users/arkavo/Projects/ArkavoKit` — a separate repository. Branch and commit there, not in `authnz-rs`.
 
@@ -1839,15 +1874,18 @@ from a network blip."
 
 Not a task — the sequence the spec requires, to run once every task above has landed.
 
-- [ ] `APP_ATTEST_APP_ID` is set in every environment that serves registration. The gate fails closed without it, so an unset value takes registration down.
-- [ ] `device_attest_keys` table created in each environment.
-- [ ] `DYNAMODB_DEVICE_ATTEST_KEYS_TABLE` set, or the default `device_attest_keys` matches the created table.
+- [ ] **Deploy v0.11.2 (the camelCase fix) before v0.12.0, and see one real `register-attest` succeed on it.** Without the fix no genuine attestation decodes at all, so the gate would refuse everyone. Proving the verifier accepts real client bytes while registration is still open turns a potential outage into a log line.
+- [x] `device_attest_keys` table created — `prod-device-attest-keys`, ACTIVE, PK `key_id`, PAY_PER_REQUEST (2026-09-20).
+- [x] `DYNAMODB_DEVICE_ATTEST_KEYS_TABLE` staged in `production/start.sh`.
+- [ ] `APP_ATTEST_APP_ID` is set in every environment that serves registration, with **both** app-id hashes. The gate fails closed without it, so an unset value takes registration down. Staged in `production/start.sh`; not yet live — the running process has only the iOS hash.
 - [ ] If any ArkavoKit build is already in users' hands: deploy the endpoints first, release the app build, and only then flip enforcement. Enforcing on deploy kills registration for every shipped client, since none of them call App Attest.
 - [ ] If nothing is shipped yet: enforce from the first deploy.
 
 ## Self-Review
 
 **Spec coverage.** Gate placement → Tasks 5, 6. Ticket mechanism → Task 5. Shared verifier → Task 1. The three verification gaps → Tasks 2 (nonce ext), 3 (chain), and the counter-reset gap, which Task 3's refusal of a leaf-only chain does not address — it is bounded instead by Task 4's registration budget, since each completed registration consumes a slot. Mandatory `APP_ATTEST_APP_ID` → Tasks 1, 5. Rate policy → Task 4. Client → Task 8. Error handling → Tasks 5 (429), 6 (403), 8 (three distinct Swift errors). soft-webauthn test → Task 7. Deployment → checklist above.
+
+**Checks Task 1 missed (found in review of #80).** The spec's "confirm present" list — aaguid, counter = 0, `key_id == SHA256(publicKey)` — was one-third present: only the counter. The aaguid and key_id/credentialId checks were added in #80, before the nonce compare so a tamper test can reach them. See the spec's status note under that list for the accepted aaguid values and why they are not environment-selected.
 
 **Type consistency.** `AttestedKey`, `VerifyOptions`, `verify_attestation` defined in Task 1 and used unchanged in Tasks 2 and 5. `RegistrationTicket`, `ticket_is_valid`, `SESSION_REG_TICKET_KEY` defined in Task 5 and used unchanged in Tasks 6 and 7. `AttestKeyRecord` gains `window_base` in Task 4 Step 1 and carries it through Step 4. `AppAttesting` defined and consumed within Task 8.
 

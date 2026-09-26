@@ -146,6 +146,17 @@ The remaining checks should be confirmed present in the extracted validator:
 - counter is 0 at attestation time
 - `key_id == SHA256(publicKey)`
 
+> **Status (2026-09-25).** Only the counter check was present when the gate
+> PR (#80) was drafted; the other two were added in the same PR. As built:
+> aaguid must be `appattest` or `appattestdevelop` on **every** server — not
+> selected by environment, because macOS emits `appattest` even from a
+> locally signed build (answered; no `appattestsandbox`), and `rpIdHash`
+> already pins Team + Bundle ID, so a development key still needs our signing
+> identity. `key_id` must equal the padded standard base64 of SHA256 of the
+> credCert's uncompressed EC point, and authData's `credentialId` must equal
+> the same hash. Both run before the nonce compare, on both the gate and the
+> bound-device path.
+
 ### Rate policy
 
 One genuine device can attest repeatedly, so the gate alone does not bound
