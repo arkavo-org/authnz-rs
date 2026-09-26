@@ -3,7 +3,21 @@
 
 use crate::AppState;
 use crate::agent::{AgentError, db_err, live_delegation};
-use crate::db::{AgentDelegation, AgentWorkload, Binding, DynamoDBError, WorkloadState};
+use crate::constants::{
+    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, EVIDENCE_REF_MAX_LEN, INCIDENT_MAX_LEN,
+    WORKLOAD_STATUS_LEASE_SECONDS,
+};
+use crate::db::{
+    AgentDelegation, AgentWorkload, Binding, DynamoDBError, QuarantineOutcome, WorkloadState,
+};
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Extension, Path};
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
+use chrono::Utc;
+use log::warn;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Refuse an empty, oversized or control-character label before it reaches
@@ -139,6 +153,142 @@ pub(crate) async fn bind_workload(
     Err(AgentError::Conflict(
         "workload changed concurrently; retry".into(),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuarantineRequest {
+    pub incident: String,
+    #[serde(default)]
+    pub evidence_ref: Option<String>,
+}
+
+/// Contract v1 status body; quarantine and recover answer with it too.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadStatus {
+    pub workload: String,
+    pub owner: String,
+    pub current_did: String,
+    pub swarm: String,
+    pub state: String,
+    pub generation: u64,
+    pub incident: Option<String>,
+    pub valid_until: i64,
+}
+
+impl WorkloadStatus {
+    pub(crate) fn of(w: &AgentWorkload, now: i64) -> Self {
+        Self {
+            workload: w.workload_id.clone(),
+            owner: w.owner.to_string(),
+            current_did: w.current_did.clone(),
+            swarm: w.swarm.clone(),
+            state: w.state.as_str().to_string(),
+            generation: w.generation,
+            incident: w.incident.clone(),
+            valid_until: now + WORKLOAD_STATUS_LEASE_SECONDS,
+        }
+    }
+}
+
+/// Who is latching a quarantine.
+enum QuarantineCaller {
+    Owner(Uuid),
+}
+
+impl QuarantineCaller {
+    fn owner(&self) -> Uuid {
+        match self {
+            Self::Owner(u) => *u,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Owner(u) => format!("owner:{u}"),
+        }
+    }
+}
+
+/// The owner by passkey auth CWT or, when `X-Auth-Token` is absent, by an
+/// `agents:delegate` Bearer token whose assertion is at most an hour old.
+async fn quarantine_caller(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<QuarantineCaller, AgentError> {
+    let owner = crate::agent::authenticate_operator(
+        app_state,
+        headers,
+        AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS,
+    )
+    .await?;
+    Ok(QuarantineCaller::Owner(owner.user_id))
+}
+
+/// POST /agents/workloads/:workload_id/quarantine — latch a quarantine.
+/// Idempotent per incident; a different incident while latched is 409, so
+/// the incident a recovery must cite stays unambiguous.
+pub async fn quarantine_workload(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(workload_id): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AgentError> {
+    let caller = quarantine_caller(&app_state, &headers).await?;
+    // Parsed from raw bytes: a Guardian signs the exact body.
+    let req: QuarantineRequest = serde_json::from_slice(&body)
+        .map_err(|e| AgentError::InvalidRequest(format!("quarantine body: {e}")))?;
+    validate_label("incident", &req.incident, INCIDENT_MAX_LEN)?;
+    if let Some(ev) = &req.evidence_ref {
+        validate_label("evidence_ref", ev, EVIDENCE_REF_MAX_LEN)?;
+    }
+    let w = app_state
+        .db_store
+        .get_workload(&workload_id)
+        .await
+        .map_err(db_err)?
+        .ok_or(AgentError::WorkloadNotFound)?;
+    if w.owner != caller.owner() {
+        return Err(AgentError::Forbidden(
+            "workload belongs to a different owner".into(),
+        ));
+    }
+    let now = Utc::now().timestamp();
+    match app_state
+        .db_store
+        .quarantine_workload(
+            &workload_id,
+            &req.incident,
+            req.evidence_ref.as_deref(),
+            &caller.label(),
+            now,
+        )
+        .await
+        .map_err(db_err)?
+    {
+        QuarantineOutcome::Latched(q) => {
+            warn!(
+                "Workload {} quarantined by {} (incident {}, generation {})",
+                q.workload_id,
+                caller.label(),
+                req.incident,
+                q.generation
+            );
+            Ok(Json(WorkloadStatus::of(&q, now)))
+        }
+        QuarantineOutcome::AlreadyLatched(q) => Ok(Json(WorkloadStatus::of(&q, now))),
+        QuarantineOutcome::OtherIncident(q) => Err(AgentError::Conflict(format!(
+            "workload already quarantined under incident {}",
+            q.incident.unwrap_or_default()
+        ))),
+        QuarantineOutcome::ClearedIncident(_) => Err(AgentError::Conflict(format!(
+            "incident {} was already cleared by recovery; report a new incident",
+            req.incident
+        ))),
+        QuarantineOutcome::Raced => Err(AgentError::Conflict(
+            "workload changed concurrently; retry".into(),
+        )),
+        QuarantineOutcome::NotFound => Err(AgentError::WorkloadNotFound),
+    }
 }
 
 #[cfg(test)]

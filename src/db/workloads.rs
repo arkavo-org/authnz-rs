@@ -7,7 +7,9 @@
 
 use super::{AgentDelegation, DynamoDBError, DynamoDBStore};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_dynamodb::types::{AttributeValue, ConditionCheck, Put, TransactWriteItem, Update};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, ConditionCheck, Put, ReturnValue, TransactWriteItem, Update,
+};
 use log::{error, info};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -65,6 +67,24 @@ pub struct AgentWorkload {
     pub last_cleared_incident: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Result of a quarantine request against the stored latch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineOutcome {
+    /// This call latched it; the record carries the new generation.
+    Latched(AgentWorkload),
+    /// Already latched under the same incident: nothing changed.
+    AlreadyLatched(AgentWorkload),
+    /// Already latched under a different incident: nothing changed.
+    OtherIncident(AgentWorkload),
+    /// Eligible, and the incident is the one the last recovery cleared:
+    /// refused so a replayed or stale report cannot re-latch it.
+    ClearedIncident(AgentWorkload),
+    /// The condition failed but the re-read shows the workload eligible:
+    /// a recovery landed in between. The caller retries.
+    Raced,
+    NotFound,
 }
 
 /// What an authorize does to the workload row, decided from the row as the
@@ -238,6 +258,73 @@ impl DynamoDBStore {
             .await
             .map_err(|e| classify(e, &self.agent_workloads_table))?;
         out.item.as_ref().map(item_to_workload).transpose()
+    }
+
+    /// Latch a quarantine: eligible → quarantined with `generation + 1`, in
+    /// one conditional update. A latched workload is never re-latched; the
+    /// re-read tells an idempotent repeat from a second incident.
+    pub async fn quarantine_workload(
+        &self,
+        workload_id: &str,
+        incident: &str,
+        evidence_ref: Option<&str>,
+        by: &str,
+        now: i64,
+    ) -> Result<QuarantineOutcome, DynamoDBError> {
+        let set = "SET #st = :q, incident = :inc, quarantined_by = :by, \
+                   quarantined_at = :now, updated_at = :now, #g = #g + :one";
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.agent_workloads_table)
+            .key("workload_id", s(workload_id))
+            .condition_expression(
+                "attribute_exists(workload_id) AND #st = :eligible \
+                 AND (attribute_not_exists(last_cleared_incident) OR last_cleared_incident <> :inc)",
+            )
+            .expression_attribute_names("#st", "state")
+            .expression_attribute_names("#g", "generation")
+            .expression_attribute_values(":q", s(WorkloadState::Quarantined.as_str()))
+            .expression_attribute_values(":eligible", s(WorkloadState::Eligible.as_str()))
+            .expression_attribute_values(":inc", s(incident))
+            .expression_attribute_values(":by", s(by))
+            .expression_attribute_values(":now", n(now))
+            .expression_attribute_values(":one", n(1))
+            .return_values(ReturnValue::AllNew);
+        let expression = match evidence_ref {
+            Some(e) => {
+                req = req.expression_attribute_values(":ev", s(e));
+                format!("{set}, evidence_ref = :ev")
+            }
+            None => format!("{set} REMOVE evidence_ref"),
+        };
+        match req.update_expression(expression).send().await {
+            Ok(out) => {
+                let item = out.attributes.ok_or_else(|| {
+                    DynamoDBError::Internal("quarantine returned no attributes".into())
+                })?;
+                Ok(QuarantineOutcome::Latched(item_to_workload(&item)?))
+            }
+            Err(err) => match classify(err, &self.agent_workloads_table) {
+                DynamoDBError::ConditionalConflict => {
+                    Ok(match self.get_workload(workload_id).await? {
+                        None => QuarantineOutcome::NotFound,
+                        Some(w)
+                            if w.state == WorkloadState::Eligible
+                                && w.last_cleared_incident.as_deref() == Some(incident) =>
+                        {
+                            QuarantineOutcome::ClearedIncident(w)
+                        }
+                        Some(w) if w.state == WorkloadState::Eligible => QuarantineOutcome::Raced,
+                        Some(w) if w.incident.as_deref() == Some(incident) => {
+                            QuarantineOutcome::AlreadyLatched(w)
+                        }
+                        Some(w) => QuarantineOutcome::OtherIncident(w),
+                    })
+                }
+                other => Err(other),
+            },
+        }
     }
 
     /// Plant a workload row on its own; `ConditionalConflict` if the id
@@ -925,6 +1012,104 @@ pub(crate) mod tests {
                 .workload_id,
             mine.workload_id
         );
+    }
+
+    #[tokio::test]
+    async fn quarantine_latches_once_per_incident() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let w = sample(Uuid::new_v4(), "fleet", "did:key:z6MkA");
+        store.create_workload(&w).await.unwrap();
+
+        let first = store
+            .quarantine_workload(
+                &w.workload_id,
+                "inc-1",
+                Some("ev-1"),
+                "owner:x",
+                1_790_000_100,
+            )
+            .await
+            .unwrap();
+        let QuarantineOutcome::Latched(q) = first else {
+            panic!("expected Latched, got {first:?}");
+        };
+        assert_eq!(q.state, WorkloadState::Quarantined);
+        assert_eq!(q.generation, 2);
+        assert_eq!(q.incident.as_deref(), Some("inc-1"));
+        assert_eq!(q.evidence_ref.as_deref(), Some("ev-1"));
+        assert_eq!(q.quarantined_by.as_deref(), Some("owner:x"));
+        assert_eq!(q.quarantined_at, Some(1_790_000_100));
+
+        let again = store
+            .quarantine_workload(&w.workload_id, "inc-1", None, "guardian:g", 1_790_000_200)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&again, QuarantineOutcome::AlreadyLatched(a)
+                if a.generation == 2 && a.quarantined_by.as_deref() == Some("owner:x")),
+            "{again:?}"
+        );
+
+        let other = store
+            .quarantine_workload(&w.workload_id, "inc-2", None, "owner:x", 1_790_000_300)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&other, QuarantineOutcome::OtherIncident(o)
+                if o.incident.as_deref() == Some("inc-1") && o.generation == 2),
+            "{other:?}"
+        );
+
+        assert_eq!(
+            store
+                .quarantine_workload("wl-absent", "inc-1", None, "owner:x", 1)
+                .await
+                .unwrap(),
+            QuarantineOutcome::NotFound
+        );
+        assert_eq!(
+            store.get_workload("wl-absent").await.unwrap(),
+            None,
+            "no stub row"
+        );
+
+        // A recovered workload refuses the incident it just cleared, so a
+        // replayed report cannot re-latch it; a new incident still latches.
+        let recovered = AgentWorkload {
+            last_cleared_incident: Some("inc-old".into()),
+            ..sample(Uuid::new_v4(), "fleet", "did:key:z6MkB")
+        };
+        store.create_workload(&recovered).await.unwrap();
+        let cleared = store
+            .quarantine_workload(
+                &recovered.workload_id,
+                "inc-old",
+                None,
+                "guardian:g",
+                1_790_000_400,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&cleared, QuarantineOutcome::ClearedIncident(c)
+                if c.state == WorkloadState::Eligible && c.generation == 1),
+            "{cleared:?}"
+        );
+        assert!(matches!(
+            store
+                .quarantine_workload(
+                    &recovered.workload_id,
+                    "inc-new",
+                    None,
+                    "guardian:g",
+                    1_790_000_500
+                )
+                .await
+                .unwrap(),
+            QuarantineOutcome::Latched(_)
+        ));
     }
 
     #[tokio::test]

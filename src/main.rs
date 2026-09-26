@@ -657,6 +657,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/agents/challenge", get(agent::generate_agent_challenge))
         .route("/agents/token", post(agent::issue_agent_token))
+        // Workload quarantine (owner or enrolled Guardian). Contract v1.
+        .route(
+            "/agents/workloads/:workload_id/quarantine",
+            post(workload::quarantine_workload),
+        )
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).

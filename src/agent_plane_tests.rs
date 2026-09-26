@@ -44,6 +44,10 @@ pub(crate) fn router(state: AppState) -> Router {
             get(crate::agent::generate_agent_challenge),
         )
         .route("/agents/token", post(crate::agent::issue_agent_token))
+        .route(
+            "/agents/workloads/:workload_id/quarantine",
+            post(crate::workload::quarantine_workload),
+        )
         .layer(Extension(state))
 }
 
@@ -134,6 +138,15 @@ impl Plane {
                         .to_string(),
                 ))
                 .unwrap(),
+        )
+        .await
+    }
+
+    pub async fn quarantine(&self, cwt: &str, wid: &str, incident: &str) -> (StatusCode, Value) {
+        self.post_json(
+            &format!("/agents/workloads/{wid}/quarantine"),
+            ("X-Auth-Token", cwt),
+            json!({"incident": incident, "evidence_ref": null}),
         )
         .await
     }
@@ -928,5 +941,378 @@ async fn the_token_stage_also_refuses_a_did_that_is_not_current() {
             StatusCode::FORBIDDEN,
             json!("Forbidden: agent DID is not the workload's current binding")
         )
+    );
+}
+
+#[tokio::test]
+async fn owner_quarantine_latches_once_per_incident() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&a, "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+
+    let (st, body) = p.quarantine(&cwt, &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["workload"], json!(wid));
+    assert_eq!(body["owner"], json!(owner.to_string()));
+    assert_eq!(body["state"], "quarantined");
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["incident"], "inc-1");
+
+    let (st, body) = p.quarantine(&cwt, &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["generation"], 2,
+        "a repeat of the same incident changes nothing"
+    );
+
+    let (st, body) = p.quarantine(&cwt, &wid, "inc-2").await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("inc-1"), "{body}");
+    let stored = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.incident.as_deref(), stored.generation),
+        (Some("inc-1"), 2)
+    );
+}
+
+#[tokio::test]
+async fn quarantine_needs_the_owner_and_a_valid_body() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (_, stranger) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(
+        p.quarantine(&stranger, &wid, "inc-1").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        p.quarantine(&cwt, "wl-absent", "inc-1").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &wid, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (st, _) = p
+        .send(
+            Request::post(format!("/agents/workloads/{wid}/quarantine"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"incident": "inc-1"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
+}
+
+#[tokio::test]
+async fn quarantined_workload_cannot_mint_even_under_a_rebound_did() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a2) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a2, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.mint(&a2).await.0, StatusCode::OK);
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.mint(&a2).await.0,
+        StatusCode::FORBIDDEN,
+        "the rebound DID"
+    );
+    assert_eq!(
+        p.mint(&a1).await.0,
+        StatusCode::FORBIDDEN,
+        "the original DID"
+    );
+}
+
+#[tokio::test]
+async fn rebinding_is_refused_while_quarantined() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a3) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+
+    let (st, body) = p
+        .authorize(auth, authorize_body(&a3, "fleet", "kit-1", false))
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    let w = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!((w.current_did, w.generation), (did_key(&a1), 2));
+    assert_eq!(
+        p.store
+            .get_agent_delegation(&did_key(&a3))
+            .await
+            .unwrap()
+            .map(|d| d.agent_did),
+        None
+    );
+    assert_eq!(
+        p.mint(&a3).await.0,
+        StatusCode::NOT_FOUND,
+        "no delegation was written for the new DID"
+    );
+}
+
+#[tokio::test]
+async fn refusal_bodies_are_contract_v1() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let (a1, a2, stray, legacy) = (fresh_agent(), fresh_agent(), fresh_agent(), fresh_agent());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a2, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    let support = |d: &SigningKey, w: Option<String>| {
+        crate::db::workloads_test_support::delegation(&did_key(d), owner, w)
+    };
+    p.store
+        .create_agent_delegation(&support(&stray, Some(wid.clone())))
+        .await
+        .unwrap();
+    p.store
+        .create_agent_delegation(&support(&legacy, None))
+        .await
+        .unwrap();
+
+    // The texts are pinned in docs/agent-credentials-contract.md v1; edge
+    // matches them byte for byte.
+    let body = |v: Value| v.as_str().unwrap().to_string();
+    let (st, b) = p.mint(&legacy).await;
+    assert_eq!(
+        (st, body(b)),
+        (
+            StatusCode::FORBIDDEN,
+            "Forbidden: delegation predates workloads; authorize again with workload_name and swarm"
+                .to_string()
+        )
+    );
+    let (st, b) = p.mint(&stray).await;
+    assert_eq!(
+        (st, body(b)),
+        (
+            StatusCode::FORBIDDEN,
+            "Forbidden: agent DID is not the workload's current binding".to_string()
+        )
+    );
+    let (st, b) = p.mint(&a1).await;
+    assert_eq!(
+        (st, body(b)),
+        (StatusCode::FORBIDDEN, "Delegation revoked".to_string())
+    );
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let (st, b) = p.mint(&a2).await;
+    assert_eq!(
+        (st, body(b)),
+        (StatusCode::FORBIDDEN, "Workload quarantined".to_string())
+    );
+    let (st, b) = p
+        .authorize(
+            auth,
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false),
+        )
+        .await;
+    assert_eq!(
+        (st, body(b)),
+        (StatusCode::FORBIDDEN, "Workload quarantined".to_string())
+    );
+}
+
+#[tokio::test]
+async fn owner_quarantine_accepts_an_agents_delegate_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (stranger, _) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let now = Utc::now().timestamp();
+    let bearer = |user: Uuid, client: &str, scope: &str, auth_time: i64| {
+        format!(
+            "Bearer {}",
+            p.delegate_token(user, client, scope, "webauthn", Some(auth_time))
+        )
+    };
+    let body = json!({"incident": "inc-1", "evidence_ref": null});
+    let cases = [
+        (
+            "stale",
+            bearer(
+                owner,
+                DELEGATE_CLIENT,
+                "openid agents:delegate",
+                now - 3_700,
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "no scope",
+            bearer(owner, DELEGATE_CLIENT, "openid", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong client",
+            bearer(owner, "some-other-rp", "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "not the owner",
+            bearer(stranger, DELEGATE_CLIENT, "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (what, token, expected) in cases {
+        assert_eq!(
+            p.post_json(&path, ("Authorization", &token), body.clone())
+                .await
+                .0,
+            expected,
+            "{what}"
+        );
+    }
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
+
+    let ok = bearer(
+        owner,
+        DELEGATE_CLIENT,
+        "openid agents:delegate",
+        now - 3_000,
+    );
+    let (st, resp) = p.post_json(&path, ("Authorization", &ok), body).await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    assert_eq!(resp["state"], "quarantined");
+    assert_eq!(
+        p.store
+            .get_workload(&wid)
+            .await
+            .unwrap()
+            .unwrap()
+            .quarantined_by,
+        Some(format!("owner:{owner}"))
+    );
+}
+
+#[tokio::test]
+async fn a_quarantined_workload_is_refused_at_both_challenge_and_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+
+    // The challenge step's own `eligible_workload` call refuses it.
+    let (st, body) = p
+        .send(
+            Request::get(format!("/agents/challenge?did={}", did_key(&a)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+
+    // The token step is exercised on its own: write a challenge straight
+    // into storage — bypassing GET /agents/challenge — so only the
+    // token-stage `eligible_workload` check in `issue_agent_token` runs.
+    let mut challenge_bytes = [0u8; 32];
+    getrandom::getrandom(&mut challenge_bytes).unwrap();
+    let challenge = base64::engine::general_purpose::STANDARD.encode(challenge_bytes);
+    let nonce = Uuid::new_v4().to_string();
+    p.store
+        .put_agent_challenge(&did_key(&a), &challenge, &nonce, Utc::now().timestamp())
+        .await
+        .unwrap();
+    let sig = base64::engine::general_purpose::STANDARD.encode(a.sign(&challenge_bytes).to_bytes());
+    let (st, body) = p
+        .send(
+            Request::post("/agents/token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "did": did_key(&a),
+                        "challenge": challenge,
+                        "signature": sig,
+                        "nonce": nonce,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
     );
 }

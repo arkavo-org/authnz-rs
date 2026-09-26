@@ -10,7 +10,7 @@ use webauthn_rs::prelude::*;
 mod workloads;
 #[cfg(test)]
 pub(crate) use workloads::tests as workloads_test_support;
-pub use workloads::{AgentWorkload, Binding, WorkloadState, workload_id_for};
+pub use workloads::{AgentWorkload, Binding, QuarantineOutcome, WorkloadState, workload_id_for};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {
