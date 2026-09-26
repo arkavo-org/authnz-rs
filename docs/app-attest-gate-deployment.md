@@ -13,8 +13,11 @@
 | v0.11.0 – v0.11.2 | Still open. The preflight endpoints exist and issue tickets; `/register` ignores them. |
 | **v0.12.0** | **Enforcing.** `/register` requires a ticket. This is the one-way deploy. |
 
-Production is on **v0.11.0** at the time of writing, which is behind `main` in
-two ways that matter:
+Production has been on **v0.12.0** since 2026-09-25 — the gate is enforcing;
+the unticketed probe in Phase 1 returned 403 with the preflight message. The
+v0.11.2 binary is kept at `production/authnz-rs.v0.11.2` for rollback.
+
+The order it took, and that any rebuild from scratch must repeat:
 
 - **v0.11.2 carries the camelCase CBOR fix.** Without it every genuine
   attestation fails at decode with `missing field att_stmt`, so
@@ -216,12 +219,19 @@ binary.
 # The challenge endpoint must answer without authentication.
 curl -si https://identity.arkavo.net/device-check/register-challenge | head -1
 
-# Registration without a ticket must be refused.
-curl -si https://identity.arkavo.net/register/some-unused-handle | head -1
+# Registration without a ticket must be refused. `handle` and `did` are
+# required query parameters; any syntactically valid did:key will do, since
+# the gate refuses before either is looked up.
+u=gatecheck$(date +%s)
+curl -si "https://identity.arkavo.net/register/$u?handle=$u.arkavo.social&did=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" | head -1
 ```
 
 Expect `200` on the first and `403` on the second. A `200` on the second means
 the gate is not engaged — roll back.
+
+A `400` on the second proves nothing: it is axum rejecting the query string
+(`missing field handle` / `missing field did`) before the handler, and so
+before the gate, runs.
 
 Check the 403 body too, not just the status: it must name the preflight
 (`Device attestation required: call GET /device-check/register-challenge …`).
