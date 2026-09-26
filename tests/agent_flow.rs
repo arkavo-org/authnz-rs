@@ -59,7 +59,7 @@ async fn authorize_challenge_token_refresh_revoke() {
             &json!({"agent_did": did, "name": "it-agent", "entitlements": [
                 "https://arkavo.ai/attr/tdf/value/decrypt",
                 "https://arkavo.ai/attr/action/value/read"
-            ]}),
+            ], "workload_name": "it-workload", "swarm": "it-kit"}),
         )
         .send()
         .await

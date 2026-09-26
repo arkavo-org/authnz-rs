@@ -33,11 +33,13 @@
 
 use crate::AppState;
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_MINUTES_MAX, AUTH_TOKEN_HOURS,
-    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_MINUTES_MAX,
+    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
+    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN, WORKLOAD_NAME_MAX_LEN,
 };
 use crate::cwt;
-use crate::db::{AgentDelegation, DynamoDBError};
+use crate::db::{AgentDelegation, DynamoDBError, workload_id_for};
+use crate::workload::{bind_workload, validate_label};
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path, Query},
@@ -116,12 +118,24 @@ pub struct AuthorizeAgentRequest {
     pub agent_did: String,
     pub name: String,
     pub entitlements: Vec<String>,
+    /// Selects the owner's workload of this name, creating it if absent.
+    pub workload_name: String,
+    /// SwarmKit `kit_id` the delegation is bound to. Absent for an agent
+    /// onboarded before it has a kit (trust QR); its tokens then carry no
+    /// `arkavo_swarm` and the platform will not release sealed keys to it.
+    #[serde(default)]
+    pub swarm: Option<String>,
+    /// Tokens for this delegation live at most
+    /// [`crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES`].
+    #[serde(default)]
+    pub short_lived: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AuthorizeAgentResponse {
     pub success: bool,
     pub message: String,
+    pub workload_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +183,8 @@ pub struct DelegationInfo {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked: bool,
+    pub workload_id: Option<String>,
+    pub short_lived: bool,
 }
 
 // ============================================================================
@@ -212,9 +228,9 @@ pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
 // ============================================================================
 
 #[derive(Debug)]
-struct HumanDelegator {
-    user_id: Uuid,
-    username: Option<String>,
+pub(crate) struct HumanDelegator {
+    pub(crate) user_id: Uuid,
+    pub(crate) username: Option<String>,
 }
 
 /// Authenticate the human delegator from `X-Auth-Token` (Arkavo CWT, `aud = "arkavo"`).
@@ -225,7 +241,7 @@ struct HumanDelegator {
 /// claims describing an agent or device NPE (`arkavo_npe` set, or `arkavo_roles`
 /// containing `"agent"`). Agent-to-agent delegation is not supported yet (the
 /// delegator must be a human CWT).
-async fn authenticate_human(
+pub(crate) async fn authenticate_human(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<HumanDelegator, AgentError> {
@@ -265,6 +281,107 @@ async fn authenticate_human(
         .map(|u| u.username);
 
     Ok(HumanDelegator { user_id, username })
+}
+
+/// The operator authorizing an agent: a passkey auth CWT in `X-Auth-Token`
+/// (checked first, unchanged), or else an OIDC access token in
+/// `Authorization: Bearer` carrying `agents:delegate`, so `arkavo agent
+/// authorize` (and the owner's quarantine/recover) can use the operator's
+/// `arkavo-identity` session. `max_auth_age` bounds how old the WebAuthn
+/// assertion behind a Bearer token may be for the calling endpoint.
+pub(crate) async fn authenticate_operator(
+    app_state: &AppState,
+    headers: &HeaderMap,
+    max_auth_age: i64,
+) -> Result<HumanDelegator, AgentError> {
+    if headers.contains_key("X-Auth-Token") {
+        return authenticate_human(app_state, headers).await;
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(AgentError::MissingToken)?;
+    let bytes = cwt::decode_from_header(token).map_err(|_| AgentError::InvalidToken)?;
+    let now = Utc::now().timestamp();
+    let opts = cwt::VerifyOptions {
+        expected_iss: Some(&app_state.issuer),
+        // Checked below against the delegate allowlist: an OIDC access token
+        // carries aud = [client_id, platform audience?].
+        expected_aud: None,
+        now,
+        skew_secs: cwt::DEFAULT_SKEW_SECS,
+    };
+    let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
+        warn!("Rejected agents:delegate token: {}", e);
+        AgentError::InvalidToken
+    })?;
+    check_delegate_claims(
+        &claims,
+        &app_state.agent_delegate_client_ids,
+        now,
+        max_auth_age,
+    )?;
+    let user_id = user_id_from_claims(&claims)?;
+    let username = app_state
+        .db_store
+        .get_user_by_id(&user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.username);
+    Ok(HumanDelegator { user_id, username })
+}
+
+/// What a verified OIDC access token must carry to act as the owner on the
+/// agent plane: `agents:delegate`, a client in `aud` that is on the delegate
+/// allowlist *now* (a refresh token keeps minting the scope after its client
+/// is delisted, so issuance-time checks are not enough), a passkey sign-in,
+/// and a WebAuthn assertion no older than `max_auth_age` seconds. Returns
+/// that assertion time.
+fn check_delegate_claims(
+    claims: &cwt::ArkavoClaims,
+    delegate_clients: &[String],
+    now: i64,
+    max_auth_age: i64,
+) -> Result<i64, AgentError> {
+    let scoped = claims
+        .custom
+        .scope
+        .as_deref()
+        .is_some_and(|s| crate::oidc::has_scope(s, AGENTS_DELEGATE_SCOPE));
+    if !scoped {
+        return Err(AgentError::Forbidden(
+            "access token lacks the agents:delegate scope".into(),
+        ));
+    }
+    let audiences: Vec<&String> = match &claims.aud {
+        cwt::Audience::Single(a) => vec![a],
+        cwt::Audience::Multiple(v) => v.iter().collect(),
+    };
+    if !audiences
+        .iter()
+        .any(|a| delegate_clients.iter().any(|c| c == *a))
+    {
+        return Err(AgentError::Forbidden(
+            "access token was not issued to a delegating client".into(),
+        ));
+    }
+    if claims.custom.idp.as_deref() != Some("webauthn") {
+        return Err(AgentError::Forbidden(
+            "agents:delegate requires a passkey sign-in".into(),
+        ));
+    }
+    let auth_time = claims
+        .custom
+        .auth_time
+        .ok_or_else(|| AgentError::Unauthorized("access token carries no auth_time".into()))?;
+    if !crate::oidc::within_age(auth_time, now, max_auth_age) {
+        return Err(AgentError::Unauthorized(format!(
+            "passkey assertion is older than {max_auth_age} s; sign in again"
+        )));
+    }
+    Ok(auth_time)
 }
 
 /// Root user id from a verified CWT: `claims.sub` parsed as a bare UUID (the
@@ -316,13 +433,22 @@ pub async fn authorize_agent(
         request.agent_did, request.name
     );
     validate_did_key(&request.agent_did)?;
+    validate_label(
+        "workload_name",
+        &request.workload_name,
+        WORKLOAD_NAME_MAX_LEN,
+    )?;
+    if let Some(swarm) = &request.swarm {
+        validate_label("swarm", swarm, SWARM_ID_MAX_LEN)?;
+    }
     if request.entitlements.is_empty() {
         return Err(AgentError::InsufficientEntitlements(
             "At least one entitlement is required".into(),
         ));
     }
 
-    let human = authenticate_human(&app_state, &headers).await?;
+    let human =
+        authenticate_operator(&app_state, &headers, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS).await?;
 
     // Subset check against the delegator's own stored entitlements.
     let delegable = app_state
@@ -358,22 +484,6 @@ pub async fn authorize_agent(
         return Err(AgentError::MaxAgentsExceeded(current_count));
     }
 
-    // Only a delegation that is still usable blocks re-authorization. A
-    // revoked one has always been replaceable; an *expired* one must be too,
-    // or the DID deadlocks after AGENT_DELEGATION_DAYS -- /agents/challenge
-    // refuses it as expired while re-authorizing it returns 409 forever, and
-    // nothing in the flow tells the user to DELETE it first.
-    if let Some(existing) = app_state
-        .db_store
-        .get_agent_delegation(&request.agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
-        && existing.revoked_at.is_none()
-        && existing.expires_at.is_none_or(|e| now <= e)
-    {
-        return Err(AgentError::DelegationAlreadyExists);
-    }
-
     let delegation = AgentDelegation {
         agent_did: request.agent_did.clone(),
         delegator_type: "human".to_string(),
@@ -387,18 +497,27 @@ pub async fn authorize_agent(
         created_at: now,
         expires_at: Some(now + AGENT_DELEGATION_DAYS * 24 * 60 * 60),
         revoked_at: None,
+        workload_id: Some(workload_id_for(&human.user_id, &request.workload_name)),
+        short_lived: request.short_lived,
     };
+    let workload = bind_workload(
+        &app_state,
+        human.user_id,
+        &request.workload_name,
+        request.swarm.as_deref(),
+        &delegation,
+        now,
+    )
+    .await?;
 
-    app_state
-        .db_store
-        .create_agent_delegation(&delegation)
-        .await
-        .map_err(map_create_delegation_error)?;
-
-    info!("Agent delegation created for: {}", request.agent_did);
+    info!(
+        "Agent delegation created for {} in workload {}",
+        request.agent_did, workload.workload_id
+    );
     Ok(Json(AuthorizeAgentResponse {
         success: true,
         message: "Agent authorized successfully".to_string(),
+        workload_id: workload.workload_id,
     }))
 }
 
@@ -426,6 +545,8 @@ pub async fn list_delegations(
                 created_at: d.created_at,
                 expires_at: d.expires_at,
                 revoked: d.revoked_at.is_some(),
+                workload_id: d.workload_id,
+                short_lived: d.short_lived,
             })
             .collect(),
     }))
@@ -506,6 +627,22 @@ async fn active_delegation(
         }
     }
     Ok(delegation)
+}
+
+/// The DID's delegation if it can still mint: present, not revoked, not
+/// expired at `now`. The one liveness probe: authorize asks it whether a DID
+/// is taken and whether a rebind has a previous delegation to revoke.
+pub(crate) async fn live_delegation(
+    app_state: &AppState,
+    agent_did: &str,
+    now: i64,
+) -> Result<Option<AgentDelegation>, AgentError> {
+    Ok(app_state
+        .db_store
+        .get_agent_delegation(agent_did)
+        .await
+        .map_err(db_err)?
+        .filter(|d| d.revoked_at.is_none() && d.expires_at.is_none_or(|e| now <= e)))
 }
 
 fn random_challenge_bytes() -> [u8; 32] {
@@ -712,11 +849,8 @@ pub(crate) fn agent_cwt_claims(
         )))
 }
 
-fn map_create_delegation_error(e: DynamoDBError) -> AgentError {
-    match e {
-        DynamoDBError::ConditionalConflict => AgentError::DelegationAlreadyExists,
-        other => AgentError::DatabaseError(Box::new(other)),
-    }
+pub(crate) fn db_err(e: DynamoDBError) -> AgentError {
+    AgentError::DatabaseError(Box::new(e))
 }
 
 fn mint_agent_cwt(
@@ -768,6 +902,15 @@ pub enum AgentError {
     ChallengeExpired,
     #[error("Challenge mismatch")]
     ChallengeMismatch,
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+    #[error("Conflict: {0}")]
+    Conflict(String),
+    /// Body is contract v1 text (docs/agent-credentials-contract.md).
+    #[error("Workload quarantined")]
+    WorkloadQuarantined,
     #[error("Database error: {0}")]
     DatabaseError(#[from] Box<DynamoDBError>),
 }
@@ -792,6 +935,11 @@ impl IntoResponse for AgentError {
             | AgentError::MaxAgentsExceeded(_)
             | AgentError::ChallengeExpired
             | AgentError::ChallengeMismatch => (StatusCode::BAD_REQUEST, self.to_string()),
+            AgentError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AgentError::Forbidden(_) | AgentError::WorkloadQuarantined => {
+                (StatusCode::FORBIDDEN, self.to_string())
+            }
+            AgentError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -842,6 +990,8 @@ mod tests {
             created_at: 1_700_000_000,
             expires_at: Some(1_700_000_000 + 30 * 86_400),
             revoked_at: None,
+            workload_id: Some("wl-00112233445566778899aabbccddeeff".into()),
+            short_lived: false,
         }
     }
 
@@ -1152,6 +1302,13 @@ mod tests {
             (AgentError::ChallengeMismatch, StatusCode::BAD_REQUEST),
             (AgentError::ChallengeExpired, StatusCode::BAD_REQUEST),
             (
+                AgentError::InvalidRequest("x".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (AgentError::Forbidden("x".into()), StatusCode::FORBIDDEN),
+            (AgentError::Conflict("x".into()), StatusCode::CONFLICT),
+            (AgentError::WorkloadQuarantined, StatusCode::FORBIDDEN),
+            (
                 AgentError::DatabaseError(Box::new(DynamoDBError::TableNotExists(
                     "agent_delegations".into(),
                 ))),
@@ -1164,18 +1321,74 @@ mod tests {
     }
 
     #[test]
-    fn create_delegation_conditional_conflict_is_already_exists() {
-        assert!(matches!(
-            map_create_delegation_error(DynamoDBError::ConditionalConflict),
-            AgentError::DelegationAlreadyExists
-        ));
-        let mapped =
-            map_create_delegation_error(DynamoDBError::TableNotExists("agent_delegations".into()));
+    fn db_err_keeps_a_missing_table_a_503() {
+        let mapped = db_err(DynamoDBError::TableNotExists("agent_workloads".into()));
         assert!(matches!(mapped, AgentError::DatabaseError(_)));
         assert_eq!(
             mapped.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn the_quarantine_refusal_body_is_contract_text() {
+        let resp = AgentError::WorkloadQuarantined.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Workload quarantined");
+    }
+
+    #[test]
+    fn check_delegate_claims_needs_scope_client_passkey_and_a_recent_assertion() {
+        let now = 1_790_000_000;
+        let clients = vec!["arkavo-edge".to_string()];
+        let good = || {
+            cwt::ArkavoClaims::oidc_access(
+                "https://identity.arkavo.net",
+                "arkavo:u",
+                "arkavo-edge",
+                1,
+            )
+            .with_idp("webauthn")
+            .with_scope("openid agents:delegate")
+            .with_auth_time(now - 3_600)
+        };
+        let hour = AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS;
+        assert_eq!(
+            check_delegate_claims(&good(), &clients, now, hour).unwrap(),
+            now - 3_600
+        );
+        assert!(
+            matches!(
+                check_delegate_claims(&good(), &clients, now, 300),
+                Err(AgentError::Unauthorized(_))
+            ),
+            "the recover limit is five minutes"
+        );
+        assert!(matches!(
+            check_delegate_claims(&good().with_scope("openid"), &clients, now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good(), &["other".to_string()], now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good().with_idp("google"), &clients, now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good().with_auth_time(now - 3_601), &clients, now, hour),
+            Err(AgentError::Unauthorized(_))
+        ));
+        let mut no_time = good();
+        no_time.custom.auth_time = None;
+        assert!(matches!(
+            check_delegate_claims(&no_time, &clients, now, hour),
+            Err(AgentError::Unauthorized(_))
+        ));
     }
 
     #[test]

@@ -1,0 +1,168 @@
+//! Agent workloads over HTTP: binding at authorize time. Contract:
+//! docs/agent-credentials-contract.md (v1).
+
+use crate::AppState;
+use crate::agent::{AgentError, db_err, live_delegation};
+use crate::db::{AgentDelegation, AgentWorkload, Binding, DynamoDBError, WorkloadState};
+use uuid::Uuid;
+
+/// Refuse an empty, oversized or control-character label before it reaches
+/// storage or a token claim.
+pub(crate) fn validate_label(field: &str, value: &str, max: usize) -> Result<(), AgentError> {
+    if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(AgentError::InvalidRequest(format!(
+            "{field} must be 1 to {max} characters with no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `owner` may overwrite `existing`, a live delegation of the DID
+/// being authorized into workload `workload_id`: only the DID's own
+/// delegation for that workload, or a row from before workloads that the
+/// same owner wrote. Mirrors the condition on the delegation put
+/// (`DynamoDBStore::agent_delegation_put`).
+fn replaceable(existing: &AgentDelegation, owner: Uuid, workload_id: &str) -> bool {
+    match &existing.workload_id {
+        Some(bound) => bound == workload_id,
+        None => existing.root_user_id == owner,
+    }
+}
+
+/// Select (or create) `owner`'s workload `name`, bind it to the DID of
+/// `delegation` and `swarm`, and write `delegation`, all in one transaction.
+///
+/// `delegation.workload_id` must already name the workload
+/// (`workload_id_for(owner, name)`). `swarm = None` means no swarm for a new
+/// workload and the current one for an existing workload. A different DID or
+/// swarm rebinds the workload (generation + 1); a different DID also revokes
+/// the previously bound DID's delegation for this workload. Refused while
+/// quarantined, so a new key is never a way out of a quarantine.
+pub(crate) async fn bind_workload(
+    app_state: &AppState,
+    owner: Uuid,
+    name: &str,
+    swarm: Option<&str>,
+    delegation: &AgentDelegation,
+    now: i64,
+) -> Result<AgentWorkload, AgentError> {
+    let db = &app_state.db_store;
+    let did = delegation.agent_did.as_str();
+    let workload_id = delegation
+        .workload_id
+        .as_deref()
+        .ok_or_else(|| db_err(DynamoDBError::Internal("delegation has no workload".into())))?;
+    // Every condition sits in one transaction, whose failure does not say
+    // which condition tripped: on a conflict, re-read and decide again.
+    for _ in 0..3 {
+        if let Some(existing) = live_delegation(app_state, did, now).await?
+            && !replaceable(&existing, owner, workload_id)
+        {
+            return Err(AgentError::DelegationAlreadyExists);
+        }
+        let current = db.get_workload(workload_id).await.map_err(db_err)?;
+        let (bound, outcome) = match &current {
+            None => {
+                let created = AgentWorkload {
+                    workload_id: workload_id.to_string(),
+                    owner,
+                    name: name.to_string(),
+                    current_did: did.to_string(),
+                    swarm: swarm.unwrap_or_default().to_string(),
+                    state: WorkloadState::Eligible,
+                    generation: 1,
+                    incident: None,
+                    evidence_ref: None,
+                    quarantined_by: None,
+                    quarantined_at: None,
+                    last_cleared_incident: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let outcome = db
+                    .commit_binding(Binding::Create(&created), delegation, now)
+                    .await;
+                (created, outcome)
+            }
+            Some(w) => {
+                if w.owner != owner {
+                    return Err(AgentError::Forbidden(
+                        "workload belongs to a different owner".into(),
+                    ));
+                }
+                if w.state == WorkloadState::Quarantined {
+                    return Err(AgentError::WorkloadQuarantined);
+                }
+                // Omitting the swarm keeps the workload's current one.
+                let swarm = swarm.unwrap_or(w.swarm.as_str());
+                if w.current_did == did && w.swarm == swarm {
+                    let outcome = db.commit_binding(Binding::Keep(w), delegation, now).await;
+                    (w.clone(), outcome)
+                } else {
+                    let revoke_previous = !w.current_did.is_empty()
+                        && w.current_did != did
+                        && live_delegation(app_state, &w.current_did, now)
+                            .await?
+                            .is_some_and(|d| d.workload_id.as_deref() == Some(workload_id));
+                    let binding = Binding::Rebind {
+                        from: w,
+                        did,
+                        swarm,
+                        revoke_previous,
+                    };
+                    let outcome = db.commit_binding(binding, delegation, now).await;
+                    let rebound = AgentWorkload {
+                        current_did: did.to_string(),
+                        swarm: swarm.to_string(),
+                        generation: w.generation + 1,
+                        updated_at: now,
+                        ..w.clone()
+                    };
+                    (rebound, outcome)
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => return Ok(bound),
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(AgentError::Conflict(
+        "workload changed concurrently; retry".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_label_bounds_and_control_characters() {
+        assert!(validate_label("swarm", "kit-1", 128).is_ok());
+        assert!(validate_label("swarm", &"k".repeat(128), 128).is_ok());
+        assert!(matches!(
+            validate_label("swarm", "", 128),
+            Err(AgentError::InvalidRequest(_))
+        ));
+        assert!(validate_label("swarm", &"k".repeat(129), 128).is_err());
+        assert!(validate_label("swarm", "kit\n1", 128).is_err());
+    }
+
+    #[test]
+    fn only_the_dids_own_workload_or_its_owners_legacy_row_is_replaceable() {
+        let (owner, stranger) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let wid = crate::db::workload_id_for(&owner, "fleet");
+        let row = |workload_id: Option<String>, root: Uuid| {
+            crate::db::workloads_test_support::delegation("did:key:z6MkA", root, workload_id)
+        };
+        assert!(replaceable(&row(Some(wid.clone()), owner), owner, &wid));
+        assert!(!replaceable(
+            &row(Some("wl-other".into()), owner),
+            owner,
+            &wid
+        ));
+        assert!(replaceable(&row(None, owner), owner, &wid));
+        assert!(!replaceable(&row(None, stranger), owner, &wid));
+    }
+}

@@ -1,11 +1,16 @@
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, Put};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
+
+mod workloads;
+#[cfg(test)]
+pub(crate) use workloads::tests as workloads_test_support;
+pub use workloads::{AgentWorkload, Binding, WorkloadState, workload_id_for};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {
@@ -50,6 +55,13 @@ pub struct AgentDelegation {
     pub expires_at: Option<i64>,
     /// Revocation timestamp (Unix epoch)
     pub revoked_at: Option<i64>,
+    /// Workload this delegation binds the agent DID to. `None` only on rows
+    /// written before workloads existed: those cannot mint, and a new
+    /// authorize by the same owner for the same DID replaces them.
+    pub workload_id: Option<String>,
+    /// Tokens minted under this delegation live at most
+    /// [`crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES`].
+    pub short_lived: bool,
 }
 
 /// A challenge taken from a delegation row by [`DynamoDBStore::take_agent_challenge`].
@@ -199,6 +211,7 @@ pub struct DynamoDBStore {
     patreon_tokens_table: String,
     agent_delegations_table: String,
     device_attest_keys_table: String,
+    agent_workloads_table: String,
     default_entitlements: Vec<String>,
 }
 
@@ -212,6 +225,7 @@ impl DynamoDBStore {
         patreon_tokens_table: String,
         agent_delegations_table: String,
         device_attest_keys_table: String,
+        agent_workloads_table: String,
         default_entitlements: Vec<String>,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -224,6 +238,7 @@ impl DynamoDBStore {
             patreon_tokens_table,
             agent_delegations_table,
             device_attest_keys_table,
+            agent_workloads_table,
             default_entitlements,
         ))
     }
@@ -245,6 +260,7 @@ impl DynamoDBStore {
         patreon_tokens_table: String,
         agent_delegations_table: String,
         device_attest_keys_table: String,
+        agent_workloads_table: String,
         default_entitlements: Vec<String>,
     ) -> Self {
         Self {
@@ -256,6 +272,7 @@ impl DynamoDBStore {
             patreon_tokens_table,
             agent_delegations_table,
             device_attest_keys_table,
+            agent_workloads_table,
             default_entitlements,
         }
     }
@@ -1507,19 +1524,22 @@ impl DynamoDBStore {
     // Agent delegation (PE → agent NPE)
     // ------------------------------------------------------------------
 
-    /// Create (or overwrite a revoked) agent delegation record.
-    pub async fn create_agent_delegation(
+    /// The conditional put that writes `delegation`, for a transaction. It
+    /// never clobbers a delegation that can still mint for someone else: it
+    /// replaces only a revoked or expired row (a DID must not deadlock once
+    /// its delegation ages out; a row with no `expires_at` never matches the
+    /// comparison), the DID's own row for the same workload (the operator
+    /// re-authorizing it, e.g. to add the swarm), or a row from before
+    /// workloads that the same owner wrote. `now` is the caller's clock, so
+    /// its own liveness check and this condition agree.
+    pub(crate) fn agent_delegation_put(
         &self,
         delegation: &AgentDelegation,
-    ) -> Result<(), DynamoDBError> {
-        info!(
-            "Creating agent delegation. Table: {}, Agent DID: {}",
-            self.agent_delegations_table, delegation.agent_did
-        );
-
-        let mut item_builder = self
-            .client
-            .put_item()
+        now: i64,
+    ) -> Result<Put, DynamoDBError> {
+        let list =
+            |v: &[String]| AttributeValue::L(v.iter().cloned().map(AttributeValue::S).collect());
+        let mut put = Put::builder()
             .table_name(&self.agent_delegations_table)
             .item("agent_did", AttributeValue::S(delegation.agent_did.clone()))
             .item(
@@ -1530,93 +1550,64 @@ impl DynamoDBStore {
                 "delegator_id",
                 AttributeValue::S(delegation.delegator_id.clone()),
             )
-            .item(
-                "entitlements",
-                AttributeValue::L(
-                    delegation
-                        .entitlements
-                        .iter()
-                        .map(|e| AttributeValue::S(e.clone()))
-                        .collect(),
-                ),
-            )
+            .item("entitlements", list(&delegation.entitlements))
             .item("name", AttributeValue::S(delegation.name.clone()))
             .item("depth", AttributeValue::N(delegation.depth.to_string()))
             .item(
                 "root_user_id",
                 AttributeValue::S(delegation.root_user_id.to_string()),
             )
-            .item(
-                "chain",
-                AttributeValue::L(
-                    delegation
-                        .chain
-                        .iter()
-                        .map(|d| AttributeValue::S(d.clone()))
-                        .collect(),
-                ),
-            )
+            .item("chain", list(&delegation.chain))
             .item(
                 "created_at",
                 AttributeValue::N(delegation.created_at.to_string()),
-            );
-
+            )
+            .item("short_lived", AttributeValue::Bool(delegation.short_lived));
         if let Some(username) = &delegation.delegator_username {
-            item_builder =
-                item_builder.item("delegator_username", AttributeValue::S(username.clone()));
+            put = put.item("delegator_username", AttributeValue::S(username.clone()));
         }
         if let Some(expires_at) = delegation.expires_at {
-            item_builder =
-                item_builder.item("expires_at", AttributeValue::N(expires_at.to_string()));
+            put = put.item("expires_at", AttributeValue::N(expires_at.to_string()));
         }
         if let Some(revoked_at) = delegation.revoked_at {
-            item_builder =
-                item_builder.item("revoked_at", AttributeValue::N(revoked_at.to_string()));
+            put = put.item("revoked_at", AttributeValue::N(revoked_at.to_string()));
         }
-
-        // Close the TOCTOU between authorize_agent's existence check and
-        // this put: an *active* row must not be clobbered. Re-authorize is
-        // allowed for a revoked DID (attribute_exists(revoked_at)) and for an
-        // expired one (expires_at < now) -- otherwise the DID deadlocks once
-        // the delegation ages out. A row with no expires_at is never
-        // replaceable this way, since the comparison is false when the
-        // attribute is absent.
-        let item_builder = item_builder
-            .condition_expression(
-                "attribute_not_exists(agent_did) OR attribute_exists(revoked_at) OR expires_at < :now",
-            )
+        let mut condition = String::from(
+            "attribute_not_exists(agent_did) OR attribute_exists(revoked_at) \
+             OR expires_at < :now \
+             OR (attribute_not_exists(workload_id) AND root_user_id = :owner)",
+        );
+        if let Some(workload_id) = &delegation.workload_id {
+            put = put
+                .item("workload_id", AttributeValue::S(workload_id.clone()))
+                .expression_attribute_values(":wid", AttributeValue::S(workload_id.clone()));
+            condition.push_str(" OR workload_id = :wid");
+        }
+        put.condition_expression(condition)
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
             .expression_attribute_values(
-                ":now",
-                AttributeValue::N(chrono::Utc::now().timestamp().to_string()),
-            );
+                ":owner",
+                AttributeValue::S(delegation.root_user_id.to_string()),
+            )
+            .build()
+            .map_err(|e| DynamoDBError::Internal(e.to_string()))
+    }
 
-        match item_builder.send().await {
-            Ok(_) => {
-                info!("Created agent delegation for: {}", delegation.agent_did);
-                Ok(())
-            }
-            Err(err) => {
-                if let SdkError::ServiceError(ref service_error) = err {
-                    match service_error.err().meta().code() {
-                        Some("ConditionalCheckFailedException") => {
-                            return Err(DynamoDBError::ConditionalConflict);
-                        }
-                        Some("ResourceNotFoundException") => {
-                            error!(
-                                "agent_delegations table {} does not exist",
-                                self.agent_delegations_table
-                            );
-                            return Err(DynamoDBError::TableNotExists(
-                                self.agent_delegations_table.clone(),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                error!("Failed to write agent delegation: {:?}", err);
-                Err(DynamoDBError::SdkError(err.to_string()))
-            }
-        }
+    /// Write a delegation row on its own, under the same condition as
+    /// authorize's transaction. Tests use it to plant rows (legacy, stray)
+    /// that authorize itself would never write.
+    #[cfg(test)]
+    pub async fn create_agent_delegation(
+        &self,
+        delegation: &AgentDelegation,
+    ) -> Result<(), DynamoDBError> {
+        let put = self.agent_delegation_put(delegation, chrono::Utc::now().timestamp())?;
+        self.transact(vec![
+            aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                .put(put)
+                .build(),
+        ])
+        .await
     }
 
     /// Get an agent delegation by agent DID.
@@ -1955,6 +1946,15 @@ impl DynamoDBStore {
             created_at: req_n(item, "created_at")?,
             expires_at: opt_n(item, "expires_at"),
             revoked_at: opt_n(item, "revoked_at"),
+            workload_id: item
+                .get("workload_id")
+                .and_then(|av| av.as_s().ok())
+                .map(|s| s.to_string()),
+            short_lived: item
+                .get("short_lived")
+                .and_then(|av| av.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
         })
     }
 }
@@ -2278,6 +2278,7 @@ pub(crate) mod tests {
             "patreon_tokens".into(),
             "agent_delegations".into(),
             "device_attest_keys".into(),
+            "agent_workloads".into(),
             vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()],
         ))
     }

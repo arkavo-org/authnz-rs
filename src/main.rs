@@ -50,6 +50,8 @@ use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon
 use authnz_rs::{constants, cwt, keys};
 
 mod agent;
+#[cfg(test)]
+mod agent_plane_tests;
 mod apple_signin;
 mod authn;
 mod db;
@@ -63,6 +65,7 @@ mod patreon;
 #[cfg(test)]
 mod registration_gate_tests;
 mod webvh;
+mod workload;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -446,6 +449,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "agent_delegations".to_string()),
         env::var("DYNAMODB_DEVICE_ATTEST_KEYS_TABLE")
             .unwrap_or_else(|_| "device_attest_keys".to_string()),
+        env::var("DYNAMODB_AGENT_WORKLOADS_TABLE")
+            .unwrap_or_else(|_| "agent_workloads".to_string()),
         default_entitlements,
     )
     .await
@@ -1440,6 +1445,7 @@ pub(crate) mod test_helpers {
                 "patreon_tokens".to_string(),
                 "agent_delegations".to_string(),
                 "device_attest_keys".to_string(),
+                "agent_workloads".to_string(),
                 crate::constants::DEFAULT_USER_ENTITLEMENTS
                     .iter()
                     .map(|s| (*s).to_string())
