@@ -336,6 +336,15 @@ pub async fn finish_register(
             // between. 403 is the honest answer and the client's existing
             // registrationCapExceeded path handles it; a distinct code is not
             // worth a new client release.
+            //
+            // The slot and the ticket are both spent before `add_credential`,
+            // so a failed credential write burns them with no account made.
+            // Deliberately not refunded: `attestKey` is once-per-key, so the
+            // client's retry re-runs the preflight under a fresh key_id and
+            // never draws on this key's budget again. A refund would be a
+            // conditional decrement in the security path that no user could
+            // observe. Revisit if keys ever become reusable across
+            // registrations.
             if let Err(e) = app_state
                 .db_store
                 .reserve_attest_registration(&ticket.key_id)
