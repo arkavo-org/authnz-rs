@@ -687,6 +687,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // Guardian enrollment (owner). A Guardian may only quarantine.
         .route("/guardians", post(guardian::enroll_guardian))
+        .route(
+            "/guardians/:guardian_id",
+            axum::routing::delete(guardian::revoke_guardian),
+        )
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).

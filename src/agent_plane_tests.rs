@@ -59,6 +59,10 @@ pub(crate) fn router(state: AppState) -> Router {
             post(crate::workload::recover_workload),
         )
         .route("/guardians", post(crate::guardian::enroll_guardian))
+        .route(
+            "/guardians/:guardian_id",
+            delete(crate::guardian::revoke_guardian),
+        )
         .layer(Extension(state))
 }
 
@@ -230,6 +234,16 @@ impl Plane {
             .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         body["guardian_id"].as_str().unwrap().to_string()
+    }
+
+    pub async fn revoke_guardian(&self, cwt: &str, gid: &str) -> (StatusCode, Value) {
+        self.send(
+            Request::delete(format!("/guardians/{gid}"))
+                .header("X-Auth-Token", cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     /// A Guardian-signed request. `uri` may carry a query; the header was
@@ -2112,6 +2126,12 @@ async fn guardians_get_403_everywhere_but_quarantine() {
                     .to_string(),
             ),
         ),
+        (
+            "DELETE",
+            format!("/guardians/{gid}"),
+            format!("/guardians/{gid}"),
+            None,
+        ),
     ];
     for (method, uri, path, body) in requests {
         let bytes = body.as_deref().unwrap_or("").as_bytes().to_vec();
@@ -2226,4 +2246,183 @@ async fn guardian_enrollment_is_owner_only_and_validates_the_key() {
         )
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_bad_guardian_header_never_falls_back_to_the_owner_credential() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt, wid, gid, _) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let forged = guardian_header(
+        &gid,
+        &fresh_agent(),
+        "POST",
+        &path,
+        Utc::now().timestamp(),
+        body.as_bytes(),
+    );
+    for hdr in ["not-a-signature".to_string(), forged] {
+        let (st, resp) = p
+            .send(
+                Request::post(&path)
+                    .header("X-Auth-Token", &cwt)
+                    .header("X-Guardian-Signature", &hdr)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{hdr}: {resp}");
+    }
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
+}
+
+#[tokio::test]
+async fn a_guardian_header_takes_precedence_over_an_owner_credential() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt, wid, gid, gsk) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let hdr = guardian_header(
+        &gid,
+        &gsk,
+        "POST",
+        &path,
+        Utc::now().timestamp(),
+        body.as_bytes(),
+    );
+    let (st, resp) = p
+        .send(
+            Request::post(&path)
+                .header("X-Auth-Token", &cwt)
+                .header("X-Guardian-Signature", &hdr)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    let w = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!(w.quarantined_by, Some(format!("guardian:{gid}")));
+}
+
+#[tokio::test]
+async fn the_signed_path_excludes_the_query_string() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, wid, gid, gsk) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let uri = format!("{path}?x=1");
+    let body = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+    let over_query = guardian_header(&gid, &gsk, "POST", &uri, now, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &uri, &over_query, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let over_path = guardian_header(&gid, &gsk, "POST", &path, now, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &uri, &over_path, Some(&body)).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_public_key_enrolls_only_once_whoever_the_owner() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, c1) = p.user(&[READ]).await;
+    let (_, c2) = p.user(&[READ]).await;
+    let gsk = fresh_agent();
+    p.enroll_guardian(&c1, &gsk).await;
+    let again = json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"});
+    for cwt in [&c1, &c2] {
+        let (st, body) = p
+            .post_json("/guardians", ("X-Auth-Token", cwt), again.clone())
+            .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn owner_revokes_a_guardian_and_its_signatures_stop() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt, wid, gid, gsk) = guarded(&p).await;
+    let (_, stranger) = p.user(&[READ]).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/guardians/{gid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "no credential");
+    assert_eq!(
+        p.revoke_guardian(&stranger, &gid).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let signed_delete =
+        guardian_header(&gid, &gsk, "DELETE", &format!("/guardians/{gid}"), now, b"");
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/guardians/{gid}"))
+                .header("X-Auth-Token", &cwt)
+                .header("X-Guardian-Signature", &signed_delete)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a Guardian cannot revoke, even with the owner's token"
+    );
+    assert_eq!(
+        p.revoke_guardian(&cwt, &Uuid::new_v4().to_string()).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        p.revoke_guardian(&cwt, &gid).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        p.revoke_guardian(&cwt, &gid).await.0,
+        StatusCode::NO_CONTENT,
+        "idempotent"
+    );
+
+    let hdr = guardian_header(&gid, &gsk, "POST", &path, now, body.as_bytes());
+    let (st, revoked) = p.signed("POST", &path, &hdr, Some(&body)).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let unknown = guardian_header(
+        &Uuid::new_v4().to_string(),
+        &gsk,
+        "POST",
+        &path,
+        now,
+        body.as_bytes(),
+    );
+    let (_, unknown) = p.signed("POST", &path, &unknown, Some(&body)).await;
+    assert_eq!(
+        revoked, unknown,
+        "a revoked Guardian reads as an unknown one"
+    );
+    let w = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!((w.state, w.generation), (WorkloadState::Eligible, 1));
+
+    let (st, _) = p
+        .post_json(
+            "/guardians",
+            ("X-Auth-Token", &cwt),
+            json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "a revoked key stays burned");
 }

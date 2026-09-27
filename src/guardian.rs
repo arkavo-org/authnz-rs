@@ -1,22 +1,22 @@
-//! Guardians: minimal enrollment (`POST /guardians`) and request
-//! authentication by `X-Guardian-Signature`. A Guardian may only latch a
+//! Guardians: enrollment (`POST /guardians`), revocation
+//! (`DELETE /guardians/{id}`) and request authentication by
+//! `X-Guardian-Signature`. A Guardian may only latch a
 //! quarantine on its owner's workloads. Contract: docs/agent-credentials-contract.md (v1).
 
 use crate::AppState;
 use crate::agent::{AgentError, db_err};
 use crate::constants::{GUARDIAN_NAME_MAX_LEN, GUARDIAN_SIGNATURE_SKEW_SECONDS};
-use crate::db::Guardian;
+use crate::db::{DynamoDBError, Guardian};
 use crate::workload::validate_label;
 use axum::Json;
-use axum::extract::Extension;
-use axum::http::{HeaderMap, Method};
+use axum::extract::{Extension, Path};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine;
 use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 pub(crate) const GUARDIAN_SIGNATURE_HEADER: &str = "X-Guardian-Signature";
 
@@ -32,7 +32,12 @@ pub struct EnrollGuardianResponse {
     pub guardian_id: String,
 }
 
-/// POST /guardians — the owner enrolls a Guardian's Ed25519 key.
+/// The one answer for a Guardian id that does not verify: unknown, revoked,
+/// or a bad signature all read alike.
+const DOES_NOT_VERIFY: &str = "guardian signature does not verify";
+
+/// POST /guardians — the owner enrolls a Guardian's Ed25519 key. A key
+/// enrolls once, across all owners and even after revocation (409).
 pub async fn enroll_guardian(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -42,21 +47,50 @@ pub async fn enroll_guardian(
     let owner = crate::agent::authenticate_human(&app_state, &headers).await?;
     validate_label("name", &req.name, GUARDIAN_NAME_MAX_LEN)?;
     let public_key = parse_guardian_key(&req.public_key)?;
-    let guardian = Guardian {
-        guardian_id: Uuid::new_v4().to_string(),
-        owner: owner.user_id,
-        name: req.name,
-        public_key,
-        created_at: Utc::now().timestamp(),
-    };
-    app_state
+    let guardian = Guardian::enrolling(owner.user_id, req.name, public_key, Utc::now().timestamp());
+    match app_state.db_store.create_guardian(&guardian).await {
+        Ok(()) => Ok(Json(EnrollGuardianResponse {
+            guardian_id: guardian.guardian_id,
+        })),
+        Err(DynamoDBError::ConditionalConflict) => Err(AgentError::Conflict(
+            "public_key is already enrolled".into(),
+        )),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
+/// DELETE /guardians/:guardian_id — the enrolling owner revokes a Guardian.
+/// Its signatures then answer 401 like an unknown Guardian's. Idempotent.
+pub async fn revoke_guardian(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(guardian_id): Path<String>,
+) -> Result<StatusCode, AgentError> {
+    refuse_guardian(&headers)?;
+    let owner = crate::agent::authenticate_human(&app_state, &headers).await?;
+    let guardian = app_state
         .db_store
-        .create_guardian(&guardian)
+        .get_guardian(&guardian_id)
         .await
-        .map_err(db_err)?;
-    Ok(Json(EnrollGuardianResponse {
-        guardian_id: guardian.guardian_id,
-    }))
+        .map_err(db_err)?
+        .ok_or(AgentError::GuardianNotFound)?;
+    if guardian.owner != owner.user_id {
+        return Err(AgentError::Forbidden(
+            "guardian belongs to a different owner".into(),
+        ));
+    }
+    match app_state
+        .db_store
+        .revoke_guardian(&guardian_id, owner.user_id, Utc::now().timestamp())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        // Rows are never deleted and their owner never changes, so the only
+        // way the conditioned write fails after the read above is a row
+        // that is gone.
+        Err(DynamoDBError::ConditionalConflict) => Err(AgentError::GuardianNotFound),
+        Err(e) => Err(db_err(e)),
+    }
 }
 
 /// A 32-byte Ed25519 public key that decodes to a point of large order. A
@@ -144,14 +178,15 @@ pub(crate) async fn verify_guardian_request(
         .get_guardian(&header.guardian_id)
         .await
         .map_err(db_err)?
-        .ok_or_else(|| AgentError::Unauthorized("guardian signature does not verify".into()))?;
+        .filter(|g| g.revoked_at.is_none())
+        .ok_or_else(|| AgentError::Unauthorized(DOES_NOT_VERIFY.into()))?;
     let key = VerifyingKey::from_bytes(&guardian.public_key)
-        .map_err(|_| AgentError::Unauthorized("guardian signature does not verify".into()))?;
+        .map_err(|_| AgentError::Unauthorized(DOES_NOT_VERIFY.into()))?;
     key.verify_strict(
         &signing_input(method.as_str(), path, header.timestamp, body),
         &header.signature,
     )
-    .map_err(|_| AgentError::Unauthorized("guardian signature does not verify".into()))?;
+    .map_err(|_| AgentError::Unauthorized(DOES_NOT_VERIFY.into()))?;
     // Only after the signature verifies, so unauthenticated traffic cannot
     // move a Guardian's clock.
     match app_state

@@ -997,6 +997,8 @@ pub enum AgentError {
     Conflict(String),
     #[error("Workload not found")]
     WorkloadNotFound,
+    #[error("Guardian not found")]
+    GuardianNotFound,
     /// Body is contract v1 text (docs/agent-credentials-contract.md).
     #[error("Workload quarantined")]
     WorkloadQuarantined,
@@ -1029,7 +1031,9 @@ impl IntoResponse for AgentError {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
             AgentError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
-            AgentError::WorkloadNotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            AgentError::WorkloadNotFound | AgentError::GuardianNotFound => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -1501,6 +1505,7 @@ mod tests {
             (AgentError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (AgentError::Conflict("x".into()), StatusCode::CONFLICT),
             (AgentError::WorkloadNotFound, StatusCode::NOT_FOUND),
+            (AgentError::GuardianNotFound, StatusCode::NOT_FOUND),
             (AgentError::WorkloadQuarantined, StatusCode::FORBIDDEN),
             (
                 AgentError::DatabaseError(Box::new(DynamoDBError::TableNotExists(

@@ -143,7 +143,11 @@ KAS rule (informative; opentdf-platform P2): deny an agent-token rewrap when the
 
 `POST /guardians`
 
-Caller: the owner (`X-Auth-Token` passkey auth CWT). Request: `{"public_key": "<base64url, no padding, 32-byte Ed25519 public key>", "name": string (1–64 chars)}`. Response 200: `{"guardian_id": "<uuid>"}`. Errors: 400 key not 32 bytes, not a valid point, or weak (small-order); 401.
+Caller: the owner (`X-Auth-Token` passkey auth CWT). Request: `{"public_key": "<base64url, no padding, 32-byte Ed25519 public key>", "name": string (1–64 chars)}`. Response 200: `{"guardian_id": "<uuid>"}`. Errors: 400 key not 32 bytes, not a valid point, or weak (small-order); 401; 409 the key is already enrolled — by any owner, including a Guardian since revoked. A key enrolls at most once, so it has exactly one replay clock (the signed bytes do not name the Guardian), and a revoked key cannot come back with a fresh one; enroll a new key instead.
+
+`DELETE /guardians/{guardian_id}`
+
+Caller: the owner who enrolled the Guardian (`X-Auth-Token` passkey auth CWT). No body. Response 204, also when the Guardian is already revoked. Errors: 401 missing or invalid credential; 403 the Guardian was enrolled by another owner, or the request carries `X-Guardian-Signature`; 404 unknown `guardian_id`. From then on the Guardian's requests are refused with 401 and the same body as an unknown `guardian_id`, however they are signed. Quarantines it already latched stay latched (recovery clears them) and keep `guardian:<guardian_id>` as who latched them.
 
 Guardian request authentication:
 
@@ -154,9 +158,9 @@ signed bytes (UTF-8): METHOD "\n" PATH "\n" unix_ts "\n" hex(sha256(body))
 
 - `METHOD` upper case (`POST`); `PATH` is the request path exactly as sent, without query string; `unix_ts` decimal seconds; `hex` lower case; `body` the exact request body bytes (empty body hashes the empty string).
 - `|now − unix_ts| ≤ 60` s.
-- Verified with strict Ed25519 verification against the public key enrolled under `guardian_id`, never a key carried by the request.
+- Verified with strict Ed25519 verification against the public key enrolled under `guardian_id`, never a key carried by the request. An unknown or revoked `guardian_id` is refused (401) exactly as a signature that does not verify.
 - Replay protection: the server stores `last_signed_at`, the `unix_ts` of the most recent request from that Guardian whose signature verified — the clock advances whenever a request's signature verifies, regardless of whether the request then succeeds or is refused for another reason. A request whose `unix_ts` is not strictly greater than `last_signed_at` is refused (401), even inside the ±60 s window. A Guardian therefore sends at most one request per second, with increasing timestamps.
-- A Guardian may call only quarantine, only for its owner's workloads. Any other agent-plane request carrying `X-Guardian-Signature` (`/agents/authorize`, `/agents/delegations`, `/agents/challenge`, `/agents/token`, recover, status, `/guardians`) gets 403 whether or not the signature verifies.
+- A Guardian may call only quarantine, only for its owner's workloads. Any other agent-plane request carrying `X-Guardian-Signature` (`/agents/authorize`, `/agents/delegations`, `/agents/challenge`, `/agents/token`, recover, status, `POST /guardians`, `DELETE /guardians/{guardian_id}`) gets 403 whether or not the signature verifies.
 
 ## Discovery
 
