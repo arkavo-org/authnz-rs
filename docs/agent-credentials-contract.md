@@ -24,7 +24,7 @@ Minted by `POST /agents/token` after the agent signs the challenge from `GET /ag
 | `arkavo_entitlements` | text | delegated FQNs ∩ what the owner holds now |
 | `arkavo_npe` | text | `{type: "agent", delegation_id: <DID>, depth: 0, chain: []}` |
 | `arkavo_workload` | text | **new:** the workload id, e.g. `wl-6f1c…` (`wl-` + 32 lowercase hex) |
-| `arkavo_swarm` | text | **new:** the SwarmKit `kit_id` the workload is bound to. **Omitted** while the workload has no swarm (an agent onboarded by trust QR before specialization). The platform denies agent rewraps whose token lacks it, so such an agent holds a token but cannot unwrap sealed keys. |
+| `arkavo_swarm` | text | **new:** the SwarmKit `kit_id` the workload is bound to. **Omitted** while the workload has no swarm (an agent onboarded by trust QR before specialization). KAS rule (informative; opentdf-platform P2, see below): once that rule lands, the platform denies agent rewraps whose token lacks it, so such an agent holds a token but cannot unwrap sealed keys. |
 
 A token is only minted while its workload is `eligible` and the token's `sub` is the workload's `current_did`.
 
@@ -36,7 +36,7 @@ Every error response from the endpoints below has a `text/plain` body. Clients s
 |---|---|---|---|
 | `Workload quarantined` | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize` | The workload's quarantine latch is set. |
 | `Forbidden: delegation predates workloads; authorize again with workload_name and swarm` | 403 | `/agents/challenge`, `/agents/token` | The delegation row has no workload. |
-| `Forbidden: agent DID is not the workload's current binding` | 403 | `/agents/challenge`, `/agents/token` | The workload is bound to a different DID. (After recovery, or a rebind, the old DID's delegation is revoked while it still names this workload, so it gets `Delegation revoked` instead; a DID authorized elsewhere in the meantime keeps this response.) |
+| `Forbidden: agent DID is not the workload's current binding` | 403 | `/agents/challenge`, `/agents/token` | The workload is bound to a different DID. (After recovery, or a rebind, the old DID's delegation is revoked while it still names this workload, so it gets `Delegation revoked` instead; a DID since authorized into another workload is untouched and mints for that workload.) |
 | `Delegation revoked` | 403 | `/agents/challenge`, `/agents/token` | The delegation was revoked: by DELETE, by a rebind to another DID (while it still named this workload), or by recovery (while it still named this workload). |
 
 Other 4xx bodies are informative and may change within v1.
@@ -114,7 +114,7 @@ Request: `{"incident": string (1–256 chars, no control characters)}` — must 
 
 Effect, in one write: `state = eligible`, `current_did = ""`, `incident = null`, `generation + 1`, and the delegation of the previously bound DID is revoked **only while that delegation still names this workload**; if the DID has since been authorized into another workload (or revoked another way), its delegation is left alone. Nothing can mint for this workload until the owner authorizes again (`POST /agents/authorize`).
 
-Response 200: the status body. The cleared incident is recorded; a later quarantine citing it is refused (409). Errors: 400 `incident` empty, over 256 characters, or containing control characters; 401 missing, invalid or stale credential; 403 not the owner, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 not quarantined, incident mismatch, or concurrent change; 422 missing `incident` field or malformed JSON body (parsed by the `Json` extractor before the handler runs).
+Response 200: the status body. The cleared incident is recorded; a later quarantine citing it is refused (409). Errors: request body is parsed by axum's `Json` extractor before the handler runs — 400 malformed or empty JSON body, or a bad `incident` (empty, over 256 characters, or containing control characters); 401 missing, invalid or stale credential; 403 not the owner, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 not quarantined, incident mismatch, or concurrent change; 415 if `Content-Type` isn't `application/json`; 422 missing or mistyped `incident` field.
 
 ## Workload status
 

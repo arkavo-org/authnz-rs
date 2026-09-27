@@ -39,7 +39,7 @@ when unset.
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
 | `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine/recover) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
-| `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/workloads/:id/status` (the platform KAS's `agent_status` client). Empty ⇒ 403, and the KAS denies every agent rewrap. |
+| `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/workloads/:id/status` (intended for the platform KAS's `agent_status` client). Empty ⇒ 403; once opentdf-platform P2 lands, the KAS denies every agent rewrap when the status call fails. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
@@ -396,7 +396,7 @@ when unset.
   - `/.well-known/cose-keys` — COSE_Key Set for CWT verifiers (OpenTDF, native).
   - Same `kid` (RFC 7638 thumbprint) in both formats — JWKS advertises the base64url-encoded form; COSE_Key uses raw 32-byte hash.
 - **Discovery doc** (`/.well-known/openid-configuration`) advertises `access_token_format: "application/cwt"` and `cose_keys_uri` for CWT-aware RPs.
-- **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key, App Attest key or agent Ed25519 key. The platform KAS enforces it (DPoP) for agent tokens from contract v1 on; authnz-rs itself does not verify PoP.
+- **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key, App Attest key or agent Ed25519 key. authnz-rs never verifies PoP; the platform KAS will enforce it (DPoP) for agent tokens once opentdf-platform P1 lands (a contract v1 consumer).
 
 **WebAuthn Protection**:
 - All authentication requires valid WebAuthn ceremony
