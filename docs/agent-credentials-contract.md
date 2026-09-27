@@ -92,7 +92,7 @@ Callers:
 - the owner, with `X-Auth-Token: <passkey auth CWT>` or, when that header is absent, `Authorization: Bearer <agents:delegate access token>` with `now − auth_time ≤ 3600`; or
 - a Guardian enrolled by that owner (`X-Guardian-Signature`, below). `X-Guardian-Signature` is checked before either owner credential.
 
-Request: `{"incident": string (1–256 chars), "evidence_ref": string (1–1024 chars, no control characters) | null}`
+Request: `{"incident": string (1–256 chars, no control characters), "evidence_ref": string (1–1024 chars, no control characters) | null}`
 
 `evidence_ref` is optional: omit it or send `null` to leave it unset. When present it must be 1–1024 characters with no control characters — an empty string (`""`) is refused (400).
 
@@ -102,7 +102,7 @@ Response 200: the status body (below) after the call.
 - Already quarantined with a different `incident`: 409, nothing changes.
 - Eligible, and `incident` equals the incident the last recovery cleared (stored as `last_cleared_incident`): 409, nothing changes. A cleared incident cannot re-latch; report a new incident id.
 
-Errors: 400 bad body (including an empty `evidence_ref`); 401 bad or missing credential, stale `auth_time`, or a replayed Guardian signature; 403 caller is neither the owner nor one of the owner's Guardians, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 as above, or `workload changed concurrently; retry` when the conditional write raced a concurrent change (e.g. a recovery landing between the read and the write) — retry the request.
+Errors: 400 bad body (an empty, over-256-character or control-character `incident`, or an empty `evidence_ref`); 401 bad or missing credential, stale `auth_time`, or a replayed Guardian signature; 403 caller is neither the owner nor one of the owner's Guardians, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 as above, or `workload changed concurrently; retry` when the conditional write raced a concurrent change (e.g. a recovery landing between the read and the write) — retry the request.
 
 The latch holds until recovery. While quarantined, `/agents/challenge`, `/agents/token` and `/agents/authorize` refuse the workload with 403.
 
@@ -166,4 +166,4 @@ signed bytes (UTF-8): METHOD "\n" PATH "\n" unix_ts "\n" hex(sha256(body))
 
 ## Discovery
 
-`GET /.well-known/agent-configuration` adds `agent_workloads_endpoint` (`<issuer>/agents/workloads`), `guardian_registration_endpoint` (`<issuer>/guardians`), `short_lived_token_lifetime_seconds` (300), `workload_status_lease_seconds` (5) and `contract_version` (`"v1"`).
+`GET /.well-known/agent-configuration` adds `agent_workloads_endpoint` (`<issuer>/agents/workloads`), `guardian_registration_endpoint` (`<issuer>/guardians`), `short_lived_token_lifetime_seconds` (`min(agent_token_lifetime_seconds, 300)`: 300 unless `AGENT_TOKEN_MINUTES` is below 5), `workload_status_lease_seconds` (5) and `contract_version` (`"v1"`).

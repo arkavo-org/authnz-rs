@@ -147,6 +147,7 @@ DYNAMODB_CREDENTIALS_TABLE=credentials
 DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
+DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 DYNAMODB_AGENT_WORKLOADS_TABLE=agent_workloads
 DYNAMODB_GUARDIANS_TABLE=guardians
 
@@ -252,6 +253,20 @@ aws dynamodb create-table --table-name guardians \
   --attribute-definitions AttributeName=guardian_id,AttributeType=S \
   --key-schema AttributeName=guardian_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
 ```
+
+IAM: authorize, quarantine and recovery write `agent_delegations` and
+`agent_workloads` together through `dynamodb:TransactWriteItems`, which IAM
+authorizes per item (there is no separate `TransactWriteItems` permission).
+The service role needs, in addition to what it already holds:
+
+| Table | Actions |
+|---|---|
+| `agent_delegations` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`, `dynamodb:ConditionCheckItem` (new: a rebind or recovery that leaves the previous DID's delegation alone checks it is not still bound to the workload), plus the existing `dynamodb:Query` on `root_user_id-index` and `dynamodb:Scan` |
+| `agent_workloads` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`, `dynamodb:ConditionCheckItem` |
+| `guardians` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem` |
+
+Without `ConditionCheckItem` the whole transaction is denied: the rebind or
+recovery fails outright rather than half-applying.
 
 ### Systemd Service Setup
 
