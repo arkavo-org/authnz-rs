@@ -224,12 +224,12 @@ impl Plane {
         .unwrap()
     }
 
-    pub async fn enroll_guardian(&self, cwt: &str, gsk: &SigningKey) -> String {
+    pub async fn enroll_guardian(&self, owner: Uuid, cwt: &str, gsk: &SigningKey) -> String {
         let (st, body) = self
             .post_json(
                 "/guardians",
                 ("X-Auth-Token", cwt),
-                json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"}),
+                enroll_body(owner, gsk, "pager"),
             )
             .await;
         assert_eq!(st, StatusCode::OK, "{body}");
@@ -268,6 +268,23 @@ impl Plane {
         )
         .await
     }
+}
+
+/// Proof of possession for enrolling `gsk` as `owner`'s Guardian, per
+/// contract v1 (spelled out here so the test pins the signed bytes).
+pub(crate) fn enroll_proof(owner: Uuid, gsk: &SigningKey) -> String {
+    let key = b64url(gsk.verifying_key().as_bytes());
+    let msg = format!("arkavo-guardian-enroll\n{owner}\n{key}");
+    b64url(&gsk.sign(msg.as_bytes()).to_bytes())
+}
+
+/// A `POST /guardians` body enrolling `gsk` for `owner`, with its proof.
+pub(crate) fn enroll_body(owner: Uuid, gsk: &SigningKey, name: &str) -> Value {
+    json!({
+        "public_key": b64url(gsk.verifying_key().as_bytes()),
+        "name": name,
+        "proof": enroll_proof(owner, gsk),
+    })
 }
 
 pub(crate) fn b64url(bytes: &[u8]) -> String {
@@ -1881,7 +1898,7 @@ async fn guarded(p: &Plane) -> (Uuid, String, String, String, SigningKey) {
         StatusCode::OK
     );
     let gsk = fresh_agent();
-    let gid = p.enroll_guardian(&cwt, &gsk).await;
+    let gid = p.enroll_guardian(owner, &cwt, &gsk).await;
     (owner, cwt, workload_id_for(&owner, "fleet"), gid, gsk)
 }
 
@@ -2333,14 +2350,18 @@ async fn the_signed_path_excludes_the_query_string() {
 #[tokio::test]
 async fn a_public_key_enrolls_only_once_whoever_the_owner() {
     let Some(p) = Plane::new().await else { return };
-    let (_, c1) = p.user(&[READ]).await;
-    let (_, c2) = p.user(&[READ]).await;
+    let (o1, c1) = p.user(&[READ]).await;
+    let (o2, c2) = p.user(&[READ]).await;
     let gsk = fresh_agent();
-    p.enroll_guardian(&c1, &gsk).await;
-    let again = json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"});
-    for cwt in [&c1, &c2] {
+    p.enroll_guardian(o1, &c1, &gsk).await;
+    // Each with a valid proof for itself: the key holder cannot enroll twice.
+    for (owner, cwt) in [(o1, &c1), (o2, &c2)] {
         let (st, body) = p
-            .post_json("/guardians", ("X-Auth-Token", cwt), again.clone())
+            .post_json(
+                "/guardians",
+                ("X-Auth-Token", cwt),
+                enroll_body(owner, &gsk, "pager"),
+            )
             .await;
         assert_eq!(st, StatusCode::CONFLICT, "{body}");
     }
@@ -2349,7 +2370,7 @@ async fn a_public_key_enrolls_only_once_whoever_the_owner() {
 #[tokio::test]
 async fn owner_revokes_a_guardian_and_its_signatures_stop() {
     let Some(p) = Plane::new().await else { return };
-    let (_, cwt, wid, gid, gsk) = guarded(&p).await;
+    let (owner, cwt, wid, gid, gsk) = guarded(&p).await;
     let (_, stranger) = p.user(&[READ]).await;
     let path = format!("/agents/workloads/{wid}/quarantine");
     let body = quarantine_body("g-inc-1");
@@ -2421,8 +2442,81 @@ async fn owner_revokes_a_guardian_and_its_signatures_stop() {
         .post_json(
             "/guardians",
             ("X-Auth-Token", &cwt),
-            json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"}),
+            enroll_body(owner, &gsk, "pager"),
         )
         .await;
     assert_eq!(st, StatusCode::CONFLICT, "a revoked key stays burned");
+}
+
+#[tokio::test]
+async fn a_guardian_key_cannot_be_squatted_by_another_owner() {
+    let Some(p) = Plane::new().await else { return };
+    let (alice, alice_cwt) = p.user(&[READ]).await;
+    let (mallory, mallory_cwt) = p.user(&[READ]).await;
+    let gsk = fresh_agent();
+    let key = b64url(gsk.verifying_key().as_bytes());
+    let attempts = [
+        ("no proof", json!({"public_key": key, "name": "squat"})),
+        (
+            "proof by another key",
+            json!({"public_key": key, "name": "squat", "proof": enroll_proof(mallory, &fresh_agent())}),
+        ),
+        (
+            "alice's captured proof",
+            json!({"public_key": key, "name": "squat", "proof": enroll_proof(alice, &gsk)}),
+        ),
+        (
+            "not base64url",
+            json!({"public_key": key, "name": "squat", "proof": "not base64url!"}),
+        ),
+    ];
+    for (what, body) in attempts {
+        let (st, resp) = p
+            .post_json("/guardians", ("X-Auth-Token", &mallory_cwt), body)
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{what}: {resp}");
+    }
+    // The key is still free for its holder.
+    let gid = p.enroll_guardian(alice, &alice_cwt, &gsk).await;
+    assert_eq!(
+        p.store.get_guardian(&gid).await.unwrap().unwrap().owner,
+        alice
+    );
+}
+
+#[tokio::test]
+async fn garbage_guardian_ids_are_refused_before_storage() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt, wid, _, gsk) = guarded(&p).await;
+    let oversized = "a".repeat(3000);
+    for id in ["not-a-uuid", oversized.as_str()] {
+        assert_eq!(
+            p.revoke_guardian(&cwt, id).await.0,
+            StatusCode::NOT_FOUND,
+            "DELETE {}",
+            &id[..10]
+        );
+    }
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+    let unknown = guardian_header(
+        &Uuid::new_v4().to_string(),
+        &gsk,
+        "POST",
+        &path,
+        now,
+        body.as_bytes(),
+    );
+    let (_, unknown) = p.signed("POST", &path, &unknown, Some(&body)).await;
+    for id in ["not-a-uuid", oversized.as_str()] {
+        let hdr = guardian_header(id, &gsk, "POST", &path, now, body.as_bytes());
+        let (st, resp) = p.signed("POST", &path, &hdr, Some(&body)).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "header id {}", &id[..10]);
+        assert_eq!(resp, unknown);
+    }
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
 }

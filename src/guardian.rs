@@ -17,6 +17,7 @@ use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 pub(crate) const GUARDIAN_SIGNATURE_HEADER: &str = "X-Guardian-Signature";
 
@@ -25,6 +26,11 @@ pub struct EnrollGuardianRequest {
     /// base64url (no padding) of the 32-byte Ed25519 public key.
     pub public_key: String,
     pub name: String,
+    /// base64url (no padding) Ed25519 signature by that key over
+    /// [`enrollment_input`]. Optional here only so a missing proof answers
+    /// with the contract's 400 rather than the extractor's 422.
+    #[serde(default)]
+    pub proof: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,8 +42,10 @@ pub struct EnrollGuardianResponse {
 /// or a bad signature all read alike.
 const DOES_NOT_VERIFY: &str = "guardian signature does not verify";
 
-/// POST /guardians — the owner enrolls a Guardian's Ed25519 key. A key
-/// enrolls once, across all owners and even after revocation (409).
+/// POST /guardians — the owner enrolls a Guardian's Ed25519 key, proving
+/// possession of it. A key enrolls once, across all owners and even after
+/// revocation (409); the proof names the enrolling owner, so nobody who
+/// merely learns a key (or a proof made for someone else) can claim it.
 pub async fn enroll_guardian(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -47,6 +55,7 @@ pub async fn enroll_guardian(
     let owner = crate::agent::authenticate_human(&app_state, &headers).await?;
     validate_label("name", &req.name, GUARDIAN_NAME_MAX_LEN)?;
     let public_key = parse_guardian_key(&req.public_key)?;
+    verify_enrollment_proof(owner.user_id, &public_key, req.proof.as_deref())?;
     let guardian = Guardian::enrolling(owner.user_id, req.name, public_key, Utc::now().timestamp());
     match app_state.db_store.create_guardian(&guardian).await {
         Ok(()) => Ok(Json(EnrollGuardianResponse {
@@ -68,6 +77,9 @@ pub async fn revoke_guardian(
 ) -> Result<StatusCode, AgentError> {
     refuse_guardian(&headers)?;
     let owner = crate::agent::authenticate_human(&app_state, &headers).await?;
+    if !is_guardian_id(&guardian_id) {
+        return Err(AgentError::GuardianNotFound);
+    }
     let guardian = app_state
         .db_store
         .get_guardian(&guardian_id)
@@ -111,6 +123,47 @@ pub(crate) fn parse_guardian_key(b64: &str) -> Result<[u8; 32], AgentError> {
         ));
     }
     Ok(key)
+}
+
+/// Whether `id` could name a Guardian: a canonical (hyphenated, lower-case)
+/// UUID. Anything else is refused before it reaches a storage key.
+fn is_guardian_id(id: &str) -> bool {
+    Uuid::try_parse(id).is_ok_and(|u| u.hyphenated().to_string() == id)
+}
+
+/// The bytes a Guardian key signs to be enrolled for `owner` (contract v1):
+/// `arkavo-guardian-enroll \n owner_uuid \n public_key_b64url`.
+pub(crate) fn enrollment_input(owner: Uuid, public_key: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "arkavo-guardian-enroll\n{}\n{}",
+        owner.hyphenated(),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key)
+    )
+    .into_bytes()
+}
+
+fn verify_enrollment_proof(
+    owner: Uuid,
+    public_key: &[u8; 32],
+    proof: Option<&str>,
+) -> Result<(), AgentError> {
+    let bad = || {
+        AgentError::InvalidRequest(
+            "proof must be the Guardian key's signature over its enrollment for this owner".into(),
+        )
+    };
+    let sig: [u8; 64] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(proof.ok_or_else(bad)?)
+        .map_err(|_| bad())?
+        .try_into()
+        .map_err(|_| bad())?;
+    VerifyingKey::from_bytes(public_key)
+        .map_err(|_| bad())?
+        .verify_strict(
+            &enrollment_input(owner, public_key),
+            &Signature::from_bytes(&sig),
+        )
+        .map_err(|_| bad())
 }
 
 /// The bytes a Guardian signs (contract v1):
@@ -168,6 +221,9 @@ pub(crate) async fn verify_guardian_request(
         .to_str()
         .map_err(|_| AgentError::Unauthorized("malformed X-Guardian-Signature".into()))?;
     let header = parse_signature_header(raw)?;
+    if !is_guardian_id(&header.guardian_id) {
+        return Err(AgentError::Unauthorized(DOES_NOT_VERIFY.into()));
+    }
     if header.timestamp.abs_diff(now) > GUARDIAN_SIGNATURE_SKEW_SECONDS {
         return Err(AgentError::Unauthorized(
             "guardian signature timestamp is outside the allowed skew".into(),
@@ -283,6 +339,33 @@ mod tests {
             "g-1.1790000000.AAAA",
         ] {
             assert!(parse_signature_header(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn enrollment_input_names_the_owner_and_the_key() {
+        let owner = Uuid::parse_str("0f0e0d0c-0b0a-4908-8706-050403020100").unwrap();
+        assert_eq!(
+            enrollment_input(owner, &[0u8; 32]),
+            b"arkavo-guardian-enroll\n0f0e0d0c-0b0a-4908-8706-050403020100\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn only_canonical_uuids_are_guardian_ids() {
+        let id = Uuid::new_v4().to_string();
+        assert!(is_guardian_id(&id));
+        for bad in [
+            String::new(),
+            "not-a-uuid".into(),
+            id.to_uppercase(),
+            id.replace('-', ""),
+            format!("{{{id}}}"),
+            "a".repeat(3000),
+        ] {
+            assert!(!is_guardian_id(&bad), "{bad:.40}");
         }
     }
 
