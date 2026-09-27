@@ -327,6 +327,59 @@ impl DynamoDBStore {
         }
     }
 
+    /// Clear a quarantine, conditional on it still being latched under
+    /// `incident` at the generation the caller read (so a concurrent rebind,
+    /// re-latch or second recovery fails it): eligible, `generation + 1`,
+    /// `incident` recorded as cleared, DID unbound. In the same transaction
+    /// the unbound DID's delegation is revoked when `revoke_old_delegation`
+    /// — only while it still names this workload (P4) — or else must hold no
+    /// unrevoked delegation for it, so a stale "nothing to revoke" fails.
+    /// Nothing mints for the workload until the owner authorizes again.
+    pub async fn recover_workload(
+        &self,
+        w: &AgentWorkload,
+        incident: &str,
+        revoke_old_delegation: bool,
+        now: i64,
+    ) -> Result<(), DynamoDBError> {
+        let clear = built(
+            Update::builder()
+                .table_name(&self.agent_workloads_table)
+                .key("workload_id", s(&w.workload_id))
+                .condition_expression("#st = :q AND incident = :inc AND #g = :g")
+                .update_expression(
+                    "SET #st = :eligible, last_cleared_incident = :inc, updated_at = :now, \
+                     #g = #g + :one REMOVE current_did, incident, evidence_ref, \
+                     quarantined_by, quarantined_at",
+                )
+                .expression_attribute_names("#st", "state")
+                .expression_attribute_names("#g", "generation")
+                .expression_attribute_values(":q", s(WorkloadState::Quarantined.as_str()))
+                .expression_attribute_values(":eligible", s(WorkloadState::Eligible.as_str()))
+                .expression_attribute_values(":inc", s(incident))
+                .expression_attribute_values(":g", n(w.generation))
+                .expression_attribute_values(":now", n(now))
+                .expression_attribute_values(":one", n(1))
+                .build(),
+        )?;
+        let mut items = vec![TransactWriteItem::builder().update(clear).build()];
+        if !w.current_did.is_empty() {
+            items.push(if revoke_old_delegation {
+                self.revoke_delegation_item(&w.current_did, &w.workload_id, now)?
+            } else {
+                self.nothing_to_revoke_item(&w.current_did, &w.workload_id)?
+            });
+        }
+        self.transact(items).await?;
+        info!(
+            "Recovered workload {} (cleared incident {}, generation {})",
+            w.workload_id,
+            incident,
+            w.generation + 1
+        );
+        Ok(())
+    }
+
     /// Plant a workload row on its own; `ConditionalConflict` if the id
     /// already exists. Production creates workloads only through
     /// [`Self::commit_binding`], together with the delegation.
@@ -1145,5 +1198,227 @@ pub(crate) mod tests {
             .unwrap();
         let r = store.get_workload(&w.workload_id).await.unwrap().unwrap();
         assert_eq!((r.swarm.as_str(), r.generation), ("kit-7", 3));
+    }
+
+    /// Latch `incident` on `wid`, returning the quarantined row.
+    async fn latch(store: &DynamoDBStore, wid: &str, incident: &str) -> AgentWorkload {
+        match store
+            .quarantine_workload(wid, incident, Some("ev"), "owner:x", 1_790_000_100)
+            .await
+            .unwrap()
+        {
+            QuarantineOutcome::Latched(q) => q,
+            other => panic!("expected Latched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_requires_the_latched_incident_and_revokes_the_delegation() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let owner = Uuid::new_v4();
+        let did = unique_did("Rec");
+        let w = sample(owner, "fleet", &did);
+        store.create_workload(&w).await.unwrap();
+        store
+            .create_agent_delegation(&delegation(&did, owner, Some(w.workload_id.clone())))
+            .await
+            .unwrap();
+        let q = latch(&store, &w.workload_id, "inc-1").await;
+
+        assert!(
+            matches!(
+                store
+                    .recover_workload(&q, "inc-2", true, 1_790_000_200)
+                    .await,
+                Err(DynamoDBError::ConditionalConflict)
+            ),
+            "the wrong incident"
+        );
+        assert!(
+            matches!(
+                store
+                    .recover_workload(&w, "inc-1", true, 1_790_000_200)
+                    .await,
+                Err(DynamoDBError::ConditionalConflict)
+            ),
+            "a stale (pre-quarantine) snapshot"
+        );
+        assert!(
+            store
+                .get_agent_delegation(&did)
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none(),
+            "a cancelled transaction revokes nothing"
+        );
+
+        store
+            .recover_workload(&q, "inc-1", true, 1_790_000_300)
+            .await
+            .unwrap();
+        let r = store.get_workload(&w.workload_id).await.unwrap().unwrap();
+        assert_eq!(r.state, WorkloadState::Eligible);
+        assert_eq!(r.current_did, "");
+        assert_eq!(r.generation, 3);
+        assert_eq!(r.incident, None);
+        assert_eq!(r.evidence_ref, None);
+        assert_eq!(r.quarantined_by, None);
+        assert_eq!(r.quarantined_at, None);
+        assert_eq!(r.last_cleared_incident.as_deref(), Some("inc-1"));
+        assert!(
+            store
+                .get_agent_delegation(&did)
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+        assert!(
+            matches!(
+                store
+                    .recover_workload(&q, "inc-1", true, 1_790_000_400)
+                    .await,
+                Err(DynamoDBError::ConditionalConflict)
+            ),
+            "a second recovery from the same snapshot"
+        );
+        assert_eq!(
+            store
+                .get_workload(&w.workload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_leaves_a_did_authorized_elsewhere_and_refuses_a_stale_nothing_to_revoke() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let owner = Uuid::new_v4();
+        let did = unique_did("Moved");
+        let w = sample(owner, "fleet", &did);
+        store.create_workload(&w).await.unwrap();
+        store
+            .create_agent_delegation(&delegation(&did, owner, Some(w.workload_id.clone())))
+            .await
+            .unwrap();
+        let q = latch(&store, &w.workload_id, "inc-1").await;
+
+        // The caller decided there was nothing to revoke, but the DID still
+        // holds a live delegation for this workload: refused.
+        assert!(matches!(
+            store
+                .recover_workload(&q, "inc-1", false, 1_790_000_200)
+                .await,
+            Err(DynamoDBError::ConditionalConflict)
+        ));
+
+        // The DID's delegation was revoked and it has since been authorized
+        // into another workload: recovery must not revoke that delegation
+        // (P4), and must not be blocked by it.
+        store.revoke_delegation(&did).await.unwrap();
+        let elsewhere = workload_id_for(&owner, "other");
+        store
+            .create_agent_delegation(&delegation(&did, owner, Some(elsewhere.clone())))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .recover_workload(&q, "inc-1", true, 1_790_000_200)
+                .await,
+            Err(DynamoDBError::ConditionalConflict)
+        ));
+        store
+            .recover_workload(&q, "inc-1", false, 1_790_000_300)
+            .await
+            .unwrap();
+        let d = store.get_agent_delegation(&did).await.unwrap().unwrap();
+        assert_eq!(d.workload_id, Some(elsewhere));
+        assert!(d.revoked_at.is_none());
+        assert_eq!(
+            store
+                .get_workload(&w.workload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkloadState::Eligible
+        );
+    }
+
+    /// `Raced` is a quarantine whose conditional write failed against the
+    /// latch and whose re-read then saw a recovery land. Hammer quarantine
+    /// with a new incident while the old one is recovered until that
+    /// interleaving happens; a retry then latches.
+    #[tokio::test]
+    async fn a_quarantine_racing_a_recovery_reports_raced_and_a_retry_latches() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let w = sample(Uuid::new_v4(), "fleet", "");
+        store.create_workload(&w).await.unwrap();
+        let wid = w.workload_id.as_str();
+        let mut incident = 0u32;
+        let mut raced = None;
+        for _ in 0..40 {
+            incident += 1;
+            let latched = format!("inc-{incident}");
+            let next = format!("inc-{}", incident + 1);
+            let q = latch(&store, wid, &latched).await;
+            let recover = store.recover_workload(&q, &latched, false, 1_790_000_200);
+            let hammer = async {
+                for _ in 0..1_000 {
+                    match store
+                        .quarantine_workload(wid, &next, None, "owner:x", 1_790_000_300)
+                        .await
+                        .unwrap()
+                    {
+                        QuarantineOutcome::OtherIncident(_) => continue,
+                        other => return other,
+                    }
+                }
+                panic!("the recovery never landed");
+            };
+            let (recovered, outcome) = tokio::join!(recover, hammer);
+            recovered.unwrap();
+            match outcome {
+                QuarantineOutcome::Raced => {
+                    raced = Some(next);
+                    break;
+                }
+                // The hammer latched after the recovery: clear it and go again.
+                QuarantineOutcome::Latched(q2) => {
+                    incident += 1;
+                    store
+                        .recover_workload(&q2, &next, false, 1_790_000_400)
+                        .await
+                        .unwrap();
+                }
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        let next = raced.expect("no quarantine raced a recovery in 40 rounds");
+        let after = store.get_workload(wid).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            WorkloadState::Eligible,
+            "Raced changed nothing"
+        );
+        assert!(matches!(
+            store
+                .quarantine_workload(wid, &next, None, "owner:x", 1_790_000_500)
+                .await
+                .unwrap(),
+            QuarantineOutcome::Latched(_)
+        ));
     }
 }

@@ -3855,22 +3855,6 @@ mod tests {
         assert_eq!(record.user.auth_time, Some(auth_iat));
     }
 
-    /// A passkey auth CWT for `user` whose assertion happened `age` seconds ago.
-    fn auth_cwt_aged(app_state: &AppState, user: Uuid, age: i64) -> String {
-        let mut claims = crate::cwt::ArkavoClaims::auth(
-            &app_state.issuer,
-            &user.to_string(),
-            AUTH_TOKEN_HOURS,
-            None,
-        )
-        .with_idp("webauthn");
-        claims.iat = Utc::now().timestamp() - age;
-        claims.exp = claims.iat + AUTH_TOKEN_HOURS * 3600;
-        crate::cwt::encode_for_header(
-            &crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
-        )
-    }
-
     #[tokio::test]
     async fn max_age_forces_a_fresh_passkey_assertion() {
         let Some(store) = crate::db::tests::local_store() else {
@@ -3898,7 +3882,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Auth-Token",
-            auth_cwt_aged(&app_state, user.user_id, 400)
+            crate::test_helpers::auth_cwt_aged(&app_state, user.user_id, 400)
                 .parse()
                 .unwrap(),
         );
@@ -3914,7 +3898,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Auth-Token",
-            auth_cwt_aged(&app_state, user.user_id, 400)
+            crate::test_helpers::auth_cwt_aged(&app_state, user.user_id, 400)
                 .parse()
                 .unwrap(),
         );
@@ -3927,7 +3911,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Auth-Token",
-            auth_cwt_aged(&app_state, user.user_id, 10).parse().unwrap(),
+            crate::test_helpers::auth_cwt_aged(&app_state, user.user_id, 10)
+                .parse()
+                .unwrap(),
         );
         let resp = call_authorize(&app_state, headers, query(), &codes).await;
         assert_eq!(redirect_error(&resp), None);

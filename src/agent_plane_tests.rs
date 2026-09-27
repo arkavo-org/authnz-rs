@@ -54,6 +54,10 @@ pub(crate) fn router(state: AppState) -> Router {
             "/agents/workloads/:workload_id/status",
             get(crate::workload::workload_status),
         )
+        .route(
+            "/agents/workloads/:workload_id/recover",
+            post(crate::workload::recover_workload),
+        )
         .layer(Extension(state))
 }
 
@@ -153,6 +157,20 @@ impl Plane {
             &format!("/agents/workloads/{wid}/quarantine"),
             ("X-Auth-Token", cwt),
             json!({"incident": incident, "evidence_ref": null}),
+        )
+        .await
+    }
+
+    pub async fn recover(
+        &self,
+        auth: (&str, &str),
+        wid: &str,
+        incident: &str,
+    ) -> (StatusCode, Value) {
+        self.post_json(
+            &format!("/agents/workloads/{wid}/recover"),
+            auth,
+            json!({"incident": incident}),
         )
         .await
     }
@@ -1481,5 +1499,303 @@ async fn generation_increases_on_every_change_and_only_then() {
         p.generation(&wid).await,
         3,
         "refused second incident: unchanged"
+    );
+    assert_eq!(p.recover(auth, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(p.generation(&wid).await, 4, "recovered");
+    assert_eq!(
+        p.authorize(
+            auth,
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.generation(&wid).await, 5, "bound again");
+}
+
+#[tokio::test]
+async fn only_the_owner_with_a_fresh_passkey_recovers_citing_the_incident() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a1 = fresh_agent();
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&a1, "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (st, tok) = p.mint(&a1).await;
+    assert_eq!(st, StatusCode::OK, "{tok}");
+    let agent_token = tok["token"].as_str().unwrap().to_string();
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let aged = |age: i64| crate::test_helpers::auth_cwt_aged(&p.state, owner, age);
+
+    let (_, stranger) = p.user(&[READ]).await;
+    assert_eq!(
+        p.recover(("X-Auth-Token", &stranger), &wid, "inc-1")
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "not the owner"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &aged(301)), &wid, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "a passkey assertion older than 300 s"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &aged(600)), &wid, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &agent_token), &wid, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "the agent cannot recover"
+    );
+    assert_eq!(
+        p.recover(
+            ("X-Auth-Token", &service_cwt(&p, STATUS_CLIENT)),
+            &wid,
+            "inc-1"
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED,
+        "an orchestrator's service identity cannot recover"
+    );
+    let (st, _) = p
+        .send(
+            Request::post(format!("/agents/workloads/{wid}/recover"))
+                .header("X-Auth-Token", &cwt)
+                .header("X-Guardian-Signature", "g.1.sig")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"incident": "inc-1"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a Guardian can never recover");
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &wid, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), "wl-unknown", "inc-1")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (st, body) = p.recover(("X-Auth-Token", &cwt), &wid, "inc-9").await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "recovery must cite the latched incident"
+    );
+    assert!(
+        body.to_string()
+            .contains("incident does not match the quarantine being cleared"),
+        "{body}"
+    );
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Quarantined
+    );
+
+    let (st, body) = p.recover(("X-Auth-Token", &aged(299)), &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "eligible");
+    assert_eq!(body["current_did"], "");
+    assert_eq!(body["generation"], 3);
+    assert_eq!(body["incident"], Value::Null);
+    let status = json_of(p.status(&wid, Some(&service_cwt(&p, STATUS_CLIENT))).await).await;
+    assert_eq!(
+        (
+            &status["state"],
+            &status["current_did"],
+            &status["generation"]
+        ),
+        (&json!("eligible"), &json!(""), &json!(3))
+    );
+
+    let (st, b) = p.mint(&a1).await;
+    assert_eq!(
+        (st, b),
+        (StatusCode::FORBIDDEN, json!("Delegation revoked")),
+        "the old delegation is revoked"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &wid, "inc-1").await.0,
+        StatusCode::CONFLICT,
+        "not quarantined"
+    );
+    // A replayed quarantine citing the cleared incident cannot re-latch.
+    assert_eq!(
+        p.quarantine(&cwt, &wid, "inc-1").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(p.generation(&wid).await, 3);
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-2").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owner_recovery_accepts_a_fresh_agents_delegate_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (stranger, _) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let now = Utc::now().timestamp();
+    let bearer = |user: Uuid, client: &str, scope: &str, auth_time: i64| {
+        format!(
+            "Bearer {}",
+            p.delegate_token(user, client, scope, "webauthn", Some(auth_time))
+        )
+    };
+    let cases = [
+        // Fine for authorize and quarantine (≤ 3600 s), not for recovery (≤ 300 s).
+        (
+            "stale for recovery",
+            bearer(owner, DELEGATE_CLIENT, "openid agents:delegate", now - 400),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "just past the bound",
+            bearer(owner, DELEGATE_CLIENT, "openid agents:delegate", now - 302),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "no scope",
+            bearer(owner, DELEGATE_CLIENT, "openid", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong client",
+            bearer(owner, "some-other-rp", "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "not the owner",
+            bearer(stranger, DELEGATE_CLIENT, "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (what, token, expected) in cases {
+        assert_eq!(
+            p.recover(("Authorization", &token), &wid, "inc-1").await.0,
+            expected,
+            "{what}"
+        );
+    }
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Quarantined
+    );
+
+    let ok = bearer(
+        owner,
+        DELEGATE_CLIENT,
+        "openid agents:delegate",
+        Utc::now().timestamp() - 299,
+    );
+    let (st, body) = p.recover(("Authorization", &ok), &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "eligible");
+}
+
+#[tokio::test]
+async fn recovery_needs_a_new_delegation() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (a1, a2) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(p.recover(auth, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.mint(&a2).await.0,
+        StatusCode::NOT_FOUND,
+        "nothing is authorized yet"
+    );
+
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a2, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, body) = p.mint(&a2).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    assert_eq!(claims.custom.arkavo_workload, Some(wid.clone()));
+    let status = json_of(p.status(&wid, Some(&service_cwt(&p, STATUS_CLIENT))).await).await;
+    assert_eq!(status["current_did"], json!(did_key(&a2)));
+    assert_eq!(status["generation"], 4);
+}
+
+#[tokio::test]
+async fn recovery_leaves_the_old_did_alone_once_it_is_authorized_elsewhere() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a1 = fresh_agent();
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{}", did_key(&a1)))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    // "fleet" is still bound to a1, but a1 now belongs to "other".
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "other", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let (st, body) = p.recover(auth, &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["current_did"], "");
+    let (st, body) = p.mint(&a1).await;
+    assert_eq!(st, StatusCode::OK, "a1 still mints for \"other\": {body}");
+    assert_eq!(
+        verify_token(&p, body["token"].as_str().unwrap())
+            .custom
+            .arkavo_workload,
+        Some(workload_id_for(&owner, "other"))
     );
 }

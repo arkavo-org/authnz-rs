@@ -232,6 +232,10 @@ pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
 pub(crate) struct HumanDelegator {
     pub(crate) user_id: Uuid,
     pub(crate) username: Option<String>,
+    /// When the passkey assertion behind the credential happened: the passkey
+    /// auth CWT's `iat` (only the WebAuthn ceremony mints one), or a Bearer
+    /// token's `auth_time`. Recovery requires it to be recent.
+    pub(crate) issued_at: i64,
 }
 
 /// Authenticate the human delegator from `X-Auth-Token` (Arkavo CWT, `aud = "arkavo"`).
@@ -281,7 +285,11 @@ pub(crate) async fn authenticate_human(
         .flatten()
         .map(|u| u.username);
 
-    Ok(HumanDelegator { user_id, username })
+    Ok(HumanDelegator {
+        user_id,
+        username,
+        issued_at: claims.iat,
+    })
 }
 
 /// The operator authorizing an agent: a passkey auth CWT in `X-Auth-Token`
@@ -317,7 +325,7 @@ pub(crate) async fn authenticate_operator(
         warn!("Rejected agents:delegate token: {}", e);
         AgentError::InvalidToken
     })?;
-    check_delegate_claims(
+    let auth_time = check_delegate_claims(
         &claims,
         &app_state.agent_delegate_client_ids,
         now,
@@ -331,7 +339,11 @@ pub(crate) async fn authenticate_operator(
         .ok()
         .flatten()
         .map(|u| u.username);
-    Ok(HumanDelegator { user_id, username })
+    Ok(HumanDelegator {
+        user_id,
+        username,
+        issued_at: auth_time,
+    })
 }
 
 /// What a verified OIDC access token must carry to act as the owner on the

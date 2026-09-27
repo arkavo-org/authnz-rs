@@ -1,11 +1,12 @@
-//! Agent workloads over HTTP: binding at authorize time. Contract:
+//! Agent workloads over HTTP: binding at authorize time, quarantine,
+//! recovery and the status lease. Contract:
 //! docs/agent-credentials-contract.md (v1).
 
 use crate::AppState;
 use crate::agent::{AgentError, db_err, live_delegation};
 use crate::constants::{
     AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, EVIDENCE_REF_MAX_LEN, INCIDENT_MAX_LEN,
-    WORKLOAD_STATUS_LEASE_SECONDS,
+    RECOVERY_TOKEN_MAX_AGE_SECONDS, WORKLOAD_STATUS_LEASE_SECONDS,
 };
 use crate::db::{
     AgentDelegation, AgentWorkload, Binding, DynamoDBError, QuarantineOutcome, WorkloadState,
@@ -17,7 +18,7 @@ use axum::extract::{Extension, Path};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -290,6 +291,106 @@ pub async fn quarantine_workload(
         )),
         QuarantineOutcome::NotFound => Err(AgentError::WorkloadNotFound),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecoverRequest {
+    pub incident: String,
+}
+
+/// POST /agents/workloads/:workload_id/recover — the only way out of a
+/// quarantine: the owner alone, with a passkey assertion from the last five
+/// minutes, citing the incident being cleared. Unbinds the DID and revokes
+/// its delegation, so nothing mints until the owner authorizes again.
+/// Guardians, agents and services cannot call it.
+pub async fn recover_workload(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(workload_id): Path<String>,
+    Json(req): Json<RecoverRequest>,
+) -> Result<impl IntoResponse, AgentError> {
+    // Contract v1: any request carrying a Guardian signature is refused here,
+    // verified or not, even alongside a valid owner credential.
+    if headers.contains_key("X-Guardian-Signature") {
+        return Err(AgentError::Forbidden(
+            "a Guardian may only quarantine".into(),
+        ));
+    }
+    // The passkey CWT is aged by its `iat` here; the Bearer path already
+    // bounded `auth_time` inside, and reports it as `issued_at` too.
+    let owner =
+        crate::agent::authenticate_operator(&app_state, &headers, RECOVERY_TOKEN_MAX_AGE_SECONDS)
+            .await?;
+    let now = Utc::now().timestamp();
+    if !crate::oidc::within_age(owner.issued_at, now, RECOVERY_TOKEN_MAX_AGE_SECONDS) {
+        return Err(AgentError::Unauthorized(format!(
+            "recovery needs a passkey assertion from the last \
+             {RECOVERY_TOKEN_MAX_AGE_SECONDS} s; sign in again"
+        )));
+    }
+    validate_label("incident", &req.incident, INCIDENT_MAX_LEN)?;
+    let db = &app_state.db_store;
+    // The write is conditioned on everything decided here; on a conflict,
+    // re-read and decide again (a concurrent recovery then reads as "not
+    // quarantined", a DID authorized elsewhere as nothing to revoke).
+    for _ in 0..3 {
+        let w = db
+            .get_workload(&workload_id)
+            .await
+            .map_err(db_err)?
+            .ok_or(AgentError::WorkloadNotFound)?;
+        if w.owner != owner.user_id {
+            return Err(AgentError::Forbidden(
+                "workload belongs to a different owner".into(),
+            ));
+        }
+        if w.state != WorkloadState::Quarantined {
+            return Err(AgentError::Conflict("workload is not quarantined".into()));
+        }
+        if w.incident.as_deref() != Some(req.incident.as_str()) {
+            return Err(AgentError::Conflict(
+                "incident does not match the quarantine being cleared".into(),
+            ));
+        }
+        // Not a liveness question: an expired delegation naming the workload
+        // is revoked too, so the old DID reads (and is refused) as revoked.
+        let revoke_old = !w.current_did.is_empty()
+            && db
+                .get_agent_delegation(&w.current_did)
+                .await
+                .map_err(db_err)?
+                .is_some_and(|d| {
+                    d.revoked_at.is_none() && d.workload_id.as_deref() == Some(&w.workload_id)
+                });
+        match db
+            .recover_workload(&w, &req.incident, revoke_old, now)
+            .await
+        {
+            Ok(()) => {}
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+        let recovered = AgentWorkload {
+            state: WorkloadState::Eligible,
+            current_did: String::new(),
+            generation: w.generation + 1,
+            incident: None,
+            evidence_ref: None,
+            quarantined_by: None,
+            quarantined_at: None,
+            last_cleared_incident: Some(req.incident.clone()),
+            updated_at: now,
+            ..w
+        };
+        info!(
+            "Workload {} recovered by owner {} (cleared incident {}, generation {})",
+            recovered.workload_id, owner.user_id, req.incident, recovered.generation
+        );
+        return Ok(Json(WorkloadStatus::of(&recovered, now)));
+    }
+    Err(AgentError::Conflict(
+        "workload changed concurrently; read its status and retry".into(),
+    ))
 }
 
 /// GET /agents/workloads/:workload_id/status — what the KAS checks before

@@ -678,6 +678,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/agents/workloads/:workload_id/status",
             get(workload::workload_status),
         )
+        // Owner recovery of a quarantined workload. Contract v1.
+        .route(
+            "/agents/workloads/:workload_id/recover",
+            post(workload::recover_workload),
+        )
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
@@ -1452,6 +1457,19 @@ mod tests {
 pub(crate) mod test_helpers {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// A passkey auth CWT for `user` whose assertion happened `age` seconds ago.
+    pub(crate) fn auth_cwt_aged(app_state: &AppState, user: uuid::Uuid, age: i64) -> String {
+        let hours = crate::constants::AUTH_TOKEN_HOURS;
+        let mut claims =
+            crate::cwt::ArkavoClaims::auth(&app_state.issuer, &user.to_string(), hours, None)
+                .with_idp("webauthn");
+        claims.iat = chrono::Utc::now().timestamp() - age;
+        claims.exp = claims.iat + hours * 3600;
+        crate::cwt::encode_for_header(
+            &crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+        )
+    }
 
     /// Build an AppState suitable for unit tests. Uses a fixed scalar
     /// so signatures are reproducible. Requires AWS env vars to be set
