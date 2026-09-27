@@ -2432,6 +2432,16 @@ mod tests {
     }
 
     #[test]
+    fn within_age_bounds_are_inclusive_with_skew_for_the_future() {
+        let (now, max_age) = (1_790_000_000, 300);
+        let skew = crate::cwt::DEFAULT_SKEW_SECS;
+        assert!(within_age(now - max_age, now, max_age), "age == max_age");
+        assert!(!within_age(now - max_age - 1, now, max_age), "max_age + 1");
+        assert!(within_age(now + skew, now, max_age), "-skew");
+        assert!(!within_age(now + skew + 1, now, max_age), "-skew - 1");
+    }
+
+    #[test]
     fn test_parse_clients_refuses_the_passkey_cwt_audience() {
         let vars = env_vars(&[
             ("OIDC_CLIENT_EDGE_ID", "arkavo"),
