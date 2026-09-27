@@ -30,11 +30,23 @@ pub struct PutEntitlementsResponse {
     pub entitlements: Vec<String>,
 }
 
-/// Verify the `X-Auth-Token` CWT and require the service-account role.
-/// Audience is not pinned: service CWTs carry `aud = client_id` (+ platform).
+/// Verify the `X-Auth-Token` CWT and require the service-account role and an
+/// `ADMIN_CLIENT_IDS` client. Audience is not pinned: service CWTs carry
+/// `aud = client_id` (+ platform).
 pub fn require_service_cwt(
     app_state: &AppState,
     headers: &HeaderMap,
+) -> Result<cwt::ArkavoClaims, EntitlementError> {
+    require_service_cwt_for(app_state, headers, &app_state.admin_client_ids)
+}
+
+/// The service-CWT gate with an explicit client allowlist, so a service that
+/// needs one endpoint (the KAS reading workload status) is not also granted
+/// the admin endpoints.
+pub fn require_service_cwt_for(
+    app_state: &AppState,
+    headers: &HeaderMap,
+    allow: &[String],
 ) -> Result<cwt::ArkavoClaims, EntitlementError> {
     let token = headers
         .get("X-Auth-Token")
@@ -49,13 +61,13 @@ pub fn require_service_cwt(
         skew_secs: cwt::DEFAULT_SKEW_SECS,
     };
     let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
-        warn!("Rejected admin token: {}", e);
+        warn!("Rejected service token: {}", e);
         EntitlementError::InvalidToken
     })?;
     if !is_service_claims(&claims) {
         return Err(EntitlementError::Forbidden);
     }
-    if !is_admin_client(&claims.sub, &app_state.admin_client_ids) {
+    if !is_admin_client(&claims.sub, allow) {
         return Err(EntitlementError::Forbidden);
     }
     Ok(claims)
@@ -325,6 +337,31 @@ mod tests {
         assert_eq!(
             other.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn require_service_cwt_for_checks_the_given_allowlist() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let claims = cwt::ArkavoClaims::auth(&app_state.issuer, "client:platform-status", 1, None)
+            .with_arkavo_roles(vec!["service-account".into()]);
+        let token = cwt::encode_for_header(
+            &cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Auth-Token", token.parse().unwrap());
+        assert!(require_service_cwt_for(&app_state, &headers, &["platform-status".into()]).is_ok());
+        assert!(
+            matches!(
+                require_service_cwt(&app_state, &headers),
+                Err(EntitlementError::Forbidden)
+            ),
+            "ADMIN_CLIENT_IDS (\"it\") does not include the status client"
         );
     }
 }

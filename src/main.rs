@@ -311,6 +311,10 @@ pub struct AppState {
     /// access tokens `POST /agents/authorize` accepts
     /// (`AGENT_DELEGATE_CLIENT_IDS`). Empty ⇒ the scope is refused everywhere.
     pub agent_delegate_client_ids: Arc<Vec<String>>,
+    /// client_ids whose service CWTs may read
+    /// `GET /agents/workloads/:id/status` (`AGENT_STATUS_CLIENT_IDS`) — the
+    /// platform KAS's `agent_status` client. Empty ⇒ 403.
+    pub agent_status_client_ids: Arc<Vec<String>>,
     /// Expected App Attest App ID hashes (`APP_ATTEST_APP_ID`), each the
     /// hex-encoded SHA-256 of "<TeamID>.<BundleID>", lower-cased.
     ///
@@ -484,6 +488,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "AGENT_DELEGATE_CLIENT_IDS is empty: the agents:delegate scope is refused for every client"
         );
     }
+    let agent_status_client_ids = parse_id_list(env::var("AGENT_STATUS_CLIENT_IDS").ok());
+    if agent_status_client_ids.is_empty() {
+        log::warn!(
+            "AGENT_STATUS_CLIENT_IDS is empty: GET /agents/workloads/:id/status will 403 and the KAS will deny every agent rewrap"
+        );
+    }
 
     // Create the app state
     let app_state = AppState {
@@ -505,6 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
         agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
+        agent_status_client_ids: Arc::new(agent_status_client_ids),
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
         )),
@@ -661,6 +672,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/agents/workloads/:workload_id/quarantine",
             post(workload::quarantine_workload),
+        )
+        // Workload status lease for the platform KAS. Contract v1.
+        .route(
+            "/agents/workloads/:workload_id/status",
+            get(workload::workload_status),
         )
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
@@ -1531,6 +1547,7 @@ pub(crate) mod test_helpers {
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
+            agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             app_attest_app_id: Arc::new(Vec::new()),
         }
     }

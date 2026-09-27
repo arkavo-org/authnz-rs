@@ -24,6 +24,8 @@ pub(crate) const READ: &str = "https://arkavo.ai/attr/action/value/read";
 pub(crate) const DECRYPT: &str = "https://arkavo.ai/attr/tdf/value/decrypt";
 /// Allowlisted for `agents:delegate` by `test_helpers`.
 pub(crate) const DELEGATE_CLIENT: &str = "arkavo-edge";
+/// Allowlisted for the status endpoint by `test_helpers`.
+pub(crate) const STATUS_CLIENT: &str = "platform-status";
 
 pub(crate) struct Plane {
     pub app: Router,
@@ -47,6 +49,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route(
             "/agents/workloads/:workload_id/quarantine",
             post(crate::workload::quarantine_workload),
+        )
+        .route(
+            "/agents/workloads/:workload_id/status",
+            get(crate::workload::workload_status),
         )
         .layer(Extension(state))
 }
@@ -151,6 +157,26 @@ impl Plane {
         .await
     }
 
+    pub async fn status(&self, wid: &str, token: Option<&str>) -> axum::response::Response {
+        let mut req = Request::get(format!("/agents/workloads/{wid}/status"));
+        if let Some(t) = token {
+            req = req.header("X-Auth-Token", t);
+        }
+        self.app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    pub async fn generation(&self, wid: &str) -> u64 {
+        let resp = self
+            .status(wid, Some(&service_cwt(self, STATUS_CLIENT)))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_of(resp).await["generation"].as_u64().unwrap()
+    }
+
     /// An `agents:delegate`-style OIDC access token for `owner`.
     pub fn delegate_token(
         &self,
@@ -174,6 +200,24 @@ impl Plane {
         )
         .unwrap()
     }
+}
+
+/// A service CWT the way `client_credentials` shapes one for `client`.
+pub(crate) fn service_cwt(p: &Plane, client: &str) -> String {
+    let claims =
+        crate::cwt::ArkavoClaims::auth(&p.state.issuer, &format!("client:{client}"), 1, None)
+            .with_arkavo_roles(vec!["service-account".into()]);
+    crate::cwt::encode_for_header(
+        &crate::cwt::mint(&claims, &p.state.cwt_signing_key, &p.state.cwt_kid).unwrap(),
+    )
+}
+
+pub(crate) async fn json_of(resp: axum::response::Response) -> Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 pub(crate) fn did_key(sk: &SigningKey) -> String {
@@ -1314,5 +1358,128 @@ async fn a_quarantined_workload_is_refused_at_both_challenge_and_token() {
     assert_eq!(
         (st, body),
         (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+}
+
+#[tokio::test]
+async fn status_requires_an_allowlisted_service_cwt_and_leases_five_seconds() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&a, "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+
+    assert_eq!(
+        p.status(&wid, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.status(&wid, Some(&cwt)).await.status(),
+        StatusCode::FORBIDDEN,
+        "a human CWT"
+    );
+    assert_eq!(
+        p.status(&wid, Some(&service_cwt(&p, "it"))).await.status(),
+        StatusCode::FORBIDDEN,
+        "an admin client is not a status client"
+    );
+
+    let before = Utc::now().timestamp();
+    let resp = p.status(&wid, Some(&service_cwt(&p, STATUS_CLIENT))).await;
+    let after = Utc::now().timestamp();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body = json_of(resp).await;
+    let valid_until = body["valid_until"].as_i64().unwrap();
+    assert!(
+        (before + 5..=after + 5).contains(&valid_until),
+        "valid_until = now + 5"
+    );
+    assert_eq!(
+        body,
+        json!({
+            "workload": wid, "owner": owner.to_string(), "current_did": did_key(&a),
+            "swarm": "kit-1", "state": "eligible", "generation": 1, "incident": null,
+            "valid_until": valid_until,
+        })
+    );
+    assert_eq!(
+        p.status("wl-absent", Some(&service_cwt(&p, STATUS_CLIENT)))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // A workload authorized before its agent has a kit reports an empty swarm.
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "bare", "", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let bare = json_of(
+        p.status(
+            &workload_id_for(&owner, "bare"),
+            Some(&service_cwt(&p, STATUS_CLIENT)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(bare["swarm"], "");
+}
+
+#[tokio::test]
+async fn generation_increases_on_every_change_and_only_then() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(
+        p.authorize(
+            auth,
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.generation(&wid).await, 1, "created");
+    assert_eq!(
+        p.authorize(
+            auth,
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.generation(&wid).await, 2, "rebound");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(p.generation(&wid).await, 3, "quarantined");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.generation(&wid).await,
+        3,
+        "same incident again: unchanged"
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &wid, "inc-2").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        p.generation(&wid).await,
+        3,
+        "refused second incident: unchanged"
     );
 }

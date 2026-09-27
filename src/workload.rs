@@ -10,11 +10,12 @@ use crate::constants::{
 use crate::db::{
     AgentDelegation, AgentWorkload, Binding, DynamoDBError, QuarantineOutcome, WorkloadState,
 };
+use crate::entitlements::EntitlementError;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path};
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -289,6 +290,38 @@ pub async fn quarantine_workload(
         )),
         QuarantineOutcome::NotFound => Err(AgentError::WorkloadNotFound),
     }
+}
+
+/// GET /agents/workloads/:workload_id/status — what the KAS checks before
+/// releasing a key to an agent token. Served from a strongly consistent read
+/// of the latch with a 5-second lease, never from a cache.
+pub async fn workload_status(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(workload_id): Path<String>,
+) -> Result<Response, AgentError> {
+    crate::entitlements::require_service_cwt_for(
+        &app_state,
+        &headers,
+        &app_state.agent_status_client_ids,
+    )
+    .map_err(|e| match e {
+        EntitlementError::MissingToken => AgentError::MissingToken,
+        EntitlementError::InvalidToken => AgentError::InvalidToken,
+        _ => AgentError::Forbidden("client may not read workload status".into()),
+    })?;
+    let w = app_state
+        .db_store
+        .get_workload(&workload_id)
+        .await
+        .map_err(db_err)?
+        .ok_or(AgentError::WorkloadNotFound)?;
+    let mut resp = Json(WorkloadStatus::of(&w, Utc::now().timestamp())).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(resp)
 }
 
 #[cfg(test)]
