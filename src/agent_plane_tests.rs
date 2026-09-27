@@ -1,6 +1,5 @@
-//! The agent plane — workloads, `agents:delegate`, and (in later tasks)
-//! quarantine, recovery, Guardians and the status lease — driven through the
-//! real handlers against DynamoDB Local. Every test returns early unless
+//! The agent plane — workloads, `agents:delegate`, quarantine, recovery,
+//! Guardians and the status lease — driven through the real handlers against DynamoDB Local. Every test returns early unless
 //! `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it.
 //!
 //! Bin-local for the same reason as `registration_gate_tests.rs`: `AppState`

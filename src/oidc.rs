@@ -2024,8 +2024,8 @@ pub(crate) fn has_scope(scope: &str, want: &str) -> bool {
 /// Whether an event timestamped `issued_at` is within `max_age` seconds of
 /// `now`, allowing [`crate::cwt::DEFAULT_SKEW_SECS`] of clock skew for an
 /// `issued_at` that is slightly in the future. The single freshness check for
-/// every `auth_time` / auth-age comparison in this module; later tasks
-/// (`agents:delegate` at `/agents/authorize`, quarantine, recover) reuse it.
+/// every `auth_time` / auth-age comparison, including the `agents:delegate`
+/// checks at `/agents/authorize`, quarantine and recover.
 pub(crate) fn within_age(issued_at: i64, now: i64, max_age: i64) -> bool {
     (-crate::cwt::DEFAULT_SKEW_SECS..=max_age).contains(&(now - issued_at))
 }
