@@ -36,8 +36,8 @@ Every error response from the endpoints below has a `text/plain` body. Clients s
 |---|---|---|---|
 | `Workload quarantined` | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize` | The workload's quarantine latch is set. |
 | `Forbidden: delegation predates workloads; authorize again with workload_name and swarm` | 403 | `/agents/challenge`, `/agents/token` | The delegation row has no workload. |
-| `Forbidden: agent DID is not the workload's current binding` | 403 | `/agents/challenge`, `/agents/token` | The workload is bound to a different DID. (After recovery the old DID's delegation is revoked, so it gets `Delegation revoked` instead.) |
-| `Delegation revoked` | 403 | `/agents/challenge`, `/agents/token` | The delegation was revoked: by DELETE, by a rebind to another DID, or by recovery. |
+| `Forbidden: agent DID is not the workload's current binding` | 403 | `/agents/challenge`, `/agents/token` | The workload is bound to a different DID. (After recovery, or a rebind, the old DID's delegation is revoked while it still names this workload, so it gets `Delegation revoked` instead; a DID authorized elsewhere in the meantime keeps this response.) |
+| `Delegation revoked` | 403 | `/agents/challenge`, `/agents/token` | The delegation was revoked: by DELETE, by a rebind to another DID (while it still named this workload), or by recovery (while it still named this workload). |
 
 Other 4xx bodies are informative and may change within v1.
 
@@ -66,12 +66,12 @@ Semantics:
 - The workload id is derived server-side from `(owner, workload_name)`; the same owner and name always select the same workload.
 - A new workload starts `eligible`, `generation = 1`, bound to `agent_did` and `swarm`.
 - A new workload authorized without `swarm` has `swarm = ""`: its tokens omit `arkavo_swarm` and its status shows `"swarm": ""`.
-- Authorizing a different DID, or a `swarm` different from the workload's, rebinds it: `generation + 1`; when the DID changes, the previously bound DID's delegation is revoked in the same write. Omitting `swarm` for an existing workload keeps its current swarm.
+- Authorizing a different DID, or a `swarm` different from the workload's, rebinds it: `generation + 1`; when the DID changes, the previously bound DID's delegation is revoked in the same write, but only while it still names this workload (if it has since been authorized elsewhere, it is left alone). Omitting `swarm` for an existing workload keeps its current swarm.
 - Authorizing the DID that already holds an active delegation for the same workload replaces that delegation (e.g. to add the swarm once the agent is specialized, or to change entitlements or `short_lived`); this is not a 409.
 - Any authorize against a quarantined workload is refused (403). Rebinding is not a way out of quarantine.
-- A delegation row from before workloads existed (no `workload_id`) cannot mint and is replaced by a new authorize for the same DID without a prior DELETE.
+- A delegation row from before workloads existed (no `workload_id`) cannot mint and is replaced by a new authorize for the same DID, without a prior DELETE, only by its own owner (`root_user_id`): a legacy row's owner may re-authorize it straight into a workload; a different owner authorizing the same DID gets 409 instead.
 
-Errors: 400 invalid DID or field; 422 missing required JSON field (`agent_did`, `name`, `entitlements`, `workload_name`); 401 missing, invalid or stale operator credential; 403 entitlements empty or not held, scope or client not allowed, workload quarantined; 409 DID already has an active delegation for a different workload, or a concurrent change (retry).
+Errors: 400 invalid DID or field; 422 missing required JSON field (`agent_did`, `name`, `entitlements`, `workload_name`); 401 missing, invalid or stale operator credential; 403 entitlements empty or not held, scope or client not allowed, workload quarantined; 409 DID already has an active delegation for a different workload or for a legacy row owned by someone else, or a concurrent change (retry).
 
 ## The `agents:delegate` OIDC scope
 
@@ -100,7 +100,7 @@ Response 200: the status body (below) after the call.
 - Already quarantined with a different `incident`: 409, nothing changes.
 - Eligible, and `incident` equals the incident the last recovery cleared (stored as `last_cleared_incident`): 409, nothing changes. A cleared incident cannot re-latch; report a new incident id.
 
-Errors: 400 bad body (including an empty `evidence_ref`); 401 bad or missing credential, stale `auth_time`, or a replayed Guardian signature; 403 caller is neither the owner nor one of the owner's Guardians, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 as above.
+Errors: 400 bad body (including an empty `evidence_ref`); 401 bad or missing credential, stale `auth_time`, or a replayed Guardian signature; 403 caller is neither the owner nor one of the owner's Guardians, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 as above, or `workload changed concurrently; retry` when the conditional write raced a concurrent change (e.g. a recovery landing between the read and the write) — retry the request.
 
 The latch holds until recovery. While quarantined, `/agents/challenge`, `/agents/token` and `/agents/authorize` refuse the workload with 403.
 
@@ -110,11 +110,11 @@ The latch holds until recovery. While quarantined, `/agents/challenge`, `/agents
 
 Caller: the owner only, with a passkey assertion at most 300 s old: `X-Auth-Token: <passkey auth CWT>` whose `iat` is at most 300 s old or, when that header is absent, `Authorization: Bearer <agents:delegate access token>` with `now − auth_time ≤ 300`. Guardians, agent tokens and service CWTs cannot recover.
 
-Request: `{"incident": string}` — must equal the latched incident.
+Request: `{"incident": string (1–256 chars, no control characters)}` — must equal the latched incident.
 
-Effect, in one write: `state = eligible`, `current_did = ""`, `incident = null`, `generation + 1`, and the delegation of the previously bound DID is revoked. Nothing can mint until the owner authorizes again (`POST /agents/authorize`).
+Effect, in one write: `state = eligible`, `current_did = ""`, `incident = null`, `generation + 1`, and the delegation of the previously bound DID is revoked **only while that delegation still names this workload**; if the DID has since been authorized into another workload (or revoked another way), its delegation is left alone. Nothing can mint for this workload until the owner authorizes again (`POST /agents/authorize`).
 
-Response 200: the status body. The cleared incident is recorded; a later quarantine citing it is refused (409). Errors: 401 missing, invalid or stale credential; 403 not the owner, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 not quarantined, incident mismatch, or concurrent change.
+Response 200: the status body. The cleared incident is recorded; a later quarantine citing it is refused (409). Errors: 400 `incident` empty, over 256 characters, or containing control characters; 401 missing, invalid or stale credential; 403 not the owner, or the Bearer token lacks the scope or the client; 404 unknown workload; 409 not quarantined, incident mismatch, or concurrent change; 422 missing `incident` field or malformed JSON body (parsed by the `Json` extractor before the handler runs).
 
 ## Workload status
 
@@ -143,7 +143,7 @@ KAS rule (informative; opentdf-platform P2): deny an agent-token rewrap when the
 
 `POST /guardians`
 
-Caller: the owner (`X-Auth-Token` passkey auth CWT). Request: `{"public_key": "<base64url, no padding, 32-byte Ed25519 public key>", "name": string (1–64 chars), "proof": "<base64url, no padding, Ed25519 signature>"}`. `proof` is the Guardian key's signature, verified strictly, over the UTF-8 bytes `"arkavo-guardian-enroll" "\n" owner_uuid "\n" public_key`, where `owner_uuid` is the enrolling owner's account UUID (hyphenated, lower case; the account the auth CWT authenticates, not an `arkavo:` prefixed form) and `public_key` is the base64url string sent. Proof of possession stops anyone who merely learns a Guardian's public key from enrolling it first, and binding the owner stops a captured proof from being replayed by another owner. Response 200: `{"guardian_id": "<uuid>"}`. Errors: 400 key not 32 bytes, not a valid point, or weak (small-order), or `proof` missing, malformed, or not a valid signature by that key over that owner's enrollment; 401; 409 the key is already enrolled — by any owner, including a Guardian since revoked. A key enrolls at most once, so it has exactly one replay clock (the signed bytes do not name the Guardian), and a revoked key cannot come back with a fresh one; enroll a new key instead.
+Caller: the owner (`X-Auth-Token` passkey auth CWT). Request: `{"public_key": "<base64url, no padding, 32-byte Ed25519 public key>", "name": string (1–64 chars), "proof": "<base64url, no padding, Ed25519 signature>"}`. `proof` is the Guardian key's signature, verified strictly, over the UTF-8 bytes `"arkavo-guardian-enroll" "\n" owner_uuid "\n" public_key`, where `owner_uuid` is the enrolling owner's account UUID (hyphenated, lower case; the account the auth CWT authenticates, not an `arkavo:` prefixed form) and `public_key` is the base64url string sent. Proof of possession stops anyone who merely learns a Guardian's public key from enrolling it first, and binding the owner stops a captured proof from being replayed by another owner. `guardian_id` is not chosen by the caller: it is a UUID derived from the enrolled key's SHA-256, so the same key always enrolls under the same id (and a key's identity is not the signed-bytes owner, only the storage row). Response 200: `{"guardian_id": "<uuid>"}`. Errors: 400 key not 32 bytes, not a valid point, or weak (small-order), or `proof` missing, malformed, or not a valid signature by that key over that owner's enrollment; 401; 409 the key is already enrolled — by any owner, including a Guardian since revoked. A key enrolls at most once, so it has exactly one replay clock (the signed bytes do not name the Guardian), and a revoked key cannot come back with a fresh one; enroll a new key instead.
 
 `DELETE /guardians/{guardian_id}`
 
@@ -160,7 +160,7 @@ signed bytes (UTF-8): METHOD "\n" PATH "\n" unix_ts "\n" hex(sha256(body))
 - `|now − unix_ts| ≤ 60` s.
 - Verified with strict Ed25519 verification against the public key enrolled under `guardian_id`, never a key carried by the request. A `guardian_id` that is not a canonical UUID (hyphenated, lower case), unknown, or revoked is refused (401) exactly as a signature that does not verify.
 - Replay protection: the server stores `last_signed_at`, the `unix_ts` of the most recent request from that Guardian whose signature verified — the clock advances whenever a request's signature verifies, regardless of whether the request then succeeds or is refused for another reason. A request whose `unix_ts` is not strictly greater than `last_signed_at` is refused (401), even inside the ±60 s window. A Guardian therefore sends at most one request per second, with increasing timestamps.
-- A Guardian may call only quarantine, only for its owner's workloads. Any other agent-plane request carrying `X-Guardian-Signature` (`/agents/authorize`, `/agents/delegations`, `/agents/challenge`, `/agents/token`, recover, status, `POST /guardians`, `DELETE /guardians/{guardian_id}`) gets 403 whether or not the signature verifies.
+- A Guardian may call only quarantine, only for its owner's workloads. Any other agent-plane request carrying `X-Guardian-Signature` (`/agents/authorize`, `/agents/delegations`, `/agents/challenge`, `/agents/token`, recover, status, `POST /guardians`, `DELETE /guardians/{guardian_id}`) gets 403 whether or not the signature verifies. That 403 applies to a well-formed request: a malformed JSON body or query string on one of those endpoints is rejected by request parsing (400/415/422) before the handler runs and checks for a Guardian header — quarantine is the exception, since it reads the raw body itself and authenticates the caller (Guardian or owner) before parsing it as JSON.
 
 ## Discovery
 

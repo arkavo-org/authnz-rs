@@ -1,6 +1,7 @@
 ---
 paths:
   - "src/db.rs"
+  - "src/db/**/*.rs"
 ---
 
 ## DynamoDB Schema
@@ -51,11 +52,48 @@ paths:
 - **Attributes**: delegator_type (`human`|`agent`), delegator_id (String),
   delegator_username (String, optional), entitlements (List of String),
   name (String), depth (Number), root_user_id (String/UUID), chain (List of
-  String), created_at / expires_at / revoked_at (Number), and the transient
-  challenge triple `challenge`, `challenge_nonce`, `challenge_issued_at`
-  (set by `/agents/challenge`, removed atomically by `/agents/token`)
+  String), created_at / expires_at / revoked_at (Number), workload_id
+  (String, absent on a pre-workload row), short_lived (Boolean), and the
+  transient challenge triple `challenge`, `challenge_nonce`,
+  `challenge_issued_at` (set by `/agents/challenge`, removed atomically by
+  `/agents/token`)
 - **GSI**: root_user_id-index (partition key: root_user_id) — list/count a
   user's agents
+
+### agent_workloads table
+- **Primary Key**: workload_id (String) - `wl-` + 32 hex, derived from (owner, name)
+- **Attributes**: owner (String/UUID), name (String), current_did (String,
+  absent while unbound — including after a recovery, until the owner
+  authorizes again), swarm (String, absent while the workload has no kit —
+  never stored as an empty string), state (`eligible`|`quarantined`),
+  generation (Number, +1 on every change to `current_did`, `swarm` or
+  `state`), incident / evidence_ref / quarantined_by (String, present only
+  while quarantined), quarantined_at (Number, present only while
+  quarantined), last_cleared_incident (String, the incident the most recent
+  recovery cleared), created_at / updated_at (Number)
+- **Reads**: always `consistent_read(true)`; no GSI (status must see the latch).
+- **Writes**: create is `attribute_not_exists(workload_id)`; quarantine is
+  conditional on `state = eligible` (and the incident not being the one last
+  cleared); rebind and recover are `TransactWriteItems` with the
+  `agent_delegations` revoke, conditional on the generation (and, for
+  recover, the latched incident) read. Recovery `REMOVE`s `current_did`,
+  `incident`, `evidence_ref`, `quarantined_by` and `quarantined_at` rather
+  than writing empty strings.
+
+### guardians table
+- **Primary Key**: guardian_id (String/UUID) - a UUID (version 8) derived
+  from the enrolled key's SHA-256, so the same key always enrolls under the
+  same id and an id is never caller-chosen
+- **Attributes**: owner (String/UUID), public_key (Binary, 32-byte Ed25519),
+  name (String), created_at (Number), last_signed_at (Number, optional — the
+  `unix_ts` of the most recently accepted `X-Guardian-Signature`; advanced
+  only strictly forward and only while unrevoked, enforcing both the replay
+  window and revocation in one conditional update), revoked_at (Number,
+  optional — set `if_not_exists` so the first revocation time sticks; the row
+  is never deleted, so a revoked key's id can never be reused)
+- **Writes**: enrollment is `attribute_not_exists(guardian_id)` (one key, one
+  row, forever); revocation and the signature-clock advance are conditional
+  updates keyed on `guardian_id` and (for revocation) `owner`.
 
 ### patreon_tokens table
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link

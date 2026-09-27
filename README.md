@@ -21,6 +21,8 @@ export DECODING_KEY_PATH=/path/to/decodekey.pem
 export DYNAMODB_CREDENTIALS_TABLE=prod-credentials
 export DYNAMODB_HANDLES_TABLE=prod-handles
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=prod-agent-delegations
+export DYNAMODB_AGENT_WORKLOADS_TABLE=prod-agent-workloads
+export DYNAMODB_GUARDIANS_TABLE=prod-guardians
 export AWS_REGION=your-region
 ```
 
@@ -284,6 +286,11 @@ export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
 export ADMIN_CLIENT_IDS=catalog-node
+
+# Agent credentials and quarantine (docs/agent-credentials-contract.md v1).
+export AGENT_DELEGATE_CLIENT_IDS=arkavo-edge        # may request agents:delegate
+export AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>   # reads workload status
+
 # export USER_DEFAULT_ENTITLEMENTS=https://arkavo.ai/attr/tdf/value/decrypt
 ```
 

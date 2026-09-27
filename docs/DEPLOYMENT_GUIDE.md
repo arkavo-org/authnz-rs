@@ -147,6 +147,12 @@ DYNAMODB_CREDENTIALS_TABLE=credentials
 DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
+DYNAMODB_AGENT_WORKLOADS_TABLE=agent_workloads
+DYNAMODB_GUARDIANS_TABLE=guardians
+
+# Agent credentials (docs/agent-credentials-contract.md v1)
+AGENT_DELEGATE_CLIENT_IDS=arkavo-edge
+AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>
 
 # App Attest registration gate — see docs/app-attest-gate-deployment.md before
 # setting these. The table is inert until the gate ships; APP_ATTEST_APP_ID is
@@ -230,6 +236,22 @@ prepends the real peer address. If clients can reach authnz-rs directly,
 they can forge this header and poison the audit log. The audit value is
 not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
+
+#### `agent_workloads` and `guardians` Tables
+
+Required before deploying 0.13.0: `/agents/authorize` writes `agent_workloads`,
+and `POST /guardians` writes `guardians`. See
+[docs/agent-credentials-contract.md](agent-credentials-contract.md) (v1) and
+`.claude/rules/dynamodb-schema.md` for the full attribute list.
+
+```bash
+aws dynamodb create-table --table-name agent_workloads \
+  --attribute-definitions AttributeName=workload_id,AttributeType=S \
+  --key-schema AttributeName=workload_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+aws dynamodb create-table --table-name guardians \
+  --attribute-definitions AttributeName=guardian_id,AttributeType=S \
+  --key-schema AttributeName=guardian_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+```
 
 ### Systemd Service Setup
 
