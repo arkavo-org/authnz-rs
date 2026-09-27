@@ -366,6 +366,18 @@ fn parse_id_list(raw: Option<String>) -> Vec<String> {
         .collect()
 }
 
+/// `OIDC_PLATFORM_AUDIENCE`, unset when blank. Refuses the passkey CWT
+/// audience: every access token carries the platform audience, so each one
+/// would otherwise verify as a passkey auth CWT.
+fn parse_platform_audience(raw: Option<String>) -> Result<Option<String>, String> {
+    match raw.filter(|v| !v.is_empty()) {
+        Some(v) if v == crate::constants::ARKAVO_CWT_AUDIENCE => Err(format!(
+            "OIDC_PLATFORM_AUDIENCE is \"{v}\", the audience of passkey auth CWTs; choose another audience"
+        )),
+        other => Ok(other),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -508,11 +520,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwt_verifying_key: Arc::new(cwt_verifying_key),
         cwt_kid: Arc::new(cwt_kid),
         issuer: Arc::new(issuer),
-        platform_audience: Arc::new(
-            env::var("OIDC_PLATFORM_AUDIENCE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-        ),
+        platform_audience: Arc::new(parse_platform_audience(
+            env::var("OIDC_PLATFORM_AUDIENCE").ok(),
+        )?),
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
@@ -1239,6 +1249,21 @@ mod tests {
         assert!(parse_app_attest_app_ids(None).is_empty());
         assert!(parse_app_attest_app_ids(Some("")).is_empty());
         assert!(parse_app_attest_app_ids(Some("  ,  , ")).is_empty());
+    }
+
+    #[test]
+    fn platform_audience_refuses_the_passkey_cwt_audience() {
+        assert_eq!(super::parse_platform_audience(None), Ok(None));
+        assert_eq!(
+            super::parse_platform_audience(Some(String::new())),
+            Ok(None)
+        );
+        assert_eq!(
+            super::parse_platform_audience(Some("https://platform.arkavo.net".into())),
+            Ok(Some("https://platform.arkavo.net".to_string()))
+        );
+        let err = super::parse_platform_audience(Some("arkavo".into())).unwrap_err();
+        assert!(err.contains("OIDC_PLATFORM_AUDIENCE"), "{err}");
     }
 
     #[test]

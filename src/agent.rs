@@ -260,7 +260,8 @@ pub(crate) struct HumanDelegator {
 /// delegate; Apple-only and service-account subjects are rejected, as are any
 /// claims describing an agent or device NPE (`arkavo_npe` set, or `arkavo_roles`
 /// containing `"agent"`). Agent-to-agent delegation is not supported yet (the
-/// delegator must be a human CWT).
+/// delegator must be a human CWT). Claims carrying `scope` or `auth_time` are
+/// OIDC access tokens, never a passkey auth CWT, and are refused (401).
 pub(crate) async fn authenticate_human(
     app_state: &AppState,
     headers: &HeaderMap,
@@ -282,6 +283,16 @@ pub(crate) async fn authenticate_human(
         warn!("Rejected delegator token: {}", e);
         AgentError::InvalidToken
     })?;
+    // `aud = "arkavo"` alone does not identify a passkey auth CWT: an OIDC
+    // access token for a client (or platform audience) named "arkavo" carries
+    // it too, and would otherwise act as the owner here with a refreshable,
+    // never-renewed `auth_time`. `authn::mint_auth_token` never sets `scope`
+    // or `auth_time`; every access token carries `scope`.
+    if claims.custom.scope.is_some() || claims.custom.auth_time.is_some() {
+        return Err(AgentError::Unauthorized(
+            "X-Auth-Token must be a passkey auth CWT".into(),
+        ));
+    }
 
     let lifetime = claims.exp.saturating_sub(claims.iat);
     let max_auth = AUTH_TOKEN_HOURS * 3600 + cwt::DEFAULT_SKEW_SECS;

@@ -462,7 +462,8 @@ fn load_clients_from_env() -> Result<HashMap<String, OidcClient>, String> {
 ///
 /// Returns an empty map (with a warning) when no tags are configured. Errors
 /// when a tag has `_ID` but no `_REDIRECT_URIS`, when `_REDIRECT_URIS` is
-/// empty after trimming, or when two tags resolve to the same `client_id`.
+/// empty after trimming, when two tags resolve to the same `client_id`, or
+/// when a `client_id` is [`crate::constants::ARKAVO_CWT_AUDIENCE`].
 fn parse_clients_from_env_vars<I>(vars: I) -> Result<HashMap<String, OidcClient>, String>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -482,6 +483,13 @@ where
     let mut clients: HashMap<String, OidcClient> = HashMap::new();
     for tag in tags {
         let client_id = env_map[&format!("OIDC_CLIENT_{}_ID", tag)].clone();
+        if client_id == crate::constants::ARKAVO_CWT_AUDIENCE {
+            return Err(format!(
+                "OIDC_CLIENT_{}_ID is \"{}\", the audience of passkey auth CWTs; choose another client_id",
+                tag,
+                crate::constants::ARKAVO_CWT_AUDIENCE
+            ));
+        }
         let client_secret = env_map
             .get(&format!("OIDC_CLIENT_{}_SECRET", tag))
             .filter(|s| !s.is_empty())
@@ -2421,6 +2429,17 @@ mod tests {
         ]);
         let err = parse_clients_from_env_vars(vars).unwrap_err();
         assert!(err.contains("Duplicate OIDC client_id"));
+    }
+
+    #[test]
+    fn test_parse_clients_refuses_the_passkey_cwt_audience() {
+        let vars = env_vars(&[
+            ("OIDC_CLIENT_EDGE_ID", "arkavo"),
+            ("OIDC_CLIENT_EDGE_REDIRECT_URIS", "https://x/cb"),
+        ]);
+        let err = parse_clients_from_env_vars(vars).unwrap_err();
+        assert!(err.contains("OIDC_CLIENT_EDGE_ID"), "{err}");
+        assert!(err.contains("\"arkavo\""), "{err}");
     }
 
     #[test]

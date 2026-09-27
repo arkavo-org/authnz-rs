@@ -864,6 +864,68 @@ async fn x_auth_token_wins_over_a_bearer_token() {
     assert_eq!(body["workload_id"], json!(workload_id_for(&owner, "fleet")));
 }
 
+/// A fresh `agents:delegate` access token whose audience is `"arkavo"`, as a
+/// relying party registered under that client_id would receive one.
+fn arkavo_audience_access_token(p: &Plane, owner: Uuid) -> String {
+    let claims = crate::cwt::ArkavoClaims::oidc_access(
+        &p.state.issuer,
+        &format!("arkavo:{owner}"),
+        "arkavo",
+        1,
+    )
+    .with_idp("webauthn")
+    .with_scope("openid agents:delegate")
+    .with_auth_time(Utc::now().timestamp());
+    crate::cwt::encode_for_header(
+        &crate::cwt::mint(&claims, &p.state.cwt_signing_key, &p.state.cwt_kid).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn an_access_token_is_never_a_passkey_auth_cwt() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let token = arkavo_audience_access_token(&p, owner);
+
+    let (st, body) = p.recover(("X-Auth-Token", &token), &wid, "inc-1").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body.to_string()
+            .contains("X-Auth-Token must be a passkey auth CWT"),
+        "{body}"
+    );
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Quarantined
+    );
+
+    let (st, body) = p
+        .authorize(
+            ("X-Auth-Token", &token),
+            authorize_body(&fresh_agent(), "fleet2", "kit-1", false),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        p.store
+            .get_workload(&workload_id_for(&owner, "fleet2"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn a_rebind_revokes_the_previous_dids_expired_delegation_too() {
     let Some(p) = Plane::new().await else { return };

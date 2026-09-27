@@ -11,6 +11,11 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// `aud` of Arkavo-issued passkey auth and registration CWTs. Reserved: it
+/// may not be an OIDC client_id or the platform audience, because an access
+/// token carrying it would verify wherever a passkey CWT is expected.
+pub const ARKAVO_CWT_AUDIENCE: &str = "arkavo";
+
 /// Freshness window (seconds) for a device's last successful App Attest
 /// assertion. Within this window since the last verified assertion, the
 /// device is classed `attested`; once it expires the device is `managed`
