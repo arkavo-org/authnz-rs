@@ -3,7 +3,7 @@
 //! docs/agent-credentials-contract.md (v1).
 
 use crate::AppState;
-use crate::agent::{AgentError, db_err, live_delegation};
+use crate::agent::{AgentError, db_err, is_live};
 use crate::constants::{
     AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, EVIDENCE_REF_MAX_LEN, INCIDENT_MAX_LEN,
     RECOVERY_TOKEN_MAX_AGE_SECONDS, WORKLOAD_STATUS_LEASE_SECONDS,
@@ -54,7 +54,9 @@ fn replaceable(existing: &AgentDelegation, owner: Uuid, workload_id: &str) -> bo
 /// workload and the current one for an existing workload. A different DID or
 /// swarm rebinds the workload (generation + 1); a different DID also revokes
 /// the previously bound DID's delegation for this workload. Refused while
-/// quarantined, so a new key is never a way out of a quarantine.
+/// quarantined, so a new key is never a way out of a quarantine; refused too
+/// while the DID is the current binding of another, quarantined workload
+/// (whatever its delegation's liveness), so moving the DID is not either.
 pub(crate) async fn bind_workload(
     app_state: &AppState,
     owner: Uuid,
@@ -72,7 +74,20 @@ pub(crate) async fn bind_workload(
     // Every condition sits in one transaction, whose failure does not say
     // which condition tripped: on a conflict, re-read and decide again.
     for _ in 0..3 {
-        if let Some(existing) = live_delegation(app_state, did, now).await?
+        // Read regardless of liveness: a revoked or expired delegation still
+        // names the workload the DID was last bound to.
+        let existing = db.get_agent_delegation(did).await.map_err(db_err)?;
+        if let Some(bound) = existing.as_ref().and_then(|d| d.workload_id.as_deref())
+            && bound != workload_id
+            && db
+                .get_workload(bound)
+                .await
+                .map_err(db_err)?
+                .is_some_and(|w| w.state == WorkloadState::Quarantined && w.current_did == did)
+        {
+            return Err(AgentError::WorkloadQuarantined);
+        }
+        if let Some(existing) = existing.filter(|d| is_live(d, now))
             && !replaceable(&existing, owner, workload_id)
         {
             return Err(AgentError::DelegationAlreadyExists);

@@ -1305,6 +1305,100 @@ async fn rebinding_is_refused_while_quarantined() {
 }
 
 #[tokio::test]
+async fn a_quarantined_did_cannot_leave_by_authorizing_into_another_workload() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let x = fresh_agent();
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&x, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{}", did_key(&x)))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let (st, body) = p
+        .authorize(auth, authorize_body(&x, "fleet2", "kit-1", false))
+        .await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+    let fleet2 = workload_id_for(&owner, "fleet2");
+    assert_eq!(p.store.get_workload(&fleet2).await.unwrap(), None);
+    let d = p
+        .store
+        .get_agent_delegation(&did_key(&x))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.workload_id.as_deref(), Some(wid.as_str()));
+    assert_ne!(p.mint(&x).await.0, StatusCode::OK);
+
+    // Recovery clears the latch; the DID may then be authorized elsewhere.
+    assert_eq!(p.recover(auth, &wid, "inc-1").await.0, StatusCode::OK);
+    let (st, body) = p
+        .authorize(auth, authorize_body(&x, "fleet2", "kit-1", false))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, body) = p.mint(&x).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        verify_token(&p, body["token"].as_str().unwrap())
+            .custom
+            .arkavo_workload,
+        Some(fleet2)
+    );
+}
+
+#[tokio::test]
+async fn an_expired_delegation_does_not_carry_a_did_out_of_quarantine() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let x = fresh_agent();
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&x, "fleet", "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let wid = workload_id_for(&owner, "fleet");
+    assert_eq!(p.quarantine(&cwt, &wid, "inc-1").await.0, StatusCode::OK);
+    let expired = AgentDelegation {
+        expires_at: Some(Utc::now().timestamp() - 60),
+        ..crate::db::workloads_test_support::delegation(&did_key(&x), owner, Some(wid.clone()))
+    };
+    p.store.create_agent_delegation(&expired).await.unwrap();
+
+    let (st, body) = p
+        .authorize(auth, authorize_body(&x, "fleet2", "kit-1", false))
+        .await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+    assert_eq!(
+        p.store
+            .get_workload(&workload_id_for(&owner, "fleet2"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn refusal_bodies_are_contract_v1() {
     let Some(p) = Plane::new().await else { return };
     let (owner, cwt) = p.user(&[READ]).await;

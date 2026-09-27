@@ -711,20 +711,10 @@ pub(crate) const REFUSE_LEGACY_DELEGATION: &str =
     "delegation predates workloads; authorize again with workload_name and swarm";
 pub(crate) const REFUSE_NOT_CURRENT_DID: &str = "agent DID is not the workload's current binding";
 
-/// The DID's delegation if it can still mint: present, not revoked, not
-/// expired at `now`. The one liveness probe: authorize asks it whether a DID
-/// is already taken.
-pub(crate) async fn live_delegation(
-    app_state: &AppState,
-    agent_did: &str,
-    now: i64,
-) -> Result<Option<AgentDelegation>, AgentError> {
-    Ok(app_state
-        .db_store
-        .get_agent_delegation(agent_did)
-        .await
-        .map_err(db_err)?
-        .filter(|d| d.revoked_at.is_none() && d.expires_at.is_none_or(|e| now <= e)))
+/// Whether a delegation can still mint: not revoked, not expired at `now`.
+/// The one liveness test: authorize asks it whether a DID is already taken.
+pub(crate) fn is_live(d: &AgentDelegation, now: i64) -> bool {
+    d.revoked_at.is_none() && d.expires_at.is_none_or(|e| now <= e)
 }
 
 fn random_challenge_bytes() -> [u8; 32] {

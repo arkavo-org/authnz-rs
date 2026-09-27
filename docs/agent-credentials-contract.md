@@ -34,7 +34,7 @@ Every error response from the endpoints below has a `text/plain` body. Clients s
 
 | Body (exact, no trailing newline) | Status | Returned by | Meaning |
 |---|---|---|---|
-| `Workload quarantined` | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize` | The workload's quarantine latch is set. |
+| `Workload quarantined` | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize` | The workload's quarantine latch is set (at `/agents/authorize`: the target workload's, or that of the workload the DID's delegation names while it is still bound to the DID). |
 | `Forbidden: delegation predates workloads; authorize again with workload_name and swarm` | 403 | `/agents/challenge`, `/agents/token` | The delegation row has no workload. |
 | `Forbidden: agent DID is not the workload's current binding` | 403 | `/agents/challenge`, `/agents/token` | The workload is bound to a different DID. (After recovery, or a rebind, the old DID's delegation is revoked while it still names this workload, so it gets `Delegation revoked` instead; a DID since authorized into another workload is untouched and mints for that workload.) |
 | `Delegation revoked` | 403 | `/agents/challenge`, `/agents/token` | The delegation was revoked: by DELETE, by a rebind to another DID (while it still named this workload), or by recovery (while it still named this workload). |
@@ -69,9 +69,10 @@ Semantics:
 - Authorizing a different DID, or a `swarm` different from the workload's, rebinds it: `generation + 1`; when the DID changes, the previously bound DID's delegation is revoked in the same write, but only while it still names this workload (if it has since been authorized elsewhere, it is left alone). Omitting `swarm` for an existing workload keeps its current swarm.
 - Authorizing the DID that already holds an active delegation for the same workload replaces that delegation (e.g. to add the swarm once the agent is specialized, or to change entitlements or `short_lived`); this is not a 409.
 - Any authorize against a quarantined workload is refused (403). Rebinding is not a way out of quarantine.
+- Authorizing a DID into another workload is refused (403 `Workload quarantined`) while the workload its delegation names is quarantined and still bound to that DID, whether that delegation is live, revoked by DELETE, or expired: moving the DID is not a way out of quarantine either; recover that workload first.
 - A delegation row from before workloads existed (no `workload_id`) cannot mint and is replaced by a new authorize for the same DID, without a prior DELETE, only by its own owner (`root_user_id`): a legacy row's owner may re-authorize it straight into a workload; a different owner authorizing the same DID gets 409 instead.
 
-Errors: 400 invalid DID or field; 422 missing required JSON field (`agent_did`, `name`, `entitlements`, `workload_name`); 401 missing, invalid or stale operator credential; 403 entitlements empty or not held, scope or client not allowed, workload quarantined; 409 DID already has an active delegation for a different workload or for a legacy row owned by someone else, or a concurrent change (retry).
+Errors: 400 invalid DID or field; 422 missing required JSON field (`agent_did`, `name`, `entitlements`, `workload_name`); 401 missing, invalid or stale operator credential; 403 entitlements empty or not held, scope or client not allowed, workload quarantined (the target, or the workload the DID's delegation names while still bound to the DID); 409 DID already has an active delegation for a different workload or for a legacy row owned by someone else, or a concurrent change (retry).
 
 ## The `agents:delegate` OIDC scope
 
