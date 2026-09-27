@@ -59,6 +59,7 @@ mod device_check;
 mod entities;
 mod entitlements;
 mod google_signin;
+mod guardian;
 mod identity;
 mod oidc;
 mod patreon;
@@ -455,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "device_attest_keys".to_string()),
         env::var("DYNAMODB_AGENT_WORKLOADS_TABLE")
             .unwrap_or_else(|_| "agent_workloads".to_string()),
+        env::var("DYNAMODB_GUARDIANS_TABLE").unwrap_or_else(|_| "guardians".to_string()),
         default_entitlements,
     )
     .await
@@ -683,6 +685,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/agents/workloads/:workload_id/recover",
             post(workload::recover_workload),
         )
+        // Guardian enrollment (owner). A Guardian may only quarantine.
+        .route("/guardians", post(guardian::enroll_guardian))
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
@@ -1485,6 +1489,7 @@ pub(crate) mod test_helpers {
                 "agent_delegations".to_string(),
                 "device_attest_keys".to_string(),
                 "agent_workloads".to_string(),
+                "guardians".to_string(),
                 crate::constants::DEFAULT_USER_ENTITLEMENTS
                     .iter()
                     .map(|s| (*s).to_string())

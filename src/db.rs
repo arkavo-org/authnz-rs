@@ -7,7 +7,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
+mod guardians;
 mod workloads;
+pub use guardians::Guardian;
 #[cfg(test)]
 pub(crate) use workloads::tests as workloads_test_support;
 pub use workloads::{AgentWorkload, Binding, QuarantineOutcome, WorkloadState, workload_id_for};
@@ -212,6 +214,7 @@ pub struct DynamoDBStore {
     agent_delegations_table: String,
     device_attest_keys_table: String,
     agent_workloads_table: String,
+    guardians_table: String,
     default_entitlements: Vec<String>,
 }
 
@@ -226,6 +229,7 @@ impl DynamoDBStore {
         agent_delegations_table: String,
         device_attest_keys_table: String,
         agent_workloads_table: String,
+        guardians_table: String,
         default_entitlements: Vec<String>,
     ) -> Result<Self, DynamoDBError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -239,6 +243,7 @@ impl DynamoDBStore {
             agent_delegations_table,
             device_attest_keys_table,
             agent_workloads_table,
+            guardians_table,
             default_entitlements,
         ))
     }
@@ -261,6 +266,7 @@ impl DynamoDBStore {
         agent_delegations_table: String,
         device_attest_keys_table: String,
         agent_workloads_table: String,
+        guardians_table: String,
         default_entitlements: Vec<String>,
     ) -> Self {
         Self {
@@ -273,6 +279,7 @@ impl DynamoDBStore {
             agent_delegations_table,
             device_attest_keys_table,
             agent_workloads_table,
+            guardians_table,
             default_entitlements,
         }
     }
@@ -2281,6 +2288,7 @@ pub(crate) mod tests {
             "agent_delegations".into(),
             "device_attest_keys".into(),
             "agent_workloads".into(),
+            "guardians".into(),
             vec!["https://arkavo.ai/attr/tdf/value/decrypt".to_string()],
         ))
     }

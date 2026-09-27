@@ -66,5 +66,6 @@ mk --table-name agent_delegations --attribute-definitions AttributeName=agent_di
    --key-schema AttributeName=agent_did,KeyType=HASH \
    --global-secondary-indexes '[{"IndexName":"root_user_id-index","KeySchema":[{"AttributeName":"root_user_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]'
 mk --table-name agent_workloads --attribute-definitions AttributeName=workload_id,AttributeType=S --key-schema AttributeName=workload_id,KeyType=HASH
+mk --table-name guardians --attribute-definitions AttributeName=guardian_id,AttributeType=S --key-schema AttributeName=guardian_id,KeyType=HASH
 mk --table-name device_attest_keys --attribute-definitions AttributeName=key_id,AttributeType=S --key-schema AttributeName=key_id,KeyType=HASH
 echo "tables ready at $EP"

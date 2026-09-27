@@ -40,6 +40,7 @@ use crate::constants::{
 };
 use crate::cwt;
 use crate::db::{AgentDelegation, AgentWorkload, DynamoDBError, WorkloadState, workload_id_for};
+use crate::guardian::refuse_guardian;
 use crate::workload::{bind_workload, validate_label};
 use axum::http::HeaderMap;
 use axum::{
@@ -441,6 +442,7 @@ pub async fn authorize_agent(
     headers: HeaderMap,
     Json(request): Json<AuthorizeAgentRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     info!(
         "Authorizing agent: {} with name: {}",
         request.agent_did, request.name
@@ -539,6 +541,7 @@ pub async fn list_delegations(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     let human = authenticate_human(&app_state, &headers).await?;
 
     let delegations = app_state
@@ -571,6 +574,7 @@ pub async fn revoke_delegation(
     headers: HeaderMap,
     Path(agent_did): Path<String>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     let human = authenticate_human(&app_state, &headers).await?;
 
     let delegation = app_state
@@ -707,8 +711,10 @@ fn random_challenge_bytes() -> [u8; 32] {
 /// GET /agents/challenge?did=… — issue a challenge for an active delegation.
 pub async fn generate_agent_challenge(
     Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ChallengeQueryParams>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     validate_did_key(&params.did)?;
     let delegation = active_delegation(&app_state, &params.did).await?;
     eligible_workload(&app_state, &delegation).await?;
@@ -735,8 +741,10 @@ pub async fn generate_agent_challenge(
 /// POST /agents/token — verify the signed challenge, mint the agent CWT.
 pub async fn issue_agent_token(
     Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
     Json(request): Json<TokenRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     info!("Issuing agent token for DID: {}", request.did);
     validate_did_key(&request.did)?;
 

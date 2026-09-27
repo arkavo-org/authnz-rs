@@ -12,10 +12,11 @@ use crate::db::{
     AgentDelegation, AgentWorkload, Binding, DynamoDBError, QuarantineOutcome, WorkloadState,
 };
 use crate::entitlements::EntitlementError;
+use crate::guardian::{GUARDIAN_SIGNATURE_HEADER, refuse_guardian, verify_guardian_request};
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Extension, Path};
-use axum::http::HeaderMap;
+use axum::extract::{Extension, OriginalUri, Path};
+use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use log::{info, warn};
@@ -195,28 +196,45 @@ impl WorkloadStatus {
 /// Who is latching a quarantine.
 enum QuarantineCaller {
     Owner(Uuid),
+    Guardian { guardian_id: String, owner: Uuid },
 }
 
 impl QuarantineCaller {
     fn owner(&self) -> Uuid {
         match self {
             Self::Owner(u) => *u,
+            Self::Guardian { owner, .. } => *owner,
         }
     }
 
     fn label(&self) -> String {
         match self {
             Self::Owner(u) => format!("owner:{u}"),
+            Self::Guardian { guardian_id, .. } => format!("guardian:{guardian_id}"),
         }
     }
 }
 
-/// The owner by passkey auth CWT or, when `X-Auth-Token` is absent, by an
-/// `agents:delegate` Bearer token whose assertion is at most an hour old.
+/// A Guardian when the request carries `X-Guardian-Signature` (checked
+/// before either owner credential, so a signed request never falls back to
+/// one); otherwise the owner by passkey auth CWT or, when `X-Auth-Token` is
+/// absent, by an `agents:delegate` Bearer token whose assertion is at most
+/// an hour old.
 async fn quarantine_caller(
     app_state: &AppState,
     headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    body: &[u8],
+    now: i64,
 ) -> Result<QuarantineCaller, AgentError> {
+    if headers.contains_key(GUARDIAN_SIGNATURE_HEADER) {
+        let g = verify_guardian_request(app_state, headers, method, path, body, now).await?;
+        return Ok(QuarantineCaller::Guardian {
+            guardian_id: g.guardian_id,
+            owner: g.owner,
+        });
+    }
     let owner = crate::agent::authenticate_operator(
         app_state,
         headers,
@@ -232,10 +250,14 @@ async fn quarantine_caller(
 pub async fn quarantine_workload(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     Path(workload_id): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AgentError> {
-    let caller = quarantine_caller(&app_state, &headers).await?;
+    let now = Utc::now().timestamp();
+    // The signed PATH is the path as sent, without the query string.
+    let caller = quarantine_caller(&app_state, &headers, &method, uri.path(), &body, now).await?;
     // Parsed from raw bytes: a Guardian signs the exact body.
     let req: QuarantineRequest = serde_json::from_slice(&body)
         .map_err(|e| AgentError::InvalidRequest(format!("quarantine body: {e}")))?;
@@ -254,7 +276,6 @@ pub async fn quarantine_workload(
             "workload belongs to a different owner".into(),
         ));
     }
-    let now = Utc::now().timestamp();
     match app_state
         .db_store
         .quarantine_workload(
@@ -309,13 +330,8 @@ pub async fn recover_workload(
     Path(workload_id): Path<String>,
     Json(req): Json<RecoverRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
-    // Contract v1: any request carrying a Guardian signature is refused here,
-    // verified or not, even alongside a valid owner credential.
-    if headers.contains_key("X-Guardian-Signature") {
-        return Err(AgentError::Forbidden(
-            "a Guardian may only quarantine".into(),
-        ));
-    }
+    // Verified or not, and even alongside a valid owner credential.
+    refuse_guardian(&headers)?;
     // The passkey CWT is aged by its `iat` here; the Bearer path already
     // bounded `auth_time` inside, and reports it as `issued_at` too.
     let owner =
@@ -401,6 +417,7 @@ pub async fn workload_status(
     headers: HeaderMap,
     Path(workload_id): Path<String>,
 ) -> Result<Response, AgentError> {
+    refuse_guardian(&headers)?;
     crate::entitlements::require_service_cwt_for(
         &app_state,
         &headers,

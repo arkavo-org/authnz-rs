@@ -58,6 +58,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/agents/workloads/:workload_id/recover",
             post(crate::workload::recover_workload),
         )
+        .route("/guardians", post(crate::guardian::enroll_guardian))
         .layer(Extension(state))
 }
 
@@ -218,6 +219,58 @@ impl Plane {
         )
         .unwrap()
     }
+
+    pub async fn enroll_guardian(&self, cwt: &str, gsk: &SigningKey) -> String {
+        let (st, body) = self
+            .post_json(
+                "/guardians",
+                ("X-Auth-Token", cwt),
+                json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "pager"}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        body["guardian_id"].as_str().unwrap().to_string()
+    }
+
+    /// A Guardian-signed request. `uri` may carry a query; the header was
+    /// signed over its path alone.
+    pub async fn signed(
+        &self,
+        method: &str,
+        uri: &str,
+        header: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Guardian-Signature", header);
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        self.send(
+            req.body(Body::from(body.unwrap_or("").to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+}
+
+pub(crate) fn b64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `X-Guardian-Signature` for a request, per contract v1.
+pub(crate) fn guardian_header(
+    id: &str,
+    sk: &SigningKey,
+    method: &str,
+    path: &str,
+    ts: i64,
+    body: &[u8],
+) -> String {
+    let sig = sk.sign(&crate::guardian::signing_input(method, path, ts, body));
+    format!("{id}.{ts}.{}", b64url(&sig.to_bytes()))
 }
 
 /// A service CWT the way `client_credentials` shapes one for `client`.
@@ -1798,4 +1851,379 @@ async fn recovery_leaves_the_old_did_alone_once_it_is_authorized_elsewhere() {
             .arkavo_workload,
         Some(workload_id_for(&owner, "other"))
     );
+}
+
+/// An owner with one authorized agent in workload "fleet", and an enrolled
+/// Guardian: (owner, owner CWT, workload id, guardian id, guardian key).
+async fn guarded(p: &Plane) -> (Uuid, String, String, String, SigningKey) {
+    let (owner, cwt) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let gsk = fresh_agent();
+    let gid = p.enroll_guardian(&cwt, &gsk).await;
+    (owner, cwt, workload_id_for(&owner, "fleet"), gid, gsk)
+}
+
+fn quarantine_body(incident: &str) -> String {
+    json!({"incident": incident, "evidence_ref": "s3://evidence/1"}).to_string()
+}
+
+#[tokio::test]
+async fn enrolled_guardian_can_quarantine() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, wid, gid, gsk) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let hdr = guardian_header(
+        &gid,
+        &gsk,
+        "POST",
+        &path,
+        Utc::now().timestamp(),
+        body.as_bytes(),
+    );
+    let (st, resp) = p.signed("POST", &path, &hdr, Some(&body)).await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    assert_eq!(resp["state"], "quarantined");
+    assert_eq!(resp["generation"], 2);
+    let w = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!(w.quarantined_by, Some(format!("guardian:{gid}")));
+    assert_eq!(w.evidence_ref.as_deref(), Some("s3://evidence/1"));
+}
+
+#[tokio::test]
+async fn guardian_signature_by_a_self_supplied_key_is_rejected() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, wid, gid, _) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let attacker = fresh_agent();
+    // The body even names the attacker's key; nothing may read it.
+    let body = json!({
+        "incident": "forged",
+        "evidence_ref": null,
+        "public_key": b64url(attacker.verifying_key().as_bytes()),
+    })
+    .to_string();
+    let now = Utc::now().timestamp();
+    let hdr = guardian_header(&gid, &attacker, "POST", &path, now, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let with_key_header = p
+        .send(
+            Request::post(&path)
+                .header("X-Guardian-Signature", &hdr)
+                .header(
+                    "X-Guardian-Public-Key",
+                    b64url(attacker.verifying_key().as_bytes()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(with_key_header.0, StatusCode::UNAUTHORIZED);
+
+    let unknown = guardian_header(
+        &Uuid::new_v4().to_string(),
+        &attacker,
+        "POST",
+        &path,
+        now,
+        body.as_bytes(),
+    );
+    assert_eq!(
+        p.signed("POST", &path, &unknown, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
+}
+
+#[tokio::test]
+async fn guardian_signature_binds_body_path_and_time() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt, wid, gid, gsk) = guarded(&p).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &cwt),
+            authorize_body(&fresh_agent(), "other", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let other_path = format!(
+        "/agents/workloads/{}/quarantine",
+        workload_id_for(&owner, "other")
+    );
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+    let sign = |method: &str, path: &str, ts: i64, body: &str| {
+        guardian_header(&gid, &gsk, method, path, ts, body.as_bytes())
+    };
+
+    let cases = [
+        (
+            "another body",
+            sign("POST", &path, now, &quarantine_body("g-inc-2")),
+        ),
+        ("another path", sign("POST", &other_path, now, &body)),
+        ("another method", sign("GET", &path, now, &body)),
+        ("two minutes old", sign("POST", &path, now - 120, &body)),
+        ("two minutes ahead", sign("POST", &path, now + 120, &body)),
+        ("malformed", "not-a-signature".to_string()),
+    ];
+    for (what, hdr) in cases {
+        assert_eq!(
+            p.signed("POST", &path, &hdr, Some(&body)).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{what}"
+        );
+    }
+    let good = sign("POST", &path, now, &body);
+    assert_eq!(
+        p.signed("POST", &path, &good, Some(&body)).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn guardian_cannot_quarantine_another_owners_workload() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, _, gid, gsk) = guarded(&p).await;
+    let (o2, c2) = p.user(&[READ]).await;
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &c2),
+            authorize_body(&fresh_agent(), "fleet", "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let wid2 = workload_id_for(&o2, "fleet");
+    let path = format!("/agents/workloads/{wid2}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let hdr = guardian_header(
+        &gid,
+        &gsk,
+        "POST",
+        &path,
+        Utc::now().timestamp(),
+        body.as_bytes(),
+    );
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // Contract P7: the signature verified, so the clock advanced even though
+    // the request was refused; the same header is now a replay.
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.store.get_workload(&wid2).await.unwrap().unwrap().state,
+        WorkloadState::Eligible
+    );
+}
+
+#[tokio::test]
+async fn guardians_get_403_everywhere_but_quarantine() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, wid, gid, gsk) = guarded(&p).await;
+    let qpath = format!("/agents/workloads/{wid}/quarantine");
+    let qbody = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+    let hdr = guardian_header(&gid, &gsk, "POST", &qpath, now, qbody.as_bytes());
+    assert_eq!(
+        p.signed("POST", &qpath, &hdr, Some(&qbody)).await.0,
+        StatusCode::OK
+    );
+
+    let a = fresh_agent();
+    let did = did_key(&a);
+    // (method, uri, signed path, body) — each validly signed for itself.
+    let requests: Vec<(&str, String, String, Option<String>)> = vec![
+        (
+            "POST",
+            "/agents/authorize".into(),
+            "/agents/authorize".into(),
+            Some(authorize_body(&a, "fleet2", "kit-1", false).to_string()),
+        ),
+        (
+            "GET",
+            "/agents/delegations".into(),
+            "/agents/delegations".into(),
+            None,
+        ),
+        (
+            "DELETE",
+            format!("/agents/delegations/{did}"),
+            format!("/agents/delegations/{did}"),
+            None,
+        ),
+        (
+            "GET",
+            format!("/agents/challenge?did={did}"),
+            "/agents/challenge".into(),
+            None,
+        ),
+        (
+            "POST",
+            "/agents/token".into(),
+            "/agents/token".into(),
+            Some(
+                json!({"did": did, "challenge": "AA==", "signature": "AA==", "nonce": "n"})
+                    .to_string(),
+            ),
+        ),
+        (
+            "POST",
+            format!("/agents/workloads/{wid}/recover"),
+            format!("/agents/workloads/{wid}/recover"),
+            Some(json!({"incident": "g-inc-1"}).to_string()),
+        ),
+        (
+            "GET",
+            format!("/agents/workloads/{wid}/status"),
+            format!("/agents/workloads/{wid}/status"),
+            None,
+        ),
+        (
+            "POST",
+            "/guardians".into(),
+            "/guardians".into(),
+            Some(
+                json!({"public_key": b64url(gsk.verifying_key().as_bytes()), "name": "again"})
+                    .to_string(),
+            ),
+        ),
+    ];
+    for (method, uri, path, body) in requests {
+        let bytes = body.as_deref().unwrap_or("").as_bytes().to_vec();
+        let hdr = guardian_header(&gid, &gsk, method, &path, now, &bytes);
+        let (st, resp) = p.signed(method, &uri, &hdr, body.as_deref()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{method} {uri}: {resp}");
+    }
+    assert_eq!(
+        p.store.get_workload(&wid).await.unwrap().unwrap().state,
+        WorkloadState::Quarantined,
+        "the reporting Guardian could not recover"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_guardian_request_is_rejected_even_inside_the_window() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, _, wid, gid, gsk) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let body = quarantine_body("g-inc-1");
+    let now = Utc::now().timestamp();
+    let hdr = guardian_header(&gid, &gsk, "POST", &path, now, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "same request again"
+    );
+    let older = guardian_header(&gid, &gsk, "POST", &path, now - 1, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &older, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "an older signature"
+    );
+    let newer = guardian_header(&gid, &gsk, "POST", &path, now + 1, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &newer, Some(&body)).await.0,
+        StatusCode::OK,
+        "idempotent repeat, fresh signature"
+    );
+}
+
+#[tokio::test]
+async fn a_cleared_incident_cannot_re_quarantine_after_recovery() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt, wid, gid, gsk) = guarded(&p).await;
+    let path = format!("/agents/workloads/{wid}/quarantine");
+    let now = Utc::now().timestamp();
+    let body = quarantine_body("g-inc-1");
+    let first = guardian_header(&gid, &gsk, "POST", &path, now, body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &first, Some(&body)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &wid, "g-inc-1").await.0,
+        StatusCode::OK
+    );
+
+    // The exact request replayed after recovery: refused as a replay.
+    assert_eq!(
+        p.signed("POST", &path, &first, Some(&body)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Freshly signed but citing the cleared incident: refused, still eligible.
+    let again = guardian_header(&gid, &gsk, "POST", &path, now + 1, body.as_bytes());
+    let (st, resp) = p.signed("POST", &path, &again, Some(&body)).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{resp}");
+    let w = p.store.get_workload(&wid).await.unwrap().unwrap();
+    assert_eq!((w.state, w.generation), (WorkloadState::Eligible, 3));
+    // A new incident latches.
+    let new_body = quarantine_body("g-inc-2");
+    let new = guardian_header(&gid, &gsk, "POST", &path, now + 2, new_body.as_bytes());
+    assert_eq!(
+        p.signed("POST", &path, &new, Some(&new_body)).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn guardian_enrollment_is_owner_only_and_validates_the_key() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let key = b64url(fresh_agent().verifying_key().as_bytes());
+    let (st, _) = p
+        .send(
+            Request::post("/guardians")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"public_key": key, "name": "pager"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = p
+        .post_json(
+            "/guardians",
+            ("X-Auth-Token", &cwt),
+            json!({"public_key": b64url(&[1u8; 31]), "name": "pager"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = p
+        .post_json(
+            "/guardians",
+            ("X-Auth-Token", &cwt),
+            json!({"public_key": key, "name": ""}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }
