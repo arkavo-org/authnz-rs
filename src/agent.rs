@@ -36,7 +36,7 @@ use crate::constants::{
     AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_SHORT_LIVED_TOKEN_MINUTES,
     AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE,
     AUTH_TOKEN_HOURS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
-    WORKLOAD_NAME_MAX_LEN,
+    WORKLOAD_NAME_MAX_LEN, WORKLOAD_STATUS_LEASE_SECONDS,
 };
 use crate::cwt;
 use crate::db::{AgentDelegation, AgentWorkload, DynamoDBError, WorkloadState, workload_id_for};
@@ -77,6 +77,12 @@ pub struct AgentConfiguration {
     pub did_methods_supported: Vec<&'static str>,
     pub proof_signing_alg_values_supported: Vec<&'static str>,
     pub authorization_deep_link_scheme: String,
+    pub agent_workloads_endpoint: String,
+    pub guardian_registration_endpoint: String,
+    pub short_lived_token_lifetime_seconds: i64,
+    pub workload_status_lease_seconds: i64,
+    /// Version of docs/agent-credentials-contract.md this server implements.
+    pub contract_version: &'static str,
 }
 
 impl AgentConfiguration {
@@ -97,6 +103,14 @@ impl AgentConfiguration {
             did_methods_supported: vec!["did:key"],
             proof_signing_alg_values_supported: vec!["EdDSA"],
             authorization_deep_link_scheme: "arkavo://agent/authorize".to_string(),
+            agent_workloads_endpoint: format!("{}/agents/workloads", base),
+            guardian_registration_endpoint: format!("{}/guardians", base),
+            short_lived_token_lifetime_seconds: token_minutes
+                .clamp(1, AGENT_TOKEN_MINUTES_MAX)
+                .min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
+                * 60,
+            workload_status_lease_seconds: WORKLOAD_STATUS_LEASE_SECONDS,
+            contract_version: "v1",
         }
     }
 }
@@ -1622,5 +1636,21 @@ mod tests {
             c.delegation_lifetime_seconds,
             AGENT_DELEGATION_DAYS * 86_400
         );
+        assert_eq!(
+            c.agent_workloads_endpoint,
+            "https://identity.arkavo.net/agents/workloads"
+        );
+        assert_eq!(
+            c.guardian_registration_endpoint,
+            "https://identity.arkavo.net/guardians"
+        );
+        assert_eq!(c.short_lived_token_lifetime_seconds, 300);
+        assert_eq!(
+            AgentConfiguration::new("https://identity.arkavo.net", 3)
+                .short_lived_token_lifetime_seconds,
+            180
+        );
+        assert_eq!(c.workload_status_lease_seconds, 5);
+        assert_eq!(c.contract_version, "v1");
     }
 }
