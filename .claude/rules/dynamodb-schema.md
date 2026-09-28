@@ -51,34 +51,37 @@ paths:
 - **Primary Key**: agent_did (String) - `did:key:z6Mk…`
 - **Attributes**: delegator_type (`human`|`agent`), delegator_id (String),
   delegator_username (String, optional), entitlements (List of String),
-  name (String), depth (Number), root_user_id (String/UUID), chain (List of
-  String), created_at / expires_at / revoked_at (Number), workload_id
-  (String, absent on a pre-workload row), short_lived (Boolean), and the
-  transient challenge triple `challenge`, `challenge_nonce`,
-  `challenge_issued_at` (set by `/agents/challenge`, removed atomically by
-  `/agents/token`)
+  name (String, a label), depth (Number), root_user_id (String/UUID), chain
+  (List of String), created_at / expires_at / revoked_at (Number),
+  short_lived (Boolean), swarm (String, absent while the agent has no kit —
+  never an empty string), and the transient challenge triple `challenge`,
+  `challenge_nonce`, `challenge_issued_at` (set by `/agents/challenge`,
+  removed atomically by `/agents/token`)
+- **Trust state** (contract v2; the row is the agent identity, one key):
+  state (`unassessed`|`eligible`|`quarantined`; absent on a row written before
+  v2, which reads as `unassessed`), state_version (Number, +1 on every change
+  of `state`, a swarm change, a revocation, and an authorize over a revoked,
+  expired or pre-v2 row, never on a renewal; absent = 0 on a pre-v2 row),
+  appraised_until (Number),
+  appraised_by (String, `owner:<uuid>` | `guardian:<id>`),
+  appraisal_evidence_ref (String), incident / evidence_ref / quarantined_by
+  (String, present only while quarantined), quarantined_at (Number, present
+  only while quarantined), last_cleared_incident (String, the incident the
+  most recent recovery cleared), recovered_at (Number, never removed: the
+  owner may not appraise a recovered key), updated_at (Number). A pre-v2
+  `workload_id` attribute is removed by the next authorize.
+- **Reads**: `get_agent_delegation` is `consistent_read(true)` (issuance and
+  the status lease must see the latch).
+- **Writes**: every trust-state change is one conditional `UpdateItem` —
+  authorize on the `state_version` read (`attribute_not_exists` when 0) and
+  not quarantined (and not revoked when it keeps the version); quarantine on
+  the owner and version read, not quarantined and the incident not being
+  the one last cleared; recover on quarantined, the latched incident and the
+  version read; appraisal on the version read, not quarantined and a live
+  delegation; revocation (`revoked_at`, `state_version + 1`) on the owner and
+  version read. No `TransactWriteItems`.
 - **GSI**: root_user_id-index (partition key: root_user_id) — list/count a
   user's agents
-
-### agent_workloads table
-- **Primary Key**: workload_id (String) - `wl-` + 32 hex, derived from (owner, name)
-- **Attributes**: owner (String/UUID), name (String), current_did (String,
-  absent while unbound — including after a recovery, until the owner
-  authorizes again), swarm (String, absent while the workload has no kit —
-  never stored as an empty string), state (`eligible`|`quarantined`),
-  generation (Number, +1 on every change to `current_did`, `swarm` or
-  `state`), incident / evidence_ref / quarantined_by (String, present only
-  while quarantined), quarantined_at (Number, present only while
-  quarantined), last_cleared_incident (String, the incident the most recent
-  recovery cleared), created_at / updated_at (Number)
-- **Reads**: always `consistent_read(true)`; no GSI (status must see the latch).
-- **Writes**: create is `attribute_not_exists(workload_id)`; quarantine is
-  conditional on `state = eligible` (and the incident not being the one last
-  cleared); rebind and recover are `TransactWriteItems` with the
-  `agent_delegations` revoke, conditional on the generation (and, for
-  recover, the latched incident) read. Recovery `REMOVE`s `current_did`,
-  `incident`, `evidence_ref`, `quarantined_by` and `quarantined_at` rather
-  than writing empty strings.
 
 ### guardians table
 - **Primary Key**: guardian_id (String/UUID) - a UUID (version 8) derived

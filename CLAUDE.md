@@ -38,13 +38,14 @@ when unset.
 | `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
-| `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine/recover) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
-| `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/workloads/:id/status` (intended for the platform KAS's `agent_status` client). Empty ⇒ 403; once opentdf-platform P2 lands, the KAS denies every agent rewrap when the status call fails. |
+| `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine, recover and appraisal) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
+| `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/:did/status` (intended for the platform entity resolver's `agent_status` client). Empty ⇒ 403, and the platform withholds every agent's entitlements. |
+| `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
 | `ENABLE_HTTP3` | QUIC listener on UDP/`PORT` (binary built with `--features http3`, TLS required). |
-| `DYNAMODB_*_TABLE` | `CREDENTIALS`, `HANDLES`, `DEVICE_BINDINGS`, `IDENTITY_LINKS`, `PATREON_TOKENS`, `AGENT_DELEGATIONS`, `DEVICE_ATTEST_KEYS`, `AGENT_WORKLOADS`, `GUARDIANS`. Default to the unprefixed table names in the DynamoDB Schema section. |
+| `DYNAMODB_*_TABLE` | `CREDENTIALS`, `HANDLES`, `DEVICE_BINDINGS`, `IDENTITY_LINKS`, `PATREON_TOKENS`, `AGENT_DELEGATIONS`, `DEVICE_ATTEST_KEYS`, `GUARDIANS`. Default to the unprefixed table names in the DynamoDB Schema section. |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_DYNAMODB` | Standard AWS SDK settings (`load_defaults`); the endpoint override points at local DynamoDB. |
 | `REDIS_URL` | Cache for Patreon snapshots and pending Google logins; in-memory fallback when unset. |
 | `OIDC_ISSUER` | Issuer URL in tokens and the discovery doc. Required to act as an OIDC IdP. |
@@ -176,26 +177,30 @@ when unset.
   access token (`Authorization: Bearer`, allowlisted client, `auth_time`
   within 3600 s). Creates a delegation record for `agent_did` with a subset
   of the delegator's own stored entitlements
-  (`DynamoDBStore::get_user_entitlements`). Body adds `workload_name`
-  (required), `swarm` (optional: no `arkavo_swarm` claim until set),
-  `short_lived`; creates or selects the owner's workload (`workload.rs`),
-  rebinding it (generation + 1; the old DID's delegation is revoked, but only
-  while it still names this workload) and refusing while quarantined. A
-  legacy (pre-workload) delegation row for the same DID is replaceable only
-  by its own owner (`root_user_id`). Response adds `workload_id`.
+  (`DynamoDBStore::get_user_entitlements`). Body adds `swarm` (optional: no
+  `arkavo_swarm` claim until set) and `short_lived`. One identity is one key
+  (the DID); authorize is the owner's bootstrap appraisal: `eligible` until
+  the passkey assertion time (auth CWT `iat` / Bearer `auth_time`) +
+  `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (`owner_appraisal_deadline`; 403 once
+  past), with `plan_authorize` deciding the `state_version` (a swarm change
+  bumps it). Refused while the key is quarantined or once it has been
+  recovered; 409 while another owner's delegation of the DID is live. The
+  agent quota applies only when authorize adds a delegation.
+  Response `{success, message, agent, state, state_version, appraised_until}`.
 - `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
 - `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
   challenge is stored on the delegation row (no cookie session)
 - `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
   Ed25519 proof over the decoded challenge bytes, returns
-  `{token, expires_at, entitlements}`. Mints only while the workload is
-  eligible and the DID is its `current_did`; a pre-workload delegation row
-  cannot mint. `token` is a single CWT (no delegation JWT): `aud` = the
+  `{token, expires_at, entitlements}`. Mints only while the identity is
+  `eligible` (`agent::issuable`; a row written before v2 is `unassessed`).
+  `token` is a single CWT (no delegation JWT): `aud` = the
   configured `AGENT_TOKEN_AUDIENCES` list, `exp - iat` capped at
-  `AGENT_TOKEN_MINUTES` (hard max 15 min; ≤ 300 s when `short_lived`), `act` =
-  `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe` describes the agent (type, delegation
-  id, depth, chain), `arkavo_workload`/`arkavo_swarm` name the bound workload
-  (swarm omitted until the workload has one), `cnf` is bound to the agent's
+  `AGENT_TOKEN_MINUTES` (hard max 15 min; ≤ 300 s when `short_lived`; never
+  past `appraised_until`), `act` = `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe`
+  describes the agent (type, delegation id, depth, chain),
+  `arkavo_state_version` is the identity's `state_version` at mint,
+  `arkavo_swarm` its kit (omitted until it has one), `cnf` is bound to the agent's
   Ed25519 `did:key`. There is no refresh — the agent re-runs the
   challenge/token exchange for a new one. This is the contract
   `arkavo-edge/crates/arkavo-agent-auth` expects (#54); its `delegation_jwt`
@@ -204,25 +209,40 @@ when unset.
 - Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
   (#50) and the ERS surface (#48) are follow-ups
 - Wire contract for all of this and the endpoints below:
-  [docs/agent-credentials-contract.md](docs/agent-credentials-contract.md) (v1).
+  [docs/agent-credentials-contract.md](docs/agent-credentials-contract.md) (v2).
 
-**workload.rs** - Agent workloads (quarantine and status)
-- `agent_workloads` row keyed by `wl-<hex>` derived from (owner, name); read with
-  consistent reads only. `generation` +1 on every change to DID, swarm or state.
-- `POST /agents/workloads/:id/quarantine`: owner (passkey auth CWT, or an
+**agent_state.rs** - The agent identity's trust state (quarantine, recovery,
+appraisal, status)
+- State lives on the `agent_delegations` row (`db/agent_state.rs`):
+  `unassessed | eligible | quarantined` stored, `suspended` derived
+  (`eligible` past `appraised_until`). `state_version` +1 on every stored
+  state change, a swarm change, a revocation, and an authorize over a
+  revoked/expired/pre-v2 row; never on a renewal. Every write is one
+  conditional `UpdateItem` on the version read (quarantine and revocation also
+  on the owner read; appraisal also on a live delegation).
+- `POST /agents/:did/quarantine`: owner (passkey auth CWT, or an
   `agents:delegate` Bearer token with `auth_time` ≤ 3600 s old) or the owner's
-  Guardian; latches, idempotent per incident, 409 on a second incident, on the
-  incident the last recovery cleared, and on a write that races a concurrent
-  change (`Raced`; retry).
-- `POST /agents/workloads/:id/recover`: owner only, passkey assertion ≤ 300 s old
-  (auth CWT `iat`, or Bearer `auth_time`), cites the incident; unbinds the DID and
-  revokes its delegation in one transaction — only while that delegation still
-  names this workload; a DID authorized elsewhere since is left alone.
-- The four 403 bodies in the contract's "Refusal bodies" table are part of v1
+  Guardian; latches whatever the delegation's liveness, idempotent per
+  incident, 409 on a second incident, on the incident the last recovery
+  cleared, and on a write that races a concurrent change (`Raced`; retry).
+- `POST /agents/:did/recover`: owner only, passkey assertion ≤ 300 s old
+  (auth CWT `iat`, or Bearer `auth_time`), cites the incident; the identity
+  becomes `unassessed` with `recovered_at` set; once recovered, the key is
+  Guardian-appraised for life (the owner's path back is a new key). The
+  delegation is kept.
+- `POST /agents/:did/appraisal`: an enrolled Guardian of the owner (≤
+  `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` from now) or the owner (≤
+  `AGENT_OWNER_APPRAISAL_TTL_SECONDS` from its passkey assertion, never a
+  recovered key); clamps `appraised_until` to that; 403 for quarantined,
+  revoked, expired, another owner's agent, a stale owner assertion, or a
+  Guardian whose key is the agent's own.
+- The 403 bodies in the contract's "Refusal bodies" table are part of v2
   (`agent::REFUSE_*`, `AgentError::{WorkloadQuarantined, DelegationRevoked}`);
-  `agent_plane_tests::refusal_bodies_are_contract_v1` pins them.
-- `GET /agents/workloads/:id/status`: service CWT from `AGENT_STATUS_CLIENT_IDS`;
-  `valid_until = now + 5`.
+  `agent_plane_tests::refusal_bodies_are_contract_v2` pins them.
+- `GET /agents/:did/status`: service CWT from `AGENT_STATUS_CLIENT_IDS`;
+  `valid_until = now + 5`, capped at `appraised_until` while eligible; 404 for
+  an unknown, revoked or expired delegation unless quarantined.
+- `AppraisalConfig` parses the two appraisal lifetimes at startup.
 
 **guardian.rs** - Minimal Guardian enrollment and revocation
 - `POST /guardians` (owner, passkey auth CWT): registers a 32-byte Ed25519 key
@@ -238,9 +258,10 @@ when unset.
 - `X-Guardian-Signature: <id>.<ts>.<sig>` over `METHOD\nPATH\nts\nhex(sha256(body))`,
   ±60 s, `verify_strict` against the enrolled key only; each Guardian's accepted
   timestamps must strictly increase (`last_signed_at`), so a replay is 401.
-  Guardians get 403 on every agent-plane endpoint except quarantine — that 403
-  is for a well-formed request; a malformed body/query on any other endpoint
-  is refused by request parsing (400/415/422) before the Guardian check runs.
+  Guardians get 403 on every agent-plane endpoint except quarantine and
+  appraisal — that 403 is for a well-formed request; a malformed body/query on
+  any other endpoint is refused by request parsing (400/415/422) before the
+  Guardian check runs.
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `register_challenge` / `register_attest` (**unauthenticated**, Task 5): the registration

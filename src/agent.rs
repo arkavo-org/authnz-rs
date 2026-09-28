@@ -32,7 +32,7 @@
 //! the ERS resolution surface (#48).
 
 use crate::AppState;
-use crate::agent_state::{owner_appraisal_deadline, validate_label};
+use crate::agent_state::{AppraisalConfig, owner_appraisal_deadline, validate_label};
 use crate::constants::{
     AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_SHORT_LIVED_TOKEN_MINUTES,
     AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS,
@@ -79,16 +79,21 @@ pub struct AgentConfiguration {
     pub did_methods_supported: Vec<&'static str>,
     pub proof_signing_alg_values_supported: Vec<&'static str>,
     pub authorization_deep_link_scheme: String,
-    pub agent_workloads_endpoint: String,
+    /// URI template of an agent identity's state endpoints: append
+    /// `/quarantine`, `/recover`, `/appraisal` or `/status` after replacing
+    /// `{did}` with the agent's `did:key`.
+    pub agent_state_endpoint: String,
     pub guardian_registration_endpoint: String,
     pub short_lived_token_lifetime_seconds: i64,
-    pub workload_status_lease_seconds: i64,
+    pub agent_status_lease_seconds: i64,
+    pub owner_appraisal_ttl_seconds: i64,
+    pub guardian_appraisal_max_seconds: i64,
     /// Version of docs/agent-credentials-contract.md this server implements.
     pub contract_version: &'static str,
 }
 
 impl AgentConfiguration {
-    pub fn new(issuer: &str, token_minutes: i64) -> Self {
+    pub fn new(issuer: &str, token_minutes: i64, appraisal: AppraisalConfig) -> Self {
         let base = issuer.trim_end_matches('/');
         Self {
             issuer: base.to_string(),
@@ -105,14 +110,16 @@ impl AgentConfiguration {
             did_methods_supported: vec!["did:key"],
             proof_signing_alg_values_supported: vec!["EdDSA"],
             authorization_deep_link_scheme: "arkavo://agent/authorize".to_string(),
-            agent_workloads_endpoint: format!("{}/agents/workloads", base),
+            agent_state_endpoint: format!("{}/agents/{{did}}", base),
             guardian_registration_endpoint: format!("{}/guardians", base),
             short_lived_token_lifetime_seconds: token_minutes
                 .clamp(1, AGENT_TOKEN_MINUTES_MAX)
                 .min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
                 * 60,
-            workload_status_lease_seconds: AGENT_STATUS_LEASE_SECONDS,
-            contract_version: "v1",
+            agent_status_lease_seconds: AGENT_STATUS_LEASE_SECONDS,
+            owner_appraisal_ttl_seconds: appraisal.owner_ttl_seconds,
+            guardian_appraisal_max_seconds: appraisal.guardian_max_seconds,
+            contract_version: "v2",
         }
     }
 }
@@ -124,6 +131,7 @@ pub async fn serve_agent_configuration(
     Json(AgentConfiguration::new(
         &app_state.issuer,
         app_state.agent_tokens.minutes,
+        app_state.appraisal,
     ))
 }
 
@@ -1875,7 +1883,11 @@ mod tests {
 
     #[test]
     fn agent_configuration_endpoints_and_limits() {
-        let c = AgentConfiguration::new("https://identity.arkavo.net/", 15);
+        let c = AgentConfiguration::new(
+            "https://identity.arkavo.net/",
+            15,
+            AppraisalConfig::default(),
+        );
         assert_eq!(c.issuer, "https://identity.arkavo.net");
         assert_eq!(
             c.agent_token_endpoint,
@@ -1885,7 +1897,12 @@ mod tests {
         assert_eq!(c.max_delegation_depth, MAX_DELEGATION_DEPTH);
         assert_eq!(c.agent_token_lifetime_seconds, 15 * 60);
         assert_eq!(
-            AgentConfiguration::new("https://identity.arkavo.net/", 7).agent_token_lifetime_seconds,
+            AgentConfiguration::new(
+                "https://identity.arkavo.net/",
+                7,
+                AppraisalConfig::default()
+            )
+            .agent_token_lifetime_seconds,
             7 * 60
         );
         assert_eq!(
@@ -1893,8 +1910,8 @@ mod tests {
             AGENT_DELEGATION_DAYS * 86_400
         );
         assert_eq!(
-            c.agent_workloads_endpoint,
-            "https://identity.arkavo.net/agents/workloads"
+            c.agent_state_endpoint,
+            "https://identity.arkavo.net/agents/{did}"
         );
         assert_eq!(
             c.guardian_registration_endpoint,
@@ -1902,11 +1919,33 @@ mod tests {
         );
         assert_eq!(c.short_lived_token_lifetime_seconds, 300);
         assert_eq!(
-            AgentConfiguration::new("https://identity.arkavo.net", 3)
+            AgentConfiguration::new("https://identity.arkavo.net", 3, AppraisalConfig::default())
                 .short_lived_token_lifetime_seconds,
             180
         );
-        assert_eq!(c.workload_status_lease_seconds, 5);
-        assert_eq!(c.contract_version, "v1");
+        assert_eq!(c.agent_status_lease_seconds, 5);
+        assert_eq!(
+            (
+                c.owner_appraisal_ttl_seconds,
+                c.guardian_appraisal_max_seconds
+            ),
+            (43_200, 900)
+        );
+        let tuned = AgentConfiguration::new(
+            "https://identity.arkavo.net",
+            15,
+            AppraisalConfig {
+                owner_ttl_seconds: 3_600,
+                guardian_max_seconds: 300,
+            },
+        );
+        assert_eq!(
+            (
+                tuned.owner_appraisal_ttl_seconds,
+                tuned.guardian_appraisal_max_seconds
+            ),
+            (3_600, 300)
+        );
+        assert_eq!(c.contract_version, "v2");
     }
 }

@@ -148,12 +148,13 @@ DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
 DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
-DYNAMODB_AGENT_WORKLOADS_TABLE=agent_workloads
 DYNAMODB_GUARDIANS_TABLE=guardians
 
-# Agent credentials (docs/agent-credentials-contract.md v1)
+# Agent credentials (docs/agent-credentials-contract.md v2)
 AGENT_DELEGATE_CLIENT_IDS=arkavo-edge
 AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>
+# AGENT_OWNER_APPRAISAL_TTL_SECONDS=43200
+# AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS=900
 
 # App Attest registration gate — see docs/app-attest-gate-deployment.md before
 # setting these. The table is inert until the gate ships; APP_ATTEST_APP_ID is
@@ -238,35 +239,45 @@ they can forge this header and poison the audit log. The audit value is
 not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
 
-#### `agent_workloads` and `guardians` Tables
+#### `guardians` Table and Agent Trust State
 
-Required before deploying 0.13.0: `/agents/authorize` writes `agent_workloads`,
-and `POST /guardians` writes `guardians`. See
-[docs/agent-credentials-contract.md](agent-credentials-contract.md) (v1) and
+Required before deploying 0.13.0: `POST /guardians` writes `guardians`. The
+agent trust state (contract v2) lives on the existing `agent_delegations`
+rows, so there is no other new table; `agent_workloads` is not used (v1 was
+never deployed; delete it if a staging environment created one). See
+[docs/agent-credentials-contract.md](agent-credentials-contract.md) (v2) and
 `.claude/rules/dynamodb-schema.md` for the full attribute list.
 
 ```bash
-aws dynamodb create-table --table-name agent_workloads \
-  --attribute-definitions AttributeName=workload_id,AttributeType=S \
-  --key-schema AttributeName=workload_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
 aws dynamodb create-table --table-name guardians \
   --attribute-definitions AttributeName=guardian_id,AttributeType=S \
   --key-schema AttributeName=guardian_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
 ```
 
-IAM: authorize, quarantine and recovery write `agent_delegations` and
-`agent_workloads` together through `dynamodb:TransactWriteItems`, which IAM
-authorizes per item (there is no separate `TransactWriteItems` permission).
-The service role needs, in addition to what it already holds:
+IAM: every trust-state write is a single conditional `UpdateItem`; nothing
+uses `TransactWriteItems`, so `ConditionCheckItem` is not needed. The service
+role needs, in addition to the actions track 1 already uses on
+`agent_delegations` (`PutItem`, `UpdateItem`, `GetItem`, `Query` on
+`root_user_id-index`, `Scan`):
 
 | Table | Actions |
 |---|---|
-| `agent_delegations` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`, `dynamodb:ConditionCheckItem` (new: a rebind or recovery that leaves the previous DID's delegation alone checks it is not still bound to the workload), plus the existing `dynamodb:Query` on `root_user_id-index` and `dynamodb:Scan` |
-| `agent_workloads` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`, `dynamodb:ConditionCheckItem` |
+| `agent_delegations` | nothing new (`UpdateItem` and `GetItem` carry authorize, quarantine, recovery and appraisal) |
 | `guardians` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem` |
 
-Without `ConditionCheckItem` the whole transaction is denied: the rebind or
-recovery fails outright rather than half-applying.
+Existing (track-1) delegation rows carry no trust state. They read as
+`unassessed`: `/agents/challenge` and `/agents/token` answer 403
+`Forbidden: agent is unassessed; it needs an appraisal` until the owner runs
+`POST /agents/authorize` for the same DID once (no DELETE needed), which is
+the owner's bootstrap appraisal.
+
+Optional appraisal lifetimes (out of range fails startup):
+`AGENT_OWNER_APPRAISAL_TTL_SECONDS` (default 43200, at most 86400) and
+`AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` (default and at most 900). Until a
+Guardian is enrolled, every agent needs an owner passkey appraisal at least
+every `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (counted from the passkey tap) or
+it is suspended and stops minting; the owner renews with
+`POST /agents/{did}/appraisal`, which resends no entitlements.
 
 ### Systemd Service Setup
 
