@@ -1028,6 +1028,100 @@ async fn a_token_ends_with_the_appraisal() {
     assert_eq!(verify_token(&p, body["token"].as_str().unwrap()).exp, until);
 }
 
+/// The token request checks its proof against one read of the identity, then
+/// looks up the owner's entitlements; whatever lands in between, the token
+/// follows the identity as it is when it is minted.
+#[tokio::test]
+async fn a_token_is_minted_from_the_identity_as_it_is_at_the_mint() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ, DECRYPT]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let held = vec![READ.to_string(), DECRYPT.to_string()];
+    let mint = |read: crate::db::AgentDelegation| {
+        let (state, held) = (p.state.clone(), held.clone());
+        async move { crate::agent::mint_from_current(&state, &read, &held).await }
+    };
+    let a = fresh_agent();
+    let did = did_key(&a);
+    let mut body = authorize_body(&a, "kit-1", false);
+    body["entitlements"] = json!([READ, DECRYPT]);
+    assert_eq!(p.authorize(auth, body).await.0, StatusCode::OK);
+    let read = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
+
+    // A shortened appraisal: the token ends with it, not with the one read.
+    let until = Utc::now().timestamp() + 30;
+    p.set_appraised_until(&did, until).await;
+    let m = mint(read.clone()).await.unwrap();
+    assert_eq!(m.response.expires_at, until);
+    assert_eq!(verify_token(&p, &m.response.token).exp, until);
+
+    // An appraisal that has ended: refused, never a token with exp <= iat.
+    p.set_appraised_until(&did, Utc::now().timestamp() - 1)
+        .await;
+    assert_eq!(
+        mint(read.clone()).await.unwrap_err().to_string(),
+        "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+    );
+
+    // The owner renews with fewer entitlements and short-lived tokens.
+    let mut body = authorize_body(&a, "kit-1", true);
+    body["entitlements"] = json!([READ]);
+    assert_eq!(p.authorize(auth, body).await.0, StatusCode::OK);
+    let m = mint(read.clone()).await.unwrap();
+    assert_eq!(m.response.entitlements, vec![READ.to_string()]);
+    let claims = verify_token(&p, &m.response.token);
+    assert_eq!(claims.exp - claims.iat, 300);
+    assert_eq!(
+        claims.custom.arkavo_entitlements,
+        Some(vec![READ.to_string()])
+    );
+
+    // The key changed hands: refused like a stale challenge.
+    let other_owner = crate::db::AgentDelegation {
+        root_user_id: Uuid::new_v4(),
+        ..read.clone()
+    };
+    assert!(matches!(
+        mint(other_owner).await,
+        Err(crate::agent::AgentError::ChallengeMismatch)
+    ));
+
+    // Quarantined.
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        mint(read).await.unwrap_err().to_string(),
+        "Workload quarantined"
+    );
+
+    // Revoked.
+    let b = fresh_agent();
+    assert_eq!(
+        p.authorize(auth, authorize_body(&b, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let read = p
+        .store
+        .get_agent_delegation(&did_key(&b))
+        .await
+        .unwrap()
+        .unwrap();
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{}", did_key(&b)))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        mint(read).await.unwrap_err().to_string(),
+        "Delegation revoked"
+    );
+}
+
 #[tokio::test]
 async fn an_agent_without_a_swarm_mints_without_the_swarm_claim() {
     let Some(p) = Plane::new().await else { return };

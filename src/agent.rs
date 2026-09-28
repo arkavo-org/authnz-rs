@@ -938,7 +938,7 @@ pub async fn issue_agent_token(
         return Err(AgentError::ChallengeExpired);
     }
 
-    let mut delegation = active_delegation(&app_state, &request.did).await?;
+    let delegation = active_delegation(&app_state, &request.did).await?;
 
     let challenge_bytes = base64::engine::general_purpose::STANDARD
         .decode(&request.challenge)
@@ -959,30 +959,66 @@ pub async fn issue_agent_token(
     // Agents keep stale entitlements for the whole delegation lifetime
     // otherwise: mint against what the delegator currently holds, not what
     // was captured at authorize time.
-    let stored = app_state
+    let held = app_state
         .db_store
         .get_user_entitlements(&delegation.root_user_id)
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
-    let effective = intersect_entitlements(&delegation.entitlements, &stored);
+    let minted = mint_from_current(&app_state, &delegation, &held).await?;
+
+    info!(
+        "Agent token issued for {} at state_version {}",
+        request.did, minted.state_version
+    );
+    Ok(Json(minted.response))
+}
+
+/// A token minted by [`mint_from_current`], and the version it carries.
+#[derive(Debug)]
+pub(crate) struct Minted {
+    pub response: TokenResponse,
+    pub state_version: u64,
+}
+
+/// Mint the agent token from a strongly consistent read of the identity
+/// taken after every other lookup of the token request, so a quarantine,
+/// revocation, expiry, shortened appraisal or re-authorize (fewer
+/// entitlements, `short_lived`, another swarm) that lands while the request
+/// is in flight is honoured: the token carries the current row's
+/// entitlements (∩ `held`, what the owner holds now), lifetime,
+/// `state_version` and swarm. `read` is the row the proof was checked
+/// against; a row that has since changed hands is refused like a
+/// challenge that no longer matches (its owner's entitlements were not the
+/// ones looked up).
+pub(crate) async fn mint_from_current(
+    app_state: &AppState,
+    read: &AgentDelegation,
+    held: &[String],
+) -> Result<Minted, AgentError> {
+    let current = active_delegation(app_state, &read.agent_did).await?;
+    if current.root_user_id != read.root_user_id {
+        return Err(AgentError::ChallengeMismatch);
+    }
+    issuable(&current, Utc::now().timestamp())?;
+    let effective = intersect_entitlements(&current.entitlements, held);
     if effective.is_empty() {
         return Err(AgentError::InsufficientEntitlements(
             "delegated entitlements no longer held by delegator".into(),
         ));
     }
-    delegation.entitlements = effective;
-
-    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
-
-    info!(
-        "Agent token issued for {} at state_version {}",
-        request.did, delegation.trust.state_version
-    );
-    Ok(Json(TokenResponse {
-        token,
-        expires_at,
-        entitlements: delegation.entitlements,
-    }))
+    let delegation = AgentDelegation {
+        entitlements: effective,
+        ..current
+    };
+    let (token, expires_at) = mint_agent_cwt(app_state, &delegation)?;
+    Ok(Minted {
+        response: TokenResponse {
+            token,
+            expires_at,
+            entitlements: delegation.entitlements,
+        },
+        state_version: delegation.trust.state_version,
+    })
 }
 
 /// Entitlements a delegation may actually exercise right now: the delegated
@@ -1104,9 +1140,20 @@ pub(crate) fn agent_cwt_claims(
     if !delegation.swarm.is_empty() {
         claims = claims.with_arkavo_swarm(&delegation.swarm);
     }
-    // Every token's lifetime is covered by a current appraisal.
+    // Every token's lifetime is covered by a current appraisal and by the
+    // delegation itself; one that would end before it starts is refused, never
+    // minted with `exp <= iat`.
     if let Some(until) = delegation.trust.appraised_until {
+        if until <= claims.iat {
+            return Err(AgentError::Forbidden(REFUSE_SUSPENDED.into()));
+        }
         claims.exp = claims.exp.min(until);
+    }
+    if let Some(end) = delegation.expires_at {
+        if end <= claims.iat {
+            return Err(AgentError::DelegationExpired);
+        }
+        claims.exp = claims.exp.min(end);
     }
     Ok(claims)
 }
@@ -1255,7 +1302,8 @@ mod tests {
             root_user_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             chain: vec![],
             created_at: 1_700_000_000,
-            expires_at: Some(1_700_000_000 + 30 * 86_400),
+            // 2100-01-01: never the bound on a token's lifetime.
+            expires_at: Some(4_102_444_800),
             revoked_at: None,
             short_lived: false,
             swarm: "kit-alpha".into(),
@@ -1470,6 +1518,38 @@ mod tests {
             900,
             "the lifetime cap still applies"
         );
+    }
+
+    #[test]
+    fn a_token_never_outlives_the_delegation_nor_ends_before_it_starts() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let claims_for = |appraised_until: i64, expires_at: i64| {
+            let mut d = sample_delegation(TEST_DID);
+            d.trust.appraised_until = Some(appraised_until);
+            d.expires_at = Some(expires_at);
+            agent_cwt_claims("https://identity.arkavo.net", &cfg, &d)
+        };
+        let now = Utc::now().timestamp();
+        let claims = claims_for(now + 3_600, now + 60).unwrap();
+        assert_eq!(claims.exp, now + 60, "capped at the delegation's expiry");
+        // An appraisal that has ended by the time the claims are built.
+        assert_eq!(
+            claims_for(now, now + 3_600).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        assert_eq!(
+            claims_for(now - 1, now + 3_600).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        // A delegation that has ended by then.
+        assert!(matches!(
+            claims_for(now + 3_600, now),
+            Err(AgentError::DelegationExpired)
+        ));
     }
 
     #[test]

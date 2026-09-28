@@ -51,7 +51,7 @@ The challenge signature is verified with strict Ed25519 verification against the
 | `iss` | 1 | `https://identity.arkavo.net` |
 | `sub` | 2 | the agent's `did:key` (Ed25519): the agent identity |
 | `aud` | 3 | array: `AGENT_TOKEN_AUDIENCES` |
-| `exp`, `iat` | 4, 6 | `exp − iat ≤ 900`; `≤ 300` when the delegation is `short_lived`; and `exp ≤ appraised_until` |
+| `exp`, `iat` | 4, 6 | `exp − iat ≤ 900`; `≤ 300` when the delegation is `short_lived`; `exp ≤ appraised_until`; and `exp ≤` the delegation's `expires_at` |
 | `cti` | 7 | 16 random bytes |
 | `cnf` | 8 | `{1: COSE_Key (OKP, Ed25519, the agent key), 2: kid = the DID bytes}` |
 | `act` | `"act"` | `[{"sub": <each AGENT_AUTHORIZED_ACTORS entry>}]`, omitted when empty |
@@ -65,6 +65,8 @@ The challenge signature is verified with strict Ed25519 verification against the
 `arkavo_workload` (v1) is not minted.
 
 A token is minted (and a challenge issued) only while the identity is `eligible`: the delegation exists, is not revoked or expired, and `now < appraised_until`. Every `AGENT_TOKEN_AUDIENCES` verifier accepts the token and only the platform asks for status, so issuance itself refuses every other state.
+
+The token is minted from a strongly consistent read of the identity taken after every other lookup the request makes, so a quarantine, revocation, expiry, appraisal change or re-authorize that lands while the request is in flight applies to it: it carries the entitlements, lifetime (`short_lived`), swarm and `state_version` of that read, and its `exp` is bounded by that read's `appraised_until`. A token whose `exp` would not be after its `iat` is never minted: the request is refused with `Forbidden: agent appraisal expired; it needs a fresh appraisal` when the appraisal has ended, or `Delegation expired` when the delegation has.
 
 ## Refusal bodies (part of v2)
 
