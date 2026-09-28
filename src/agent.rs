@@ -1098,13 +1098,16 @@ impl AgentTokenConfig {
             return Err("AGENT_TOKEN_AUDIENCES must list at least one audience".into());
         }
         for aud in &audiences {
-            if aud == crate::constants::ARKAVO_CWT_AUDIENCE {
+            // Compared the way a verifier might match it: case and a
+            // trailing slash do not make it another audience.
+            let normalized = aud.trim().trim_end_matches('/').to_ascii_lowercase();
+            if normalized == crate::constants::ARKAVO_CWT_AUDIENCE {
                 return Err(format!(
                     "AGENT_TOKEN_AUDIENCES lists \"{aud}\", the audience of passkey auth CWTs; \
                      an agent token must never pass for one"
                 ));
             }
-            if aud == AGENT_TOKEN_REFUSED_KAS_AUDIENCE {
+            if normalized == AGENT_TOKEN_REFUSED_KAS_AUDIENCE {
                 return Err(format!(
                     "AGENT_TOKEN_AUDIENCES lists \"{aud}\": the KAS never asks for agent \
                      status, so it must not accept agent tokens; remove it"
@@ -1950,6 +1953,11 @@ mod tests {
             "https://platform.arkavo.net,arkavo",
             "https://kas.arkavo.net",
             "https://platform.arkavo.net, https://kas.arkavo.net",
+            "ARKAVO",
+            " Arkavo ",
+            "https://kas.arkavo.net/",
+            "HTTPS://KAS.ARKAVO.NET//",
+            "https://platform.arkavo.net,https://Kas.Arkavo.Net/",
         ] {
             let err = AgentTokenConfig::parse(Some(listed.into()), None, None).unwrap_err();
             assert!(
