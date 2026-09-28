@@ -624,6 +624,8 @@ pub(crate) mod tests {
             revoked_at: None,
             workload_id,
             short_lived: false,
+            swarm: String::new(),
+            trust: Default::default(),
         }
     }
 

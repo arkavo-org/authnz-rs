@@ -7,8 +7,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
+mod agent_state;
 mod guardians;
 mod workloads;
+pub use agent_state::AgentTrust;
 pub use guardians::Guardian;
 #[cfg(test)]
 pub(crate) use workloads::tests as workloads_test_support;
@@ -31,7 +33,7 @@ pub struct UserCredentials {
 /// One row per agent DID. A pending challenge for the token flow is stored on
 /// the same row (`challenge`, `challenge_nonce`, `challenge_issued_at`) and
 /// removed atomically when taken, so no cookie session is involved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDelegation {
     /// Agent's DID (did:key:z6Mk...)
     pub agent_did: String,
@@ -64,6 +66,12 @@ pub struct AgentDelegation {
     /// Tokens minted under this delegation live at most
     /// [`crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES`].
     pub short_lived: bool,
+    /// SwarmKit `kit_id`; empty while the agent has no kit (the attribute
+    /// is then absent, never an empty string).
+    pub swarm: String,
+    /// The identity's trust state (`state`, `state_version`, appraisal,
+    /// quarantine latch, recovery).
+    pub trust: AgentTrust,
 }
 
 /// A challenge taken from a delegation row by [`DynamoDBStore::take_agent_challenge`].
@@ -1734,15 +1742,24 @@ impl DynamoDBStore {
         Ok(total)
     }
 
-    /// Revoke one delegation (sets `revoked_at`).
+    /// Revoke one delegation (sets `revoked_at`) and move its
+    /// `state_version`, so no write that read the live row can clear the
+    /// revocation and keep the version its tokens carry. The cascade uses
+    /// this; `DELETE /agents/delegations/{did}` itself goes through the
+    /// owner- and version-conditioned `revoke_agent`.
     pub async fn revoke_delegation(&self, agent_did: &str) -> Result<(), DynamoDBError> {
         let revoked_at = chrono::Utc::now().timestamp();
         self.client
             .update_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
-            .update_expression("SET revoked_at = :revoked_at")
+            .update_expression(
+                "SET revoked_at = :revoked_at, \
+                 state_version = if_not_exists(state_version, :zero) + :one",
+            )
             .expression_attribute_values(":revoked_at", AttributeValue::N(revoked_at.to_string()))
+            .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
             .send()
             .await
             .map_err(|err| {
@@ -1964,6 +1981,12 @@ impl DynamoDBStore {
                 .and_then(|av| av.as_bool().ok())
                 .copied()
                 .unwrap_or(false),
+            swarm: item
+                .get("swarm")
+                .and_then(|av| av.as_s().ok())
+                .cloned()
+                .unwrap_or_default(),
+            trust: agent_state::trust_from_item(item)?,
         })
     }
 }

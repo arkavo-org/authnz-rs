@@ -539,6 +539,8 @@ pub async fn authorize_agent(
         revoked_at: None,
         workload_id: Some(workload_id_for(&human.user_id, &request.workload_name)),
         short_lived: request.short_lived,
+        swarm: request.swarm.clone().unwrap_or_default(),
+        trust: Default::default(),
     };
     let workload = bind_workload(
         &app_state,
@@ -1101,6 +1103,8 @@ mod tests {
             revoked_at: None,
             workload_id: Some("wl-00112233445566778899aabbccddeeff".into()),
             short_lived: false,
+            swarm: String::new(),
+            trust: Default::default(),
         }
     }
 
