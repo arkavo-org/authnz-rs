@@ -1137,6 +1137,92 @@ async fn a_new_key_is_a_new_identity() {
     assert_eq!(p.trust(&did_key(&a2)).await.state_version, 1);
 }
 
+/// Present a signed challenge to `/agents/token` as given.
+async fn present_token_proof(
+    p: &Plane,
+    did: &str,
+    challenge: &str,
+    signature: &[u8],
+    nonce: &str,
+) -> (StatusCode, Value) {
+    p.send(
+        Request::post("/agents/token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "did": did,
+                    "challenge": challenge,
+                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
+                    "nonce": nonce,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_small_order_did_key_is_never_an_agent_identity() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    // did:key of the Ed25519 identity point (y = 1), a small-order key.
+    let mut identity = vec![0xed, 0x01, 1];
+    identity.extend_from_slice(&[0u8; 31]);
+    let did = format!("did:key:z{}", bs58::encode(identity).into_string());
+
+    // A row for it, as an earlier deploy could have written (the DID is
+    // fixed, so this also resets whatever an earlier run left behind).
+    let row = crate::db::AgentDelegation {
+        trust: AgentTrust {
+            state: AgentState::Eligible,
+            state_version: 1,
+            appraised_until: Some(Utc::now().timestamp() + 3_600),
+            ..AgentTrust::default()
+        },
+        ..crate::db::agent_state_test_support::delegation(&did, owner)
+    };
+    p.store.put_agent_row(&row).await.unwrap();
+
+    let (st, body) = p
+        .authorize(
+            ("X-Auth-Token", &cwt),
+            json!({"agent_did": did, "name": "weak", "entitlements": [READ]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let stored = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.name.as_str(), stored.trust.state_version),
+        ("agent", 1),
+        "authorize wrote nothing"
+    );
+
+    // The row never mints, whatever signature is presented.
+    let (st, body) = p
+        .send(
+            Request::get(format!("/agents/challenge?did={did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    let challenge = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let nonce = Uuid::new_v4().to_string();
+    p.store
+        .plant_agent_challenge(&did, &challenge, &nonce, Utc::now().timestamp())
+        .await
+        .unwrap();
+    // R = the identity point, s = 0: verifies for any message under the
+    // lax check.
+    let mut forged = [0u8; 64];
+    forged[0] = 1;
+    let (st, body) = present_token_proof(&p, &did, &challenge, &forged, &nonce).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.get("token").is_none());
+}
+
 /// A fresh `agents:delegate` access token whose audience is `"arkavo"`, as a
 /// relying party registered under that client_id would receive one.
 fn arkavo_audience_access_token(p: &Plane, owner: Uuid) -> String {

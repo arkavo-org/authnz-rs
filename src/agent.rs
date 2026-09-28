@@ -52,7 +52,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -226,7 +226,10 @@ pub struct DelegationInfo {
 // ============================================================================
 
 /// Extract the Ed25519 public key from `did:key:z6Mk…` (multicodec 0xed01,
-/// base58btc).
+/// base58btc). The key must decode to a curve point of large order: a
+/// small-order ("weak") key, such as the identity point, would let a
+/// non-strict verifier accept signatures nobody made, so such a DID is not
+/// an agent identity at all.
 pub fn extract_ed25519_pubkey(did: &str) -> Result<[u8; 32], AgentError> {
     let key_part = did
         .strip_prefix("did:key:z")
@@ -248,9 +251,17 @@ pub fn extract_ed25519_pubkey(did: &str) -> Result<[u8; 32], AgentError> {
             decoded[0], decoded[1]
         )));
     }
-    decoded[2..34]
+    let key: [u8; 32] = decoded[2..34]
         .try_into()
-        .map_err(|_| AgentError::InvalidDID("Invalid key length".into()))
+        .map_err(|_| AgentError::InvalidDID("Invalid key length".into()))?;
+    let point = VerifyingKey::from_bytes(&key)
+        .map_err(|_| AgentError::InvalidDID("Key is not an Ed25519 point".into()))?;
+    if point.is_weak() {
+        return Err(AgentError::InvalidDID(
+            "Key is a small-order Ed25519 point".into(),
+        ));
+    }
+    Ok(key)
 }
 
 pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
@@ -923,7 +934,7 @@ pub async fn issue_agent_token(
     let verifying_key = VerifyingKey::from_bytes(&extract_ed25519_pubkey(&request.did)?)
         .map_err(|e| AgentError::InvalidDID(format!("Invalid public key: {}", e)))?;
     verifying_key
-        .verify(&challenge_bytes, &signature)
+        .verify_strict(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
     issuable(&delegation, Utc::now().timestamp())?;
@@ -1204,7 +1215,7 @@ mod tests {
     use super::*;
     use crate::constants::DEFAULT_USER_ENTITLEMENTS;
     use crate::db::AgentTrust;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
 
     const TEST_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
@@ -1266,6 +1277,50 @@ mod tests {
             extract_ed25519_pubkey(&did).unwrap(),
             sk.verifying_key().to_bytes()
         );
+    }
+
+    /// The did:key naming raw key bytes, whether or not they are a usable key.
+    fn did_key_of_bytes(key: &[u8; 32]) -> String {
+        let mut bytes = vec![0xed, 0x01];
+        bytes.extend_from_slice(key);
+        format!("did:key:z{}", bs58::encode(bytes).into_string())
+    }
+
+    #[test]
+    fn small_order_and_off_curve_keys_are_not_agent_identities() {
+        // The identity point: a small-order key.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&identity)).unwrap_err();
+        assert!(err.to_string().contains("small-order"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&identity)).is_err());
+        // Bytes that decode to no curve point at all.
+        let off_curve = (2u8..=255)
+            .map(|b| {
+                let mut k = [0u8; 32];
+                k[0] = b;
+                k
+            })
+            .find(|k| VerifyingKey::from_bytes(k).is_err())
+            .expect("some y has no x");
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&off_curve)).unwrap_err();
+        assert!(err.to_string().contains("not an Ed25519 point"), "{err}");
+    }
+
+    #[test]
+    fn a_forged_signature_under_a_small_order_key_never_verifies_strictly() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let vk = VerifyingKey::from_bytes(&identity).unwrap();
+        // R = the identity point, s = 0: [s]B = R + [k]A holds for any message.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let forged = Signature::from_bytes(&forged);
+        assert!(
+            vk.verify(b"any challenge", &forged).is_ok(),
+            "the lax check accepts it"
+        );
+        assert!(vk.verify_strict(b"any challenge", &forged).is_err());
     }
 
     #[test]

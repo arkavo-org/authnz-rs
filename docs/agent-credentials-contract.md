@@ -44,6 +44,8 @@ A value outside its range stops the server at startup. The bounds follow NIST SP
 
 Minted by `POST /agents/token` after the agent signs the challenge from `GET /agents/challenge` (wire unchanged from the identity-plane end state). COSE_Sign1, ES256, CBOR tag 61, sent base64url without padding.
 
+The challenge signature is verified with strict Ed25519 verification against the key in the DID. A DID whose key is not a valid Ed25519 point, or is a small-order (weak) point, is refused (400) at `/agents/authorize`, `/agents/challenge`, `/agents/token` and on the `/agents/{did}/…` endpoints: under such a key a signature nobody made could verify.
+
 | Claim | CBOR key | Value |
 |---|---|---|
 | `iss` | 1 | `https://identity.arkavo.net` |
@@ -91,7 +93,7 @@ Request (JSON):
 
 | Field | Type | Rule |
 |---|---|---|
-| `agent_did` | string | `did:key:z6Mk…` (Ed25519): the identity |
+| `agent_did` | string | `did:key:z6Mk…` (Ed25519): the identity. The key must be a valid Ed25519 point that is not small-order (weak); any other key is 400. |
 | `name` | string | a label for people; not an identifier |
 | `entitlements` | string[] | each held by the owner now; empty is refused (403) |
 | `swarm` | string | optional, 1–128 chars when present: the SwarmKit `kit_id`. Omit it (or send `null`) before the agent has a kit; an empty string is 400. |

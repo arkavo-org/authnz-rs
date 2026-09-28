@@ -1763,6 +1763,31 @@ impl DynamoDBStore {
         }
     }
 
+    /// Plant a pending challenge on a row as given, unconditionally: tests
+    /// use it to reach `/agents/token` for rows the challenge endpoint
+    /// would refuse.
+    #[cfg(test)]
+    pub async fn plant_agent_challenge(
+        &self,
+        agent_did: &str,
+        challenge: &str,
+        nonce: &str,
+        issued_at: i64,
+    ) -> Result<(), DynamoDBError> {
+        self.client
+            .update_item()
+            .table_name(&self.agent_delegations_table)
+            .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .update_expression("SET challenge = :c, challenge_nonce = :n, challenge_issued_at = :t")
+            .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
+            .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
+            .expression_attribute_values(":t", AttributeValue::N(issued_at.to_string()))
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Atomically take the pending challenge if `(challenge, nonce)` match.
     ///
     /// Returns `Ok(None)` when nothing matched (unknown DID, no pending
