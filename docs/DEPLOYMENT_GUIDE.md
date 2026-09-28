@@ -147,6 +147,29 @@ DYNAMODB_CREDENTIALS_TABLE=credentials
 DYNAMODB_HANDLES_TABLE=handles
 DYNAMODB_DEVICE_BINDINGS_TABLE=device_bindings
 DYNAMODB_IDENTITY_LINKS_TABLE=identity_links
+DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
+DYNAMODB_GUARDIANS_TABLE=guardians
+
+# Agent credentials (docs/agent-credentials-contract.md v2)
+# Agent tokens go to every audience listed here, and only the platform checks
+# agent status, so list exactly these two. Never the KAS
+# (https://kas.arkavo.net) nor "arkavo": either one stops startup.
+AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kg.arkavo.net
+AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
+AGENT_DELEGATE_CLIENT_IDS=arkavo-edge
+# The platform's status client: a confidential OIDC client that mints its
+# service CWT with client_credentials. Register it with the triple below
+# (_REDIRECT_URIS is required by the parser even for client_credentials; an
+# unused URI is fine) and list the same client_id in AGENT_STATUS_CLIENT_IDS.
+# Its secret goes into the platform's agent_status.client_secret. Without the
+# triple the platform cannot mint the CWT, every status call fails, and every
+# agent's entitlements are withheld.
+OIDC_CLIENT_PLATFORMSTATUS_ID=<platform agent_status client_id>
+OIDC_CLIENT_PLATFORMSTATUS_SECRET=<confidential; never paste>
+OIDC_CLIENT_PLATFORMSTATUS_REDIRECT_URIS=https://identity.arkavo.net/oauth/unused
+AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>
+# AGENT_OWNER_APPRAISAL_TTL_SECONDS=43200
+# AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS=900
 
 # App Attest registration gate — see docs/app-attest-gate-deployment.md before
 # setting these. The table is inert until the gate ships; APP_ATTEST_APP_ID is
@@ -230,6 +253,70 @@ prepends the real peer address. If clients can reach authnz-rs directly,
 they can forge this header and poison the audit log. The audit value is
 not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
+
+#### `guardians` Table and Agent Trust State
+
+Required before deploying 0.13.0: `POST /guardians` writes the table named
+by `DYNAMODB_GUARDIANS_TABLE`. Create it, and grant the IAM actions below,
+under exactly that name: `guardians` with the environment file above, or the
+prefixed name when the other tables are prefixed (`prod-guardians` alongside
+`prod-credentials` and `prod-agent-delegations`, as in the README). A table
+under any other name leaves the owner paths working while every Guardian
+enrollment and signed request fails with 503. The agent trust state
+(contract v2) lives on the existing `agent_delegations` rows, so there is no
+other new table; `agent_workloads` is not used (v1 was never deployed;
+delete it if a staging environment created one). See
+[docs/agent-credentials-contract.md](agent-credentials-contract.md) (v2) and
+`.claude/rules/dynamodb-schema.md` for the full attribute list.
+
+```bash
+# The same value the server runs with, e.g. guardians or prod-guardians.
+DYNAMODB_GUARDIANS_TABLE=guardians
+aws dynamodb create-table --table-name "$DYNAMODB_GUARDIANS_TABLE" \
+  --attribute-definitions AttributeName=guardian_id,AttributeType=S \
+  --key-schema AttributeName=guardian_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+```
+
+`AGENT_TOKEN_AUDIENCES` must not list the KAS: agent status is checked by
+the platform's entity resolver, never by the KAS, so a KAS that accepted
+agent tokens would honour a quarantined or suspended agent's token until it
+expires. The server refuses to start when the list contains
+`https://kas.arkavo.net` or `arkavo` (the passkey CWT audience). Remove
+the KAS from a running environment's list before deploying this release.
+
+IAM: every trust-state write is a single conditional `UpdateItem`; nothing
+uses `TransactWriteItems`, so `ConditionCheckItem` is not needed. The service
+role needs, in addition to the actions track 1 already uses on
+`agent_delegations` (`PutItem`, `UpdateItem`, `GetItem`, `Query` on
+`root_user_id-index`, `Scan`):
+
+| Table | Actions |
+|---|---|
+| `agent_delegations` | nothing new (`UpdateItem` and `GetItem` carry authorize, quarantine, recovery and appraisal) |
+| the `DYNAMODB_GUARDIANS_TABLE` table | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem` |
+
+Existing (track-1) delegation rows carry no trust state. They read as
+`unassessed`: `/agents/challenge` and `/agents/token` answer 403
+`Forbidden: agent is unassessed; it needs an appraisal` until the owner runs
+`POST /agents/authorize` for the same DID once (no DELETE needed), which is
+the owner's bootstrap appraisal.
+
+Optional appraisal lifetimes (out of range fails startup):
+`AGENT_OWNER_APPRAISAL_TTL_SECONDS` (default 43200, at most 86400) and
+`AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` (default and at most 900). Until a
+Guardian is enrolled, every agent needs an owner passkey appraisal at least
+every `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (counted from the passkey tap) or
+it is suspended and stops minting; the owner renews with
+`POST /agents/{did}/appraisal`, which resends no entitlements.
+
+An appraisal — owner or Guardian — renews eligibility only; it never extends
+the delegation itself. The delegation expires `AGENT_DELEGATION_DAYS` (30
+days) after the identity's last owner authorize, and only a fresh
+`POST /agents/authorize` by the owner resets that clock. This matters most
+after recovery: a recovered key can never be re-authorized by its owner
+(only a Guardian may appraise it from then on), so a recovered key stops
+minting at most 30 days after its last authorize even while a Guardian
+keeps appraising it — the owner authorizes a new key before then.
 
 ### Systemd Service Setup
 

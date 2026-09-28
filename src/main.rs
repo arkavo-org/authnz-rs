@@ -50,6 +50,9 @@ use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon
 use authnz_rs::{constants, cwt, keys};
 
 mod agent;
+#[cfg(test)]
+mod agent_plane_tests;
+mod agent_state;
 mod apple_signin;
 mod authn;
 mod db;
@@ -57,6 +60,7 @@ mod device_check;
 mod entities;
 mod entitlements;
 mod google_signin;
+mod guardian;
 mod identity;
 mod oidc;
 mod patreon;
@@ -304,6 +308,17 @@ pub struct AppState {
     /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
     /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
     pub admin_client_ids: Arc<Vec<String>>,
+    /// OIDC client_ids that may request the `agents:delegate` scope and whose
+    /// access tokens `POST /agents/authorize` accepts
+    /// (`AGENT_DELEGATE_CLIENT_IDS`). Empty ⇒ the scope is refused everywhere.
+    pub agent_delegate_client_ids: Arc<Vec<String>>,
+    /// client_ids whose service CWTs may read
+    /// `GET /agents/:did/status` (`AGENT_STATUS_CLIENT_IDS`) — the
+    /// platform KAS's `agent_status` client. Empty ⇒ 403.
+    pub agent_status_client_ids: Arc<Vec<String>>,
+    /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
+    /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
+    pub appraisal: agent_state::AppraisalConfig,
     /// Expected App Attest App ID hashes (`APP_ATTEST_APP_ID`), each the
     /// hex-encoded SHA-256 of "<TeamID>.<BundleID>", lower-cased.
     ///
@@ -343,6 +358,27 @@ pub fn parse_app_attest_app_ids(raw: Option<&str>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// A comma-separated client id list from an env var, blanks dropped.
+fn parse_id_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `OIDC_PLATFORM_AUDIENCE`, unset when blank. Refuses the passkey CWT
+/// audience: every access token carries the platform audience, so each one
+/// would otherwise verify as a passkey auth CWT.
+fn parse_platform_audience(raw: Option<String>) -> Result<Option<String>, String> {
+    match raw.filter(|v| !v.is_empty()) {
+        Some(v) if v == crate::constants::ARKAVO_CWT_AUDIENCE => Err(format!(
+            "OIDC_PLATFORM_AUDIENCE is \"{v}\", the audience of passkey auth CWTs; choose another audience"
+        )),
+        other => Ok(other),
+    }
 }
 
 #[tokio::main]
@@ -433,6 +469,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "agent_delegations".to_string()),
         env::var("DYNAMODB_DEVICE_ATTEST_KEYS_TABLE")
             .unwrap_or_else(|_| "device_attest_keys".to_string()),
+        env::var("DYNAMODB_GUARDIANS_TABLE").unwrap_or_else(|_| "guardians".to_string()),
         default_entitlements,
     )
     .await
@@ -454,15 +491,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("agent token config: {e}"))?;
 
-    let admin_client_ids: Vec<String> = env::var("ADMIN_CLIENT_IDS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let admin_client_ids = parse_id_list(env::var("ADMIN_CLIENT_IDS").ok());
     if admin_client_ids.is_empty() {
         log::warn!(
             "ADMIN_CLIENT_IDS is empty: PUT /admin/users/:id/entitlements and GET /entities/:id will 403"
+        );
+    }
+    let agent_delegate_client_ids = parse_id_list(env::var("AGENT_DELEGATE_CLIENT_IDS").ok());
+    if agent_delegate_client_ids.is_empty() {
+        log::warn!(
+            "AGENT_DELEGATE_CLIENT_IDS is empty: the agents:delegate scope is refused for every client"
+        );
+    }
+    let appraisal = agent_state::AppraisalConfig::parse(
+        env::var("AGENT_OWNER_APPRAISAL_TTL_SECONDS").ok(),
+        env::var("AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS").ok(),
+    )?;
+    let agent_status_client_ids = parse_id_list(env::var("AGENT_STATUS_CLIENT_IDS").ok());
+    if agent_status_client_ids.is_empty() {
+        log::warn!(
+            "AGENT_STATUS_CLIENT_IDS is empty: GET /agents/:did/status will 403 and the platform will withhold every agent's entitlements"
         );
     }
 
@@ -477,14 +525,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwt_verifying_key: Arc::new(cwt_verifying_key),
         cwt_kid: Arc::new(cwt_kid),
         issuer: Arc::new(issuer),
-        platform_audience: Arc::new(
-            env::var("OIDC_PLATFORM_AUDIENCE")
-                .ok()
-                .filter(|v| !v.is_empty()),
-        ),
+        platform_audience: Arc::new(parse_platform_audience(
+            env::var("OIDC_PLATFORM_AUDIENCE").ok(),
+        )?),
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
+        agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
+        agent_status_client_ids: Arc::new(agent_status_client_ids),
+        appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
         )),
@@ -637,6 +686,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/agents/challenge", get(agent::generate_agent_challenge))
         .route("/agents/token", post(agent::issue_agent_token))
+        // Agent identity quarantine (owner or enrolled Guardian). Contract v2.
+        .route(
+            "/agents/:did/quarantine",
+            post(agent_state::quarantine_agent),
+        )
+        // Status lease for the platform's entity resolver. Contract v2.
+        .route("/agents/:did/status", get(agent_state::agent_status))
+        // Owner recovery of a quarantined identity. Contract v2.
+        .route("/agents/:did/recover", post(agent_state::recover_agent))
+        // Appraisal by an enrolled Guardian or the owner. Contract v2.
+        .route("/agents/:did/appraisal", post(agent_state::appraise_agent))
+        // Guardian enrollment (owner). A Guardian may only quarantine and appraise.
+        .route("/guardians", post(guardian::enroll_guardian))
+        .route(
+            "/guardians/:guardian_id",
+            axum::routing::delete(guardian::revoke_guardian),
+        )
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
@@ -1188,6 +1254,31 @@ mod tests {
     }
 
     #[test]
+    fn platform_audience_refuses_the_passkey_cwt_audience() {
+        assert_eq!(super::parse_platform_audience(None), Ok(None));
+        assert_eq!(
+            super::parse_platform_audience(Some(String::new())),
+            Ok(None)
+        );
+        assert_eq!(
+            super::parse_platform_audience(Some("https://platform.arkavo.net".into())),
+            Ok(Some("https://platform.arkavo.net".to_string()))
+        );
+        let err = super::parse_platform_audience(Some("arkavo".into())).unwrap_err();
+        assert!(err.contains("OIDC_PLATFORM_AUDIENCE"), "{err}");
+    }
+
+    #[test]
+    fn parse_id_list_trims_and_drops_blanks() {
+        assert_eq!(
+            super::parse_id_list(Some(" arkavo-edge, ,platform-status ".into())),
+            vec!["arkavo-edge".to_string(), "platform-status".to_string()]
+        );
+        assert!(super::parse_id_list(None).is_empty());
+        assert!(super::parse_id_list(Some("".into())).is_empty());
+    }
+
+    #[test]
     fn comma_separated_value_is_not_treated_as_one_string() {
         // Regression for a configuration that took registration down: the old
         // parser lower-cased the whole value and compared it whole, so
@@ -1402,6 +1493,19 @@ pub(crate) mod test_helpers {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    /// A passkey auth CWT for `user` whose assertion happened `age` seconds ago.
+    pub(crate) fn auth_cwt_aged(app_state: &AppState, user: uuid::Uuid, age: i64) -> String {
+        let hours = crate::constants::AUTH_TOKEN_HOURS;
+        let mut claims =
+            crate::cwt::ArkavoClaims::auth(&app_state.issuer, &user.to_string(), hours, None)
+                .with_idp("webauthn");
+        claims.iat = chrono::Utc::now().timestamp() - age;
+        claims.exp = claims.iat + hours * 3600;
+        crate::cwt::encode_for_header(
+            &crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+        )
+    }
+
     /// Build an AppState suitable for unit tests. Uses a fixed scalar
     /// so signatures are reproducible. Requires AWS env vars to be set
     /// (fake values are fine) before calling, as DynamoDBStore::new is async.
@@ -1415,6 +1519,7 @@ pub(crate) mod test_helpers {
                 "patreon_tokens".to_string(),
                 "agent_delegations".to_string(),
                 "device_attest_keys".to_string(),
+                "guardians".to_string(),
                 crate::constants::DEFAULT_USER_ENTITLEMENTS
                     .iter()
                     .map(|s| (*s).to_string())
@@ -1494,6 +1599,9 @@ pub(crate) mod test_helpers {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
+            agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }
     }

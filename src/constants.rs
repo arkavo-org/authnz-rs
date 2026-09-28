@@ -11,6 +11,11 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// `aud` of Arkavo-issued passkey auth and registration CWTs. Reserved: it
+/// may not be an OIDC client_id or the platform audience, because an access
+/// token carrying it would verify wherever a passkey CWT is expected.
+pub const ARKAVO_CWT_AUDIENCE: &str = "arkavo";
+
 /// Freshness window (seconds) for a device's last successful App Attest
 /// assertion. Within this window since the last verified assertion, the
 /// device is classed `attested`; once it expires the device is `managed`
@@ -139,6 +144,60 @@ pub const MAX_DELEGATION_DEPTH: u8 = 5;
 
 /// Maximum number of active agents delegated by a single root user
 pub const MAX_AGENTS_PER_USER: u32 = 640;
+
+/// Lifetime cap, in minutes, of an agent CWT whose delegation was authorized
+/// with `short_lived` (the operator sets it for sealed-knowledge work). Five
+/// minutes bounds how long a stolen token is useful even before the KAS's
+/// status check sees a quarantine.
+pub const AGENT_SHORT_LIVED_TOKEN_MINUTES: i64 = 5;
+
+/// OAuth scope that lets an OIDC access token authorize agents at
+/// `POST /agents/authorize`, so `arkavo agent authorize` can run on the
+/// operator's `arkavo-identity` session instead of a raw passkey CWT.
+pub const AGENTS_DELEGATE_SCOPE: &str = "agents:delegate";
+
+/// Maximum age (seconds) of the WebAuthn assertion (`auth_time`) behind an
+/// `agents:delegate` access token. Refresh carries `auth_time` forward
+/// unchanged, so a refresh-token renewal can never satisfy this on its own.
+pub const AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS: i64 = 3600;
+
+/// Lease on an agent status answer: `valid_until = now + this` (earlier
+/// when the appraisal ends first). The platform caches no longer, so a
+/// quarantine reaches every rewrap within it.
+pub const AGENT_STATUS_LEASE_SECONDS: i64 = 5;
+
+/// Default lifetime (seconds) of the owner's appraisal: `POST /agents/authorize`
+/// and an owner `POST /agents/{did}/appraisal` set `appraised_until` to the
+/// passkey assertion time (`auth_time`) plus this. NIST SP 800-63B-4 §2.3.3
+/// caps AAL3 reauthentication at 12 hours; the default takes that stricter
+/// bound.
+pub const OWNER_APPRAISAL_TTL_DEFAULT_SECONDS: i64 = 12 * 3600;
+
+/// Ceiling on `AGENT_OWNER_APPRAISAL_TTL_SECONDS`. The owner appraises with a
+/// passkey, and a synced passkey is AAL2 at most; AAL2 reauthentication
+/// SHOULD be no more than 24 hours (SP 800-63B-4 §2.3.2).
+pub const OWNER_APPRAISAL_TTL_MAX_SECONDS: i64 = 24 * 3600;
+
+/// Default and ceiling (seconds) of a Guardian appraisal: the AAL3 inactivity
+/// bound (§2.3.3) and the agent token's maximum lifetime, so every token is
+/// covered by a current appraisal.
+pub const GUARDIAN_APPRAISAL_MAX_SECONDS: i64 = 15 * 60;
+
+/// Maximum age (seconds) of the passkey auth CWT that recovers a quarantined
+/// agent identity. Lifting a quarantine needs a fresh assertion, not any
+/// token that has not expired yet.
+pub const RECOVERY_TOKEN_MAX_AGE_SECONDS: i64 = 300;
+
+/// Allowed clock difference (seconds) on an `X-Guardian-Signature` timestamp.
+pub const GUARDIAN_SIGNATURE_SKEW_SECONDS: u64 = 60;
+
+/// Length limits (characters) on operator- and Guardian-supplied labels that
+/// end up in storage and token claims.
+pub const SWARM_ID_MAX_LEN: usize = 128;
+pub const INCIDENT_MAX_LEN: usize = 256;
+pub const EVIDENCE_REF_MAX_LEN: usize = 1024;
+pub const GUARDIAN_NAME_MAX_LEN: usize = 64;
+pub const AGENT_NAME_MAX_LEN: usize = 64;
 
 /// Attribute FQN for the "create a TDF" entitlement.
 pub const ENTITLEMENT_TDF_CREATE: &str = "https://arkavo.ai/attr/tdf/value/create";

@@ -1,6 +1,7 @@
 ---
 paths:
   - "src/db.rs"
+  - "src/db/**/*.rs"
 ---
 
 ## DynamoDB Schema
@@ -50,12 +51,58 @@ paths:
 - **Primary Key**: agent_did (String) - `did:key:z6Mk…`
 - **Attributes**: delegator_type (`human`|`agent`), delegator_id (String),
   delegator_username (String, optional), entitlements (List of String),
-  name (String), depth (Number), root_user_id (String/UUID), chain (List of
-  String), created_at / expires_at / revoked_at (Number), and the transient
-  challenge triple `challenge`, `challenge_nonce`, `challenge_issued_at`
-  (set by `/agents/challenge`, removed atomically by `/agents/token`)
+  name (String, a label), depth (Number), root_user_id (String/UUID), chain
+  (List of String), created_at / expires_at / revoked_at (Number),
+  short_lived (Boolean), swarm (String, absent while the agent has no kit —
+  never an empty string), and the transient challenge triple `challenge`,
+  `challenge_nonce`, `challenge_issued_at` (set by `/agents/challenge` only
+  while the row is `eligible` with `appraised_until` in the future, unrevoked
+  and unexpired; removed atomically by `/agents/token`)
+- **Trust state** (contract v2; the row is the agent identity, one key):
+  state (`unassessed`|`eligible`|`quarantined`; absent on a row written before
+  v2, which reads as `unassessed`), state_version (Number, +1 on every change
+  of `state`, a swarm change, a revocation, and an authorize over a revoked,
+  expired or pre-v2 row, never on a renewal; absent = 0 on a pre-v2 row),
+  appraised_until (Number),
+  appraised_by (String, `owner:<uuid>` | `guardian:<id>`),
+  appraisal_evidence_ref (String, the evidence an appraisal cited; removed
+  by the next appraisal without one, an authorize and a recovery),
+  incident / evidence_ref / quarantined_by
+  (String, present only while quarantined), quarantined_at (Number, present
+  only while quarantined), last_cleared_incident (String, the incident the
+  most recent recovery cleared), recovered_at (Number, never removed: the
+  owner may not appraise a recovered key), updated_at (Number). A pre-v2
+  `workload_id` attribute is removed by the next authorize.
+- **Reads**: `get_agent_delegation` is `consistent_read(true)` (issuance and
+  the status lease must see the latch).
+- **Writes**: every trust-state change is one conditional `UpdateItem` —
+  authorize on what it read: a create on no row at all; a renewal of the
+  owner's own delegation on the `state_version` read (`attribute_not_exists`
+  when 0), not quarantined, the same owner, not revoked and not expired; a
+  new delegation over a revoked or expired one on the version read, not
+  quarantined, its previous owner, and still revoked or expired; quarantine on
+  the owner and version read, not quarantined and the incident not being
+  the one last cleared; recover on quarantined, the latched incident and the
+  version read; appraisal on the version read, not quarantined and a live
+  delegation; revocation (`revoked_at`, `state_version + 1`) on the owner and
+  version read. No `TransactWriteItems`.
 - **GSI**: root_user_id-index (partition key: root_user_id) — list/count a
   user's agents
+
+### guardians table
+- **Primary Key**: guardian_id (String/UUID) - a UUID (version 8) derived
+  from the enrolled key's SHA-256, so the same key always enrolls under the
+  same id and an id is never caller-chosen
+- **Attributes**: owner (String/UUID), public_key (Binary, 32-byte Ed25519),
+  name (String), created_at (Number), last_signed_at (Number, optional — the
+  `unix_ts` of the most recently accepted `X-Guardian-Signature`; advanced
+  only strictly forward and only while unrevoked, enforcing both the replay
+  window and revocation in one conditional update), revoked_at (Number,
+  optional — set `if_not_exists` so the first revocation time sticks; the row
+  is never deleted, so a revoked key's id can never be reused)
+- **Writes**: enrollment is `attribute_not_exists(guardian_id)` (one key, one
+  row, forever); revocation and the signature-clock advance are conditional
+  updates keyed on `guardian_id` and (for revocation) `owner`.
 
 ### patreon_tokens table
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link

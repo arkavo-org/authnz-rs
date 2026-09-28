@@ -38,16 +38,19 @@ when unset.
 | `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
+| `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine, recover and appraisal) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
+| `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/:did/status` (intended for the platform entity resolver's `agent_status` client). Empty ⇒ 403, and the platform withholds every agent's entitlements. |
+| `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
 | `ENABLE_HTTP3` | QUIC listener on UDP/`PORT` (binary built with `--features http3`, TLS required). |
-| `DYNAMODB_*_TABLE` | `CREDENTIALS`, `HANDLES`, `DEVICE_BINDINGS`, `IDENTITY_LINKS`, `PATREON_TOKENS`, `AGENT_DELEGATIONS`, `DEVICE_ATTEST_KEYS`. Default to the unprefixed table names in the DynamoDB Schema section. |
+| `DYNAMODB_*_TABLE` | `CREDENTIALS`, `HANDLES`, `DEVICE_BINDINGS`, `IDENTITY_LINKS`, `PATREON_TOKENS`, `AGENT_DELEGATIONS`, `DEVICE_ATTEST_KEYS`, `GUARDIANS`. Default to the unprefixed table names in the DynamoDB Schema section. |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_DYNAMODB` | Standard AWS SDK settings (`load_defaults`); the endpoint override points at local DynamoDB. |
 | `REDIS_URL` | Cache for Patreon snapshots and pending Google logins; in-memory fallback when unset. |
 | `OIDC_ISSUER` | Issuer URL in tokens and the discovery doc. Required to act as an OIDC IdP. |
-| `OIDC_CLIENT_<TAG>_ID`, `_REDIRECT_URIS`, `_SECRET` | One relying party per tag. `<TAG>` is operator-chosen and never appears in tokens. Omit `_SECRET` for public PKCE-S256 clients. `_REDIRECT_URIS` is exact-match and required even for `client_credentials` service clients (use a dummy URI). See `docs/pep-service-clients.md`, `docs/google-signin.md`. |
-| `OIDC_PLATFORM_AUDIENCE` | Extra `aud` appended to every OIDC access token so any RP's token passes the OpenTDF platform's single-audience check. Also the only `resource` value (besides the client id) accepted under RFC 8707. |
+| `OIDC_CLIENT_<TAG>_ID`, `_REDIRECT_URIS`, `_SECRET` | One relying party per tag. `<TAG>` is operator-chosen and never appears in tokens. Omit `_SECRET` for public PKCE-S256 clients. A client_id of `arkavo` (the passkey CWT audience) fails startup. `_REDIRECT_URIS` is exact-match and required even for `client_credentials` service clients (use a dummy URI). See `docs/pep-service-clients.md`, `docs/google-signin.md`. |
+| `OIDC_PLATFORM_AUDIENCE` | Extra `aud` appended to every OIDC access token so any RP's token passes the OpenTDF platform's single-audience check. Also the only `resource` value (besides the client id) accepted under RFC 8707. `arkavo` (the passkey CWT audience) fails startup. |
 | `APPLE_CLIENT_ID` | Comma-separated iOS bundle ids / web Service IDs whose id_tokens are accepted. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Sign in with Google for `idp=google`. Both id and secret required or the flow fails closed. Redirect defaults to `<OIDC_ISSUER>/oauth/google/callback`. |
 | `PATREON_CLIENT_<TAG>_ID`, `_SECRET`, `_REDIRECT_URIS`; `PATREON_KMS_KEY_ID` | One Patreon OAuth client per tag (legacy untagged `PATREON_CLIENT_ID/_SECRET/_REDIRECT_URIS` still works). A redirect URI may belong to one client only. Any malformed registration or missing KMS key disables Patreon entirely (link endpoint ⇒ 503). |
@@ -169,25 +172,96 @@ when unset.
 
 **agent.rs** - Agent delegation (human PE → agent NPE, `did:key`)
 - `/.well-known/agent-configuration`: discovery metadata
-- `POST /agents/authorize` (human CWT via `X-Auth-Token`): create a
-  delegation record for `agent_did` with a subset of the delegator's own
-  stored entitlements (`DynamoDBStore::get_user_entitlements`)
+- `POST /agents/authorize`: operator auth is a passkey auth CWT
+  (`X-Auth-Token`) or, when that header is absent, an `agents:delegate` OIDC
+  access token (`Authorization: Bearer`, allowlisted client, `auth_time`
+  within 3600 s). Creates a delegation record for `agent_did` with a subset
+  of the delegator's own stored entitlements
+  (`DynamoDBStore::get_user_entitlements`). Body adds `swarm` (optional: no
+  `arkavo_swarm` claim until set) and `short_lived`. One identity is one key
+  (the DID); authorize is the owner's bootstrap appraisal: `eligible` until
+  the passkey assertion time (auth CWT `iat` / Bearer `auth_time`) +
+  `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (`owner_appraisal_deadline`; 403 once
+  past), with `plan_authorize` deciding the `state_version` (a swarm change
+  bumps it). Refused while the key is quarantined or once it has been
+  recovered; 409 while another owner's delegation of the DID is live. The
+  agent quota applies only when authorize adds a delegation.
+  Response `{success, message, agent, state, state_version, appraised_until}`.
 - `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
 - `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
   challenge is stored on the delegation row (no cookie session)
 - `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
   Ed25519 proof over the decoded challenge bytes, returns
-  `{token, expires_at, entitlements}`. `token` is a single CWT (no
-  delegation JWT): `aud` = the configured `AGENT_TOKEN_AUDIENCES` list,
-  `exp - iat` capped at `AGENT_TOKEN_MINUTES` (hard max 15 min), `act` =
-  `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe` describes the agent (type, delegation
-  id, depth, chain), `cnf` is bound to the agent's Ed25519 `did:key`. There is
-  no refresh — the agent re-runs the challenge/token exchange for a new one.
-  This is the contract `arkavo-edge/crates/arkavo-agent-auth` expects (#54);
-  its `delegation_jwt` field is `Option` with `#[serde(default)]`, so
-  omitting it is wire-compatible.
+  `{token, expires_at, entitlements}`. Mints only while the identity is
+  `eligible` (`agent::issuable`; a row written before v2 is `unassessed`).
+  `token` is a single CWT (no delegation JWT): `aud` = the
+  configured `AGENT_TOKEN_AUDIENCES` list, `exp - iat` capped at
+  `AGENT_TOKEN_MINUTES` (hard max 15 min; ≤ 300 s when `short_lived`; never
+  past `appraised_until`), `act` = `AGENT_AUTHORIZED_ACTORS`, `arkavo_npe`
+  describes the agent (type, delegation id, depth, chain),
+  `arkavo_state_version` is the identity's `state_version` at mint,
+  `arkavo_swarm` its kit (omitted until it has one), `cnf` is bound to the agent's
+  Ed25519 `did:key`. There is no refresh — the agent re-runs the
+  challenge/token exchange for a new one. This is the contract
+  `arkavo-edge/crates/arkavo-agent-auth` expects (#54); its `delegation_jwt`
+  field is `Option` with `#[serde(default)]`, so omitting it is
+  wire-compatible.
 - Extracted from PR #23; agent→agent delegation, per-agent OAuth clients
   (#50) and the ERS surface (#48) are follow-ups
+- Wire contract for all of this and the endpoints below:
+  [docs/agent-credentials-contract.md](docs/agent-credentials-contract.md) (v2).
+
+**agent_state.rs** - The agent identity's trust state (quarantine, recovery,
+appraisal, status)
+- State lives on the `agent_delegations` row (`db/agent_state.rs`):
+  `unassessed | eligible | quarantined` stored, `suspended` derived
+  (`eligible` past `appraised_until`). `state_version` +1 on every stored
+  state change, a swarm change, a revocation, and an authorize over a
+  revoked/expired/pre-v2 row; never on a renewal. Every write is one
+  conditional `UpdateItem` on the version read (quarantine and revocation also
+  on the owner read; appraisal also on a live delegation).
+- `POST /agents/:did/quarantine`: owner (passkey auth CWT, or an
+  `agents:delegate` Bearer token with `auth_time` ≤ 3600 s old) or the owner's
+  Guardian; latches whatever the delegation's liveness, idempotent per
+  incident, 409 on a second incident, on the incident the last recovery
+  cleared, and on a write that races a concurrent change (`Raced`; retry).
+- `POST /agents/:did/recover`: owner only, passkey assertion ≤ 300 s old
+  (auth CWT `iat`, or Bearer `auth_time`), cites the incident; the identity
+  becomes `unassessed` with `recovered_at` set; once recovered, the key is
+  Guardian-appraised for life (the owner's path back is a new key). The
+  delegation is kept.
+- `POST /agents/:did/appraisal`: an enrolled Guardian of the owner (≤
+  `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` from now) or the owner (≤
+  `AGENT_OWNER_APPRAISAL_TTL_SECONDS` from its passkey assertion, never a
+  recovered key); clamps `appraised_until` to that; 403 for quarantined,
+  revoked, expired, another owner's agent, a stale owner assertion, or a
+  Guardian whose key is the agent's own.
+- The 403 bodies in the contract's "Refusal bodies" table are part of v2
+  (`agent::REFUSE_*`, `AgentError::{WorkloadQuarantined, DelegationRevoked}`);
+  `agent_plane_tests::refusal_bodies_are_contract_v2` pins them.
+- `GET /agents/:did/status`: service CWT from `AGENT_STATUS_CLIENT_IDS`;
+  `valid_until = now + 5`, capped at `appraised_until` while eligible; 404 for
+  an unknown, revoked or expired delegation unless quarantined.
+- `AppraisalConfig` parses the two appraisal lifetimes at startup.
+
+**guardian.rs** - Minimal Guardian enrollment and revocation
+- `POST /guardians` (owner, passkey auth CWT): registers a 32-byte Ed25519 key
+  (weak keys refused), proving possession of it — `proof` is that key's
+  signature over an enrollment message naming the owner (400 if missing,
+  malformed, or not a valid signature by that key for that owner).
+  `guardian_id` is a UUID derived from the key's SHA-256, so a key enrolls at
+  most once, ever, under any owner (409), and a revoked key can never
+  re-enroll with a fresh id.
+- `DELETE /guardians/:id` (owner who enrolled it, passkey auth CWT only): 204
+  (idempotent on an already-revoked Guardian), 403 belongs to another owner,
+  404 unknown or non-canonical id. Revocation is a marker, never a delete.
+- `X-Guardian-Signature: <id>.<ts>.<sig>` over `METHOD\nPATH\nts\nhex(sha256(body))`,
+  ±60 s, `verify_strict` against the enrolled key only; each Guardian's accepted
+  timestamps must strictly increase (`last_signed_at`), so a replay is 401.
+  Guardians get 403 on every agent-plane endpoint except quarantine and
+  appraisal — that 403 is for a well-formed request; a malformed body/query on
+  any other endpoint is refused by request parsing (400/415/422) before the
+  Guardian check runs.
 
 **device_check.rs** - Apple DeviceCheck/App Attest integration
 - `register_challenge` / `register_attest` (**unauthenticated**, Task 5): the registration
@@ -343,7 +417,7 @@ when unset.
   - `/.well-known/cose-keys` — COSE_Key Set for CWT verifiers (OpenTDF, native).
   - Same `kid` (RFC 7638 thumbprint) in both formats — JWKS advertises the base64url-encoded form; COSE_Key uses raw 32-byte hash.
 - **Discovery doc** (`/.well-known/openid-configuration`) advertises `access_token_format: "application/cwt"` and `cose_keys_uri` for CWT-aware RPs.
-- **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key or App Attest key where available. Not verifier-enforced in this release.
+- **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key, App Attest key or agent Ed25519 key. authnz-rs never verifies PoP; the platform KAS will enforce it (DPoP) for agent tokens once opentdf-platform P1 lands (a contract v1 consumer).
 
 **WebAuthn Protection**:
 - All authentication requires valid WebAuthn ceremony

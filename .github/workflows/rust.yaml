@@ -85,6 +85,9 @@ jobs:
       AGENT_TOKEN_AUDIENCES: https://platform.test
       AGENT_AUTHORIZED_ACTORS: https://kg.test
       ADMIN_CLIENT_IDS: it
+      # The seed service CWT (client:it) doubles as the KAS status client.
+      AGENT_STATUS_CLIENT_IDS: it
+      AGENT_DELEGATE_CLIENT_IDS: arkavo-edge
       OIDC_ISSUER: http://127.0.0.1:8080
       PORT: "8080"
     steps:

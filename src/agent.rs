@@ -32,12 +32,19 @@
 //! the ERS resolution surface (#48).
 
 use crate::AppState;
+use crate::agent_state::{AppraisalConfig, owner_appraisal_deadline, validate_label};
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_TOKEN_MINUTES_MAX, AUTH_TOKEN_HOURS,
-    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_NAME_MAX_LEN,
+    AGENT_SHORT_LIVED_TOKEN_MINUTES, AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX,
+    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
+    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
 };
 use crate::cwt;
-use crate::db::{AgentDelegation, DynamoDBError};
+use crate::db::{
+    AgentDelegation, AgentState, AuthorizeOver, AuthorizeWrite, DynamoDBError, EffectiveState,
+    SwarmWrite,
+};
+use crate::guardian::refuse_guardian;
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path, Query},
@@ -73,10 +80,21 @@ pub struct AgentConfiguration {
     pub did_methods_supported: Vec<&'static str>,
     pub proof_signing_alg_values_supported: Vec<&'static str>,
     pub authorization_deep_link_scheme: String,
+    /// URI template of an agent identity's state endpoints: append
+    /// `/quarantine`, `/recover`, `/appraisal` or `/status` after replacing
+    /// `{did}` with the agent's `did:key`.
+    pub agent_state_endpoint: String,
+    pub guardian_registration_endpoint: String,
+    pub short_lived_token_lifetime_seconds: i64,
+    pub agent_status_lease_seconds: i64,
+    pub owner_appraisal_ttl_seconds: i64,
+    pub guardian_appraisal_max_seconds: i64,
+    /// Version of docs/agent-credentials-contract.md this server implements.
+    pub contract_version: &'static str,
 }
 
 impl AgentConfiguration {
-    pub fn new(issuer: &str, token_minutes: i64) -> Self {
+    pub fn new(issuer: &str, token_minutes: i64, appraisal: AppraisalConfig) -> Self {
         let base = issuer.trim_end_matches('/');
         Self {
             issuer: base.to_string(),
@@ -93,6 +111,16 @@ impl AgentConfiguration {
             did_methods_supported: vec!["did:key"],
             proof_signing_alg_values_supported: vec!["EdDSA"],
             authorization_deep_link_scheme: "arkavo://agent/authorize".to_string(),
+            agent_state_endpoint: format!("{}/agents/{{did}}", base),
+            guardian_registration_endpoint: format!("{}/guardians", base),
+            short_lived_token_lifetime_seconds: token_minutes
+                .clamp(1, AGENT_TOKEN_MINUTES_MAX)
+                .min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
+                * 60,
+            agent_status_lease_seconds: AGENT_STATUS_LEASE_SECONDS,
+            owner_appraisal_ttl_seconds: appraisal.owner_ttl_seconds,
+            guardian_appraisal_max_seconds: appraisal.guardian_max_seconds,
+            contract_version: "v2",
         }
     }
 }
@@ -104,6 +132,7 @@ pub async fn serve_agent_configuration(
     Json(AgentConfiguration::new(
         &app_state.issuer,
         app_state.agent_tokens.minutes,
+        app_state.appraisal,
     ))
 }
 
@@ -116,12 +145,27 @@ pub struct AuthorizeAgentRequest {
     pub agent_did: String,
     pub name: String,
     pub entitlements: Vec<String>,
+    /// SwarmKit `kit_id` the delegation is bound to. Absent for an agent
+    /// onboarded before it has a kit (trust QR); its tokens then carry no
+    /// `arkavo_swarm` and the platform will not release sealed keys to it.
+    #[serde(default)]
+    pub swarm: Option<String>,
+    /// Tokens for this delegation live at most
+    /// [`crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES`].
+    #[serde(default)]
+    pub short_lived: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AuthorizeAgentResponse {
     pub success: bool,
     pub message: String,
+    /// The agent identity (its DID).
+    pub agent: String,
+    /// Always `eligible`: authorize is the owner's bootstrap appraisal.
+    pub state: &'static str,
+    pub state_version: u64,
+    pub appraised_until: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +213,13 @@ pub struct DelegationInfo {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked: bool,
+    pub short_lived: bool,
+    /// `""` while the agent has no kit.
+    pub swarm: String,
+    /// `unassessed`, `eligible`, `suspended` or `quarantined`.
+    pub state: &'static str,
+    pub state_version: u64,
+    pub appraised_until: Option<i64>,
 }
 
 // ============================================================================
@@ -223,9 +274,13 @@ pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
 // ============================================================================
 
 #[derive(Debug)]
-struct HumanDelegator {
-    user_id: Uuid,
-    username: Option<String>,
+pub(crate) struct HumanDelegator {
+    pub(crate) user_id: Uuid,
+    pub(crate) username: Option<String>,
+    /// When the passkey assertion behind the credential happened: the passkey
+    /// auth CWT's `iat` (only the WebAuthn ceremony mints one), or a Bearer
+    /// token's `auth_time`. Recovery requires it to be recent.
+    pub(crate) issued_at: i64,
 }
 
 /// Authenticate the human delegator from `X-Auth-Token` (Arkavo CWT, `aud = "arkavo"`).
@@ -235,8 +290,9 @@ struct HumanDelegator {
 /// delegate; Apple-only and service-account subjects are rejected, as are any
 /// claims describing an agent or device NPE (`arkavo_npe` set, or `arkavo_roles`
 /// containing `"agent"`). Agent-to-agent delegation is not supported yet (the
-/// delegator must be a human CWT).
-async fn authenticate_human(
+/// delegator must be a human CWT). Claims carrying `scope` or `auth_time` are
+/// OIDC access tokens, never a passkey auth CWT, and are refused (401).
+pub(crate) async fn authenticate_human(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<HumanDelegator, AgentError> {
@@ -257,6 +313,16 @@ async fn authenticate_human(
         warn!("Rejected delegator token: {}", e);
         AgentError::InvalidToken
     })?;
+    // `aud = "arkavo"` alone does not identify a passkey auth CWT: an OIDC
+    // access token for a client (or platform audience) named "arkavo" carries
+    // it too, and would otherwise act as the owner here with a refreshable,
+    // never-renewed `auth_time`. `authn::mint_auth_token` never sets `scope`
+    // or `auth_time`; every access token carries `scope`.
+    if claims.custom.scope.is_some() || claims.custom.auth_time.is_some() {
+        return Err(AgentError::Unauthorized(
+            "X-Auth-Token must be a passkey auth CWT".into(),
+        ));
+    }
 
     let lifetime = claims.exp.saturating_sub(claims.iat);
     let max_auth = AUTH_TOKEN_HOURS * 3600 + cwt::DEFAULT_SKEW_SECS;
@@ -275,7 +341,116 @@ async fn authenticate_human(
         .flatten()
         .map(|u| u.username);
 
-    Ok(HumanDelegator { user_id, username })
+    Ok(HumanDelegator {
+        user_id,
+        username,
+        issued_at: claims.iat,
+    })
+}
+
+/// The operator authorizing an agent: a passkey auth CWT in `X-Auth-Token`
+/// (checked first, unchanged), or else an OIDC access token in
+/// `Authorization: Bearer` carrying `agents:delegate`, so `arkavo agent
+/// authorize` (and the owner's quarantine/recover) can use the operator's
+/// `arkavo-identity` session. `max_auth_age` bounds how old the WebAuthn
+/// assertion behind a Bearer token may be for the calling endpoint.
+pub(crate) async fn authenticate_operator(
+    app_state: &AppState,
+    headers: &HeaderMap,
+    max_auth_age: i64,
+) -> Result<HumanDelegator, AgentError> {
+    if headers.contains_key("X-Auth-Token") {
+        return authenticate_human(app_state, headers).await;
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(AgentError::MissingToken)?;
+    let bytes = cwt::decode_from_header(token).map_err(|_| AgentError::InvalidToken)?;
+    let now = Utc::now().timestamp();
+    let opts = cwt::VerifyOptions {
+        expected_iss: Some(&app_state.issuer),
+        // Checked below against the delegate allowlist: an OIDC access token
+        // carries aud = [client_id, platform audience?].
+        expected_aud: None,
+        now,
+        skew_secs: cwt::DEFAULT_SKEW_SECS,
+    };
+    let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
+        warn!("Rejected agents:delegate token: {}", e);
+        AgentError::InvalidToken
+    })?;
+    let auth_time = check_delegate_claims(
+        &claims,
+        &app_state.agent_delegate_client_ids,
+        now,
+        max_auth_age,
+    )?;
+    let user_id = user_id_from_claims(&claims)?;
+    let username = app_state
+        .db_store
+        .get_user_by_id(&user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.username);
+    Ok(HumanDelegator {
+        user_id,
+        username,
+        issued_at: auth_time,
+    })
+}
+
+/// What a verified OIDC access token must carry to act as the owner on the
+/// agent plane: `agents:delegate`, a client in `aud` that is on the delegate
+/// allowlist *now* (a refresh token keeps minting the scope after its client
+/// is delisted, so issuance-time checks are not enough), a passkey sign-in,
+/// and a WebAuthn assertion no older than `max_auth_age` seconds. Returns
+/// that assertion time.
+fn check_delegate_claims(
+    claims: &cwt::ArkavoClaims,
+    delegate_clients: &[String],
+    now: i64,
+    max_auth_age: i64,
+) -> Result<i64, AgentError> {
+    let scoped = claims
+        .custom
+        .scope
+        .as_deref()
+        .is_some_and(|s| crate::oidc::has_scope(s, AGENTS_DELEGATE_SCOPE));
+    if !scoped {
+        return Err(AgentError::Forbidden(
+            "access token lacks the agents:delegate scope".into(),
+        ));
+    }
+    let audiences: Vec<&String> = match &claims.aud {
+        cwt::Audience::Single(a) => vec![a],
+        cwt::Audience::Multiple(v) => v.iter().collect(),
+    };
+    if !audiences
+        .iter()
+        .any(|a| delegate_clients.iter().any(|c| c == *a))
+    {
+        return Err(AgentError::Forbidden(
+            "access token was not issued to a delegating client".into(),
+        ));
+    }
+    if claims.custom.idp.as_deref() != Some("webauthn") {
+        return Err(AgentError::Forbidden(
+            "agents:delegate requires a passkey sign-in".into(),
+        ));
+    }
+    let auth_time = claims
+        .custom
+        .auth_time
+        .ok_or_else(|| AgentError::Unauthorized("access token carries no auth_time".into()))?;
+    if !crate::oidc::within_age(auth_time, now, max_auth_age) {
+        return Err(AgentError::Unauthorized(format!(
+            "passkey assertion is older than {max_auth_age} s; sign in again"
+        )));
+    }
+    Ok(auth_time)
 }
 
 /// Root user id from a verified CWT: `claims.sub` parsed as a bare UUID (the
@@ -316,24 +491,34 @@ fn user_id_from_claims(claims: &cwt::ArkavoClaims) -> Result<Uuid, AgentError> {
 // Handlers
 // ============================================================================
 
-/// POST /agents/authorize — human (PE) delegates to an agent (NPE).
+/// POST /agents/authorize — human (PE) delegates to an agent (NPE). This is
+/// also the owner's bootstrap appraisal: the identity becomes `eligible`
+/// until `owner_appraisal_ttl` after the passkey assertion behind the
+/// owner's credential. One identity is one key; a new key
+/// is a new identity.
 pub async fn authorize_agent(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
     Json(request): Json<AuthorizeAgentRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
+    validate_did_key(&request.agent_did)?;
+    validate_label("name", &request.name, AGENT_NAME_MAX_LEN)?;
+    if let Some(swarm) = &request.swarm {
+        validate_label("swarm", swarm, SWARM_ID_MAX_LEN)?;
+    }
     info!(
         "Authorizing agent: {} with name: {}",
         request.agent_did, request.name
     );
-    validate_did_key(&request.agent_did)?;
     if request.entitlements.is_empty() {
         return Err(AgentError::InsufficientEntitlements(
             "At least one entitlement is required".into(),
         ));
     }
 
-    let human = authenticate_human(&app_state, &headers).await?;
+    let human =
+        authenticate_operator(&app_state, &headers, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS).await?;
 
     // Subset check against the delegator's own stored entitlements.
     let delegable = app_state
@@ -360,30 +545,11 @@ pub async fn authorize_agent(
     }
 
     let now = Utc::now().timestamp();
-    let current_count = app_state
-        .db_store
-        .count_delegations_by_root_user(human.user_id)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
-    if current_count >= MAX_AGENTS_PER_USER {
-        return Err(AgentError::MaxAgentsExceeded(current_count));
-    }
-
-    // Only a delegation that is still usable blocks re-authorization. A
-    // revoked one has always been replaceable; an *expired* one must be too,
-    // or the DID deadlocks after AGENT_DELEGATION_DAYS -- /agents/challenge
-    // refuses it as expired while re-authorizing it returns 409 forever, and
-    // nothing in the flow tells the user to DELETE it first.
-    if let Some(existing) = app_state
-        .db_store
-        .get_agent_delegation(&request.agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
-        && existing.revoked_at.is_none()
-        && existing.expires_at.is_none_or(|e| now <= e)
-    {
-        return Err(AgentError::DelegationAlreadyExists);
-    }
+    // The appraisal runs from the passkey assertion behind
+    // the credential (auth CWT `iat`, or the Bearer token's `auth_time`), not
+    // from this request; an assertion older than the lifetime is refused.
+    let appraised_until =
+        owner_appraisal_deadline(human.issued_at, app_state.appraisal.owner_ttl_seconds, now)?;
 
     let delegation = AgentDelegation {
         agent_did: request.agent_did.clone(),
@@ -398,19 +564,151 @@ pub async fn authorize_agent(
         created_at: now,
         expires_at: Some(now + AGENT_DELEGATION_DAYS * 24 * 60 * 60),
         revoked_at: None,
+        short_lived: request.short_lived,
+        swarm: String::new(),
+        trust: Default::default(),
     };
+    let appraised_by = format!("owner:{}", human.user_id);
+    // The write is conditioned on the version read; on a conflict (a
+    // concurrent quarantine, revocation, authorize or recovery), re-read and
+    // decide again.
+    for _ in 0..3 {
+        let existing = app_state
+            .db_store
+            .get_agent_delegation(&request.agent_did)
+            .await
+            .map_err(db_err)?;
+        let plan = plan_authorize(
+            existing.as_ref(),
+            human.user_id,
+            request.swarm.as_deref(),
+            now,
+        )?;
+        // The quota counts live delegations, so only an authorize that adds
+        // one is checked: renewing a delegation the owner already holds
+        // (including a track-1 row) is never refused for quota.
+        if !plan.keeps_delegation() {
+            let current_count = app_state
+                .db_store
+                .count_delegations_by_root_user(human.user_id)
+                .await
+                .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+            if current_count >= MAX_AGENTS_PER_USER {
+                return Err(AgentError::MaxAgentsExceeded(current_count));
+            }
+        }
+        let swarm = match (&request.swarm, plan.keeps_delegation()) {
+            (Some(swarm), _) => SwarmWrite::Set(swarm),
+            (None, true) => SwarmWrite::Keep,
+            (None, false) => SwarmWrite::Clear,
+        };
+        match app_state
+            .db_store
+            .authorize_agent(AuthorizeWrite {
+                delegation: &delegation,
+                swarm,
+                over: plan.over,
+                read_version: plan.read_version,
+                new_version: plan.new_version,
+                appraised_until,
+                appraised_by: &appraised_by,
+                now,
+            })
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Agent {} authorized and appraised by owner {} until {} (state_version {})",
+                    request.agent_did, human.user_id, appraised_until, plan.new_version
+                );
+                return Ok(Json(AuthorizeAgentResponse {
+                    success: true,
+                    message: "Agent authorized successfully".to_string(),
+                    agent: request.agent_did,
+                    state: AgentState::Eligible.as_str(),
+                    state_version: plan.new_version,
+                    appraised_until,
+                }));
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(AgentError::Conflict(
+        "agent changed concurrently; retry".into(),
+    ))
+}
 
-    app_state
-        .db_store
-        .create_agent_delegation(&delegation)
-        .await
-        .map_err(map_create_delegation_error)?;
+/// What an authorize by `owner` writes over `existing`, the row read for the
+/// DID: the version to condition on, the version to store, and what the row
+/// must still be when the write lands (`over`: absent, the owner's live
+/// delegation, which stays the same delegation so an omitted swarm keeps its
+/// value, or a dead one replaced by a new delegation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthorizePlan {
+    pub read_version: u64,
+    pub new_version: u64,
+    pub over: AuthorizeOver,
+}
 
-    info!("Agent delegation created for: {}", request.agent_did);
-    Ok(Json(AuthorizeAgentResponse {
-        success: true,
-        message: "Agent authorized successfully".to_string(),
-    }))
+impl AuthorizePlan {
+    /// Whether the row stays the same delegation (a renewal or amendment).
+    pub(crate) fn keeps_delegation(&self) -> bool {
+        self.over == AuthorizeOver::Live
+    }
+}
+
+/// Refused while the key's quarantine latch is set (whatever the
+/// delegation's liveness: moving or re-authorizing the key is no way out),
+/// once the key has been recovered (only a Guardian may appraise it), and
+/// while another owner's delegation of the key is live. The version bumps
+/// unless the row is a live, eligible delegation of the same owner whose
+/// swarm stays as it is (`swarm` is the request's, `None` keeping it), so a
+/// token from a revoked or expired delegation, or one minted in an earlier
+/// swarm, never revives (A → B → A would otherwise match).
+pub(crate) fn plan_authorize(
+    existing: Option<&AgentDelegation>,
+    owner: Uuid,
+    swarm: Option<&str>,
+    now: i64,
+) -> Result<AuthorizePlan, AgentError> {
+    let Some(d) = existing else {
+        return Ok(AuthorizePlan {
+            read_version: 0,
+            new_version: 1,
+            over: AuthorizeOver::Absent,
+        });
+    };
+    if d.trust.state == AgentState::Quarantined {
+        return Err(AgentError::WorkloadQuarantined);
+    }
+    if d.trust.recovered() {
+        return Err(AgentError::Forbidden(REFUSE_RECOVERED.into()));
+    }
+    let live = is_live(d, now);
+    if live && d.root_user_id != owner {
+        return Err(AgentError::DelegationAlreadyExists);
+    }
+    let keeps_delegation = live && d.root_user_id == owner;
+    let swarm_changes = swarm.is_some_and(|s| s != d.swarm);
+    let read_version = d.trust.state_version;
+    let new_version = if keeps_delegation && d.trust.state == AgentState::Eligible && !swarm_changes
+    {
+        read_version
+    } else {
+        read_version + 1
+    };
+    Ok(AuthorizePlan {
+        read_version,
+        new_version,
+        over: if keeps_delegation {
+            AuthorizeOver::Live
+        } else {
+            AuthorizeOver::Dead {
+                owner: d.root_user_id,
+            }
+        },
+    })
 }
 
 /// GET /agents/delegations — list the caller's delegations.
@@ -418,6 +716,7 @@ pub async fn list_delegations(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     let human = authenticate_human(&app_state, &headers).await?;
 
     let delegations = app_state
@@ -425,6 +724,7 @@ pub async fn list_delegations(
         .list_delegations_by_root_user(human.user_id)
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+    let now = Utc::now().timestamp();
 
     Ok(Json(DelegationListResponse {
         delegations: delegations
@@ -437,36 +737,68 @@ pub async fn list_delegations(
                 created_at: d.created_at,
                 expires_at: d.expires_at,
                 revoked: d.revoked_at.is_some(),
+                short_lived: d.short_lived,
+                state: d.trust.effective(now).as_str(),
+                state_version: d.trust.state_version,
+                appraised_until: d.trust.appraised_until,
+                swarm: d.swarm,
             })
             .collect(),
     }))
 }
 
 /// DELETE /agents/delegations/:did — revoke, cascading to child delegations.
+/// The write bumps `state_version` and is conditioned on the owner and the
+/// version read: it never lands on a key reassigned
+/// since the read, and no renewal or appraisal that read the live row can
+/// clear it and keep the version its tokens carry.
 pub async fn revoke_delegation(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
     Path(agent_did): Path<String>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     let human = authenticate_human(&app_state, &headers).await?;
+    let now = Utc::now().timestamp();
 
-    let delegation = app_state
-        .db_store
-        .get_agent_delegation(&agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
-        .ok_or(AgentError::DelegationNotFound)?;
-    if delegation.root_user_id != human.user_id {
-        return Err(AgentError::Unauthorized(
-            "delegation belongs to a different user".into(),
-        ));
+    let mut revoked = None;
+    for _ in 0..3 {
+        let delegation = app_state
+            .db_store
+            .get_agent_delegation(&agent_did)
+            .await
+            .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
+            .ok_or(AgentError::DelegationNotFound)?;
+        // Checked on every read, so a key reassigned between a read and the
+        // write gets the same answer as one that was never the caller's.
+        if delegation.root_user_id != human.user_id {
+            return Err(AgentError::Unauthorized(
+                "delegation belongs to a different user".into(),
+            ));
+        }
+        match app_state
+            .db_store
+            .revoke_agent(
+                &agent_did,
+                human.user_id,
+                delegation.trust.state_version,
+                now,
+            )
+            .await
+        {
+            Ok(d) => {
+                revoked = Some(d);
+                break;
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(AgentError::DatabaseError(Box::new(e))),
+        }
     }
-
-    app_state
-        .db_store
-        .revoke_delegation(&agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+    let Some(revoked) = revoked else {
+        return Err(AgentError::Conflict(
+            "agent changed concurrently; retry".into(),
+        ));
+    };
     let cascaded = app_state
         .db_store
         .revoke_delegations_with_chain(&agent_did)
@@ -474,13 +806,16 @@ pub async fn revoke_delegation(
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
 
     info!(
-        "Revoked delegation {} and {} child delegations",
-        agent_did, cascaded
+        "Revoked delegation {} (state_version {}) and {} child delegations",
+        agent_did, revoked.trust.state_version, cascaded
     );
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load a delegation and check it is active (not revoked/expired, chain intact).
+/// Load a delegation and check it is active (not revoked/expired, chain
+/// intact). The quarantine latch is checked first: a latched key answers
+/// `Workload quarantined` whatever its delegation's liveness, as it does at
+/// authorize, so revoking it or letting it expire never changes the answer.
 async fn active_delegation(
     app_state: &AppState,
     agent_did: &str,
@@ -492,6 +827,9 @@ async fn active_delegation(
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
         .ok_or(AgentError::DelegationNotFound)?;
 
+    if delegation.trust.state == AgentState::Quarantined {
+        return Err(AgentError::WorkloadQuarantined);
+    }
     if delegation.revoked_at.is_some() {
         return Err(AgentError::DelegationRevoked);
     }
@@ -519,6 +857,36 @@ async fn active_delegation(
     Ok(delegation)
 }
 
+/// Whether the identity may be issued a token now: only while `eligible`.
+/// Enforced here, at issuance, as well as by the platform through the status
+/// lease: every `AGENT_TOKEN_AUDIENCES` verifier accepts the token, and only
+/// the platform asks for status.
+pub(crate) fn issuable(d: &AgentDelegation, now: i64) -> Result<(), AgentError> {
+    match d.trust.effective(now) {
+        EffectiveState::Eligible => Ok(()),
+        EffectiveState::Quarantined => Err(AgentError::WorkloadQuarantined),
+        EffectiveState::Unassessed => Err(AgentError::Forbidden(REFUSE_UNASSESSED.into())),
+        EffectiveState::Suspended => Err(AgentError::Forbidden(REFUSE_SUSPENDED.into())),
+    }
+}
+
+/// Contract v2 refusal texts (docs/agent-credentials-contract.md, "Refusal
+/// bodies"), each after the `Forbidden: ` prefix. arkavo-edge sorts 403s by
+/// these; changing one is a contract change. The other two pinned bodies are
+/// the `Display` of `AgentError::WorkloadQuarantined` and
+/// `AgentError::DelegationRevoked`.
+pub(crate) const REFUSE_UNASSESSED: &str = "agent is unassessed; it needs an appraisal";
+pub(crate) const REFUSE_SUSPENDED: &str = "agent appraisal expired; it needs a fresh appraisal";
+pub(crate) const REFUSE_RECOVERED: &str = "agent was recovered; only a Guardian may appraise it";
+pub(crate) const REFUSE_STALE_ASSERTION: &str =
+    "passkey assertion is older than the owner appraisal lifetime; sign in again";
+
+/// Whether a delegation can still mint: not revoked, not expired at `now`.
+/// The one liveness test: authorize asks it whether a DID is already taken.
+pub(crate) fn is_live(d: &AgentDelegation, now: i64) -> bool {
+    d.revoked_at.is_none() && d.expires_at.is_none_or(|e| now <= e)
+}
+
 fn random_challenge_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
     getrandom::getrandom(&mut out).expect("OS RNG");
@@ -528,35 +896,61 @@ fn random_challenge_bytes() -> [u8; 32] {
 /// GET /agents/challenge?did=… — issue a challenge for an active delegation.
 pub async fn generate_agent_challenge(
     Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ChallengeQueryParams>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     validate_did_key(&params.did)?;
-    active_delegation(&app_state, &params.did).await?;
+    // The write is conditioned on the identity being issuable when it
+    // lands; when it is not, re-read so the caller gets the refusal that
+    // applies now (quarantined, revoked, expired, suspended).
+    for _ in 0..3 {
+        challenge_refusal(&app_state, &params.did).await?;
 
-    let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
-    let nonce = Uuid::new_v4().to_string();
+        let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
+        let nonce = Uuid::new_v4().to_string();
 
-    app_state
-        .db_store
-        .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
-        .await
-        .map_err(|e| match e {
-            // The only condition left on the write is that the delegation row
-            // exists, so a conflict means it was deleted between
-            // `active_delegation` above and this write.
-            DynamoDBError::ConditionalConflict => AgentError::DelegationNotFound,
-            other => AgentError::DatabaseError(Box::new(other)),
-        })?;
+        match app_state
+            .db_store
+            .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
+            .await
+        {
+            Ok(()) => {
+                info!("Challenge issued for agent: {}", params.did);
+                return Ok(Json(ChallengeResponse { challenge, nonce }));
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(challenge_contention(&app_state, &params.did).await)
+}
 
-    info!("Challenge issued for agent: {}", params.did);
-    Ok(Json(ChallengeResponse { challenge, nonce }))
+/// Why `did` may not be issued a challenge now, from a strongly consistent
+/// read: the pinned refusal for its state, `Delegation not found`, or none.
+async fn challenge_refusal(app_state: &AppState, did: &str) -> Result<(), AgentError> {
+    let delegation = active_delegation(app_state, did).await?;
+    issuable(&delegation, Utc::now().timestamp())
+}
+
+/// The answer once the conditioned challenge write has lost every retry: read
+/// the identity once more, so a quarantine (or revocation, expiry, lapsed
+/// appraisal) that won the race gets its own refusal; only an identity that
+/// still reads issuable gets the 409.
+pub(crate) async fn challenge_contention(app_state: &AppState, did: &str) -> AgentError {
+    match challenge_refusal(app_state, did).await {
+        Err(refusal) => refusal,
+        Ok(()) => AgentError::Conflict("agent changed concurrently; retry".into()),
+    }
 }
 
 /// POST /agents/token — verify the signed challenge, mint the agent CWT.
 pub async fn issue_agent_token(
     Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
     Json(request): Json<TokenRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
+    refuse_guardian(&headers)?;
     info!("Issuing agent token for DID: {}", request.did);
     validate_did_key(&request.did)?;
 
@@ -572,7 +966,7 @@ pub async fn issue_agent_token(
         return Err(AgentError::ChallengeExpired);
     }
 
-    let mut delegation = active_delegation(&app_state, &request.did).await?;
+    let delegation = active_delegation(&app_state, &request.did).await?;
 
     let challenge_bytes = base64::engine::general_purpose::STANDARD
         .decode(&request.challenge)
@@ -588,33 +982,71 @@ pub async fn issue_agent_token(
         .verify_strict(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
+    issuable(&delegation, Utc::now().timestamp())?;
+
     // Agents keep stale entitlements for the whole delegation lifetime
     // otherwise: mint against what the delegator currently holds, not what
     // was captured at authorize time.
-    let stored = app_state
+    let held = app_state
         .db_store
         .get_user_entitlements(&delegation.root_user_id)
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
-    let effective = intersect_entitlements(&delegation.entitlements, &stored);
+    let minted = mint_from_current(&app_state, &delegation, &held).await?;
+
+    info!(
+        "Agent token issued for {} at state_version {}",
+        request.did, minted.state_version
+    );
+    Ok(Json(minted.response))
+}
+
+/// A token minted by [`mint_from_current`], and the version it carries.
+#[derive(Debug)]
+pub(crate) struct Minted {
+    pub response: TokenResponse,
+    pub state_version: u64,
+}
+
+/// Mint the agent token from a strongly consistent read of the identity
+/// taken after every other lookup of the token request, so a quarantine,
+/// revocation, expiry, shortened appraisal or re-authorize (fewer
+/// entitlements, `short_lived`, another swarm) that lands while the request
+/// is in flight is honoured: the token carries the current row's
+/// entitlements (∩ `held`, what the owner holds now), lifetime,
+/// `state_version` and swarm. `read` is the row the proof was checked
+/// against; a row that has since changed hands is refused like a
+/// challenge that no longer matches (its owner's entitlements were not the
+/// ones looked up).
+pub(crate) async fn mint_from_current(
+    app_state: &AppState,
+    read: &AgentDelegation,
+    held: &[String],
+) -> Result<Minted, AgentError> {
+    let current = active_delegation(app_state, &read.agent_did).await?;
+    if current.root_user_id != read.root_user_id {
+        return Err(AgentError::ChallengeMismatch);
+    }
+    issuable(&current, Utc::now().timestamp())?;
+    let effective = intersect_entitlements(&current.entitlements, held);
     if effective.is_empty() {
         return Err(AgentError::InsufficientEntitlements(
             "delegated entitlements no longer held by delegator".into(),
         ));
     }
-    delegation.entitlements = effective;
-
-    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
-
-    info!(
-        "Agent token issued for {} (depth {})",
-        request.did, delegation.depth
-    );
-    Ok(Json(TokenResponse {
-        token,
-        expires_at,
-        entitlements: delegation.entitlements,
-    }))
+    let delegation = AgentDelegation {
+        entitlements: effective,
+        ..current
+    };
+    let (token, expires_at) = mint_agent_cwt(app_state, &delegation)?;
+    Ok(Minted {
+        response: TokenResponse {
+            token,
+            expires_at,
+            entitlements: delegation.entitlements,
+        },
+        state_version: delegation.trust.state_version,
+    })
 }
 
 /// Entitlements a delegation may actually exercise right now: the delegated
@@ -632,6 +1064,11 @@ fn intersect_entitlements(delegated: &[String], stored: &[String]) -> Vec<String
 // Token minting
 // ============================================================================
 
+/// The Arkavo KAS audience. Agent status is checked by the platform's entity
+/// resolver, not by the KAS, so an agent token the KAS accepted would be a
+/// live bearer there with no status lease: refused at startup.
+const AGENT_TOKEN_REFUSED_KAS_AUDIENCE: &str = "https://kas.arkavo.net";
+
 /// Agent token issuance config (spec §1). Parsed once at startup.
 #[derive(Debug, Clone)]
 pub struct AgentTokenConfig {
@@ -641,7 +1078,8 @@ pub struct AgentTokenConfig {
 }
 
 impl AgentTokenConfig {
-    /// `AGENT_TOKEN_AUDIENCES` (required, comma-separated), `AGENT_AUTHORIZED_ACTORS`
+    /// `AGENT_TOKEN_AUDIENCES` (required, comma-separated; never the passkey
+    /// CWT audience `arkavo` nor the KAS), `AGENT_AUTHORIZED_ACTORS`
     /// (optional, comma-separated), `AGENT_TOKEN_MINUTES` (optional, default 15, cap 15).
     pub fn parse(
         audiences: Option<String>,
@@ -658,6 +1096,23 @@ impl AgentTokenConfig {
         let audiences = split(audiences);
         if audiences.is_empty() {
             return Err("AGENT_TOKEN_AUDIENCES must list at least one audience".into());
+        }
+        for aud in &audiences {
+            // Compared the way a verifier might match it: case and a
+            // trailing slash do not make it another audience.
+            let normalized = aud.trim().trim_end_matches('/').to_ascii_lowercase();
+            if normalized == crate::constants::ARKAVO_CWT_AUDIENCE {
+                return Err(format!(
+                    "AGENT_TOKEN_AUDIENCES lists \"{aud}\", the audience of passkey auth CWTs; \
+                     an agent token must never pass for one"
+                ));
+            }
+            if normalized == AGENT_TOKEN_REFUSED_KAS_AUDIENCE {
+                return Err(format!(
+                    "AGENT_TOKEN_AUDIENCES lists \"{aud}\": the KAS never asks for agent \
+                     status, so it must not accept agent tokens; remove it"
+                ));
+            }
         }
         let authorized_actors = split(actors);
         if authorized_actors.is_empty() {
@@ -690,11 +1145,20 @@ pub(crate) fn agent_cwt_claims(
     delegation: &AgentDelegation,
 ) -> Result<cwt::ArkavoClaims, AgentError> {
     let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
+    // The 15-minute cap is applied in `ArkavoClaims::agent` itself, on every
+    // mint; this code only adds the 5-minute cap for short_lived, so it never
+    // outlives AGENT_SHORT_LIVED_TOKEN_MINUTES whatever the configured
+    // minutes are.
+    let minutes = if delegation.short_lived {
+        cfg.minutes.min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
+    } else {
+        cfg.minutes
+    };
     let mut claims = cwt::ArkavoClaims::agent(
         issuer,
         &delegation.agent_did,
         cfg.audiences.clone(),
-        cfg.minutes,
+        minutes,
     );
     if !cfg.authorized_actors.is_empty() {
         claims = claims.with_act(
@@ -704,7 +1168,7 @@ pub(crate) fn agent_cwt_claims(
                 .collect(),
         );
     }
-    Ok(claims
+    claims = claims
         .with_arkavo_account_id(&delegation.root_user_id.to_string())
         .with_arkavo_roles(vec!["agent".to_string()])
         .with_arkavo_entitlements(delegation.entitlements.clone())
@@ -717,17 +1181,36 @@ pub(crate) fn agent_cwt_claims(
             depth: Some(delegation.depth),
             chain: Some(delegation.chain.clone()),
         })
+        .with_arkavo_state_version(delegation.trust.state_version)
         .with_cnf(cwt::cnf_from_ed25519(
             &pubkey,
             delegation.agent_did.as_bytes(),
-        )))
+        ));
+    // No kit yet: omit the claim rather than send an empty one, so the
+    // platform's "token lacks arkavo_swarm" denial applies.
+    if !delegation.swarm.is_empty() {
+        claims = claims.with_arkavo_swarm(&delegation.swarm);
+    }
+    // Every token's lifetime is covered by a current appraisal and by the
+    // delegation itself; one that would end before it starts is refused, never
+    // minted with `exp <= iat`.
+    if let Some(until) = delegation.trust.appraised_until {
+        if until <= claims.iat {
+            return Err(AgentError::Forbidden(REFUSE_SUSPENDED.into()));
+        }
+        claims.exp = claims.exp.min(until);
+    }
+    if let Some(end) = delegation.expires_at {
+        if end <= claims.iat {
+            return Err(AgentError::DelegationExpired);
+        }
+        claims.exp = claims.exp.min(end);
+    }
+    Ok(claims)
 }
 
-fn map_create_delegation_error(e: DynamoDBError) -> AgentError {
-    match e {
-        DynamoDBError::ConditionalConflict => AgentError::DelegationAlreadyExists,
-        other => AgentError::DatabaseError(Box::new(other)),
-    }
+pub(crate) fn db_err(e: DynamoDBError) -> AgentError {
+    AgentError::DatabaseError(Box::new(e))
 }
 
 fn mint_agent_cwt(
@@ -779,6 +1262,17 @@ pub enum AgentError {
     ChallengeExpired,
     #[error("Challenge mismatch")]
     ChallengeMismatch,
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+    #[error("Conflict: {0}")]
+    Conflict(String),
+    #[error("Guardian not found")]
+    GuardianNotFound,
+    /// Body is contract v1 text (docs/agent-credentials-contract.md).
+    #[error("Workload quarantined")]
+    WorkloadQuarantined,
     #[error("Database error: {0}")]
     DatabaseError(#[from] Box<DynamoDBError>),
 }
@@ -803,6 +1297,12 @@ impl IntoResponse for AgentError {
             | AgentError::MaxAgentsExceeded(_)
             | AgentError::ChallengeExpired
             | AgentError::ChallengeMismatch => (StatusCode::BAD_REQUEST, self.to_string()),
+            AgentError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AgentError::Forbidden(_) | AgentError::WorkloadQuarantined => {
+                (StatusCode::FORBIDDEN, self.to_string())
+            }
+            AgentError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
+            AgentError::GuardianNotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -829,6 +1329,7 @@ impl IntoResponse for AgentError {
 mod tests {
     use super::*;
     use crate::constants::DEFAULT_USER_ENTITLEMENTS;
+    use crate::db::AgentTrust;
     use ed25519_dalek::{Signer, SigningKey, Verifier};
 
     const TEST_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -839,6 +1340,7 @@ mod tests {
         format!("did:key:z{}", bs58::encode(bytes).into_string())
     }
 
+    /// An eligible delegation, appraised far into the future, in "kit-alpha".
     fn sample_delegation(agent_did: &str) -> AgentDelegation {
         AgentDelegation {
             agent_did: agent_did.to_string(),
@@ -851,8 +1353,18 @@ mod tests {
             root_user_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             chain: vec![],
             created_at: 1_700_000_000,
-            expires_at: Some(1_700_000_000 + 30 * 86_400),
+            // 2100-01-01: never the bound on a token's lifetime.
+            expires_at: Some(4_102_444_800),
             revoked_at: None,
+            short_lived: false,
+            swarm: "kit-alpha".into(),
+            trust: AgentTrust {
+                state: AgentState::Eligible,
+                state_version: 3,
+                appraised_until: Some(i64::MAX),
+                appraised_by: Some("owner:00000000-0000-0000-0000-000000000001".into()),
+                ..AgentTrust::default()
+            },
         }
     }
 
@@ -971,14 +1483,14 @@ mod tests {
     #[test]
     fn agent_token_config_from_env_strings() {
         let cfg = AgentTokenConfig::parse(
-            Some("https://platform.arkavo.net, https://kas.arkavo.net".into()),
+            Some("https://platform.arkavo.net, https://kg.arkavo.net".into()),
             Some("https://kg.arkavo.net".into()),
             Some("60".into()),
         )
         .unwrap();
         assert_eq!(
             cfg.audiences,
-            vec!["https://platform.arkavo.net", "https://kas.arkavo.net"]
+            vec!["https://platform.arkavo.net", "https://kg.arkavo.net"]
         );
         assert_eq!(cfg.authorized_actors, vec!["https://kg.arkavo.net"]);
         assert_eq!(cfg.minutes, 15, "values above the cap clamp to 15");
@@ -1032,6 +1544,274 @@ mod tests {
         let d = sample_delegation(TEST_DID);
         let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
         assert_eq!(claims.custom.act, None);
+    }
+
+    #[test]
+    fn agent_claims_carry_the_state_version_and_swarm() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let claims = agent_cwt_claims(
+            "https://identity.arkavo.net",
+            &cfg,
+            &sample_delegation(TEST_DID),
+        )
+        .unwrap();
+        assert_eq!(claims.custom.arkavo_state_version, Some(3));
+        assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-alpha"));
+
+        let no_kit = AgentDelegation {
+            swarm: String::new(),
+            ..sample_delegation(TEST_DID)
+        };
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &no_kit).unwrap();
+        assert_eq!(claims.custom.arkavo_state_version, Some(3));
+        assert_eq!(claims.custom.arkavo_swarm, None, "omitted, not empty");
+    }
+
+    #[test]
+    fn a_token_never_outlives_the_appraisal() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let mut d = sample_delegation(TEST_DID);
+        let now = Utc::now().timestamp();
+        d.trust.appraised_until = Some(now + 60);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(claims.exp, now + 60, "capped at appraised_until");
+        d.trust.appraised_until = Some(now + 3_600);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(
+            claims.exp - claims.iat,
+            900,
+            "the lifetime cap still applies"
+        );
+    }
+
+    #[test]
+    fn a_token_never_outlives_the_delegation_nor_ends_before_it_starts() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let claims_for = |appraised_until: i64, expires_at: i64| {
+            let mut d = sample_delegation(TEST_DID);
+            d.trust.appraised_until = Some(appraised_until);
+            d.expires_at = Some(expires_at);
+            agent_cwt_claims("https://identity.arkavo.net", &cfg, &d)
+        };
+        let now = Utc::now().timestamp();
+        let claims = claims_for(now + 3_600, now + 60).unwrap();
+        assert_eq!(claims.exp, now + 60, "capped at the delegation's expiry");
+        // An appraisal that has ended by the time the claims are built.
+        assert_eq!(
+            claims_for(now, now + 3_600).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        assert_eq!(
+            claims_for(now - 1, now + 3_600).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        // A delegation that has ended by then.
+        assert!(matches!(
+            claims_for(now + 3_600, now),
+            Err(AgentError::DelegationExpired)
+        ));
+    }
+
+    #[test]
+    fn only_an_eligible_identity_is_issuable() {
+        let now = 1_790_000_000;
+        let mut d = sample_delegation(TEST_DID);
+        d.trust.appraised_until = Some(now + 1);
+        assert!(issuable(&d, now).is_ok());
+        d.trust.appraised_until = Some(now);
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        d.trust.state = AgentState::Unassessed;
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Forbidden: agent is unassessed; it needs an appraisal"
+        );
+        d.trust.state = AgentState::Quarantined;
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Workload quarantined"
+        );
+    }
+
+    #[test]
+    fn authorize_plans_the_version_and_refuses_latched_recovered_or_foreign_keys() {
+        let owner = Uuid::from_u128(1);
+        let now = 1_790_000_000;
+        let mut d = sample_delegation(TEST_DID);
+        d.root_user_id = owner;
+        d.expires_at = Some(now + 86_400);
+        let plan = |d: Option<&AgentDelegation>| plan_authorize(d, owner, None, now);
+        assert_eq!(
+            plan(None).unwrap(),
+            AuthorizePlan {
+                read_version: 0,
+                new_version: 1,
+                over: AuthorizeOver::Absent
+            }
+        );
+        assert_eq!(
+            plan(Some(&d)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 3,
+                over: AuthorizeOver::Live
+            },
+            "renewing a live eligible delegation keeps the version"
+        );
+        // A swarm change is an authorization-binding change.
+        assert_eq!(
+            plan_authorize(Some(&d), owner, Some("kit-alpha"), now)
+                .unwrap()
+                .new_version,
+            3,
+            "naming the current swarm is a renewal"
+        );
+        assert_eq!(
+            plan_authorize(Some(&d), owner, Some("kit-beta"), now)
+                .unwrap()
+                .new_version,
+            4,
+            "a swarm change bumps"
+        );
+        let suspended = AgentDelegation {
+            trust: AgentTrust {
+                appraised_until: Some(now),
+                ..d.trust.clone()
+            },
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&suspended)).unwrap().new_version,
+            3,
+            "stored state is eligible"
+        );
+        let legacy = AgentDelegation {
+            trust: AgentTrust::default(),
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&legacy)).unwrap(),
+            AuthorizePlan {
+                read_version: 0,
+                new_version: 1,
+                over: AuthorizeOver::Live
+            }
+        );
+        let revoked = AgentDelegation {
+            revoked_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&revoked)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 4,
+                over: AuthorizeOver::Dead { owner }
+            },
+            "a new delegation over a revoked one bumps the version"
+        );
+        let expired = AgentDelegation {
+            expires_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert_eq!(plan(Some(&expired)).unwrap().new_version, 4);
+        let foreign = AgentDelegation {
+            root_user_id: Uuid::from_u128(2),
+            ..d.clone()
+        };
+        assert!(matches!(
+            plan(Some(&foreign)),
+            Err(AgentError::DelegationAlreadyExists)
+        ));
+        let foreign_expired = AgentDelegation {
+            expires_at: Some(now - 1),
+            ..foreign
+        };
+        assert_eq!(
+            plan(Some(&foreign_expired)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 4,
+                over: AuthorizeOver::Dead {
+                    owner: Uuid::from_u128(2)
+                }
+            },
+            "taken over only while still the former owner's and still dead"
+        );
+        let latched = AgentDelegation {
+            trust: AgentTrust {
+                state: AgentState::Quarantined,
+                ..d.trust.clone()
+            },
+            revoked_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert!(matches!(
+            plan(Some(&latched)),
+            Err(AgentError::WorkloadQuarantined)
+        ));
+        let recovered = AgentDelegation {
+            trust: AgentTrust {
+                state: AgentState::Unassessed,
+                recovered_at: Some(now - 10),
+                ..d.trust.clone()
+            },
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&recovered)).unwrap_err().to_string(),
+            "Forbidden: agent was recovered; only a Guardian may appraise it"
+        );
+    }
+
+    #[test]
+    fn short_lived_delegations_mint_tokens_of_at_most_five_minutes() {
+        let cfg = |minutes| AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes,
+        };
+        let mut d = sample_delegation(TEST_DID);
+        let life = |c: &AgentTokenConfig, d: &AgentDelegation| {
+            let claims = agent_cwt_claims("https://identity.arkavo.net", c, d).unwrap();
+            claims.exp - claims.iat
+        };
+        assert_eq!(life(&cfg(15), &d), 900);
+        d.short_lived = true;
+        assert_eq!(life(&cfg(15), &d), 300);
+        assert_eq!(
+            life(&cfg(3), &d),
+            180,
+            "a shorter configured lifetime still wins"
+        );
+        // `cfg(60)` is built directly, bypassing `AgentTokenConfig::parse`'s
+        // own clamp to AGENT_TOKEN_MINUTES_MAX: this exercises the cap that
+        // `cwt::ArkavoClaims::agent` applies on every mint, not the one
+        // `parse` applies to config at startup.
+        assert_eq!(
+            life(&cfg(60), &sample_delegation(TEST_DID)),
+            900,
+            "the mint path itself caps at 15 minutes, not just config parsing"
+        );
+        assert_eq!(
+            life(&cfg(60), &d),
+            300,
+            "short_lived still wins over an oversized config minutes"
+        );
     }
 
     #[test]
@@ -1188,6 +1968,35 @@ mod tests {
     }
 
     #[test]
+    fn agent_token_config_refuses_the_passkey_and_kas_audiences() {
+        for listed in [
+            "arkavo",
+            "https://platform.arkavo.net,arkavo",
+            "https://kas.arkavo.net",
+            "https://platform.arkavo.net, https://kas.arkavo.net",
+            "ARKAVO",
+            " Arkavo ",
+            "https://kas.arkavo.net/",
+            "HTTPS://KAS.ARKAVO.NET//",
+            "https://platform.arkavo.net,https://Kas.Arkavo.Net/",
+        ] {
+            let err = AgentTokenConfig::parse(Some(listed.into()), None, None).unwrap_err();
+            assert!(
+                err.contains("AGENT_TOKEN_AUDIENCES lists"),
+                "{listed}: {err}"
+            );
+        }
+        assert!(
+            AgentTokenConfig::parse(
+                Some("https://platform.arkavo.net,https://kg.arkavo.net".into()),
+                None,
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn agent_token_config_rejects_non_integer_minutes() {
         let err = AgentTokenConfig::parse(
             Some("https://platform.test".into()),
@@ -1228,6 +2037,14 @@ mod tests {
             (AgentError::ChallengeMismatch, StatusCode::BAD_REQUEST),
             (AgentError::ChallengeExpired, StatusCode::BAD_REQUEST),
             (
+                AgentError::InvalidRequest("x".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (AgentError::Forbidden("x".into()), StatusCode::FORBIDDEN),
+            (AgentError::Conflict("x".into()), StatusCode::CONFLICT),
+            (AgentError::GuardianNotFound, StatusCode::NOT_FOUND),
+            (AgentError::WorkloadQuarantined, StatusCode::FORBIDDEN),
+            (
                 AgentError::DatabaseError(Box::new(DynamoDBError::TableNotExists(
                     "agent_delegations".into(),
                 ))),
@@ -1240,18 +2057,74 @@ mod tests {
     }
 
     #[test]
-    fn create_delegation_conditional_conflict_is_already_exists() {
-        assert!(matches!(
-            map_create_delegation_error(DynamoDBError::ConditionalConflict),
-            AgentError::DelegationAlreadyExists
-        ));
-        let mapped =
-            map_create_delegation_error(DynamoDBError::TableNotExists("agent_delegations".into()));
+    fn db_err_keeps_a_missing_table_a_503() {
+        let mapped = db_err(DynamoDBError::TableNotExists("agent_delegations".into()));
         assert!(matches!(mapped, AgentError::DatabaseError(_)));
         assert_eq!(
             mapped.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn the_quarantine_refusal_body_is_contract_text() {
+        let resp = AgentError::WorkloadQuarantined.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Workload quarantined");
+    }
+
+    #[test]
+    fn check_delegate_claims_needs_scope_client_passkey_and_a_recent_assertion() {
+        let now = 1_790_000_000;
+        let clients = vec!["arkavo-edge".to_string()];
+        let good = || {
+            cwt::ArkavoClaims::oidc_access(
+                "https://identity.arkavo.net",
+                "arkavo:u",
+                "arkavo-edge",
+                1,
+            )
+            .with_idp("webauthn")
+            .with_scope("openid agents:delegate")
+            .with_auth_time(now - 3_600)
+        };
+        let hour = AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS;
+        assert_eq!(
+            check_delegate_claims(&good(), &clients, now, hour).unwrap(),
+            now - 3_600
+        );
+        assert!(
+            matches!(
+                check_delegate_claims(&good(), &clients, now, 300),
+                Err(AgentError::Unauthorized(_))
+            ),
+            "the recover limit is five minutes"
+        );
+        assert!(matches!(
+            check_delegate_claims(&good().with_scope("openid"), &clients, now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good(), &["other".to_string()], now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good().with_idp("google"), &clients, now, hour),
+            Err(AgentError::Forbidden(_))
+        ));
+        assert!(matches!(
+            check_delegate_claims(&good().with_auth_time(now - 3_601), &clients, now, hour),
+            Err(AgentError::Unauthorized(_))
+        ));
+        let mut no_time = good();
+        no_time.custom.auth_time = None;
+        assert!(matches!(
+            check_delegate_claims(&no_time, &clients, now, hour),
+            Err(AgentError::Unauthorized(_))
+        ));
     }
 
     #[test]
@@ -1269,7 +2142,11 @@ mod tests {
 
     #[test]
     fn agent_configuration_endpoints_and_limits() {
-        let c = AgentConfiguration::new("https://identity.arkavo.net/", 15);
+        let c = AgentConfiguration::new(
+            "https://identity.arkavo.net/",
+            15,
+            AppraisalConfig::default(),
+        );
         assert_eq!(c.issuer, "https://identity.arkavo.net");
         assert_eq!(
             c.agent_token_endpoint,
@@ -1279,97 +2156,55 @@ mod tests {
         assert_eq!(c.max_delegation_depth, MAX_DELEGATION_DEPTH);
         assert_eq!(c.agent_token_lifetime_seconds, 15 * 60);
         assert_eq!(
-            AgentConfiguration::new("https://identity.arkavo.net/", 7).agent_token_lifetime_seconds,
+            AgentConfiguration::new(
+                "https://identity.arkavo.net/",
+                7,
+                AppraisalConfig::default()
+            )
+            .agent_token_lifetime_seconds,
             7 * 60
         );
         assert_eq!(
             c.delegation_lifetime_seconds,
             AGENT_DELEGATION_DAYS * 86_400
         );
-    }
-
-    /// Against DynamoDB Local: a delegation authorized (however it got there)
-    /// under a small-order did:key must never mint, even when the attacker
-    /// forges a signature that a non-strict Ed25519 check would accept.
-    /// Skips unless `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set.
-    #[tokio::test]
-    async fn forged_signature_for_a_weak_key_never_mints_an_agent_token() {
-        let Some(store) = crate::db::tests::local_store() else {
-            return;
-        };
-        unsafe {
-            std::env::set_var("AWS_REGION", "us-east-1");
-            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
-        }
-        let store = std::sync::Arc::new(store);
-        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
-
-        let user = store
-            .create_user(
-                &format!("weak-key-user-{}", Uuid::new_v4()),
-                "did:key:zWeakKeyTestUser",
-            )
-            .await
-            .expect("create user");
-
-        // The identity point: a small-order did:key. Whatever authorized it
-        // (this test plants the row directly — the point is what happens at
-        // /agents/token afterwards, not how the row got here).
-        let mut identity = [0u8; 32];
-        identity[0] = 1;
-        let weak_did = did_key_of_bytes(&identity);
-
-        let now = Utc::now().timestamp();
-        // Idempotent across reruns: an earlier run (or another test using
-        // the same canonical identity-point DID) may have left an active
-        // row behind, and create_agent_delegation refuses to clobber one.
-        let _ = store.revoke_delegation(&weak_did).await;
-        store
-            .create_agent_delegation(&AgentDelegation {
-                agent_did: weak_did.clone(),
-                delegator_type: "human".into(),
-                delegator_id: user.user_id.to_string(),
-                delegator_username: Some(user.username.clone()),
-                entitlements: user.entitlements.clone(),
-                name: "weak key agent".into(),
-                depth: 0,
-                root_user_id: user.user_id,
-                chain: vec![],
-                created_at: now,
-                expires_at: Some(now + 3600),
-                revoked_at: None,
-            })
-            .await
-            .expect("plant delegation");
-
-        let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
-        let nonce = Uuid::new_v4().to_string();
-        store
-            .put_agent_challenge(&weak_did, &challenge, &nonce, now)
-            .await
-            .expect("plant challenge");
-
-        // R = the identity point, s = 0: verifies under the lax check for
-        // any message, under any small-order verifying key.
-        let mut forged = [0u8; 64];
-        forged[0] = 1;
-        let signature = base64::engine::general_purpose::STANDARD.encode(forged);
-
-        let result = issue_agent_token(
-            Extension(app_state),
-            Json(TokenRequest {
-                did: weak_did,
-                challenge,
-                signature,
-                nonce,
-            }),
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "a forged signature under a small-order key must never mint an agent token"
+        assert_eq!(
+            c.agent_state_endpoint,
+            "https://identity.arkavo.net/agents/{did}"
         );
+        assert_eq!(
+            c.guardian_registration_endpoint,
+            "https://identity.arkavo.net/guardians"
+        );
+        assert_eq!(c.short_lived_token_lifetime_seconds, 300);
+        assert_eq!(
+            AgentConfiguration::new("https://identity.arkavo.net", 3, AppraisalConfig::default())
+                .short_lived_token_lifetime_seconds,
+            180
+        );
+        assert_eq!(c.agent_status_lease_seconds, 5);
+        assert_eq!(
+            (
+                c.owner_appraisal_ttl_seconds,
+                c.guardian_appraisal_max_seconds
+            ),
+            (43_200, 900)
+        );
+        let tuned = AgentConfiguration::new(
+            "https://identity.arkavo.net",
+            15,
+            AppraisalConfig {
+                owner_ttl_seconds: 3_600,
+                guardian_max_seconds: 300,
+            },
+        );
+        assert_eq!(
+            (
+                tuned.owner_appraisal_ttl_seconds,
+                tuned.guardian_appraisal_max_seconds
+            ),
+            (3_600, 300)
+        );
+        assert_eq!(c.contract_version, "v2");
     }
 }
