@@ -64,7 +64,9 @@ paths:
   expired or pre-v2 row, never on a renewal; absent = 0 on a pre-v2 row),
   appraised_until (Number),
   appraised_by (String, `owner:<uuid>` | `guardian:<id>`),
-  appraisal_evidence_ref (String), incident / evidence_ref / quarantined_by
+  appraisal_evidence_ref (String, the evidence an appraisal cited; removed
+  by the next appraisal without one, an authorize and a recovery),
+  incident / evidence_ref / quarantined_by
   (String, present only while quarantined), quarantined_at (Number, present
   only while quarantined), last_cleared_incident (String, the incident the
   most recent recovery cleared), recovered_at (Number, never removed: the

@@ -282,7 +282,8 @@ impl DynamoDBStore {
     /// appraisal (`eligible` until `appraised_until`), conditional on the row
     /// still carrying `read_version`, not being quarantined, and still being
     /// what the caller found (`w.over`, judged at `w.now`). Clears
-    /// `revoked_at`, a pending challenge and the pre-v2 `workload_id`.
+    /// `revoked_at`, a pending challenge, the evidence of the appraisal it
+    /// replaces and the pre-v2 `workload_id`.
     /// `ConditionalConflict` when the row changed since it was read.
     pub async fn authorize_agent(&self, w: AuthorizeWrite<'_>) -> Result<(), DynamoDBError> {
         let d = w.delegation;
@@ -310,6 +311,8 @@ impl DynamoDBStore {
             "challenge",
             "challenge_nonce",
             "challenge_issued_at",
+            // The evidence of the appraisal this one replaces.
+            "appraisal_evidence_ref",
         ];
         let mut req = self
             .client
@@ -485,7 +488,7 @@ impl DynamoDBStore {
     /// Clear a quarantine, conditional on it still being latched under
     /// `incident` at the version the caller read: `unassessed`,
     /// `state_version + 1`, the incident recorded as cleared, `recovered_at`
-    /// set, the appraisal removed. The delegation itself stays; only a
+    /// set, the appraisal (and its evidence) removed. The delegation itself stays; only a
     /// Guardian appraisal makes the identity eligible again.
     pub async fn recover_agent(
         &self,
@@ -504,7 +507,7 @@ impl DynamoDBStore {
                 "SET #st = :unassessed, last_cleared_incident = :inc, recovered_at = :now, \
                  updated_at = :now, state_version = state_version + :one \
                  REMOVE incident, evidence_ref, quarantined_by, quarantined_at, \
-                 appraised_until, appraised_by",
+                 appraised_until, appraised_by, appraisal_evidence_ref",
             )
             .expression_attribute_names("#st", "state")
             .expression_attribute_values(":q", s(AgentState::Quarantined.as_str()))
@@ -1329,21 +1332,6 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Whether `did`'s row carries a pending challenge.
-    async fn has_challenge(store: &DynamoDBStore, did: &str) -> bool {
-        store
-            .client
-            .get_item()
-            .table_name(&store.agent_delegations_table)
-            .key("agent_did", s(did))
-            .consistent_read(true)
-            .send()
-            .await
-            .unwrap()
-            .item
-            .is_some_and(|i| i.contains_key("challenge"))
-    }
-
     #[tokio::test]
     async fn a_challenge_is_stored_only_while_the_identity_is_issuable() {
         let Some(store) = local_store() else { return };
@@ -1365,7 +1353,7 @@ pub(crate) mod tests {
             .put_agent_challenge(&live.agent_did, "c", "n", now)
             .await
             .unwrap();
-        assert!(has_challenge(&store, &live.agent_did).await);
+        assert!(stored(&store, &live.agent_did, "challenge").await);
 
         let cases = [
             (
@@ -1417,13 +1405,64 @@ pub(crate) mod tests {
                 conflict(store.put_agent_challenge(&d.agent_did, "c", "n", now).await),
                 "{what}"
             );
-            assert!(!has_challenge(&store, &d.agent_did).await, "{what}");
+            assert!(!stored(&store, &d.agent_did, "challenge").await, "{what}");
         }
         assert!(conflict(
             store
                 .put_agent_challenge(&unique_did("none"), "c", "n", now)
                 .await
         ));
+    }
+
+    /// Whether `did`'s row carries `attribute`.
+    async fn stored(store: &DynamoDBStore, did: &str, attribute: &str) -> bool {
+        store
+            .client
+            .get_item()
+            .table_name(&store.agent_delegations_table)
+            .key("agent_did", s(did))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap()
+            .item
+            .is_some_and(|i| i.contains_key(attribute))
+    }
+
+    #[tokio::test]
+    async fn appraisal_evidence_goes_with_the_appraisal_it_belongs_to() {
+        let Some(store) = local_store() else { return };
+        let owner = Uuid::new_v4();
+        let did = unique_did("V");
+        let d = delegation(&did, owner);
+        store
+            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep, AuthorizeOver::Absent))
+            .await
+            .unwrap();
+        store
+            .appraise_agent(&did, 1, 1, 1_790_000_900, "guardian:g", Some("ev-1"), 10)
+            .await
+            .unwrap();
+        assert!(stored(&store, &did, "appraisal_evidence_ref").await);
+        // The owner's authorize replaces the Guardian's appraisal.
+        store
+            .authorize_agent(write(&d, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
+            .await
+            .unwrap();
+        assert!(!stored(&store, &did, "appraisal_evidence_ref").await);
+
+        // Recovery removes the appraisal, and its evidence with it.
+        store
+            .appraise_agent(&did, 1, 1, 1_790_000_900, "guardian:g", Some("ev-2"), 20)
+            .await
+            .unwrap();
+        store
+            .quarantine_agent(&did, owner, 1, "inc-1", None, "guardian:g", 30)
+            .await
+            .unwrap();
+        assert!(stored(&store, &did, "appraisal_evidence_ref").await);
+        store.recover_agent(&did, "inc-1", 2, 40).await.unwrap();
+        assert!(!stored(&store, &did, "appraisal_evidence_ref").await);
     }
 
     #[tokio::test]
