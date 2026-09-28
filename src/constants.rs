@@ -197,6 +197,7 @@ pub const SWARM_ID_MAX_LEN: usize = 128;
 pub const INCIDENT_MAX_LEN: usize = 256;
 pub const EVIDENCE_REF_MAX_LEN: usize = 1024;
 pub const GUARDIAN_NAME_MAX_LEN: usize = 64;
+pub const AGENT_NAME_MAX_LEN: usize = 64;
 
 /// Attribute FQN for the "create a TDF" entitlement.
 pub const ENTITLEMENT_TDF_CREATE: &str = "https://arkavo.ai/attr/tdf/value/create";

@@ -34,10 +34,10 @@
 use crate::AppState;
 use crate::agent_state::{AppraisalConfig, owner_appraisal_deadline, validate_label};
 use crate::constants::{
-    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_SHORT_LIVED_TOKEN_MINUTES,
-    AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS,
-    AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
-    SWARM_ID_MAX_LEN,
+    AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_NAME_MAX_LEN,
+    AGENT_SHORT_LIVED_TOKEN_MINUTES, AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX,
+    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
+    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
 };
 use crate::cwt;
 use crate::db::{
@@ -502,14 +502,15 @@ pub async fn authorize_agent(
     Json(request): Json<AuthorizeAgentRequest>,
 ) -> Result<impl IntoResponse, AgentError> {
     refuse_guardian(&headers)?;
+    validate_did_key(&request.agent_did)?;
+    validate_label("name", &request.name, AGENT_NAME_MAX_LEN)?;
+    if let Some(swarm) = &request.swarm {
+        validate_label("swarm", swarm, SWARM_ID_MAX_LEN)?;
+    }
     info!(
         "Authorizing agent: {} with name: {}",
         request.agent_did, request.name
     );
-    validate_did_key(&request.agent_did)?;
-    if let Some(swarm) = &request.swarm {
-        validate_label("swarm", swarm, SWARM_ID_MAX_LEN)?;
-    }
     if request.entitlements.is_empty() {
         return Err(AgentError::InsufficientEntitlements(
             "At least one entitlement is required".into(),

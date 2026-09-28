@@ -559,6 +559,42 @@ async fn authorize_validates_the_swarm_and_ignores_a_v1_workload_name() {
 }
 
 #[tokio::test]
+async fn authorize_validates_the_agent_name() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    for name in [
+        String::new(),
+        "agent\nforged log line".to_string(),
+        "tab\there".to_string(),
+        "x".repeat(65),
+    ] {
+        let mut body = authorize_body(&a, "kit-1", false);
+        body["name"] = json!(name);
+        let (st, body) = p.authorize(("X-Auth-Token", &cwt), body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name:?}: {body}");
+        assert_eq!(
+            body,
+            json!("Invalid request: name must be 1 to 64 characters with no control characters")
+        );
+    }
+    assert!(
+        p.store
+            .get_agent_delegation(&did_key(&a))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut body = authorize_body(&a, "kit-1", false);
+    body["name"] = json!("é".repeat(64));
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), body).await.0,
+        StatusCode::OK,
+        "64 characters, whatever their byte length"
+    );
+}
+
+#[tokio::test]
 async fn swarm_is_optional_and_set_by_a_later_authorize() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt) = p.user(&[READ]).await;

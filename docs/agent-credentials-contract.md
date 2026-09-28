@@ -96,7 +96,7 @@ Request (JSON):
 | Field | Type | Rule |
 |---|---|---|
 | `agent_did` | string | `did:key:z6Mk…` (Ed25519): the identity. The key must be a valid Ed25519 point that is not small-order (weak); any other key is 400. |
-| `name` | string | a label for people; not an identifier |
+| `name` | string | a label for people; not an identifier. 1–64 characters, no control characters; anything else is 400. |
 | `entitlements` | string[] | each held by the owner now; empty is refused (403) |
 | `swarm` | string | optional, 1–128 chars when present: the SwarmKit `kit_id`. Omit it (or send `null`) before the agent has a kit; an empty string is 400. |
 | `short_lived` | bool | optional, default `false`: tokens for this delegation live ≤ 300 s |
