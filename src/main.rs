@@ -67,7 +67,6 @@ mod patreon;
 #[cfg(test)]
 mod registration_gate_tests;
 mod webvh;
-mod workload;
 
 // HTTP/3 server function (feature-gated)
 #[cfg(feature = "http3")]
@@ -314,7 +313,7 @@ pub struct AppState {
     /// (`AGENT_DELEGATE_CLIENT_IDS`). Empty ⇒ the scope is refused everywhere.
     pub agent_delegate_client_ids: Arc<Vec<String>>,
     /// client_ids whose service CWTs may read
-    /// `GET /agents/workloads/:id/status` (`AGENT_STATUS_CLIENT_IDS`) — the
+    /// `GET /agents/:did/status` (`AGENT_STATUS_CLIENT_IDS`) — the
     /// platform KAS's `agent_status` client. Empty ⇒ 403.
     pub agent_status_client_ids: Arc<Vec<String>>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
@@ -470,8 +469,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "agent_delegations".to_string()),
         env::var("DYNAMODB_DEVICE_ATTEST_KEYS_TABLE")
             .unwrap_or_else(|_| "device_attest_keys".to_string()),
-        env::var("DYNAMODB_AGENT_WORKLOADS_TABLE")
-            .unwrap_or_else(|_| "agent_workloads".to_string()),
         env::var("DYNAMODB_GUARDIANS_TABLE").unwrap_or_else(|_| "guardians".to_string()),
         default_entitlements,
     )
@@ -513,7 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent_status_client_ids = parse_id_list(env::var("AGENT_STATUS_CLIENT_IDS").ok());
     if agent_status_client_ids.is_empty() {
         log::warn!(
-            "AGENT_STATUS_CLIENT_IDS is empty: GET /agents/workloads/:id/status will 403 and the KAS will deny every agent rewrap"
+            "AGENT_STATUS_CLIENT_IDS is empty: GET /agents/:did/status will 403 and the platform will withhold every agent's entitlements"
         );
     }
 
@@ -689,21 +686,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/agents/challenge", get(agent::generate_agent_challenge))
         .route("/agents/token", post(agent::issue_agent_token))
-        // Workload quarantine (owner or enrolled Guardian). Contract v1.
-        .route(
-            "/agents/workloads/:workload_id/quarantine",
-            post(workload::quarantine_workload),
-        )
-        // Workload status lease for the platform KAS. Contract v1.
-        .route(
-            "/agents/workloads/:workload_id/status",
-            get(workload::workload_status),
-        )
-        // Owner recovery of a quarantined workload. Contract v1.
-        .route(
-            "/agents/workloads/:workload_id/recover",
-            post(workload::recover_workload),
-        )
         // Guardian enrollment (owner). A Guardian may only quarantine.
         .route("/guardians", post(guardian::enroll_guardian))
         .route(
@@ -1526,7 +1508,6 @@ pub(crate) mod test_helpers {
                 "patreon_tokens".to_string(),
                 "agent_delegations".to_string(),
                 "device_attest_keys".to_string(),
-                "agent_workloads".to_string(),
                 "guardians".to_string(),
                 crate::constants::DEFAULT_USER_ENTITLEMENTS
                     .iter()

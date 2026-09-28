@@ -76,11 +76,13 @@ pub struct CustomClaims {
     pub arkavo_patreon: Option<ArkavoPatreon>,
     pub act: Option<Vec<Actor>>,
     pub arkavo_npe: Option<ArkavoNpe>,
-    /// Workload the agent token is bound to (agent CWTs only). The KAS
-    /// matches it against the workload status it fetches.
-    pub arkavo_workload: Option<String>,
+    /// The agent identity's `state_version` when the token was minted
+    /// (agent CWTs only). The platform withholds a token whose version
+    /// differs from the one the status endpoint reports, so a token minted
+    /// before a quarantine never revives after recovery and re-appraisal.
+    pub arkavo_state_version: Option<u64>,
     /// SwarmKit `kit_id` the agent's delegation is bound to (agent CWTs
-    /// only). Omitted (not `Some("")`) when the workload has no swarm.
+    /// only). Omitted (not `Some("")`) when the agent has no swarm.
     pub arkavo_swarm: Option<String>,
     /// Space-separated OAuth scopes granted to an OIDC access token.
     pub scope: Option<String>,
@@ -301,14 +303,14 @@ impl ArkavoClaims {
         self
     }
 
-    pub fn with_arkavo_workload(mut self, workload_id: &str) -> Self {
-        self.custom.arkavo_workload = Some(workload_id.into());
+    pub fn with_arkavo_state_version(mut self, version: u64) -> Self {
+        self.custom.arkavo_state_version = Some(version);
         self
     }
 
-    /// Separate from the workload: a workload has no swarm until its agent is
-    /// specialized into a kit, so an empty value omits the claim entirely
-    /// rather than round-tripping as `Some("")`.
+    /// An agent has no swarm until it is specialized into a kit, so an empty
+    /// value omits the claim entirely rather than round-tripping as
+    /// `Some("")`.
     pub fn with_arkavo_swarm(mut self, swarm: &str) -> Self {
         if !swarm.is_empty() {
             self.custom.arkavo_swarm = Some(swarm.into());
@@ -590,10 +592,10 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
         }
         entries.push((Value::Text("arkavo_npe".into()), Value::Map(m)));
     }
-    if let Some(v) = &c.custom.arkavo_workload {
+    if let Some(v) = c.custom.arkavo_state_version {
         entries.push((
-            Value::Text("arkavo_workload".into()),
-            Value::Text(v.clone()),
+            Value::Text("arkavo_state_version".into()),
+            Value::Integer(v.into()),
         ));
     }
     if let Some(v) = &c.custom.arkavo_swarm {
@@ -984,10 +986,11 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 custom.arkavo_npe = Some(n);
             }
             (Value::Text(s), _) if s == "arkavo_npe" => return Err(CwtError::Malformed),
-            (Value::Text(s), Value::Text(t)) if s == "arkavo_workload" => {
-                custom.arkavo_workload = Some(t)
+            (Value::Text(s), Value::Integer(n)) if s == "arkavo_state_version" => {
+                custom.arkavo_state_version =
+                    Some(u64::try_from(i128::from(n)).map_err(|_| CwtError::Malformed)?)
             }
-            (Value::Text(s), _) if s == "arkavo_workload" => return Err(CwtError::Malformed),
+            (Value::Text(s), _) if s == "arkavo_state_version" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Text(t)) if s == "arkavo_swarm" => {
                 custom.arkavo_swarm = Some(t)
             }
@@ -1973,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn workload_swarm_scope_and_auth_time_round_trip() {
+    fn state_version_swarm_scope_and_auth_time_round_trip() {
         let (sk, vk) = test_keypair();
         let claims = ArkavoClaims::agent(
             "https://identity.arkavo.net",
@@ -1981,7 +1984,7 @@ mod tests {
             vec!["https://platform.arkavo.net".into()],
             crate::constants::AGENT_SHORT_LIVED_TOKEN_MINUTES,
         )
-        .with_arkavo_workload("wl-00112233445566778899aabbccddeeff")
+        .with_arkavo_state_version(42)
         .with_arkavo_swarm("kit-alpha")
         .with_scope("openid agents:delegate")
         .with_auth_time(1_790_000_000);
@@ -1997,10 +2000,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            back.custom.arkavo_workload.as_deref(),
-            Some("wl-00112233445566778899aabbccddeeff")
-        );
+        assert_eq!(back.custom.arkavo_state_version, Some(42));
         assert_eq!(back.custom.arkavo_swarm.as_deref(), Some("kit-alpha"));
         assert_eq!(back.custom.scope.as_deref(), Some("openid agents:delegate"));
         assert_eq!(back.custom.auth_time, Some(1_790_000_000));
@@ -2023,16 +2023,17 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(back.custom.arkavo_workload, None);
+        assert_eq!(back.custom.arkavo_state_version, None);
         assert_eq!(back.custom.arkavo_swarm, None);
         assert_eq!(back.custom.scope, None);
         assert_eq!(back.custom.auth_time, None);
     }
 
     #[test]
-    fn mistyped_workload_swarm_scope_or_auth_time_is_malformed() {
+    fn mistyped_state_version_swarm_scope_or_auth_time_is_malformed() {
         let cases = [
-            ("arkavo_workload", Value::Integer(1.into())),
+            ("arkavo_state_version", Value::Text("1".into())),
+            ("arkavo_state_version", Value::Integer((-1).into())),
             ("arkavo_swarm", Value::Bool(true)),
             ("scope", Value::Array(vec![])),
             ("auth_time", Value::Text("1790000000".into())),
@@ -2051,8 +2052,8 @@ mod tests {
 
     #[test]
     fn with_arkavo_swarm_empty_is_omitted() {
-        // A workload has no swarm until its agent is specialized into a kit;
-        // the claim must be omitted (not `Some("")`) in that case.
+        // An agent has no swarm until it is specialized into a kit; the
+        // claim must be omitted (not `Some("")`) in that case.
         let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None).with_arkavo_swarm("");
         assert_eq!(claims.custom.arkavo_swarm, None);
 

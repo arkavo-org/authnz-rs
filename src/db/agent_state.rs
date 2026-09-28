@@ -657,7 +657,6 @@ pub(crate) mod tests {
             created_at: now,
             expires_at: Some(now + 86_400),
             revoked_at: None,
-            workload_id: None,
             short_lived: false,
             swarm: String::new(),
             trust: AgentTrust::default(),

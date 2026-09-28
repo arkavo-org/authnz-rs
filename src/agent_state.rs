@@ -1,6 +1,7 @@
 //! The agent identity's trust state over HTTP. Contract:
 //! docs/agent-credentials-contract.md (v2).
 
+use crate::agent::{AgentError, REFUSE_STALE_ASSERTION};
 use crate::constants::{
     GUARDIAN_APPRAISAL_MAX_SECONDS, OWNER_APPRAISAL_TTL_DEFAULT_SECONDS,
     OWNER_APPRAISAL_TTL_MAX_SECONDS,
@@ -59,6 +60,37 @@ impl AppraisalConfig {
             )?,
         })
     }
+}
+
+/// Refuse an empty, oversized or control-character label before it reaches
+/// storage or a token claim.
+pub(crate) fn validate_label(field: &str, value: &str, max: usize) -> Result<(), AgentError> {
+    if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(AgentError::InvalidRequest(format!(
+            "{field} must be 1 to {max} characters with no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// When an owner appraisal ends: `owner_ttl` after the
+/// passkey assertion behind the owner's credential (a passkey auth CWT's
+/// `iat`, or an `agents:delegate` token's `auth_time`), never after the
+/// request, and never later than `now + owner_ttl`, so a clock-skewed `iat`
+/// gains nothing. Refused once that moment has passed: the owner signs in
+/// again.
+pub(crate) fn owner_appraisal_deadline(
+    issued_at: i64,
+    owner_ttl: i64,
+    now: i64,
+) -> Result<i64, AgentError> {
+    let deadline = issued_at
+        .saturating_add(owner_ttl)
+        .min(now.saturating_add(owner_ttl));
+    if deadline <= now {
+        return Err(AgentError::Forbidden(REFUSE_STALE_ASSERTION.into()));
+    }
+    Ok(deadline)
 }
 
 #[cfg(test)]
@@ -122,6 +154,27 @@ mod tests {
             let err = AppraisalConfig::parse(owner.map(Into::into), guardian.map(Into::into))
                 .unwrap_err();
             assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_owner_appraisal_runs_from_the_assertion_and_is_refused_once_past() {
+        assert_eq!(
+            owner_appraisal_deadline(1_000, 43_200, 1_600).unwrap(),
+            44_200
+        );
+        assert_eq!(
+            owner_appraisal_deadline(1_700, 43_200, 1_600).unwrap(),
+            44_800,
+            "an iat ahead of the clock gains nothing"
+        );
+        assert_eq!(owner_appraisal_deadline(1_000, 600, 1_599).unwrap(), 1_600);
+        for now in [1_600, 5_000] {
+            let err = owner_appraisal_deadline(1_000, 600, now).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Forbidden: passkey assertion is older than the owner appraisal lifetime; sign in again"
+            );
         }
     }
 }

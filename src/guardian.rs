@@ -1,13 +1,13 @@
 //! Guardians: enrollment (`POST /guardians`), revocation
 //! (`DELETE /guardians/{id}`) and request authentication by
-//! `X-Guardian-Signature`. A Guardian may only latch a
-//! quarantine on its owner's workloads. Contract: docs/agent-credentials-contract.md (v1).
+//! `X-Guardian-Signature`. A Guardian may only latch a quarantine on, or
+//! appraise, its owner's agents. Contract: docs/agent-credentials-contract.md (v2).
 
 use crate::AppState;
 use crate::agent::{AgentError, db_err};
+use crate::agent_state::validate_label;
 use crate::constants::{GUARDIAN_NAME_MAX_LEN, GUARDIAN_SIGNATURE_SKEW_SECONDS};
 use crate::db::{DynamoDBError, Guardian};
-use crate::workload::validate_label;
 use axum::Json;
 use axum::extract::{Extension, Path};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -280,11 +280,11 @@ mod tests {
         assert_eq!(
             signing_input(
                 "POST",
-                "/agents/workloads/wl-1/quarantine",
+                "/agents/did:key:z6Mkexample/quarantine",
                 1_790_000_000,
                 b"{}"
             ),
-            b"POST\n/agents/workloads/wl-1/quarantine\n1790000000\n\
+            b"POST\n/agents/did:key:z6Mkexample/quarantine\n1790000000\n\
 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
                 .to_vec()
         );

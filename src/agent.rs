@@ -32,16 +32,18 @@
 //! the ERS resolution surface (#48).
 
 use crate::AppState;
+use crate::agent_state::{owner_appraisal_deadline, validate_label};
 use crate::constants::{
     AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_SHORT_LIVED_TOKEN_MINUTES,
-    AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE,
-    AUTH_TOKEN_HOURS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
-    WORKLOAD_NAME_MAX_LEN, WORKLOAD_STATUS_LEASE_SECONDS,
+    AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS,
+    AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS, MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH,
+    SWARM_ID_MAX_LEN,
 };
 use crate::cwt;
-use crate::db::{AgentDelegation, AgentWorkload, DynamoDBError, WorkloadState, workload_id_for};
+use crate::db::{
+    AgentDelegation, AgentState, AuthorizeWrite, DynamoDBError, EffectiveState, SwarmWrite,
+};
 use crate::guardian::refuse_guardian;
-use crate::workload::{bind_workload, validate_label};
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path, Query},
@@ -109,7 +111,7 @@ impl AgentConfiguration {
                 .clamp(1, AGENT_TOKEN_MINUTES_MAX)
                 .min(AGENT_SHORT_LIVED_TOKEN_MINUTES)
                 * 60,
-            workload_status_lease_seconds: WORKLOAD_STATUS_LEASE_SECONDS,
+            workload_status_lease_seconds: AGENT_STATUS_LEASE_SECONDS,
             contract_version: "v1",
         }
     }
@@ -134,8 +136,6 @@ pub struct AuthorizeAgentRequest {
     pub agent_did: String,
     pub name: String,
     pub entitlements: Vec<String>,
-    /// Selects the owner's workload of this name, creating it if absent.
-    pub workload_name: String,
     /// SwarmKit `kit_id` the delegation is bound to. Absent for an agent
     /// onboarded before it has a kit (trust QR); its tokens then carry no
     /// `arkavo_swarm` and the platform will not release sealed keys to it.
@@ -151,7 +151,12 @@ pub struct AuthorizeAgentRequest {
 pub struct AuthorizeAgentResponse {
     pub success: bool,
     pub message: String,
-    pub workload_id: String,
+    /// The agent identity (its DID).
+    pub agent: String,
+    /// Always `eligible`: authorize is the owner's bootstrap appraisal.
+    pub state: &'static str,
+    pub state_version: u64,
+    pub appraised_until: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,8 +204,13 @@ pub struct DelegationInfo {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked: bool,
-    pub workload_id: Option<String>,
     pub short_lived: bool,
+    /// `""` while the agent has no kit.
+    pub swarm: String,
+    /// `unassessed`, `eligible`, `suspended` or `quarantined`.
+    pub state: &'static str,
+    pub state_version: u64,
+    pub appraised_until: Option<i64>,
 }
 
 // ============================================================================
@@ -461,7 +471,11 @@ fn user_id_from_claims(claims: &cwt::ArkavoClaims) -> Result<Uuid, AgentError> {
 // Handlers
 // ============================================================================
 
-/// POST /agents/authorize — human (PE) delegates to an agent (NPE).
+/// POST /agents/authorize — human (PE) delegates to an agent (NPE). This is
+/// also the owner's bootstrap appraisal: the identity becomes `eligible`
+/// until `owner_appraisal_ttl` after the passkey assertion behind the
+/// owner's credential. One identity is one key; a new key
+/// is a new identity.
 pub async fn authorize_agent(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -473,11 +487,6 @@ pub async fn authorize_agent(
         request.agent_did, request.name
     );
     validate_did_key(&request.agent_did)?;
-    validate_label(
-        "workload_name",
-        &request.workload_name,
-        WORKLOAD_NAME_MAX_LEN,
-    )?;
     if let Some(swarm) = &request.swarm {
         validate_label("swarm", swarm, SWARM_ID_MAX_LEN)?;
     }
@@ -515,14 +524,11 @@ pub async fn authorize_agent(
     }
 
     let now = Utc::now().timestamp();
-    let current_count = app_state
-        .db_store
-        .count_delegations_by_root_user(human.user_id)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
-    if current_count >= MAX_AGENTS_PER_USER {
-        return Err(AgentError::MaxAgentsExceeded(current_count));
-    }
+    // The appraisal runs from the passkey assertion behind
+    // the credential (auth CWT `iat`, or the Bearer token's `auth_time`), not
+    // from this request; an assertion older than the lifetime is refused.
+    let appraised_until =
+        owner_appraisal_deadline(human.issued_at, app_state.appraisal.owner_ttl_seconds, now)?;
 
     let delegation = AgentDelegation {
         agent_did: request.agent_did.clone(),
@@ -537,30 +543,135 @@ pub async fn authorize_agent(
         created_at: now,
         expires_at: Some(now + AGENT_DELEGATION_DAYS * 24 * 60 * 60),
         revoked_at: None,
-        workload_id: Some(workload_id_for(&human.user_id, &request.workload_name)),
         short_lived: request.short_lived,
-        swarm: request.swarm.clone().unwrap_or_default(),
+        swarm: String::new(),
         trust: Default::default(),
     };
-    let workload = bind_workload(
-        &app_state,
-        human.user_id,
-        &request.workload_name,
-        request.swarm.as_deref(),
-        &delegation,
-        now,
-    )
-    .await?;
+    let appraised_by = format!("owner:{}", human.user_id);
+    // The write is conditioned on the version read; on a conflict (a
+    // concurrent quarantine, revocation, authorize or recovery), re-read and
+    // decide again.
+    for _ in 0..3 {
+        let existing = app_state
+            .db_store
+            .get_agent_delegation(&request.agent_did)
+            .await
+            .map_err(db_err)?;
+        let plan = plan_authorize(
+            existing.as_ref(),
+            human.user_id,
+            request.swarm.as_deref(),
+            now,
+        )?;
+        // The quota counts live delegations, so only an authorize that adds
+        // one is checked: renewing a delegation the owner already holds
+        // (including a track-1 row) is never refused for quota.
+        if !plan.keeps_delegation {
+            let current_count = app_state
+                .db_store
+                .count_delegations_by_root_user(human.user_id)
+                .await
+                .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+            if current_count >= MAX_AGENTS_PER_USER {
+                return Err(AgentError::MaxAgentsExceeded(current_count));
+            }
+        }
+        let swarm = match (&request.swarm, plan.keeps_delegation) {
+            (Some(swarm), _) => SwarmWrite::Set(swarm),
+            (None, true) => SwarmWrite::Keep,
+            (None, false) => SwarmWrite::Clear,
+        };
+        match app_state
+            .db_store
+            .authorize_agent(AuthorizeWrite {
+                delegation: &delegation,
+                swarm,
+                read_version: plan.read_version,
+                new_version: plan.new_version,
+                appraised_until,
+                appraised_by: &appraised_by,
+                now,
+            })
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Agent {} authorized and appraised by owner {} until {} (state_version {})",
+                    request.agent_did, human.user_id, appraised_until, plan.new_version
+                );
+                return Ok(Json(AuthorizeAgentResponse {
+                    success: true,
+                    message: "Agent authorized successfully".to_string(),
+                    agent: request.agent_did,
+                    state: AgentState::Eligible.as_str(),
+                    state_version: plan.new_version,
+                    appraised_until,
+                }));
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(AgentError::Conflict(
+        "agent changed concurrently; retry".into(),
+    ))
+}
 
-    info!(
-        "Agent delegation created for {} in workload {}",
-        request.agent_did, workload.workload_id
-    );
-    Ok(Json(AuthorizeAgentResponse {
-        success: true,
-        message: "Agent authorized successfully".to_string(),
-        workload_id: workload.workload_id,
-    }))
+/// What an authorize by `owner` writes over `existing`, the row read for the
+/// DID: the version to condition on, the version to store, and whether the
+/// row stays the same delegation (so an omitted swarm keeps its value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthorizePlan {
+    pub read_version: u64,
+    pub new_version: u64,
+    pub keeps_delegation: bool,
+}
+
+/// Refused while the key's quarantine latch is set (whatever the
+/// delegation's liveness: moving or re-authorizing the key is no way out),
+/// once the key has been recovered (only a Guardian may appraise it), and
+/// while another owner's delegation of the key is live. The version bumps
+/// unless the row is a live, eligible delegation of the same owner whose
+/// swarm stays as it is (`swarm` is the request's, `None` keeping it), so a
+/// token from a revoked or expired delegation, or one minted in an earlier
+/// swarm, never revives (A → B → A would otherwise match).
+pub(crate) fn plan_authorize(
+    existing: Option<&AgentDelegation>,
+    owner: Uuid,
+    swarm: Option<&str>,
+    now: i64,
+) -> Result<AuthorizePlan, AgentError> {
+    let Some(d) = existing else {
+        return Ok(AuthorizePlan {
+            read_version: 0,
+            new_version: 1,
+            keeps_delegation: false,
+        });
+    };
+    if d.trust.state == AgentState::Quarantined {
+        return Err(AgentError::WorkloadQuarantined);
+    }
+    if d.trust.recovered() {
+        return Err(AgentError::Forbidden(REFUSE_RECOVERED.into()));
+    }
+    let live = is_live(d, now);
+    if live && d.root_user_id != owner {
+        return Err(AgentError::DelegationAlreadyExists);
+    }
+    let keeps_delegation = live && d.root_user_id == owner;
+    let swarm_changes = swarm.is_some_and(|s| s != d.swarm);
+    let read_version = d.trust.state_version;
+    let new_version = if keeps_delegation && d.trust.state == AgentState::Eligible && !swarm_changes
+    {
+        read_version
+    } else {
+        read_version + 1
+    };
+    Ok(AuthorizePlan {
+        read_version,
+        new_version,
+        keeps_delegation,
+    })
 }
 
 /// GET /agents/delegations — list the caller's delegations.
@@ -576,6 +687,7 @@ pub async fn list_delegations(
         .list_delegations_by_root_user(human.user_id)
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+    let now = Utc::now().timestamp();
 
     Ok(Json(DelegationListResponse {
         delegations: delegations
@@ -588,8 +700,11 @@ pub async fn list_delegations(
                 created_at: d.created_at,
                 expires_at: d.expires_at,
                 revoked: d.revoked_at.is_some(),
-                workload_id: d.workload_id,
                 short_lived: d.short_lived,
+                state: d.trust.effective(now).as_str(),
+                state_version: d.trust.state_version,
+                appraised_until: d.trust.appraised_until,
+                swarm: d.swarm,
             })
             .collect(),
     }))
@@ -673,45 +788,29 @@ async fn active_delegation(
     Ok(delegation)
 }
 
-/// The workload a delegation mints under, checked for its DID: it must
-/// exist, belong to the delegation's owner, be eligible, and be bound to
-/// this DID now. Quarantine and rebinding are enforced here, at issuance,
-/// as well as at the KAS through the status lease.
-async fn eligible_workload(
-    app_state: &AppState,
-    delegation: &AgentDelegation,
-) -> Result<AgentWorkload, AgentError> {
-    let workload_id = delegation
-        .workload_id
-        .as_deref()
-        .ok_or_else(|| AgentError::Forbidden(REFUSE_LEGACY_DELEGATION.into()))?;
-    let w = app_state
-        .db_store
-        .get_workload(workload_id)
-        .await
-        .map_err(db_err)?
-        .ok_or(AgentError::WorkloadNotFound)?;
-    if w.owner != delegation.root_user_id {
-        return Err(AgentError::Forbidden(
-            "workload belongs to a different owner".into(),
-        ));
+/// Whether the identity may be issued a token now: only while `eligible`.
+/// Enforced here, at issuance, as well as by the platform through the status
+/// lease: every `AGENT_TOKEN_AUDIENCES` verifier accepts the token, and only
+/// the platform asks for status.
+pub(crate) fn issuable(d: &AgentDelegation, now: i64) -> Result<(), AgentError> {
+    match d.trust.effective(now) {
+        EffectiveState::Eligible => Ok(()),
+        EffectiveState::Quarantined => Err(AgentError::WorkloadQuarantined),
+        EffectiveState::Unassessed => Err(AgentError::Forbidden(REFUSE_UNASSESSED.into())),
+        EffectiveState::Suspended => Err(AgentError::Forbidden(REFUSE_SUSPENDED.into())),
     }
-    if w.state == WorkloadState::Quarantined {
-        return Err(AgentError::WorkloadQuarantined);
-    }
-    if w.current_did != delegation.agent_did {
-        return Err(AgentError::Forbidden(REFUSE_NOT_CURRENT_DID.into()));
-    }
-    Ok(w)
 }
 
-/// Contract v1 refusal texts (docs/agent-credentials-contract.md, "Refusal
-/// bodies"). arkavo-edge sorts 403s by these; changing one is a contract
-/// change. The other two pinned bodies are the `Display` of
-/// `AgentError::WorkloadQuarantined` and `AgentError::DelegationRevoked`.
-pub(crate) const REFUSE_LEGACY_DELEGATION: &str =
-    "delegation predates workloads; authorize again with workload_name and swarm";
-pub(crate) const REFUSE_NOT_CURRENT_DID: &str = "agent DID is not the workload's current binding";
+/// Contract v2 refusal texts (docs/agent-credentials-contract.md, "Refusal
+/// bodies"), each after the `Forbidden: ` prefix. arkavo-edge sorts 403s by
+/// these; changing one is a contract change. The other two pinned bodies are
+/// the `Display` of `AgentError::WorkloadQuarantined` and
+/// `AgentError::DelegationRevoked`.
+pub(crate) const REFUSE_UNASSESSED: &str = "agent is unassessed; it needs an appraisal";
+pub(crate) const REFUSE_SUSPENDED: &str = "agent appraisal expired; it needs a fresh appraisal";
+pub(crate) const REFUSE_RECOVERED: &str = "agent was recovered; only a Guardian may appraise it";
+pub(crate) const REFUSE_STALE_ASSERTION: &str =
+    "passkey assertion is older than the owner appraisal lifetime; sign in again";
 
 /// Whether a delegation can still mint: not revoked, not expired at `now`.
 /// The one liveness test: authorize asks it whether a DID is already taken.
@@ -734,7 +833,7 @@ pub async fn generate_agent_challenge(
     refuse_guardian(&headers)?;
     validate_did_key(&params.did)?;
     let delegation = active_delegation(&app_state, &params.did).await?;
-    eligible_workload(&app_state, &delegation).await?;
+    issuable(&delegation, Utc::now().timestamp())?;
 
     let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
     let nonce = Uuid::new_v4().to_string();
@@ -793,7 +892,7 @@ pub async fn issue_agent_token(
         .verify(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
-    let workload = eligible_workload(&app_state, &delegation).await?;
+    issuable(&delegation, Utc::now().timestamp())?;
 
     // Agents keep stale entitlements for the whole delegation lifetime
     // otherwise: mint against what the delegator currently holds, not what
@@ -811,11 +910,11 @@ pub async fn issue_agent_token(
     }
     delegation.entitlements = effective;
 
-    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation, &workload)?;
+    let (token, expires_at) = mint_agent_cwt(&app_state, &delegation)?;
 
     info!(
-        "Agent token issued for {} in workload {}",
-        request.did, workload.workload_id
+        "Agent token issued for {} at state_version {}",
+        request.did, delegation.trust.state_version
     );
     Ok(Json(TokenResponse {
         token,
@@ -895,7 +994,6 @@ pub(crate) fn agent_cwt_claims(
     issuer: &str,
     cfg: &AgentTokenConfig,
     delegation: &AgentDelegation,
-    workload: &AgentWorkload,
 ) -> Result<cwt::ArkavoClaims, AgentError> {
     let pubkey = extract_ed25519_pubkey(&delegation.agent_did)?;
     // The 15-minute cap is applied in `ArkavoClaims::agent` itself, on every
@@ -934,15 +1032,19 @@ pub(crate) fn agent_cwt_claims(
             depth: Some(delegation.depth),
             chain: Some(delegation.chain.clone()),
         })
-        .with_arkavo_workload(&workload.workload_id)
+        .with_arkavo_state_version(delegation.trust.state_version)
         .with_cnf(cwt::cnf_from_ed25519(
             &pubkey,
             delegation.agent_did.as_bytes(),
         ));
     // No kit yet: omit the claim rather than send an empty one, so the
     // platform's "token lacks arkavo_swarm" denial applies.
-    if !workload.swarm.is_empty() {
-        claims = claims.with_arkavo_swarm(&workload.swarm);
+    if !delegation.swarm.is_empty() {
+        claims = claims.with_arkavo_swarm(&delegation.swarm);
+    }
+    // Every token's lifetime is covered by a current appraisal.
+    if let Some(until) = delegation.trust.appraised_until {
+        claims.exp = claims.exp.min(until);
     }
     Ok(claims)
 }
@@ -954,14 +1056,8 @@ pub(crate) fn db_err(e: DynamoDBError) -> AgentError {
 fn mint_agent_cwt(
     app_state: &AppState,
     delegation: &AgentDelegation,
-    workload: &AgentWorkload,
 ) -> Result<(String, i64), AgentError> {
-    let claims = agent_cwt_claims(
-        &app_state.issuer,
-        &app_state.agent_tokens,
-        delegation,
-        workload,
-    )?;
+    let claims = agent_cwt_claims(&app_state.issuer, &app_state.agent_tokens, delegation)?;
     let expires_at = claims.exp;
     let bytes = cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)
         .map_err(|e| AgentError::TokenGenerationError(e.to_string()))?;
@@ -1012,8 +1108,6 @@ pub enum AgentError {
     Forbidden(String),
     #[error("Conflict: {0}")]
     Conflict(String),
-    #[error("Workload not found")]
-    WorkloadNotFound,
     #[error("Guardian not found")]
     GuardianNotFound,
     /// Body is contract v1 text (docs/agent-credentials-contract.md).
@@ -1048,9 +1142,7 @@ impl IntoResponse for AgentError {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
             AgentError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
-            AgentError::WorkloadNotFound | AgentError::GuardianNotFound => {
-                (StatusCode::NOT_FOUND, self.to_string())
-            }
+            AgentError::GuardianNotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AgentError::TokenGenerationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -1077,6 +1169,7 @@ impl IntoResponse for AgentError {
 mod tests {
     use super::*;
     use crate::constants::DEFAULT_USER_ENTITLEMENTS;
+    use crate::db::AgentTrust;
     use ed25519_dalek::{Signer, SigningKey};
 
     const TEST_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -1087,6 +1180,7 @@ mod tests {
         format!("did:key:z{}", bs58::encode(bytes).into_string())
     }
 
+    /// An eligible delegation, appraised far into the future, in "kit-alpha".
     fn sample_delegation(agent_did: &str) -> AgentDelegation {
         AgentDelegation {
             agent_did: agent_did.to_string(),
@@ -1101,29 +1195,15 @@ mod tests {
             created_at: 1_700_000_000,
             expires_at: Some(1_700_000_000 + 30 * 86_400),
             revoked_at: None,
-            workload_id: Some("wl-00112233445566778899aabbccddeeff".into()),
             short_lived: false,
-            swarm: String::new(),
-            trust: Default::default(),
-        }
-    }
-
-    fn sample_workload(did: &str) -> AgentWorkload {
-        AgentWorkload {
-            workload_id: "wl-00112233445566778899aabbccddeeff".into(),
-            owner: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
-            name: "fleet".into(),
-            current_did: did.into(),
             swarm: "kit-alpha".into(),
-            state: WorkloadState::Eligible,
-            generation: 1,
-            incident: None,
-            evidence_ref: None,
-            quarantined_by: None,
-            quarantined_at: None,
-            last_cleared_incident: None,
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_000,
+            trust: AgentTrust {
+                state: AgentState::Eligible,
+                state_version: 3,
+                appraised_until: Some(i64::MAX),
+                appraised_by: Some("owner:00000000-0000-0000-0000-000000000001".into()),
+                ..AgentTrust::default()
+            },
         }
     }
 
@@ -1203,13 +1283,7 @@ mod tests {
             minutes: 15,
         };
         let d = sample_delegation(TEST_DID);
-        let claims = agent_cwt_claims(
-            "https://identity.arkavo.net",
-            &cfg,
-            &d,
-            &sample_workload(TEST_DID),
-        )
-        .unwrap();
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
         assert_eq!(claims.sub, TEST_DID);
         assert_eq!(
             claims.aud,
@@ -1242,18 +1316,12 @@ mod tests {
             minutes: 15,
         };
         let d = sample_delegation(TEST_DID);
-        let claims = agent_cwt_claims(
-            "https://identity.arkavo.net",
-            &cfg,
-            &d,
-            &sample_workload(TEST_DID),
-        )
-        .unwrap();
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
         assert_eq!(claims.custom.act, None);
     }
 
     #[test]
-    fn agent_claims_carry_workload_and_swarm() {
+    fn agent_claims_carry_the_state_version_and_swarm() {
         let cfg = AgentTokenConfig {
             audiences: vec!["https://platform.arkavo.net".into()],
             authorized_actors: vec![],
@@ -1263,28 +1331,187 @@ mod tests {
             "https://identity.arkavo.net",
             &cfg,
             &sample_delegation(TEST_DID),
-            &sample_workload(TEST_DID),
         )
         .unwrap();
-        assert_eq!(
-            claims.custom.arkavo_workload.as_deref(),
-            Some("wl-00112233445566778899aabbccddeeff")
-        );
+        assert_eq!(claims.custom.arkavo_state_version, Some(3));
         assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-alpha"));
 
-        let no_kit = AgentWorkload {
+        let no_kit = AgentDelegation {
             swarm: String::new(),
-            ..sample_workload(TEST_DID)
+            ..sample_delegation(TEST_DID)
         };
-        let claims = agent_cwt_claims(
-            "https://identity.arkavo.net",
-            &cfg,
-            &sample_delegation(TEST_DID),
-            &no_kit,
-        )
-        .unwrap();
-        assert!(claims.custom.arkavo_workload.is_some());
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &no_kit).unwrap();
+        assert_eq!(claims.custom.arkavo_state_version, Some(3));
         assert_eq!(claims.custom.arkavo_swarm, None, "omitted, not empty");
+    }
+
+    #[test]
+    fn a_token_never_outlives_the_appraisal() {
+        let cfg = AgentTokenConfig {
+            audiences: vec!["https://platform.arkavo.net".into()],
+            authorized_actors: vec![],
+            minutes: 15,
+        };
+        let mut d = sample_delegation(TEST_DID);
+        let now = Utc::now().timestamp();
+        d.trust.appraised_until = Some(now + 60);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(claims.exp, now + 60, "capped at appraised_until");
+        d.trust.appraised_until = Some(now + 3_600);
+        let claims = agent_cwt_claims("https://identity.arkavo.net", &cfg, &d).unwrap();
+        assert_eq!(
+            claims.exp - claims.iat,
+            900,
+            "the lifetime cap still applies"
+        );
+    }
+
+    #[test]
+    fn only_an_eligible_identity_is_issuable() {
+        let now = 1_790_000_000;
+        let mut d = sample_delegation(TEST_DID);
+        d.trust.appraised_until = Some(now + 1);
+        assert!(issuable(&d, now).is_ok());
+        d.trust.appraised_until = Some(now);
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Forbidden: agent appraisal expired; it needs a fresh appraisal"
+        );
+        d.trust.state = AgentState::Unassessed;
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Forbidden: agent is unassessed; it needs an appraisal"
+        );
+        d.trust.state = AgentState::Quarantined;
+        assert_eq!(
+            issuable(&d, now).unwrap_err().to_string(),
+            "Workload quarantined"
+        );
+    }
+
+    #[test]
+    fn authorize_plans_the_version_and_refuses_latched_recovered_or_foreign_keys() {
+        let owner = Uuid::from_u128(1);
+        let now = 1_790_000_000;
+        let mut d = sample_delegation(TEST_DID);
+        d.root_user_id = owner;
+        d.expires_at = Some(now + 86_400);
+        let plan = |d: Option<&AgentDelegation>| plan_authorize(d, owner, None, now);
+        assert_eq!(
+            plan(None).unwrap(),
+            AuthorizePlan {
+                read_version: 0,
+                new_version: 1,
+                keeps_delegation: false
+            }
+        );
+        assert_eq!(
+            plan(Some(&d)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 3,
+                keeps_delegation: true
+            },
+            "renewing a live eligible delegation keeps the version"
+        );
+        // A swarm change is an authorization-binding change.
+        assert_eq!(
+            plan_authorize(Some(&d), owner, Some("kit-alpha"), now)
+                .unwrap()
+                .new_version,
+            3,
+            "naming the current swarm is a renewal"
+        );
+        assert_eq!(
+            plan_authorize(Some(&d), owner, Some("kit-beta"), now)
+                .unwrap()
+                .new_version,
+            4,
+            "a swarm change bumps"
+        );
+        let suspended = AgentDelegation {
+            trust: AgentTrust {
+                appraised_until: Some(now),
+                ..d.trust.clone()
+            },
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&suspended)).unwrap().new_version,
+            3,
+            "stored state is eligible"
+        );
+        let legacy = AgentDelegation {
+            trust: AgentTrust::default(),
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&legacy)).unwrap(),
+            AuthorizePlan {
+                read_version: 0,
+                new_version: 1,
+                keeps_delegation: true
+            }
+        );
+        let revoked = AgentDelegation {
+            revoked_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&revoked)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 4,
+                keeps_delegation: false
+            },
+            "a new delegation over a revoked one bumps the version"
+        );
+        let expired = AgentDelegation {
+            expires_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert_eq!(plan(Some(&expired)).unwrap().new_version, 4);
+        let foreign = AgentDelegation {
+            root_user_id: Uuid::from_u128(2),
+            ..d.clone()
+        };
+        assert!(matches!(
+            plan(Some(&foreign)),
+            Err(AgentError::DelegationAlreadyExists)
+        ));
+        let foreign_expired = AgentDelegation {
+            expires_at: Some(now - 1),
+            ..foreign
+        };
+        assert_eq!(
+            plan(Some(&foreign_expired)).unwrap().new_version,
+            4,
+            "taken over"
+        );
+        let latched = AgentDelegation {
+            trust: AgentTrust {
+                state: AgentState::Quarantined,
+                ..d.trust.clone()
+            },
+            revoked_at: Some(now - 1),
+            ..d.clone()
+        };
+        assert!(matches!(
+            plan(Some(&latched)),
+            Err(AgentError::WorkloadQuarantined)
+        ));
+        let recovered = AgentDelegation {
+            trust: AgentTrust {
+                state: AgentState::Unassessed,
+                recovered_at: Some(now - 10),
+                ..d.trust.clone()
+            },
+            ..d.clone()
+        };
+        assert_eq!(
+            plan(Some(&recovered)).unwrap_err().to_string(),
+            "Forbidden: agent was recovered; only a Guardian may appraise it"
+        );
     }
 
     #[test]
@@ -1294,10 +1521,9 @@ mod tests {
             authorized_actors: vec![],
             minutes,
         };
-        let w = sample_workload(TEST_DID);
         let mut d = sample_delegation(TEST_DID);
         let life = |c: &AgentTokenConfig, d: &AgentDelegation| {
-            let claims = agent_cwt_claims("https://identity.arkavo.net", c, d, &w).unwrap();
+            let claims = agent_cwt_claims("https://identity.arkavo.net", c, d).unwrap();
             claims.exp - claims.iat
         };
         assert_eq!(life(&cfg(15), &d), 900);
@@ -1523,7 +1749,6 @@ mod tests {
             ),
             (AgentError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (AgentError::Conflict("x".into()), StatusCode::CONFLICT),
-            (AgentError::WorkloadNotFound, StatusCode::NOT_FOUND),
             (AgentError::GuardianNotFound, StatusCode::NOT_FOUND),
             (AgentError::WorkloadQuarantined, StatusCode::FORBIDDEN),
             (
@@ -1540,7 +1765,7 @@ mod tests {
 
     #[test]
     fn db_err_keeps_a_missing_table_a_503() {
-        let mapped = db_err(DynamoDBError::TableNotExists("agent_workloads".into()));
+        let mapped = db_err(DynamoDBError::TableNotExists("agent_delegations".into()));
         assert!(matches!(mapped, AgentError::DatabaseError(_)));
         assert_eq!(
             mapped.into_response().status(),

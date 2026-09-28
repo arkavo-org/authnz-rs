@@ -161,9 +161,10 @@ pub const AGENTS_DELEGATE_SCOPE: &str = "agents:delegate";
 /// unchanged, so a refresh-token renewal can never satisfy this on its own.
 pub const AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS: i64 = 3600;
 
-/// Lease on a workload status answer: `valid_until = now + this`. The KAS
-/// caches no longer, so a quarantine reaches every rewrap within it.
-pub const WORKLOAD_STATUS_LEASE_SECONDS: i64 = 5;
+/// Lease on an agent status answer: `valid_until = now + this` (earlier
+/// when the appraisal ends first). The platform caches no longer, so a
+/// quarantine reaches every rewrap within it.
+pub const AGENT_STATUS_LEASE_SECONDS: i64 = 5;
 
 /// Default lifetime (seconds) of the owner's appraisal: `POST /agents/authorize`
 /// and an owner `POST /agents/{did}/appraisal` set `appraised_until` to the
@@ -183,8 +184,8 @@ pub const OWNER_APPRAISAL_TTL_MAX_SECONDS: i64 = 24 * 3600;
 pub const GUARDIAN_APPRAISAL_MAX_SECONDS: i64 = 15 * 60;
 
 /// Maximum age (seconds) of the passkey auth CWT that recovers a quarantined
-/// workload. Lifting a quarantine needs a fresh assertion, not any token
-/// that has not expired yet.
+/// agent identity. Lifting a quarantine needs a fresh assertion, not any
+/// token that has not expired yet.
 pub const RECOVERY_TOKEN_MAX_AGE_SECONDS: i64 = 300;
 
 /// Allowed clock difference (seconds) on an `X-Guardian-Signature` timestamp.
@@ -192,7 +193,6 @@ pub const GUARDIAN_SIGNATURE_SKEW_SECONDS: u64 = 60;
 
 /// Length limits (characters) on operator- and Guardian-supplied labels that
 /// end up in storage and token claims.
-pub const WORKLOAD_NAME_MAX_LEN: usize = 128;
 pub const SWARM_ID_MAX_LEN: usize = 128;
 pub const INCIDENT_MAX_LEN: usize = 256;
 pub const EVIDENCE_REF_MAX_LEN: usize = 1024;

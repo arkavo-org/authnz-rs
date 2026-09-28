@@ -2865,7 +2865,6 @@ mod tests {
                     "patreon_tokens".to_string(),
                     "agent_delegations".to_string(),
                     "device_attest_keys".to_string(),
-                    "agent_workloads".to_string(),
                     "guardians".to_string(),
                     crate::constants::DEFAULT_USER_ENTITLEMENTS
                         .iter()
@@ -2988,7 +2987,6 @@ mod tests {
                     "patreon_tokens".to_string(),
                     "agent_delegations".to_string(),
                     "device_attest_keys".to_string(),
-                    "agent_workloads".to_string(),
                     "guardians".to_string(),
                     crate::constants::DEFAULT_USER_ENTITLEMENTS
                         .iter()

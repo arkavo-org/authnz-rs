@@ -60,7 +60,7 @@ async fn authorize_challenge_token_refresh_revoke() {
             &json!({"agent_did": did, "name": "it-agent", "entitlements": [
                 "https://arkavo.ai/attr/tdf/value/decrypt",
                 "https://arkavo.ai/attr/action/value/read"
-            ], "workload_name": "it-workload", "swarm": "it-kit"}),
+            ], "swarm": "it-kit"}),
         )
         .send()
         .await
@@ -261,9 +261,9 @@ async fn mint(client: &reqwest::Client, base: &str, sk: &SigningKey) -> reqwest:
         .unwrap()
 }
 
-async fn status(client: &reqwest::Client, base: &str, wid: &str) -> Value {
+async fn status(client: &reqwest::Client, base: &str, did: &str) -> Value {
     let r = client
-        .get(format!("{base}/agents/workloads/{wid}/status"))
+        .get(format!("{base}/agents/{did}/status"))
         .header(
             "X-Auth-Token",
             std::env::var("AUTHNZ_TEST_SERVICE_CWT").unwrap(),
@@ -277,7 +277,7 @@ async fn status(client: &reqwest::Client, base: &str, wid: &str) -> Value {
 
 /// The proof a Guardian key must send with `POST /guardians`: its own
 /// signature over `arkavo-guardian-enroll\n<owner_uuid>\n<public_key_b64url>`
-/// (contract v1; `src/guardian.rs::enrollment_input`).
+/// (contract v2, unchanged from v1; `src/guardian.rs::enrollment_input`).
 fn guardian_enrollment_proof(owner: &str, guardian: &SigningKey) -> (String, String) {
     let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(guardian.verifying_key().as_bytes());
@@ -287,19 +287,46 @@ fn guardian_enrollment_proof(owner: &str, guardian: &SigningKey) -> (String, Str
     (public_key, proof)
 }
 
+/// A Guardian-signed POST of `body` to `path` (contract v2 signing input).
+async fn guardian_post(
+    client: &reqwest::Client,
+    base: &str,
+    gid: &str,
+    guardian: &SigningKey,
+    path: &str,
+    body: &str,
+) -> reqwest::Response {
+    let ts = chrono::Utc::now().timestamp();
+    let signed = format!(
+        "POST\n{path}\n{ts}\n{}",
+        hex::encode(Sha256::digest(body.as_bytes()))
+    );
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(guardian.sign(signed.as_bytes()).to_bytes());
+    client
+        .post(format!("{base}{path}"))
+        .header("X-Guardian-Signature", format!("{gid}.{ts}.{sig}"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires AUTHNZ_TEST_BASE_URL + DynamoDB Local"]
-async fn quarantine_stops_issuance_and_recovery_needs_a_new_delegation() {
+async fn quarantine_stops_issuance_and_recovery_leaves_the_key_unassessed() {
     let Some(base) = base() else { return };
     let client = reqwest::Client::new();
     let (a1, a2, guardian) = (random_agent(), random_agent(), random_agent());
-    let workload = format!("e2e-{}", uuid::Uuid::new_v4().simple());
+    let did = did_key(&a1);
     let authorize = |sk: &SigningKey| {
         json!({"agent_did": did_key(sk), "name": "e2e-agent", "entitlements": [READ],
-               "workload_name": workload, "swarm": "kit-e2e", "short_lived": true})
+               "swarm": "kit-e2e", "short_lived": true})
     };
 
-    // The operator authorizes a short-lived, workload-bound agent.
+    // The operator authorizes a short-lived agent: the owner's bootstrap
+    // appraisal makes it eligible at state_version 1.
     let r = client
         .post(format!("{base}/agents/authorize"))
         .header("X-Auth-Token", fresh_human_cwt())
@@ -308,12 +335,16 @@ async fn quarantine_stops_issuance_and_recovery_needs_a_new_delegation() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
-    let wid = r.json::<Value>().await.unwrap()["workload_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let authorized: Value = r.json().await.unwrap();
+    assert_eq!(
+        (
+            authorized["state"].as_str(),
+            authorized["state_version"].as_u64()
+        ),
+        (Some("eligible"), Some(1))
+    );
 
-    // Its token names the workload and swarm and lives five minutes.
+    // Its token carries the state version and swarm and lives five minutes.
     let r = mint(&client, &base, &a1).await;
     assert_eq!(r.status(), 200);
     let tok: Value = r.json().await.unwrap();
@@ -329,10 +360,18 @@ async fn quarantine_stops_issuance_and_recovery_needs_a_new_delegation() {
         },
     )
     .unwrap();
-    assert_eq!(claims.custom.arkavo_workload.as_deref(), Some(wid.as_str()));
+    assert_eq!(claims.custom.arkavo_state_version, Some(1));
     assert_eq!(claims.custom.arkavo_swarm.as_deref(), Some("kit-e2e"));
     assert_eq!(claims.exp - claims.iat, 300);
-    assert_eq!(status(&client, &base, &wid).await["generation"], 1);
+    let s = status(&client, &base, &did).await;
+    assert_eq!(
+        (
+            s["state"].as_str(),
+            s["state_version"].as_u64(),
+            s["appraised_by"].as_str()
+        ),
+        (Some("eligible"), Some(1), Some("owner"))
+    );
 
     // The owner enrolls a Guardian, proving possession of its key; the
     // Guardian quarantines.
@@ -349,55 +388,27 @@ async fn quarantine_stops_issuance_and_recovery_needs_a_new_delegation() {
         .as_str()
         .unwrap()
         .to_string();
-    let path = format!("/agents/workloads/{wid}/quarantine");
     let body = json!({"incident": "e2e-inc-1", "evidence_ref": null}).to_string();
-    let ts = chrono::Utc::now().timestamp();
-    let signed = format!(
-        "POST\n{path}\n{ts}\n{}",
-        hex::encode(Sha256::digest(body.as_bytes()))
-    );
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(guardian.sign(signed.as_bytes()).to_bytes());
-    let r = client
-        .post(format!("{base}{path}"))
-        .header("X-Guardian-Signature", format!("{gid}.{ts}.{sig}"))
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .unwrap();
+    let r = guardian_post(
+        &client,
+        &base,
+        &gid,
+        &guardian,
+        &format!("/agents/{did}/quarantine"),
+        &body,
+    )
+    .await;
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
 
-    // The KAS's view flips within the lease.
-    let s = status(&client, &base, &wid).await;
+    // The platform's view flips within the lease.
+    let s = status(&client, &base, &did).await;
     assert_eq!(s["state"], "quarantined");
-    assert_eq!(s["generation"], 2);
+    assert_eq!(s["state_version"], 2);
     assert_eq!(s["incident"], "e2e-inc-1");
     assert!(s["valid_until"].as_i64().unwrap() <= chrono::Utc::now().timestamp() + 5);
 
-    // No new tokens, and no escape by binding a new key.
+    // No new tokens for the key; another key is another identity.
     assert_eq!(mint(&client, &base, &a1).await.status(), 403);
-    let r = client
-        .post(format!("{base}/agents/authorize"))
-        .header("X-Auth-Token", fresh_human_cwt())
-        .json(&authorize(&a2))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 403);
-
-    // Owner recovery, citing the incident; the old delegation is gone.
-    let r = client
-        .post(format!("{base}/agents/workloads/{wid}/recover"))
-        .header("X-Auth-Token", fresh_human_cwt())
-        .json(&json!({"incident": "e2e-inc-1"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
-    assert_eq!(mint(&client, &base, &a1).await.status(), 403);
-
-    // A fresh delegation restores issuance.
     let r = client
         .post(format!("{base}/agents/authorize"))
         .header("X-Auth-Token", fresh_human_cwt())
@@ -407,10 +418,29 @@ async fn quarantine_stops_issuance_and_recovery_needs_a_new_delegation() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(mint(&client, &base, &a2).await.status(), 200);
-    let s = status(&client, &base, &wid).await;
+
+    // Owner recovery, citing the incident: the key is unassessed, and the
+    // owner may not appraise it again.
+    let r = client
+        .post(format!("{base}/agents/{did}/recover"))
+        .header("X-Auth-Token", fresh_human_cwt())
+        .json(&json!({"incident": "e2e-inc-1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let s = status(&client, &base, &did).await;
     assert_eq!(
-        (s["state"].as_str(), s["generation"].as_u64()),
-        (Some("eligible"), Some(4))
+        (s["state"].as_str(), s["state_version"].as_u64()),
+        (Some("unassessed"), Some(3))
     );
-    assert_eq!(s["current_did"], json!(did_key(&a2)));
+    assert_eq!(mint(&client, &base, &a1).await.status(), 403);
+    let r = client
+        .post(format!("{base}/agents/authorize"))
+        .header("X-Auth-Token", fresh_human_cwt())
+        .json(&authorize(&a1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
 }

@@ -1,8 +1,8 @@
 //! Guardians (`guardians` table): Ed25519 keys an owner enrolls so that a
-//! Guardian can latch quarantines on the owner's workloads. The key is read
+//! Guardian can latch quarantines on, and appraise, the owner's agents. The key is read
 //! from here on every request; a request never supplies its own key.
 
-use super::workloads::{classify, n, s};
+use super::agent_state::{classify, n, s};
 use super::{DynamoDBError, DynamoDBStore};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
