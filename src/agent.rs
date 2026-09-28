@@ -811,7 +811,10 @@ pub async fn revoke_delegation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load a delegation and check it is active (not revoked/expired, chain intact).
+/// Load a delegation and check it is active (not revoked/expired, chain
+/// intact). The quarantine latch is checked first: a latched key answers
+/// `Workload quarantined` whatever its delegation's liveness, as it does at
+/// authorize, so revoking it or letting it expire never changes the answer.
 async fn active_delegation(
     app_state: &AppState,
     agent_did: &str,
@@ -823,6 +826,9 @@ async fn active_delegation(
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
         .ok_or(AgentError::DelegationNotFound)?;
 
+    if delegation.trust.state == AgentState::Quarantined {
+        return Err(AgentError::WorkloadQuarantined);
+    }
     if delegation.revoked_at.is_some() {
         return Err(AgentError::DelegationRevoked);
     }

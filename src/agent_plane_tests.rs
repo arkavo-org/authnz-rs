@@ -1721,6 +1721,62 @@ async fn a_quarantined_identity_is_refused_at_both_challenge_and_token() {
     );
 }
 
+/// The latch answers first at both issuance steps, whatever the
+/// delegation's liveness.
+#[tokio::test]
+async fn a_quarantined_identity_is_refused_as_quarantined_once_revoked_or_expired() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let (revoked, expired) = (fresh_agent(), fresh_agent());
+    for a in [&revoked, &expired] {
+        assert_eq!(
+            p.authorize(auth, authorize_body(a, "kit-1", false)).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            p.quarantine(&cwt, &did_key(a), "inc-1").await.0,
+            StatusCode::OK
+        );
+    }
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{}", did_key(&revoked)))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let lapsed = crate::db::AgentDelegation {
+        expires_at: Some(Utc::now().timestamp() - 60),
+        ..p.store
+            .get_agent_delegation(&did_key(&expired))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    p.store.put_agent_row(&lapsed).await.unwrap();
+
+    let quarantined = (StatusCode::FORBIDDEN, json!("Workload quarantined"));
+    for a in [&revoked, &expired] {
+        let challenge = p
+            .send(
+                Request::get(format!("/agents/challenge?did={}", did_key(a)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(challenge, quarantined, "challenge for {}", did_key(a));
+        assert_eq!(
+            token_stage(&p, a).await,
+            quarantined,
+            "token for {}",
+            did_key(a)
+        );
+    }
+}
+
 #[tokio::test]
 async fn state_version_increases_on_every_state_change_and_only_then() {
     let Some(p) = Plane::new().await else { return };

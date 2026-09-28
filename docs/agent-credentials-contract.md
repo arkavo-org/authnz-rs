@@ -74,7 +74,7 @@ Every error response from the endpoints below has a `text/plain` body. Clients s
 
 | Body (exact, no trailing newline) | Since | Status | Returned by | Meaning |
 |---|---|---|---|---|
-| `Workload quarantined` | v1 | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize`, `/agents/{did}/appraisal` | The identity's quarantine latch is set. Unchanged from v1: "workload" now means the agent identity. |
+| `Workload quarantined` | v1 | 403 | `/agents/challenge`, `/agents/token`, `/agents/authorize`, `/agents/{did}/appraisal` | The identity's quarantine latch is set. Unchanged from v1: "workload" now means the agent identity. Takes precedence over `Delegation revoked` and `Delegation expired`: a latched key gets this body whatever its delegation's liveness. |
 | `Delegation revoked` | v1 | 403 | `/agents/challenge`, `/agents/token`, `/agents/{did}/appraisal` | Revoked by `DELETE /agents/delegations/{did}`. |
 | `Forbidden: agent is unassessed; it needs an appraisal` | v2 | 403 | `/agents/challenge`, `/agents/token` | No current appraisal: a row written before v2 (the owner authorizes again), or a recovered identity (a Guardian appraises it). |
 | `Forbidden: agent appraisal expired; it needs a fresh appraisal` | v2 | 403 | `/agents/challenge`, `/agents/token` | Suspended: the owner (authorize or `/appraisal`) or a Guardian (`/appraisal`) renews it. |
@@ -174,7 +174,7 @@ Response 200: the status body after the call.
 
 Errors: 400 bad body or DID; 401 bad or missing credential, stale `auth_time`, or a replayed Guardian signature; 403 caller is neither the owner nor one of the owner's Guardians, or the Bearer token lacks the scope or the client; 404 unknown DID; 409 as above, or `agent changed concurrently; retry` when the write raced a concurrent change (e.g. a recovery landing between the read and the write) — retry the request.
 
-The latch holds until recovery. While quarantined, `/agents/challenge`, `/agents/token`, `/agents/authorize` and `/agents/{did}/appraisal` refuse the DID with 403 `Workload quarantined`.
+The latch holds until recovery. While quarantined, `/agents/challenge`, `/agents/token`, `/agents/authorize` and `/agents/{did}/appraisal` refuse the DID with 403 `Workload quarantined`, also once its delegation is revoked or expired.
 
 ## Recovery
 
