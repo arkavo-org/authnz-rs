@@ -41,7 +41,8 @@ use crate::constants::{
 };
 use crate::cwt;
 use crate::db::{
-    AgentDelegation, AgentState, AuthorizeWrite, DynamoDBError, EffectiveState, SwarmWrite,
+    AgentDelegation, AgentState, AuthorizeOver, AuthorizeWrite, DynamoDBError, EffectiveState,
+    SwarmWrite,
 };
 use crate::guardian::refuse_guardian;
 use axum::http::HeaderMap;
@@ -585,7 +586,7 @@ pub async fn authorize_agent(
         // The quota counts live delegations, so only an authorize that adds
         // one is checked: renewing a delegation the owner already holds
         // (including a track-1 row) is never refused for quota.
-        if !plan.keeps_delegation {
+        if !plan.keeps_delegation() {
             let current_count = app_state
                 .db_store
                 .count_delegations_by_root_user(human.user_id)
@@ -595,7 +596,7 @@ pub async fn authorize_agent(
                 return Err(AgentError::MaxAgentsExceeded(current_count));
             }
         }
-        let swarm = match (&request.swarm, plan.keeps_delegation) {
+        let swarm = match (&request.swarm, plan.keeps_delegation()) {
             (Some(swarm), _) => SwarmWrite::Set(swarm),
             (None, true) => SwarmWrite::Keep,
             (None, false) => SwarmWrite::Clear,
@@ -605,6 +606,7 @@ pub async fn authorize_agent(
             .authorize_agent(AuthorizeWrite {
                 delegation: &delegation,
                 swarm,
+                over: plan.over,
                 read_version: plan.read_version,
                 new_version: plan.new_version,
                 appraised_until,
@@ -637,13 +639,22 @@ pub async fn authorize_agent(
 }
 
 /// What an authorize by `owner` writes over `existing`, the row read for the
-/// DID: the version to condition on, the version to store, and whether the
-/// row stays the same delegation (so an omitted swarm keeps its value).
+/// DID: the version to condition on, the version to store, and what the row
+/// must still be when the write lands (`over`: absent, the owner's live
+/// delegation, which stays the same delegation so an omitted swarm keeps its
+/// value, or a dead one replaced by a new delegation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AuthorizePlan {
     pub read_version: u64,
     pub new_version: u64,
-    pub keeps_delegation: bool,
+    pub over: AuthorizeOver,
+}
+
+impl AuthorizePlan {
+    /// Whether the row stays the same delegation (a renewal or amendment).
+    pub(crate) fn keeps_delegation(&self) -> bool {
+        self.over == AuthorizeOver::Live
+    }
 }
 
 /// Refused while the key's quarantine latch is set (whatever the
@@ -664,7 +675,7 @@ pub(crate) fn plan_authorize(
         return Ok(AuthorizePlan {
             read_version: 0,
             new_version: 1,
-            keeps_delegation: false,
+            over: AuthorizeOver::Absent,
         });
     };
     if d.trust.state == AgentState::Quarantined {
@@ -689,7 +700,13 @@ pub(crate) fn plan_authorize(
     Ok(AuthorizePlan {
         read_version,
         new_version,
-        keeps_delegation,
+        over: if keeps_delegation {
+            AuthorizeOver::Live
+        } else {
+            AuthorizeOver::Dead {
+                owner: d.root_user_id,
+            }
+        },
     })
 }
 
@@ -1491,7 +1508,7 @@ mod tests {
             AuthorizePlan {
                 read_version: 0,
                 new_version: 1,
-                keeps_delegation: false
+                over: AuthorizeOver::Absent
             }
         );
         assert_eq!(
@@ -1499,7 +1516,7 @@ mod tests {
             AuthorizePlan {
                 read_version: 3,
                 new_version: 3,
-                keeps_delegation: true
+                over: AuthorizeOver::Live
             },
             "renewing a live eligible delegation keeps the version"
         );
@@ -1539,7 +1556,7 @@ mod tests {
             AuthorizePlan {
                 read_version: 0,
                 new_version: 1,
-                keeps_delegation: true
+                over: AuthorizeOver::Live
             }
         );
         let revoked = AgentDelegation {
@@ -1551,7 +1568,7 @@ mod tests {
             AuthorizePlan {
                 read_version: 3,
                 new_version: 4,
-                keeps_delegation: false
+                over: AuthorizeOver::Dead { owner }
             },
             "a new delegation over a revoked one bumps the version"
         );
@@ -1573,9 +1590,15 @@ mod tests {
             ..foreign
         };
         assert_eq!(
-            plan(Some(&foreign_expired)).unwrap().new_version,
-            4,
-            "taken over"
+            plan(Some(&foreign_expired)).unwrap(),
+            AuthorizePlan {
+                read_version: 3,
+                new_version: 4,
+                over: AuthorizeOver::Dead {
+                    owner: Uuid::from_u128(2)
+                }
+            },
+            "taken over only while still the former owner's and still dead"
         );
         let latched = AgentDelegation {
             trust: AgentTrust {

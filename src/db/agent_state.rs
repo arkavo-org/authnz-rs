@@ -145,6 +145,22 @@ pub enum SwarmWrite<'a> {
     Clear,
 }
 
+/// What an authorize found for the DID, and so what its write requires the
+/// row still to be. The version alone is not enough: a renewal keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizeOver {
+    /// No row: the write creates it.
+    Absent,
+    /// The authorizing owner's own live delegation, renewed or amended: the
+    /// row must still be that owner's, unrevoked and unexpired.
+    Live,
+    /// A revoked or expired delegation of `owner` (the authorizing owner or
+    /// another), replaced by a new one: the row must still be that owner's
+    /// and still dead, so a renewal that landed after the read (keeping the
+    /// version) is never taken over.
+    Dead { owner: Uuid },
+}
+
 /// An authorize: the owner's bootstrap appraisal written over the row read
 /// at `read_version` (0 when absent or pre-state).
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +168,7 @@ pub struct AuthorizeWrite<'a> {
     /// Delegation fields to write; its `swarm` and `trust` are ignored.
     pub delegation: &'a AgentDelegation,
     pub swarm: SwarmWrite<'a>,
+    pub over: AuthorizeOver,
     pub read_version: u64,
     pub new_version: u64,
     pub appraised_until: i64,
@@ -263,7 +280,8 @@ fn trust_item(t: &AgentTrust) -> Item {
 impl DynamoDBStore {
     /// Write an authorize: the delegation fields, the swarm, and the owner's
     /// appraisal (`eligible` until `appraised_until`), conditional on the row
-    /// still carrying `read_version` and not being quarantined. Clears
+    /// still carrying `read_version`, not being quarantined, and still being
+    /// what the caller found (`w.over`, judged at `w.now`). Clears
     /// `revoked_at`, a pending challenge and the pre-v2 `workload_id`.
     /// `ConditionalConflict` when the row changed since it was read.
     pub async fn authorize_agent(&self, w: AuthorizeWrite<'_>) -> Result<(), DynamoDBError> {
@@ -312,7 +330,6 @@ impl DynamoDBStore {
             .expression_attribute_values(":created", n(d.created_at))
             .expression_attribute_values(":sl", AttributeValue::Bool(d.short_lived))
             .expression_attribute_values(":eligible", s(AgentState::Eligible.as_str()))
-            .expression_attribute_values(":q", s(AgentState::Quarantined.as_str()))
             .expression_attribute_values(":nv", n(w.new_version))
             .expression_attribute_values(":au", n(w.appraised_until))
             .expression_attribute_values(":ab", s(w.appraised_by))
@@ -342,24 +359,40 @@ impl DynamoDBStore {
         if w.read_version > 0 {
             req = req.expression_attribute_values(":rv", n(w.read_version));
         }
-        // Clearing `revoked_at` always moves the version: an authorize that
-        // keeps the version it read (a renewal of the live row) must still
-        // find the row unrevoked. Revocation moves the version too, so this
-        // only guards a row revoked by some other path.
-        let not_revoked = if w.new_version == w.read_version {
-            " AND attribute_not_exists(revoked_at)"
-        } else {
-            ""
+        let unlatched = "(attribute_not_exists(#st) OR #st <> :q)";
+        if w.over != AuthorizeOver::Absent {
+            req = req.expression_attribute_values(":q", s(AgentState::Quarantined.as_str()));
+        }
+        // Liveness as `agent::is_live` judges it: live through `expires_at`.
+        let condition = match w.over {
+            AuthorizeOver::Absent => "attribute_not_exists(agent_did)".to_string(),
+            // A renewal (which may keep the version) lands only on the
+            // caller's row while it is still live: never on one revoked
+            // (by any path) or expired since the read.
+            AuthorizeOver::Live => format!(
+                "{} AND {unlatched} AND root_user_id = :root \
+                 AND attribute_not_exists(revoked_at) \
+                 AND (attribute_not_exists(expires_at) OR expires_at >= :now)",
+                version_condition(w.read_version)
+            ),
+            // A new delegation replaces only the dead row it read. Renewals
+            // keep `state_version`, so without this a renewal landing after
+            // the read would be taken over with its live identity.
+            AuthorizeOver::Dead { owner } => {
+                req = req.expression_attribute_values(":old", s(&owner.to_string()));
+                format!(
+                    "{} AND {unlatched} AND root_user_id = :old \
+                     AND (attribute_exists(revoked_at) OR expires_at < :now)",
+                    version_condition(w.read_version)
+                )
+            }
         };
         req.update_expression(format!(
             "SET {} REMOVE {}",
             set.join(", "),
             remove.join(", ")
         ))
-        .condition_expression(format!(
-            "{} AND (attribute_not_exists(#st) OR #st <> :q){not_revoked}",
-            version_condition(w.read_version)
-        ))
+        .condition_expression(condition)
         .send()
         .await
         .map_err(|e| classify(e, &self.agent_delegations_table))?;
@@ -668,20 +701,31 @@ pub(crate) mod tests {
         format!("did:key:z6Mk{tag}{}", Uuid::new_v4().simple())
     }
 
+    /// An authorize at the fixed clock `now = 1_790_000_000`, before the
+    /// `expires_at` [`delegation`] gives a row.
     fn write<'a>(
         d: &'a AgentDelegation,
         read: u64,
         new: u64,
         swarm: SwarmWrite<'a>,
+        over: AuthorizeOver,
     ) -> AuthorizeWrite<'a> {
         AuthorizeWrite {
             delegation: d,
             swarm,
+            over,
             read_version: read,
             new_version: new,
             appraised_until: 1_790_043_200,
             appraised_by: "owner:x",
             now: 1_790_000_000,
+        }
+    }
+
+    /// A new delegation over `d`'s owner's dead row.
+    fn dead(d: &AgentDelegation) -> AuthorizeOver {
+        AuthorizeOver::Dead {
+            owner: d.root_user_id,
         }
     }
 
@@ -744,7 +788,13 @@ pub(crate) mod tests {
         let did = unique_did("A");
         let d = delegation(&did, owner);
         store
-            .authorize_agent(write(&d, 0, 1, SwarmWrite::Set("kit-1")))
+            .authorize_agent(write(
+                &d,
+                0,
+                1,
+                SwarmWrite::Set("kit-1"),
+                AuthorizeOver::Absent,
+            ))
             .await
             .unwrap();
         let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
@@ -757,7 +807,7 @@ pub(crate) mod tests {
         assert!(
             conflict(
                 store
-                    .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep))
+                    .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep, AuthorizeOver::Absent))
                     .await
             ),
             "a second create at version 0 loses"
@@ -770,11 +820,17 @@ pub(crate) mod tests {
         let did = unique_did("S");
         let d = delegation(&did, Uuid::new_v4());
         store
-            .authorize_agent(write(&d, 0, 1, SwarmWrite::Set("kit-1")))
+            .authorize_agent(write(
+                &d,
+                0,
+                1,
+                SwarmWrite::Set("kit-1"),
+                AuthorizeOver::Absent,
+            ))
             .await
             .unwrap();
         store
-            .authorize_agent(write(&d, 1, 1, SwarmWrite::Keep))
+            .authorize_agent(write(&d, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
             .await
             .unwrap();
         let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
@@ -792,7 +848,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .authorize_agent(write(&d, 1, 2, SwarmWrite::Clear))
+            .authorize_agent(write(&d, 1, 2, SwarmWrite::Clear, dead(&d)))
             .await
             .unwrap();
         let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
@@ -827,13 +883,13 @@ pub(crate) mod tests {
             (AgentState::Unassessed, 0)
         );
         store
-            .authorize_agent(write(&legacy, 0, 1, SwarmWrite::Keep))
+            .authorize_agent(write(&legacy, 0, 1, SwarmWrite::Keep, AuthorizeOver::Live))
             .await
             .unwrap();
         assert!(
             conflict(
                 store
-                    .authorize_agent(write(&legacy, 0, 1, SwarmWrite::Keep))
+                    .authorize_agent(write(&legacy, 0, 1, SwarmWrite::Keep, AuthorizeOver::Live))
                     .await
             ),
             "stale read version"
@@ -851,7 +907,7 @@ pub(crate) mod tests {
         assert!(
             conflict(
                 store
-                    .authorize_agent(write(&q, 4, 4, SwarmWrite::Keep))
+                    .authorize_agent(write(&q, 4, 4, SwarmWrite::Keep, AuthorizeOver::Live))
                     .await
             ),
             "a quarantined row is never overwritten, even at the version read"
@@ -865,7 +921,7 @@ pub(crate) mod tests {
         let owner = Uuid::new_v4();
         let d = delegation(&did, owner);
         store
-            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep))
+            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep, AuthorizeOver::Absent))
             .await
             .unwrap();
         let QuarantineOutcome::Latched(q) = store
@@ -921,7 +977,7 @@ pub(crate) mod tests {
         let owner = Uuid::new_v4();
         let d = delegation(&did, owner);
         store
-            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep))
+            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep, AuthorizeOver::Absent))
             .await
             .unwrap();
         store
@@ -1020,7 +1076,7 @@ pub(crate) mod tests {
         let did = unique_did("V");
         let d = delegation(&did, owner);
         store
-            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep))
+            .authorize_agent(write(&d, 0, 1, SwarmWrite::Keep, AuthorizeOver::Absent))
             .await
             .unwrap();
         // A renewal and an appraisal both read the live row at version 1 ...
@@ -1035,7 +1091,7 @@ pub(crate) mod tests {
         assert!(
             conflict(
                 store
-                    .authorize_agent(write(&d, 1, 1, SwarmWrite::Keep))
+                    .authorize_agent(write(&d, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
                     .await
             ),
             "the stale renewal cannot clear the revocation and keep version 1"
@@ -1060,7 +1116,7 @@ pub(crate) mod tests {
         assert_eq!((got.revoked_at, got.trust.state_version), (Some(50), 2));
         // Read again, the owner's authorize starts a new delegation.
         store
-            .authorize_agent(write(&d, 2, 3, SwarmWrite::Keep))
+            .authorize_agent(write(&d, 2, 3, SwarmWrite::Keep, dead(&d)))
             .await
             .unwrap();
         let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
@@ -1109,13 +1165,168 @@ pub(crate) mod tests {
         store.put_agent_row(&planted).await.unwrap();
         assert!(conflict(
             store
-                .authorize_agent(write(&planted, 1, 1, SwarmWrite::Keep))
+                .authorize_agent(write(&planted, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
                 .await
         ));
         store
-            .authorize_agent(write(&planted, 1, 2, SwarmWrite::Keep))
+            .authorize_agent(write(&planted, 1, 2, SwarmWrite::Keep, dead(&planted)))
             .await
             .unwrap();
+    }
+
+    fn eligible_at(version: u64) -> AgentTrust {
+        AgentTrust {
+            state: AgentState::Eligible,
+            state_version: version,
+            appraised_until: Some(1_790_043_200),
+            ..AgentTrust::default()
+        }
+    }
+
+    /// Owner A reads its eligible row just before it expires and plans a
+    /// renewal, which keeps the version; after the expiry owner B reads the
+    /// same version and plans a takeover. A's renewal lands first: B's write
+    /// must not take over the identity A has just renewed.
+    #[tokio::test]
+    async fn a_takeover_never_lands_on_a_row_renewed_after_its_read() {
+        let Some(store) = local_store() else { return };
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let did = unique_did("T");
+        let t = 1_790_000_000;
+        let expiring = AgentDelegation {
+            expires_at: Some(t),
+            trust: eligible_at(7),
+            ..delegation(&did, a)
+        };
+        store.put_agent_row(&expiring).await.unwrap();
+        let renewed = AgentDelegation {
+            expires_at: Some(t - 1 + 30 * 86_400),
+            ..delegation(&did, a)
+        };
+        let renewal = AuthorizeWrite {
+            now: t - 1,
+            ..write(&renewed, 7, 7, SwarmWrite::Keep, AuthorizeOver::Live)
+        };
+        let theirs = delegation(&did, b);
+        let takeover = AuthorizeWrite {
+            now: t + 1,
+            ..write(
+                &theirs,
+                7,
+                8,
+                SwarmWrite::Clear,
+                AuthorizeOver::Dead { owner: a },
+            )
+        };
+        store.authorize_agent(renewal).await.unwrap();
+        assert!(
+            conflict(store.authorize_agent(takeover).await),
+            "the renewed row is live again: it is not taken over"
+        );
+        let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
+        assert_eq!(
+            (got.root_user_id, got.trust.state_version, got.expires_at),
+            (a, 7, renewed.expires_at),
+            "still A's renewed identity"
+        );
+
+        // Had the row stayed dead, the same takeover lands.
+        store.put_agent_row(&expiring).await.unwrap();
+        store.authorize_agent(takeover).await.unwrap();
+        let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
+        assert_eq!((got.root_user_id, got.trust.state_version), (b, 8));
+    }
+
+    #[tokio::test]
+    async fn an_authorize_lands_only_on_the_row_it_read() {
+        let Some(store) = local_store() else { return };
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        // A renewal (keeping the version) of a row that expired since the read.
+        let expired = AgentDelegation {
+            expires_at: Some(100),
+            trust: eligible_at(1),
+            ..delegation(&unique_did("X"), owner)
+        };
+        store.put_agent_row(&expired).await.unwrap();
+        assert!(
+            conflict(
+                store
+                    .authorize_agent(write(&expired, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
+                    .await
+            ),
+            "a renewal never lands on an expired row"
+        );
+        // A renewal of a row that is another owner's.
+        let foreign = AgentDelegation {
+            trust: eligible_at(1),
+            ..delegation(&unique_did("F"), other)
+        };
+        store.put_agent_row(&foreign).await.unwrap();
+        let mine = delegation(&foreign.agent_did, owner);
+        assert!(
+            conflict(
+                store
+                    .authorize_agent(write(&mine, 1, 1, SwarmWrite::Keep, AuthorizeOver::Live))
+                    .await
+            ),
+            "a renewal never lands on another owner's row"
+        );
+        // A new delegation over a row that is live ...
+        assert!(
+            conflict(
+                store
+                    .authorize_agent(write(
+                        &mine,
+                        1,
+                        2,
+                        SwarmWrite::Clear,
+                        AuthorizeOver::Dead { owner: other }
+                    ))
+                    .await
+            ),
+            "a live row is never replaced"
+        );
+        // ... or dead but not the owner's it read.
+        let lapsed = AgentDelegation {
+            expires_at: Some(100),
+            ..foreign.clone()
+        };
+        store.put_agent_row(&lapsed).await.unwrap();
+        assert!(conflict(
+            store
+                .authorize_agent(write(
+                    &mine,
+                    1,
+                    2,
+                    SwarmWrite::Clear,
+                    AuthorizeOver::Dead { owner }
+                ))
+                .await
+        ));
+        store
+            .authorize_agent(write(
+                &mine,
+                1,
+                2,
+                SwarmWrite::Clear,
+                AuthorizeOver::Dead { owner: other },
+            ))
+            .await
+            .unwrap();
+        // A create never lands on an existing row, even one without a version.
+        let legacy = delegation(&unique_did("C"), owner);
+        store.put_agent_row(&legacy).await.unwrap();
+        assert!(conflict(
+            store
+                .authorize_agent(write(
+                    &legacy,
+                    0,
+                    1,
+                    SwarmWrite::Keep,
+                    AuthorizeOver::Absent
+                ))
+                .await
+        ));
     }
 
     #[tokio::test]
@@ -1123,16 +1334,34 @@ pub(crate) mod tests {
         let Some(store) = local_store() else { return };
         let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
         let did = unique_did("O");
+        // The first owner's delegation, already expired at the clock the
+        // reassignment below runs at.
+        let lapsed = AgentDelegation {
+            expires_at: Some(1_000),
+            ..delegation(&did, first)
+        };
         store
-            .authorize_agent(write(&delegation(&did, first), 0, 1, SwarmWrite::Keep))
+            .authorize_agent(write(
+                &lapsed,
+                0,
+                1,
+                SwarmWrite::Keep,
+                AuthorizeOver::Absent,
+            ))
             .await
             .unwrap();
         // The former owner (or its Guardian) reads the row at version 1 ...
         let read = store.get_agent_delegation(&did).await.unwrap().unwrap();
         assert_eq!((read.root_user_id, read.trust.state_version), (first, 1));
-        // ... the key is reassigned to another owner in between ...
+        // ... the lapsed key is reassigned to another owner in between ...
         store
-            .authorize_agent(write(&delegation(&did, second), 1, 2, SwarmWrite::Keep))
+            .authorize_agent(write(
+                &delegation(&did, second),
+                1,
+                2,
+                SwarmWrite::Keep,
+                AuthorizeOver::Dead { owner: first },
+            ))
             .await
             .unwrap();
         let reassigned = store.get_agent_delegation(&did).await.unwrap().unwrap();
