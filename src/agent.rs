@@ -46,7 +46,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -176,7 +176,10 @@ pub struct DelegationInfo {
 // ============================================================================
 
 /// Extract the Ed25519 public key from `did:key:z6Mk…` (multicodec 0xed01,
-/// base58btc).
+/// base58btc). The key must decode to a curve point of large order: a
+/// small-order ("weak") key, such as the identity point, would let a
+/// non-strict verifier accept signatures nobody made, so such a DID is not
+/// an agent identity at all.
 pub fn extract_ed25519_pubkey(did: &str) -> Result<[u8; 32], AgentError> {
     let key_part = did
         .strip_prefix("did:key:z")
@@ -198,9 +201,17 @@ pub fn extract_ed25519_pubkey(did: &str) -> Result<[u8; 32], AgentError> {
             decoded[0], decoded[1]
         )));
     }
-    decoded[2..34]
+    let key: [u8; 32] = decoded[2..34]
         .try_into()
-        .map_err(|_| AgentError::InvalidDID("Invalid key length".into()))
+        .map_err(|_| AgentError::InvalidDID("Invalid key length".into()))?;
+    let point = VerifyingKey::from_bytes(&key)
+        .map_err(|_| AgentError::InvalidDID("Key is not an Ed25519 point".into()))?;
+    if point.is_weak() {
+        return Err(AgentError::InvalidDID(
+            "Key is a small-order Ed25519 point".into(),
+        ));
+    }
+    Ok(key)
 }
 
 pub fn validate_did_key(did: &str) -> Result<(), AgentError> {
@@ -574,7 +585,7 @@ pub async fn issue_agent_token(
     let verifying_key = VerifyingKey::from_bytes(&extract_ed25519_pubkey(&request.did)?)
         .map_err(|e| AgentError::InvalidDID(format!("Invalid public key: {}", e)))?;
     verifying_key
-        .verify(&challenge_bytes, &signature)
+        .verify_strict(&challenge_bytes, &signature)
         .map_err(|_| AgentError::InvalidProof("Signature verification failed".into()))?;
 
     // Agents keep stale entitlements for the whole delegation lifetime
@@ -818,7 +829,7 @@ impl IntoResponse for AgentError {
 mod tests {
     use super::*;
     use crate::constants::DEFAULT_USER_ENTITLEMENTS;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
 
     const TEST_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
@@ -870,6 +881,71 @@ mod tests {
             extract_ed25519_pubkey(&did).unwrap(),
             sk.verifying_key().to_bytes()
         );
+    }
+
+    /// The did:key naming raw key bytes, whether or not they are a usable key.
+    fn did_key_of_bytes(key: &[u8; 32]) -> String {
+        let mut bytes = vec![0xed, 0x01];
+        bytes.extend_from_slice(key);
+        format!("did:key:z{}", bs58::encode(bytes).into_string())
+    }
+
+    #[test]
+    fn small_order_and_off_curve_keys_are_not_agent_identities() {
+        // The identity point: a small-order key.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&identity)).unwrap_err();
+        assert!(err.to_string().contains("small-order"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&identity)).is_err());
+
+        // A second, distinct small-order point (order 4: y = 0), found the
+        // same way the off-curve search below does, so the test does not
+        // depend on a hand-copied constant.
+        let other_weak = (0u8..=255)
+            .map(|b| {
+                let mut k = [0u8; 32];
+                k[0] = b;
+                k
+            })
+            .find(|k| *k != identity && VerifyingKey::from_bytes(k).is_ok_and(|vk| vk.is_weak()))
+            .expect("some low first-order-byte y is a second small-order point");
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&other_weak)).unwrap_err();
+        assert!(err.to_string().contains("small-order"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&other_weak)).is_err());
+
+        // Bytes that decode to no curve point at all.
+        let off_curve = (2u8..=255)
+            .map(|b| {
+                let mut k = [0u8; 32];
+                k[0] = b;
+                k
+            })
+            .find(|k| VerifyingKey::from_bytes(k).is_err())
+            .expect("some y has no x");
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&off_curve)).unwrap_err();
+        assert!(err.to_string().contains("not an Ed25519 point"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&off_curve)).is_err());
+
+        // A regular key must still work.
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        assert!(extract_ed25519_pubkey(&did_key_for(&sk.verifying_key())).is_ok());
+    }
+
+    #[test]
+    fn a_forged_signature_under_a_small_order_key_never_verifies_strictly() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let vk = VerifyingKey::from_bytes(&identity).unwrap();
+        // R = the identity point, s = 0: [s]B = R + [k]A holds for any message.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let forged = Signature::from_bytes(&forged);
+        assert!(
+            vk.verify(b"any challenge", &forged).is_ok(),
+            "the lax check accepts it"
+        );
+        assert!(vk.verify_strict(b"any challenge", &forged).is_err());
     }
 
     #[test]
@@ -1209,6 +1285,91 @@ mod tests {
         assert_eq!(
             c.delegation_lifetime_seconds,
             AGENT_DELEGATION_DAYS * 86_400
+        );
+    }
+
+    /// Against DynamoDB Local: a delegation authorized (however it got there)
+    /// under a small-order did:key must never mint, even when the attacker
+    /// forges a signature that a non-strict Ed25519 check would accept.
+    /// Skips unless `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set.
+    #[tokio::test]
+    async fn forged_signature_for_a_weak_key_never_mints_an_agent_token() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let store = std::sync::Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+
+        let user = store
+            .create_user(
+                &format!("weak-key-user-{}", Uuid::new_v4()),
+                "did:key:zWeakKeyTestUser",
+            )
+            .await
+            .expect("create user");
+
+        // The identity point: a small-order did:key. Whatever authorized it
+        // (this test plants the row directly — the point is what happens at
+        // /agents/token afterwards, not how the row got here).
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak_did = did_key_of_bytes(&identity);
+
+        let now = Utc::now().timestamp();
+        // Idempotent across reruns: an earlier run (or another test using
+        // the same canonical identity-point DID) may have left an active
+        // row behind, and create_agent_delegation refuses to clobber one.
+        let _ = store.revoke_delegation(&weak_did).await;
+        store
+            .create_agent_delegation(&AgentDelegation {
+                agent_did: weak_did.clone(),
+                delegator_type: "human".into(),
+                delegator_id: user.user_id.to_string(),
+                delegator_username: Some(user.username.clone()),
+                entitlements: user.entitlements.clone(),
+                name: "weak key agent".into(),
+                depth: 0,
+                root_user_id: user.user_id,
+                chain: vec![],
+                created_at: now,
+                expires_at: Some(now + 3600),
+                revoked_at: None,
+            })
+            .await
+            .expect("plant delegation");
+
+        let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
+        let nonce = Uuid::new_v4().to_string();
+        store
+            .put_agent_challenge(&weak_did, &challenge, &nonce, now)
+            .await
+            .expect("plant challenge");
+
+        // R = the identity point, s = 0: verifies under the lax check for
+        // any message, under any small-order verifying key.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let signature = base64::engine::general_purpose::STANDARD.encode(forged);
+
+        let result = issue_agent_token(
+            Extension(app_state),
+            Json(TokenRequest {
+                did: weak_did,
+                challenge,
+                signature,
+                nonce,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a forged signature under a small-order key must never mint an agent token"
         );
     }
 }
