@@ -52,6 +52,7 @@ use authnz_rs::{constants, cwt, keys};
 mod agent;
 #[cfg(test)]
 mod agent_plane_tests;
+mod agent_state;
 mod apple_signin;
 mod authn;
 mod db;
@@ -316,6 +317,9 @@ pub struct AppState {
     /// `GET /agents/workloads/:id/status` (`AGENT_STATUS_CLIENT_IDS`) — the
     /// platform KAS's `agent_status` client. Empty ⇒ 403.
     pub agent_status_client_ids: Arc<Vec<String>>,
+    /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
+    /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
+    pub appraisal: agent_state::AppraisalConfig,
     /// Expected App Attest App ID hashes (`APP_ATTEST_APP_ID`), each the
     /// hex-encoded SHA-256 of "<TeamID>.<BundleID>", lower-cased.
     ///
@@ -502,6 +506,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "AGENT_DELEGATE_CLIENT_IDS is empty: the agents:delegate scope is refused for every client"
         );
     }
+    let appraisal = agent_state::AppraisalConfig::parse(
+        env::var("AGENT_OWNER_APPRAISAL_TTL_SECONDS").ok(),
+        env::var("AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS").ok(),
+    )?;
     let agent_status_client_ids = parse_id_list(env::var("AGENT_STATUS_CLIENT_IDS").ok());
     if agent_status_client_ids.is_empty() {
         log::warn!(
@@ -528,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_client_ids: Arc::new(admin_client_ids),
         agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
         agent_status_client_ids: Arc::new(agent_status_client_ids),
+        appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
         )),
@@ -1600,6 +1609,7 @@ pub(crate) mod test_helpers {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }
     }

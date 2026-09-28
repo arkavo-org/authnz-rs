@@ -165,6 +165,23 @@ pub const AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS: i64 = 3600;
 /// caches no longer, so a quarantine reaches every rewrap within it.
 pub const WORKLOAD_STATUS_LEASE_SECONDS: i64 = 5;
 
+/// Default lifetime (seconds) of the owner's appraisal: `POST /agents/authorize`
+/// and an owner `POST /agents/{did}/appraisal` set `appraised_until` to the
+/// passkey assertion time (`auth_time`) plus this. NIST SP 800-63B-4 §2.3.3
+/// caps AAL3 reauthentication at 12 hours; the default takes that stricter
+/// bound.
+pub const OWNER_APPRAISAL_TTL_DEFAULT_SECONDS: i64 = 12 * 3600;
+
+/// Ceiling on `AGENT_OWNER_APPRAISAL_TTL_SECONDS`. The owner appraises with a
+/// passkey, and a synced passkey is AAL2 at most; AAL2 reauthentication
+/// SHOULD be no more than 24 hours (SP 800-63B-4 §2.3.2).
+pub const OWNER_APPRAISAL_TTL_MAX_SECONDS: i64 = 24 * 3600;
+
+/// Default and ceiling (seconds) of a Guardian appraisal: the AAL3 inactivity
+/// bound (§2.3.3) and the agent token's maximum lifetime, so every token is
+/// covered by a current appraisal.
+pub const GUARDIAN_APPRAISAL_MAX_SECONDS: i64 = 15 * 60;
+
 /// Maximum age (seconds) of the passkey auth CWT that recovers a quarantined
 /// workload. Lifting a quarantine needs a fresh assertion, not any token
 /// that has not expired yet.

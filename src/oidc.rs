@@ -2892,6 +2892,7 @@ mod tests {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
 
@@ -3014,6 +3015,7 @@ mod tests {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
 
