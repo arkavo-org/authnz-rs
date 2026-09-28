@@ -1410,6 +1410,22 @@ mod tests {
         let err = extract_ed25519_pubkey(&did_key_of_bytes(&identity)).unwrap_err();
         assert!(err.to_string().contains("small-order"), "{err}");
         assert!(validate_did_key(&did_key_of_bytes(&identity)).is_err());
+
+        // A second, distinct small-order point (order 4: y = 0), found the
+        // same way the off-curve search below does, so the test does not
+        // depend on a hand-copied constant.
+        let other_weak = (0u8..=255)
+            .map(|b| {
+                let mut k = [0u8; 32];
+                k[0] = b;
+                k
+            })
+            .find(|k| *k != identity && VerifyingKey::from_bytes(k).is_ok_and(|vk| vk.is_weak()))
+            .expect("some low first-order-byte y is a second small-order point");
+        let err = extract_ed25519_pubkey(&did_key_of_bytes(&other_weak)).unwrap_err();
+        assert!(err.to_string().contains("small-order"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&other_weak)).is_err());
+
         // Bytes that decode to no curve point at all.
         let off_curve = (2u8..=255)
             .map(|b| {
@@ -1421,6 +1437,11 @@ mod tests {
             .expect("some y has no x");
         let err = extract_ed25519_pubkey(&did_key_of_bytes(&off_curve)).unwrap_err();
         assert!(err.to_string().contains("not an Ed25519 point"), "{err}");
+        assert!(validate_did_key(&did_key_of_bytes(&off_curve)).is_err());
+
+        // A regular key must still work.
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        assert!(extract_ed25519_pubkey(&did_key_for(&sk.verifying_key())).is_ok());
     }
 
     #[test]
