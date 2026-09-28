@@ -2042,7 +2042,7 @@ async fn status_reports_suspended_and_never_leases_past_the_appraisal() {
         StatusCode::OK
     );
     let status_client = service_cwt(&p, STATUS_CLIENT);
-    let soon = Utc::now().timestamp() + 2;
+    let soon = Utc::now().timestamp() + 4;
     p.set_appraised_until(&did, soon).await;
     let body = json_of(p.status(&did, Some(&status_client)).await).await;
     assert_eq!(body["state"], "eligible");

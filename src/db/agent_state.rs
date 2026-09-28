@@ -74,9 +74,10 @@ impl EffectiveState {
 pub struct AgentTrust {
     pub state: AgentState,
     /// Server-assigned and monotonic: +1 on every change of the stored
-    /// state, and on an authorize that starts a new delegation over a
-    /// revoked or expired row. Never reset. 0 only on a row written before
-    /// the state existed (the attribute is absent).
+    /// state, on a swarm change, on a revocation (and its cascade), and on
+    /// an authorize that starts a new delegation over a revoked, expired or
+    /// pre-v2 row; never on a renewal. Never reset. 0 only on a row written
+    /// before the state existed (the attribute is absent).
     pub state_version: u64,
     /// Present once appraised; the identity is eligible while `now` is before it.
     pub appraised_until: Option<i64>,
@@ -1165,5 +1166,40 @@ pub(crate) mod tests {
             store.quarantine_agent(&did, second, 2, "inc-1", None, "owner:second", 62).await.unwrap(),
             QuarantineOutcome::Latched(d) if d.trust.state_version == 3
         ));
+    }
+
+    /// The owner clause refuses both writes on its own, independent of the
+    /// version: `first` reads the version the row actually carries (1) but
+    /// is not the owner, so neither write can be attributed to a stale
+    /// version read.
+    #[tokio::test]
+    async fn quarantine_and_revocation_refuse_the_wrong_owner_at_the_stored_version() {
+        let Some(store) = local_store() else { return };
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let did = unique_did("W");
+        let d = AgentDelegation {
+            trust: AgentTrust {
+                state: AgentState::Eligible,
+                state_version: 1,
+                appraised_until: Some(1_790_043_200),
+                appraised_by: Some("owner:second".into()),
+                ..AgentTrust::default()
+            },
+            ..delegation(&did, second)
+        };
+        store.put_agent_row(&d).await.unwrap();
+        assert_eq!(
+            store
+                .quarantine_agent(&did, first, 1, "inc-1", None, "owner:first", 60)
+                .await
+                .unwrap(),
+            QuarantineOutcome::NotOwner
+        );
+        assert!(conflict(store.revoke_agent(&did, first, 1, 60).await));
+        let got = store.get_agent_delegation(&did).await.unwrap().unwrap();
+        assert_eq!(got.root_user_id, second);
+        assert_eq!(got.trust.state_version, 1);
+        assert_eq!(got.trust.state, AgentState::Eligible);
+        assert_eq!(got.revoked_at, None);
     }
 }

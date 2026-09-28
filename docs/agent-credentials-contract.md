@@ -2,7 +2,7 @@
 
 **Version:** v2 (2026-09-28)
 **Owner:** authnz-rs (identity.arkavo.net)
-**Design:** arkavo-edge `docs/superpowers/specs/2026-09-26-agent-credentials-quarantine-design.md` (local), amended by the agent trust state machine amendment of 2026-09-27 (arkavo-edge#711).
+**Design:** the agent trust state machine amendment of 2026-09-27, tracked at [arkavo-org/arkavo-edge#711](https://github.com/arkavo-org/arkavo-edge/issues/711).
 
 Other repos cite this file as "authnz-rs docs/agent-credentials-contract.md v2". Any change to a name, shape, header, status code or bound below is a new version.
 
@@ -26,8 +26,8 @@ v1 was never deployed. v2 replaces it:
 | `quarantined` | yes, a latch | no | the owner or an enrolled Guardian (`/quarantine`) |
 
 - `state_version` is server-assigned and never decreases. It increases by exactly 1 when the stored state changes (`unassessed` → `eligible`, any → `quarantined`, `quarantined` → `unassessed`), when the swarm changes, when the delegation is revoked (`DELETE /agents/delegations/{did}`), and when an authorize starts a new delegation over one that was revoked, expired, or written before v2. A renewal (`eligible` → `eligible`, including out of `suspended`) and a change of entitlements or `short_lived` leave it unchanged, so a renewal never invalidates the tokens the identity already holds. A swarm change does invalidate them: a token minted in an earlier swarm never matches again, even after the agent moves back.
-- An appraisal never clears a quarantine.
-- Recovery is owner-only and moves the identity to `unassessed`. Once recovered, the key is Guardian-appraised for life; the owner's path back is a new key. The owner's authorize and `/appraisal` are refused for that key from then on, so the owner cannot change its entitlements or swarm either; a Guardian's appraisals (each at most 15 min) renew it as for any key.
+- An appraisal (owner or Guardian) never clears a quarantine, and never extends the delegation itself: the delegation expires `AGENT_DELEGATION_DAYS` (30) days after the identity's last authorize, and only an owner re-authorize (not `/appraisal`) resets that clock.
+- Recovery is owner-only and moves the identity to `unassessed`. Once recovered, the key is Guardian-appraised for the rest of its delegation; the owner's authorize and `/appraisal` are refused for that key from then on, so the owner cannot change its entitlements, swarm, or delegation lifetime either. Because a recovered key can never be re-authorized, it stops minting at most 30 days after its last authorize even while a Guardian keeps appraising it — the owner's path from there is a new key. A Guardian's appraisals (each at most 15 min) renew the appraisal, not the delegation, as for any key.
 
 ## Configuration
 
@@ -179,7 +179,7 @@ Caller: the owner only, with a passkey assertion at most 300 s old: `X-Auth-Toke
 
 Request: `{"incident": string (1–256 chars, no control characters)}` — must equal the latched incident.
 
-Effect, in one conditional write: `state = unassessed`, `state_version + 1`, `incident` cleared and recorded as `last_cleared_incident`, `recovered_at` set, the appraisal removed. The delegation itself is kept, and `recovered_at` is never removed. **Once recovered, the key is Guardian-appraised for life; the owner's path back is a new key.** The identity mints again only after a Guardian appraises it, and Guardian renewals (each at most 15 min) keep it eligible as for any key; the owner may not (authorize and `/appraisal` answer 403 `Forbidden: agent was recovered; only a Guardian may appraise it` for that key from now on, so the owner cannot change its entitlements or swarm either). Until a Guardian is enrolled for the owner, a recovered identity stays `unassessed`; the owner authorizes a new key instead.
+Effect, in one conditional write: `state = unassessed`, `state_version + 1`, `incident` cleared and recorded as `last_cleared_incident`, `recovered_at` set, the appraisal removed. The delegation itself is kept, and `recovered_at` is never removed. **Once recovered, the key is Guardian-appraised for the rest of its delegation; the owner's path back is a new key.** The identity mints again only after a Guardian appraises it, and Guardian renewals (each at most 15 min) keep it eligible, as for any key — but an appraisal never extends the delegation itself: the owner may not re-authorize this key (authorize and `/appraisal` answer 403 `Forbidden: agent was recovered; only a Guardian may appraise it` for that key from now on, so the owner cannot change its entitlements, swarm, or delegation lifetime either), so a recovered key stops minting at most `AGENT_DELEGATION_DAYS` (30) days after its last authorize, even while a Guardian keeps appraising it — the owner's path from there is a new key. Until a Guardian is enrolled for the owner, a recovered identity stays `unassessed`; the owner authorizes a new key instead.
 
 Response 200: the status body. Errors: 400 malformed or empty JSON body, bad DID, or a bad `incident`; 401 missing, invalid or stale credential; 403 not the owner, or the Bearer token lacks the scope or the client; 404 unknown DID; 409 not quarantined, incident mismatch, or concurrent change; 415 if `Content-Type` isn't `application/json`; 422 missing or mistyped `incident` field.
 

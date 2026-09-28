@@ -279,6 +279,15 @@ every `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (counted from the passkey tap) or
 it is suspended and stops minting; the owner renews with
 `POST /agents/{did}/appraisal`, which resends no entitlements.
 
+An appraisal — owner or Guardian — renews eligibility only; it never extends
+the delegation itself. The delegation expires `AGENT_DELEGATION_DAYS` (30
+days) after the identity's last owner authorize, and only a fresh
+`POST /agents/authorize` by the owner resets that clock. This matters most
+after recovery: a recovered key can never be re-authorized by its owner
+(only a Guardian may appraise it from then on), so a recovered key stops
+minting at most 30 days after its last authorize even while a Guardian
+keeps appraising it — the owner authorizes a new key before then.
+
 ### Systemd Service Setup
 
 > **Not the live deployment.** `identity.arkavo.net` runs on macOS, where there
