@@ -2,19 +2,20 @@
 //! docs/agent-credentials-contract.md (v2).
 
 use crate::AppState;
-use crate::agent::{AgentError, REFUSE_STALE_ASSERTION, db_err, validate_did_key};
+use crate::agent::{AgentError, REFUSE_STALE_ASSERTION, db_err, is_live, validate_did_key};
 use crate::constants::{
     AGENT_STATUS_LEASE_SECONDS, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, EVIDENCE_REF_MAX_LEN,
     GUARDIAN_APPRAISAL_MAX_SECONDS, INCIDENT_MAX_LEN, OWNER_APPRAISAL_TTL_DEFAULT_SECONDS,
     OWNER_APPRAISAL_TTL_MAX_SECONDS, RECOVERY_TOKEN_MAX_AGE_SECONDS,
 };
 use crate::db::{AgentDelegation, AgentState, DynamoDBError, EffectiveState, QuarantineOutcome};
+use crate::entitlements::EntitlementError;
 use crate::guardian::{GUARDIAN_SIGNATURE_HEADER, refuse_guardian, verify_guardian_request};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, OriginalUri, Path};
 use axum::http::{HeaderMap, Method};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -379,6 +380,44 @@ pub async fn recover_agent(
     Err(AgentError::Conflict(
         "agent changed concurrently; read its status and retry".into(),
     ))
+}
+
+/// GET /agents/:did/status — what the platform checks before it lets an
+/// agent token's entitlements through. Served from a strongly consistent
+/// read with a 5-second lease, never from a cache. A revoked or expired
+/// delegation is 404 unless the quarantine latch is set, which is reported
+/// whatever the delegation's liveness.
+pub async fn agent_status(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(did): Path<String>,
+) -> Result<Response, AgentError> {
+    refuse_guardian(&headers)?;
+    crate::entitlements::require_service_cwt_for(
+        &app_state,
+        &headers,
+        &app_state.agent_status_client_ids,
+    )
+    .map_err(|e| match e {
+        EntitlementError::MissingToken => AgentError::MissingToken,
+        EntitlementError::InvalidToken => AgentError::InvalidToken,
+        _ => AgentError::Forbidden("client may not read agent status".into()),
+    })?;
+    validate_did_key(&did)?;
+    let now = Utc::now().timestamp();
+    let d = app_state
+        .db_store
+        .get_agent_delegation(&did)
+        .await
+        .map_err(db_err)?
+        .filter(|d| d.trust.state == AgentState::Quarantined || is_live(d, now))
+        .ok_or(AgentError::DelegationNotFound)?;
+    let mut resp = Json(AgentStatus::of(&d, now)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(resp)
 }
 
 #[cfg(test)]

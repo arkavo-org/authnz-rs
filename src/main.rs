@@ -691,6 +691,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/agents/:did/quarantine",
             post(agent_state::quarantine_agent),
         )
+        // Status lease for the platform's entity resolver. Contract v2.
+        .route("/agents/:did/status", get(agent_state::agent_status))
         // Owner recovery of a quarantined identity. Contract v2.
         .route("/agents/:did/recover", post(agent_state::recover_agent))
         // Guardian enrollment (owner). A Guardian may only quarantine.

@@ -49,6 +49,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/agents/:did/quarantine",
             post(crate::agent_state::quarantine_agent),
         )
+        .route("/agents/:did/status", get(crate::agent_state::agent_status))
         .route(
             "/agents/:did/recover",
             post(crate::agent_state::recover_agent),
@@ -1938,6 +1939,175 @@ async fn a_former_owner_cannot_quarantine_a_reassigned_key() {
     );
 }
 
+#[tokio::test]
+async fn status_requires_an_allowlisted_service_cwt_and_leases_five_seconds() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    let (_, authorized) = p
+        .authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+        .await;
+
+    assert_eq!(
+        p.status(&did, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.status(&did, Some(&cwt)).await.status(),
+        StatusCode::FORBIDDEN,
+        "a human CWT"
+    );
+    assert_eq!(
+        p.status(&did, Some(&service_cwt(&p, "it"))).await.status(),
+        StatusCode::FORBIDDEN,
+        "an admin client is not a status client"
+    );
+
+    let before = Utc::now().timestamp();
+    let resp = p.status(&did, Some(&service_cwt(&p, STATUS_CLIENT))).await;
+    let after = Utc::now().timestamp();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body = json_of(resp).await;
+    let valid_until = body["valid_until"].as_i64().unwrap();
+    assert!(
+        (before + 5..=after + 5).contains(&valid_until),
+        "valid_until = now + 5"
+    );
+    assert_eq!(
+        body,
+        json!({
+            "agent": did, "owner": owner.to_string(), "swarm": "kit-1",
+            "state": "eligible", "state_version": 1,
+            "appraised_until": authorized["appraised_until"], "appraised_by": "owner",
+            "incident": null, "valid_until": valid_until,
+        })
+    );
+    let status_client = service_cwt(&p, STATUS_CLIENT);
+    assert_eq!(
+        p.status(&did_key(&fresh_agent()), Some(&status_client))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        p.status("wl-00112233445566778899aabbccddeeff", Some(&status_client))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // An agent authorized before it has a kit reports an empty swarm.
+    let bare = fresh_agent();
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&bare, "", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let body = json_of(p.status(&did_key(&bare), Some(&status_client)).await).await;
+    assert_eq!(body["swarm"], "");
+
+    // A revoked delegation that is not quarantined is gone to the platform.
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{did}"))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        p.status(&did, Some(&status_client)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn status_reports_suspended_and_never_leases_past_the_appraisal() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let status_client = service_cwt(&p, STATUS_CLIENT);
+    let soon = Utc::now().timestamp() + 2;
+    p.set_appraised_until(&did, soon).await;
+    let body = json_of(p.status(&did, Some(&status_client)).await).await;
+    assert_eq!(body["state"], "eligible");
+    assert_eq!(
+        body["valid_until"],
+        json!(soon),
+        "capped at appraised_until"
+    );
+
+    p.set_appraised_until(&did, Utc::now().timestamp() - 1)
+        .await;
+    let body = json_of(p.status(&did, Some(&status_client)).await).await;
+    assert_eq!(body["state"], "suspended");
+    assert_eq!(
+        body["state_version"], 1,
+        "suspension is derived, never stored"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_the_latch_after_revocation_and_unassessed_after_recovery() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let (x, y) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    for a in [&x, &y] {
+        assert_eq!(
+            p.authorize(auth, authorize_body(a, "kit-1", false)).await.0,
+            StatusCode::OK
+        );
+    }
+    let status_client = service_cwt(&p, STATUS_CLIENT);
+
+    // Quarantined, then revoked: the latch is still reported, and the
+    // revocation moved the version.
+    let did = did_key(&x);
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{did}"))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let body = json_of(p.status(&did, Some(&status_client)).await).await;
+    assert_eq!(
+        (&body["state"], &body["incident"], &body["state_version"]),
+        (&json!("quarantined"), &json!("inc-1"), &json!(3)),
+        "the latch is reported even after revocation"
+    );
+
+    // Recovered: unassessed, the appraisal gone, a new version.
+    let did = did_key(&y);
+    assert_eq!(p.quarantine(&cwt, &did, "inc-2").await.0, StatusCode::OK);
+    assert_eq!(p.recover(auth, &did, "inc-2").await.0, StatusCode::OK);
+    let body = json_of(p.status(&did, Some(&status_client)).await).await;
+    assert_eq!(
+        (
+            &body["state"],
+            &body["state_version"],
+            &body["appraised_until"],
+            &body["appraised_by"]
+        ),
+        (&json!("unassessed"), &json!(3), &Value::Null, &Value::Null)
+    );
+}
+
 /// An owner with one authorized agent, and an enrolled Guardian:
 /// (owner, owner CWT, agent DID, guardian id, guardian key).
 async fn guarded(p: &Plane) -> (Uuid, String, String, String, SigningKey) {
@@ -2115,7 +2285,6 @@ async fn guardian_cannot_quarantine_another_owners_agent() {
 }
 
 #[tokio::test]
-#[ignore = "needs GET /agents/:did/status (Task A3c)"]
 async fn guardians_get_403_everywhere_but_quarantine() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, gsk) = guarded(&p).await;
