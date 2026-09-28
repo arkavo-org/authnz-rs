@@ -900,26 +900,32 @@ pub async fn generate_agent_challenge(
 ) -> Result<impl IntoResponse, AgentError> {
     refuse_guardian(&headers)?;
     validate_did_key(&params.did)?;
-    let delegation = active_delegation(&app_state, &params.did).await?;
-    issuable(&delegation, Utc::now().timestamp())?;
+    // The write is conditioned on the identity being issuable when it
+    // lands; when it is not, re-read so the caller gets the refusal that
+    // applies now (quarantined, revoked, expired, suspended).
+    for _ in 0..3 {
+        let delegation = active_delegation(&app_state, &params.did).await?;
+        issuable(&delegation, Utc::now().timestamp())?;
 
-    let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
-    let nonce = Uuid::new_v4().to_string();
+        let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
+        let nonce = Uuid::new_v4().to_string();
 
-    app_state
-        .db_store
-        .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
-        .await
-        .map_err(|e| match e {
-            // The only condition left on the write is that the delegation row
-            // exists, so a conflict means it was deleted between
-            // `active_delegation` above and this write.
-            DynamoDBError::ConditionalConflict => AgentError::DelegationNotFound,
-            other => AgentError::DatabaseError(Box::new(other)),
-        })?;
-
-    info!("Challenge issued for agent: {}", params.did);
-    Ok(Json(ChallengeResponse { challenge, nonce }))
+        match app_state
+            .db_store
+            .put_agent_challenge(&params.did, &challenge, &nonce, Utc::now().timestamp())
+            .await
+        {
+            Ok(()) => {
+                info!("Challenge issued for agent: {}", params.did);
+                return Ok(Json(ChallengeResponse { challenge, nonce }));
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(AgentError::Conflict(
+        "agent changed concurrently; retry".into(),
+    ))
 }
 
 /// POST /agents/token — verify the signed challenge, mint the agent CWT.

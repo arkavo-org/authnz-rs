@@ -1329,6 +1329,103 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Whether `did`'s row carries a pending challenge.
+    async fn has_challenge(store: &DynamoDBStore, did: &str) -> bool {
+        store
+            .client
+            .get_item()
+            .table_name(&store.agent_delegations_table)
+            .key("agent_did", s(did))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap()
+            .item
+            .is_some_and(|i| i.contains_key("challenge"))
+    }
+
+    #[tokio::test]
+    async fn a_challenge_is_stored_only_while_the_identity_is_issuable() {
+        let Some(store) = local_store() else { return };
+        let owner = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+        let eligible = AgentTrust {
+            state: AgentState::Eligible,
+            state_version: 1,
+            appraised_until: Some(now + 600),
+            ..AgentTrust::default()
+        };
+        let row = |tag: &str| AgentDelegation {
+            trust: eligible.clone(),
+            ..delegation(&unique_did(tag), owner)
+        };
+        let live = row("I");
+        store.put_agent_row(&live).await.unwrap();
+        store
+            .put_agent_challenge(&live.agent_did, "c", "n", now)
+            .await
+            .unwrap();
+        assert!(has_challenge(&store, &live.agent_did).await);
+
+        let cases = [
+            (
+                "quarantined",
+                AgentDelegation {
+                    trust: AgentTrust {
+                        state: AgentState::Quarantined,
+                        incident: Some("inc-1".into()),
+                        ..eligible.clone()
+                    },
+                    ..row("Q")
+                },
+            ),
+            (
+                "suspended",
+                AgentDelegation {
+                    trust: AgentTrust {
+                        appraised_until: Some(now),
+                        ..eligible.clone()
+                    },
+                    ..row("S")
+                },
+            ),
+            (
+                "unassessed",
+                AgentDelegation {
+                    trust: AgentTrust::default(),
+                    ..row("U")
+                },
+            ),
+            (
+                "revoked",
+                AgentDelegation {
+                    revoked_at: Some(now - 1),
+                    ..row("R")
+                },
+            ),
+            (
+                "expired",
+                AgentDelegation {
+                    expires_at: Some(now - 1),
+                    ..row("E")
+                },
+            ),
+        ];
+        for (what, d) in cases {
+            store.put_agent_row(&d).await.unwrap();
+            assert!(
+                conflict(store.put_agent_challenge(&d.agent_did, "c", "n", now).await),
+                "{what}"
+            );
+            assert!(!has_challenge(&store, &d.agent_did).await, "{what}");
+        }
+        assert!(conflict(
+            store
+                .put_agent_challenge(&unique_did("none"), "c", "n", now)
+                .await
+        ));
+    }
+
     #[tokio::test]
     async fn quarantine_and_revocation_are_bound_to_the_owner_and_version_read() {
         let Some(store) = local_store() else { return };

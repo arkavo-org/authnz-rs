@@ -64,7 +64,7 @@ The challenge signature is verified with strict Ed25519 verification against the
 
 `arkavo_workload` (v1) is not minted.
 
-A token is minted (and a challenge issued) only while the identity is `eligible`: the delegation exists, is not revoked or expired, and `now < appraised_until`. Every `AGENT_TOKEN_AUDIENCES` verifier accepts the token and only the platform asks for status, so issuance itself refuses every other state.
+A token is minted (and a challenge issued) only while the identity is `eligible`: the delegation exists, is not revoked or expired, and `now < appraised_until`. Every `AGENT_TOKEN_AUDIENCES` verifier accepts the token and only the platform asks for status, so issuance itself refuses every other state. The challenge write is itself conditioned on the identity being `eligible` and its delegation live when the write lands, so a quarantine, revocation, expiry or lapsed appraisal that lands after `/agents/challenge` read the identity stores no challenge; the endpoint reads the identity again and answers the refusal that now applies.
 
 The token is minted from a strongly consistent read of the identity taken after every other lookup the request makes, so a quarantine, revocation, expiry, appraisal change or re-authorize that lands while the request is in flight applies to it: it carries the entitlements, lifetime (`short_lived`), swarm and `state_version` of that read, and its `exp` is bounded by that read's `appraised_until`. A token whose `exp` would not be after its `iat` is never minted: the request is refused with `Forbidden: agent appraisal expired; it needs a fresh appraisal` when the appraisal has ended, or `Delegation expired` when the delegation has.
 

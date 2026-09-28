@@ -1718,8 +1718,13 @@ impl DynamoDBStore {
         Ok(revoked)
     }
 
-    /// Store a pending challenge on the delegation row (replaces any prior one).
-    /// Fails if no delegation row exists for the DID.
+    /// Store a pending challenge on the delegation row (replaces any prior one),
+    /// only while the identity may be issued a token at `issued_at`: stored
+    /// `eligible` with `appraised_until` after it, not revoked, and not past
+    /// `expires_at` (live through it, as `agent::is_live` says). A
+    /// quarantine, revocation, expiry or lapsed appraisal that lands after
+    /// the caller's read therefore stores no challenge. `ConditionalConflict`
+    /// when the row is missing or not issuable.
     pub async fn put_agent_challenge(
         &self,
         agent_did: &str,
@@ -1740,8 +1745,17 @@ impl DynamoDBStore {
             .update_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
-            .condition_expression("attribute_exists(agent_did)")
+            .condition_expression(
+                "#st = :eligible AND appraised_until > :t \
+                 AND attribute_not_exists(revoked_at) \
+                 AND (attribute_not_exists(expires_at) OR expires_at >= :t)",
+            )
             .update_expression("SET challenge = :c, challenge_nonce = :n, challenge_issued_at = :t")
+            .expression_attribute_names("#st", "state")
+            .expression_attribute_values(
+                ":eligible",
+                AttributeValue::S(AgentState::Eligible.as_str().to_string()),
+            )
             .expression_attribute_values(":c", AttributeValue::S(challenge.to_string()))
             .expression_attribute_values(":n", AttributeValue::S(nonce.to_string()))
             .expression_attribute_values(":t", AttributeValue::N(issued_at.to_string()))

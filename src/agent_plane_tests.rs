@@ -1160,7 +1160,7 @@ async fn token_stage(p: &Plane, sk: &SigningKey) -> (StatusCode, Value) {
     let challenge = base64::engine::general_purpose::STANDARD.encode(challenge_bytes);
     let nonce = Uuid::new_v4().to_string();
     p.store
-        .put_agent_challenge(&did_key(sk), &challenge, &nonce, Utc::now().timestamp())
+        .plant_agent_challenge(&did_key(sk), &challenge, &nonce, Utc::now().timestamp())
         .await
         .unwrap();
     let sig =
