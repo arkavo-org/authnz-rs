@@ -711,6 +711,10 @@ pub async fn list_delegations(
 }
 
 /// DELETE /agents/delegations/:did — revoke, cascading to child delegations.
+/// The write bumps `state_version` and is conditioned on the owner and the
+/// version read: it never lands on a key reassigned
+/// since the read, and no renewal or appraisal that read the live row can
+/// clear it and keep the version its tokens carry.
 pub async fn revoke_delegation(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -718,24 +722,46 @@ pub async fn revoke_delegation(
 ) -> Result<impl IntoResponse, AgentError> {
     refuse_guardian(&headers)?;
     let human = authenticate_human(&app_state, &headers).await?;
+    let now = Utc::now().timestamp();
 
-    let delegation = app_state
-        .db_store
-        .get_agent_delegation(&agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
-        .ok_or(AgentError::DelegationNotFound)?;
-    if delegation.root_user_id != human.user_id {
-        return Err(AgentError::Unauthorized(
-            "delegation belongs to a different user".into(),
-        ));
+    let mut revoked = None;
+    for _ in 0..3 {
+        let delegation = app_state
+            .db_store
+            .get_agent_delegation(&agent_did)
+            .await
+            .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
+            .ok_or(AgentError::DelegationNotFound)?;
+        // Checked on every read, so a key reassigned between a read and the
+        // write gets the same answer as one that was never the caller's.
+        if delegation.root_user_id != human.user_id {
+            return Err(AgentError::Unauthorized(
+                "delegation belongs to a different user".into(),
+            ));
+        }
+        match app_state
+            .db_store
+            .revoke_agent(
+                &agent_did,
+                human.user_id,
+                delegation.trust.state_version,
+                now,
+            )
+            .await
+        {
+            Ok(d) => {
+                revoked = Some(d);
+                break;
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(AgentError::DatabaseError(Box::new(e))),
+        }
     }
-
-    app_state
-        .db_store
-        .revoke_delegation(&agent_did)
-        .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+    let Some(revoked) = revoked else {
+        return Err(AgentError::Conflict(
+            "agent changed concurrently; retry".into(),
+        ));
+    };
     let cascaded = app_state
         .db_store
         .revoke_delegations_with_chain(&agent_did)
@@ -743,8 +769,8 @@ pub async fn revoke_delegation(
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
 
     info!(
-        "Revoked delegation {} and {} child delegations",
-        agent_did, cascaded
+        "Revoked delegation {} (state_version {}) and {} child delegations",
+        agent_did, revoked.trust.state_version, cascaded
     );
     Ok(StatusCode::NO_CONTENT)
 }

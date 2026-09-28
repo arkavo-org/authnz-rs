@@ -45,6 +45,14 @@ pub(crate) fn router(state: AppState) -> Router {
             get(crate::agent::generate_agent_challenge),
         )
         .route("/agents/token", post(crate::agent::issue_agent_token))
+        .route(
+            "/agents/:did/quarantine",
+            post(crate::agent_state::quarantine_agent),
+        )
+        .route(
+            "/agents/:did/recover",
+            post(crate::agent_state::recover_agent),
+        )
         .route("/guardians", post(crate::guardian::enroll_guardian))
         .route(
             "/guardians/:guardian_id",
@@ -1102,6 +1110,834 @@ async fn a_suspended_identity_is_refused_at_both_challenge_and_token() {
     assert_eq!((st, &body["state_version"]), (StatusCode::OK, &json!(1)));
     assert_eq!(p.mint(&a).await.0, StatusCode::OK);
 }
+#[tokio::test]
+async fn a_new_key_is_a_new_identity() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let (a1, a2) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    for a in [&a1, &a2] {
+        assert_eq!(
+            p.authorize(auth, authorize_body(a, "kit-1", false)).await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        p.quarantine(&cwt, &did_key(&a1), "inc-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(p.mint(&a1).await.0, StatusCode::FORBIDDEN);
+    let (st, body) = p.mint(&a2).await;
+    assert_eq!(st, StatusCode::OK, "another key is untouched: {body}");
+    assert_eq!(p.trust(&did_key(&a2)).await.state_version, 1);
+}
+
+/// A fresh `agents:delegate` access token whose audience is `"arkavo"`, as a
+/// relying party registered under that client_id would receive one.
+fn arkavo_audience_access_token(p: &Plane, owner: Uuid) -> String {
+    let claims = crate::cwt::ArkavoClaims::oidc_access(
+        &p.state.issuer,
+        &format!("arkavo:{owner}"),
+        "arkavo",
+        1,
+    )
+    .with_idp("webauthn")
+    .with_scope("openid agents:delegate")
+    .with_auth_time(Utc::now().timestamp());
+    crate::cwt::encode_for_header(
+        &crate::cwt::mint(&claims, &p.state.cwt_signing_key, &p.state.cwt_kid).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn an_access_token_is_never_a_passkey_auth_cwt() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let token = arkavo_audience_access_token(&p, owner);
+
+    let (st, body) = p.recover(("X-Auth-Token", &token), &did, "inc-1").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body.to_string()
+            .contains("X-Auth-Token must be a passkey auth CWT"),
+        "{body}"
+    );
+    assert_eq!(p.trust(&did).await.state, AgentState::Quarantined);
+
+    let b = fresh_agent();
+    let (st, body) = p
+        .authorize(("X-Auth-Token", &token), authorize_body(&b, "kit-1", false))
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        p.store
+            .get_agent_delegation(&did_key(&b))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn owner_quarantine_latches_once_per_incident() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let (st, body) = p.quarantine(&cwt, &did, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["agent"], json!(did));
+    assert_eq!(body["owner"], json!(owner.to_string()));
+    assert_eq!(body["state"], "quarantined");
+    assert_eq!(body["state_version"], 2);
+    assert_eq!(body["incident"], "inc-1");
+
+    let (st, body) = p.quarantine(&cwt, &did, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["state_version"], 2,
+        "a repeat of the same incident changes nothing"
+    );
+
+    let (st, body) = p.quarantine(&cwt, &did, "inc-2").await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("inc-1"), "{body}");
+    let t = p.trust(&did).await;
+    assert_eq!((t.incident.as_deref(), t.state_version), (Some("inc-1"), 2));
+}
+
+#[tokio::test]
+async fn quarantine_needs_the_owner_and_a_valid_body() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let (_, stranger) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.quarantine(&stranger, &did, "inc-1").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &did_key(&fresh_agent()), "inc-1")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        p.quarantine(&cwt, "wl-00112233445566778899aabbccddeeff", "inc-1")
+            .await
+            .0,
+        StatusCode::BAD_REQUEST,
+        "a v1 workload id is not a DID"
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &did, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (st, _) = p
+        .send(
+            Request::post(format!("/agents/{did}/quarantine"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"incident": "inc-1"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(p.trust(&did).await.state, AgentState::Eligible);
+}
+
+#[tokio::test]
+async fn a_quarantined_key_stays_latched_when_its_delegation_is_revoked() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let x = fresh_agent();
+    let did = did_key(&x);
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&x, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{did}"))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let (st, body) = p.authorize(auth, authorize_body(&x, "kit-1", false)).await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+    assert_ne!(p.mint(&x).await.0, StatusCode::OK);
+    let t = p.trust(&did).await;
+    assert_eq!(
+        (t.state, t.incident.as_deref()),
+        (AgentState::Quarantined, Some("inc-1")),
+        "the latch survives revocation"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_delegation_does_not_clear_the_latch() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let x = fresh_agent();
+    let did = did_key(&x);
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&x, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let expired = crate::db::AgentDelegation {
+        expires_at: Some(Utc::now().timestamp() - 60),
+        ..p.store.get_agent_delegation(&did).await.unwrap().unwrap()
+    };
+    p.store.put_agent_row(&expired).await.unwrap();
+
+    let (st, body) = p.authorize(auth, authorize_body(&x, "kit-1", false)).await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+    assert_eq!(p.trust(&did).await.state, AgentState::Quarantined);
+}
+
+#[tokio::test]
+async fn refusal_bodies_are_contract_v2() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let (legacy, lapsed, revoked, latched) =
+        (fresh_agent(), fresh_agent(), fresh_agent(), fresh_agent());
+    p.store
+        .put_agent_row(&crate::db::agent_state_test_support::delegation(
+            &did_key(&legacy),
+            owner,
+        ))
+        .await
+        .unwrap();
+    for a in [&lapsed, &revoked, &latched] {
+        assert_eq!(
+            p.authorize(auth, authorize_body(a, "kit-1", false)).await.0,
+            StatusCode::OK
+        );
+    }
+    p.set_appraised_until(&did_key(&lapsed), Utc::now().timestamp() - 1)
+        .await;
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{}", did_key(&revoked)))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        p.quarantine(&cwt, &did_key(&latched), "inc-1").await.0,
+        StatusCode::OK
+    );
+
+    // The texts are pinned in docs/agent-credentials-contract.md v2; edge
+    // matches them byte for byte.
+    let refused = |text: &str| (StatusCode::FORBIDDEN, json!(text));
+    assert_eq!(
+        p.mint(&legacy).await,
+        refused("Forbidden: agent is unassessed; it needs an appraisal")
+    );
+    assert_eq!(
+        p.mint(&lapsed).await,
+        refused("Forbidden: agent appraisal expired; it needs a fresh appraisal")
+    );
+    assert_eq!(p.mint(&revoked).await, refused("Delegation revoked"));
+    assert_eq!(p.mint(&latched).await, refused("Workload quarantined"));
+    assert_eq!(
+        p.authorize(auth, authorize_body(&latched, "kit-1", false))
+            .await,
+        refused("Workload quarantined")
+    );
+    assert_eq!(
+        p.recover(auth, &did_key(&latched), "inc-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&latched, "kit-1", false))
+            .await,
+        refused("Forbidden: agent was recovered; only a Guardian may appraise it")
+    );
+    assert_eq!(
+        p.mint(&latched).await,
+        refused("Forbidden: agent is unassessed; it needs an appraisal")
+    );
+    // An owner appraisal cannot start from an assertion
+    // older than the configured lifetime.
+    let mut short = p.state.clone();
+    short.appraisal.owner_ttl_seconds = 60;
+    let aged = crate::test_helpers::auth_cwt_aged(&p.state, owner, 120);
+    let resp = router(short)
+        .oneshot(
+            Request::post("/agents/authorize")
+                .header("X-Auth-Token", &aged)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    authorize_body(&fresh_agent(), "kit-1", false).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let st = resp.status();
+    assert_eq!(
+        (st, json_of(resp).await),
+        refused(
+            "Forbidden: passkey assertion is older than the owner appraisal lifetime; sign in again"
+        )
+    );
+}
+
+#[tokio::test]
+async fn owner_quarantine_accepts_an_agents_delegate_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (stranger, _) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let path = format!("/agents/{did}/quarantine");
+    let now = Utc::now().timestamp();
+    let bearer = |user: Uuid, client: &str, scope: &str, auth_time: i64| {
+        format!(
+            "Bearer {}",
+            p.delegate_token(user, client, scope, "webauthn", Some(auth_time))
+        )
+    };
+    let body = json!({"incident": "inc-1", "evidence_ref": null});
+    let cases = [
+        (
+            "stale",
+            bearer(
+                owner,
+                DELEGATE_CLIENT,
+                "openid agents:delegate",
+                now - 3_700,
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "no scope",
+            bearer(owner, DELEGATE_CLIENT, "openid", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong client",
+            bearer(owner, "some-other-rp", "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "not the owner",
+            bearer(stranger, DELEGATE_CLIENT, "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (what, token, expected) in cases {
+        assert_eq!(
+            p.post_json(&path, ("Authorization", &token), body.clone())
+                .await
+                .0,
+            expected,
+            "{what}"
+        );
+    }
+    assert_eq!(p.trust(&did).await.state, AgentState::Eligible);
+
+    let ok = bearer(
+        owner,
+        DELEGATE_CLIENT,
+        "openid agents:delegate",
+        now - 3_000,
+    );
+    let (st, resp) = p.post_json(&path, ("Authorization", &ok), body).await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    assert_eq!(resp["state"], "quarantined");
+    assert_eq!(
+        p.trust(&did).await.quarantined_by,
+        Some(format!("owner:{owner}"))
+    );
+}
+
+#[tokio::test]
+async fn a_quarantined_identity_is_refused_at_both_challenge_and_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &did_key(&a), "inc-1").await.0,
+        StatusCode::OK
+    );
+    // The challenge step's own `issuable` call refuses it.
+    let (st, body) = p
+        .send(
+            Request::get(format!("/agents/challenge?did={}", did_key(&a)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        (st, body),
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+    // And the token step's, exercised on its own.
+    assert_eq!(
+        token_stage(&p, &a).await,
+        (StatusCode::FORBIDDEN, json!("Workload quarantined"))
+    );
+}
+
+#[tokio::test]
+async fn state_version_increases_on_every_state_change_and_only_then() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.state_version(&did).await, 1, "created");
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "kit-2", true)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(p.state_version(&did).await, 2, "a swarm change");
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "kit-2", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.state_version(&did).await,
+        2,
+        "renewed in the same swarm: unchanged"
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(p.state_version(&did).await, 3, "quarantined");
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.state_version(&did).await,
+        3,
+        "same incident again: unchanged"
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &did, "inc-2").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        p.state_version(&did).await,
+        3,
+        "refused second incident: unchanged"
+    );
+    assert_eq!(p.recover(auth, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(p.state_version(&did).await, 4, "recovered");
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "the owner cannot appraise a recovered key"
+    );
+    assert_eq!(p.state_version(&did).await, 4, "refused: unchanged");
+}
+
+#[tokio::test]
+async fn only_the_owner_with_a_fresh_passkey_recovers_citing_the_incident() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a1 = fresh_agent();
+    let did = did_key(&a1);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a1, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, tok) = p.mint(&a1).await;
+    assert_eq!(st, StatusCode::OK, "{tok}");
+    let agent_token = tok["token"].as_str().unwrap().to_string();
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let aged = |age: i64| crate::test_helpers::auth_cwt_aged(&p.state, owner, age);
+
+    let (_, stranger) = p.user(&[READ]).await;
+    assert_eq!(
+        p.recover(("X-Auth-Token", &stranger), &did, "inc-1")
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "not the owner"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &aged(301)), &did, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "a passkey assertion older than 300 s"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &aged(600)), &did, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &agent_token), &did, "inc-1")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "the agent cannot recover"
+    );
+    assert_eq!(
+        p.recover(
+            ("X-Auth-Token", &service_cwt(&p, STATUS_CLIENT)),
+            &did,
+            "inc-1"
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED,
+        "an orchestrator's service identity cannot recover"
+    );
+    let (st, _) = p
+        .send(
+            Request::post(format!("/agents/{did}/recover"))
+                .header("X-Auth-Token", &cwt)
+                .header("X-Guardian-Signature", "g.1.sig")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"incident": "inc-1"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a Guardian can never recover");
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &did, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &did_key(&fresh_agent()), "inc-1")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (st, body) = p.recover(("X-Auth-Token", &cwt), &did, "inc-9").await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "recovery must cite the latched incident"
+    );
+    assert!(
+        body.to_string()
+            .contains("incident does not match the quarantine being cleared"),
+        "{body}"
+    );
+    assert_eq!(p.trust(&did).await.state, AgentState::Quarantined);
+
+    let (st, body) = p.recover(("X-Auth-Token", &aged(299)), &did, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "unassessed");
+    assert_eq!(body["state_version"], 3);
+    assert_eq!(body["incident"], Value::Null);
+    assert_eq!(body["appraised_until"], Value::Null);
+    let t = p.trust(&did).await;
+    assert_eq!((t.state, t.state_version), (AgentState::Unassessed, 3));
+
+    assert_eq!(
+        p.mint(&a1).await,
+        (
+            StatusCode::FORBIDDEN,
+            json!("Forbidden: agent is unassessed; it needs an appraisal")
+        ),
+        "recovery does not make the key eligible"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &did, "inc-1").await.0,
+        StatusCode::CONFLICT,
+        "not quarantined"
+    );
+    // A replayed quarantine citing the cleared incident cannot re-latch.
+    assert_eq!(
+        p.quarantine(&cwt, &did, "inc-1").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(p.state_version(&did).await, 3);
+    assert_eq!(p.quarantine(&cwt, &did, "inc-2").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owner_recovery_accepts_a_fresh_agents_delegate_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (stranger, _) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    let now = Utc::now().timestamp();
+    let bearer = |user: Uuid, client: &str, scope: &str, auth_time: i64| {
+        format!(
+            "Bearer {}",
+            p.delegate_token(user, client, scope, "webauthn", Some(auth_time))
+        )
+    };
+    let cases = [
+        // Fine for authorize and quarantine (≤ 3600 s), not for recovery (≤ 300 s).
+        (
+            "stale for recovery",
+            bearer(owner, DELEGATE_CLIENT, "openid agents:delegate", now - 400),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "just past the bound",
+            bearer(owner, DELEGATE_CLIENT, "openid agents:delegate", now - 302),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "no scope",
+            bearer(owner, DELEGATE_CLIENT, "openid", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "wrong client",
+            bearer(owner, "some-other-rp", "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "not the owner",
+            bearer(stranger, DELEGATE_CLIENT, "openid agents:delegate", now),
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    for (what, token, expected) in cases {
+        assert_eq!(
+            p.recover(("Authorization", &token), &did, "inc-1").await.0,
+            expected,
+            "{what}"
+        );
+    }
+    assert_eq!(p.trust(&did).await.state, AgentState::Quarantined);
+
+    let ok = bearer(
+        owner,
+        DELEGATE_CLIENT,
+        "openid agents:delegate",
+        Utc::now().timestamp() - 299,
+    );
+    let (st, body) = p.recover(("Authorization", &ok), &did, "inc-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "unassessed");
+}
+
+#[tokio::test]
+async fn after_recovery_the_owner_may_authorize_a_new_key_but_not_the_old_one() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let (a1, a2) = (fresh_agent(), fresh_agent());
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.quarantine(&cwt, &did_key(&a1), "inc-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.recover(auth, &did_key(&a1), "inc-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a1, "kit-1", false))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(p.trust(&did_key(&a1)).await.state, AgentState::Unassessed);
+
+    let (st, body) = p.authorize(auth, authorize_body(&a2, "kit-1", false)).await;
+    assert_eq!(st, StatusCode::OK, "a new key is a new identity: {body}");
+    let (st, body) = p.mint(&a2).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        verify_token(&p, body["token"].as_str().unwrap())
+            .custom
+            .arkavo_state_version,
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_delegation_re_authorized_never_revives_its_tokens() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    let auth = ("X-Auth-Token", cwt.as_str());
+    assert_eq!(
+        p.authorize(auth, authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, tok) = p.mint(&a).await;
+    assert_eq!(st, StatusCode::OK, "{tok}");
+    let old = verify_token(&p, tok["token"].as_str().unwrap())
+        .custom
+        .arkavo_state_version;
+    assert_eq!(old, Some(1));
+
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{did}"))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        p.state_version(&did).await,
+        2,
+        "revocation bumps the version"
+    );
+
+    let (st, body) = p.authorize(auth, authorize_body(&a, "kit-1", false)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["state_version"], 3,
+        "a new delegation over the revoked one"
+    );
+    assert_ne!(
+        old,
+        Some(p.state_version(&did).await),
+        "the pre-revocation token no longer matches the platform's check"
+    );
+}
+
+#[tokio::test]
+async fn a_former_owner_cannot_quarantine_a_reassigned_key() {
+    let Some(p) = Plane::new().await else { return };
+    let (first, first_cwt) = p.user(&[READ]).await;
+    let (second, second_cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &first_cwt),
+            authorize_body(&a, "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let gsk = fresh_agent();
+    let gid = p.enroll_guardian(first, &first_cwt, &gsk).await;
+
+    // The first owner's delegation ages out and the second owner takes the key.
+    let expired = crate::db::AgentDelegation {
+        expires_at: Some(Utc::now().timestamp() - 60),
+        ..p.store.get_agent_delegation(&did).await.unwrap().unwrap()
+    };
+    p.store.put_agent_row(&expired).await.unwrap();
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &second_cwt),
+            authorize_body(&a, "kit-2", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let taken = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
+    assert_eq!((taken.root_user_id, taken.trust.state_version), (second, 2));
+
+    assert_eq!(
+        p.quarantine(&first_cwt, &did, "inc-1").await.0,
+        StatusCode::FORBIDDEN,
+        "the former owner"
+    );
+    let path = format!("/agents/{did}/quarantine");
+    let body = quarantine_body("inc-1");
+    let hdr = guardian_header(
+        &gid,
+        &gsk,
+        "POST",
+        &path,
+        Utc::now().timestamp(),
+        body.as_bytes(),
+    );
+    assert_eq!(
+        p.signed("POST", &path, &hdr, Some(&body)).await.0,
+        StatusCode::FORBIDDEN,
+        "the former owner's Guardian"
+    );
+    assert_eq!(
+        p.store.get_agent_delegation(&did).await.unwrap(),
+        Some(taken),
+        "the new owner's row is untouched"
+    );
+}
+
 /// An owner with one authorized agent, and an enrolled Guardian:
 /// (owner, owner CWT, agent DID, guardian id, guardian key).
 async fn guarded(p: &Plane) -> (Uuid, String, String, String, SigningKey) {
@@ -1123,7 +1959,6 @@ fn quarantine_body(incident: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn enrolled_guardian_can_quarantine() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, gsk) = guarded(&p).await;
@@ -1147,7 +1982,6 @@ async fn enrolled_guardian_can_quarantine() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn guardian_signature_by_a_self_supplied_key_is_rejected() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, _) = guarded(&p).await;
@@ -1198,7 +2032,6 @@ async fn guardian_signature_by_a_self_supplied_key_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn guardian_signature_binds_body_path_and_time() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt, agent, gid, gsk) = guarded(&p).await;
@@ -1246,7 +2079,6 @@ async fn guardian_signature_binds_body_path_and_time() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn guardian_cannot_quarantine_another_owners_agent() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, _, gid, gsk) = guarded(&p).await;
@@ -1375,7 +2207,6 @@ async fn guardians_get_403_everywhere_but_quarantine() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn a_replayed_guardian_request_is_rejected_even_inside_the_window() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, gsk) = guarded(&p).await;
@@ -1407,7 +2238,6 @@ async fn a_replayed_guardian_request_is_rejected_even_inside_the_window() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn a_cleared_incident_cannot_re_quarantine_after_recovery() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt, agent, gid, gsk) = guarded(&p).await;
@@ -1479,7 +2309,6 @@ async fn guardian_enrollment_is_owner_only_and_validates_the_key() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn a_bad_guardian_header_never_falls_back_to_the_owner_credential() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt, agent, gid, _) = guarded(&p).await;
@@ -1510,7 +2339,6 @@ async fn a_bad_guardian_header_never_falls_back_to_the_owner_credential() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn a_guardian_header_takes_precedence_over_an_owner_credential() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt, agent, gid, gsk) = guarded(&p).await;
@@ -1540,7 +2368,6 @@ async fn a_guardian_header_takes_precedence_over_an_owner_credential() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn the_signed_path_excludes_the_query_string() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, gsk) = guarded(&p).await;
@@ -1581,7 +2408,6 @@ async fn a_public_key_enrolls_only_once_whoever_the_owner() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn owner_revokes_a_guardian_and_its_signatures_stop() {
     let Some(p) = Plane::new().await else { return };
     let (owner, cwt, agent, gid, gsk) = guarded(&p).await;
@@ -1699,7 +2525,6 @@ async fn a_guardian_key_cannot_be_squatted_by_another_owner() {
 }
 
 #[tokio::test]
-#[ignore = "needs POST /agents/:did/quarantine and /recover (Task A3b)"]
 async fn garbage_guardian_ids_are_refused_before_storage() {
     let Some(p) = Plane::new().await else { return };
     let (_, cwt, agent, _, gsk) = guarded(&p).await;

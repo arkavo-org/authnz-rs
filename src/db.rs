@@ -11,7 +11,9 @@ mod agent_state;
 mod guardians;
 #[cfg(test)]
 pub(crate) use agent_state::tests as agent_state_test_support;
-pub use agent_state::{AgentState, AgentTrust, AuthorizeWrite, EffectiveState, SwarmWrite};
+pub use agent_state::{
+    AgentState, AgentTrust, AuthorizeWrite, EffectiveState, QuarantineOutcome, SwarmWrite,
+};
 pub use guardians::Guardian;
 
 #[derive(Debug, Serialize, Deserialize)]

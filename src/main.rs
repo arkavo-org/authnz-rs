@@ -686,6 +686,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/agents/challenge", get(agent::generate_agent_challenge))
         .route("/agents/token", post(agent::issue_agent_token))
+        // Agent identity quarantine (owner or enrolled Guardian). Contract v2.
+        .route(
+            "/agents/:did/quarantine",
+            post(agent_state::quarantine_agent),
+        )
+        // Owner recovery of a quarantined identity. Contract v2.
+        .route("/agents/:did/recover", post(agent_state::recover_agent))
         // Guardian enrollment (owner). A Guardian may only quarantine.
         .route("/guardians", post(guardian::enroll_guardian))
         .route(
