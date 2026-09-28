@@ -258,13 +258,13 @@ pub(crate) async fn verify_guardian_request(
     }
 }
 
-/// Guardians may call only quarantine. Every other agent-plane handler calls
+/// Guardians may call only quarantine and appraisal. Every other agent-plane handler calls
 /// this first, so a Guardian gets 403 there — whether or not its signature
 /// would verify — rather than a 401 for the CWT it does not have.
 pub(crate) fn refuse_guardian(headers: &HeaderMap) -> Result<(), AgentError> {
     if headers.contains_key(GUARDIAN_SIGNATURE_HEADER) {
         return Err(AgentError::Forbidden(
-            "guardians may only quarantine".into(),
+            "guardians may only quarantine or appraise".into(),
         ));
     }
     Ok(())

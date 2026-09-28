@@ -315,7 +315,7 @@ async fn guardian_post(
 
 #[tokio::test]
 #[ignore = "requires AUTHNZ_TEST_BASE_URL + DynamoDB Local"]
-async fn quarantine_stops_issuance_and_recovery_leaves_the_key_unassessed() {
+async fn quarantine_stops_issuance_and_only_a_guardian_re_appraises() {
     let Some(base) = base() else { return };
     let client = reqwest::Client::new();
     let (a1, a2, guardian) = (random_agent(), random_agent(), random_agent());
@@ -443,4 +443,46 @@ async fn quarantine_stops_issuance_and_recovery_leaves_the_key_unassessed() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
+
+    // guardian_post signs with a whole-second timestamp and the server
+    // requires each accepted one to be strictly later than the last for
+    // this Guardian; on a fast local round trip the quarantine call above
+    // and the appraisal below can otherwise land in the same second.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // Only a Guardian re-appraises it; the key then mints at the new version.
+    let r = guardian_post(
+        &client,
+        &base,
+        &gid,
+        &guardian,
+        &format!("/agents/{did}/appraisal"),
+        &json!({"evidence_ref": "e2e-evidence"}).to_string(),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let s = status(&client, &base, &did).await;
+    assert_eq!(
+        (
+            s["state"].as_str(),
+            s["state_version"].as_u64(),
+            s["appraised_by"].as_str()
+        ),
+        (Some("eligible"), Some(4), Some("guardian"))
+    );
+    let r = mint(&client, &base, &a1).await;
+    assert_eq!(r.status(), 200);
+    let tok: Value = r.json().await.unwrap();
+    let claims = authnz_rs::cwt::verify(
+        &authnz_rs::cwt::decode_from_header(tok["token"].as_str().unwrap()).unwrap(),
+        &vk,
+        &authnz_rs::cwt::VerifyOptions {
+            expected_iss: Some(&std::env::var("OIDC_ISSUER").unwrap()),
+            expected_aud: Some("https://platform.test"),
+            now: chrono::Utc::now().timestamp(),
+            skew_secs: authnz_rs::cwt::DEFAULT_SKEW_SECS,
+        },
+    )
+    .unwrap();
+    assert_eq!(claims.custom.arkavo_state_version, Some(4));
 }

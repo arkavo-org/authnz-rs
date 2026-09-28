@@ -2,7 +2,10 @@
 //! docs/agent-credentials-contract.md (v2).
 
 use crate::AppState;
-use crate::agent::{AgentError, REFUSE_STALE_ASSERTION, db_err, is_live, validate_did_key};
+use crate::agent::{
+    AgentError, REFUSE_RECOVERED, REFUSE_STALE_ASSERTION, db_err, extract_ed25519_pubkey, is_live,
+    validate_did_key,
+};
 use crate::constants::{
     AGENT_STATUS_LEASE_SECONDS, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, EVIDENCE_REF_MAX_LEN,
     GUARDIAN_APPRAISAL_MAX_SECONDS, INCIDENT_MAX_LEN, OWNER_APPRAISAL_TTL_DEFAULT_SECONDS,
@@ -157,14 +160,23 @@ impl AgentStatus {
 
 /// Who is changing an identity's state.
 pub(crate) enum StateCaller {
-    Owner(Uuid),
-    Guardian { guardian_id: String, owner: Uuid },
+    Owner {
+        user_id: Uuid,
+        /// The passkey assertion behind the credential (auth CWT `iat`, or
+        /// Bearer `auth_time`): an owner appraisal runs from it.
+        issued_at: i64,
+    },
+    Guardian {
+        guardian_id: String,
+        owner: Uuid,
+        public_key: [u8; 32],
+    },
 }
 
 impl StateCaller {
     pub(crate) fn owner(&self) -> Uuid {
         match self {
-            Self::Owner(u) => *u,
+            Self::Owner { user_id, .. } => *user_id,
             Self::Guardian { owner, .. } => *owner,
         }
     }
@@ -173,7 +185,7 @@ impl StateCaller {
     /// appraised.
     pub(crate) fn label(&self) -> String {
         match self {
-            Self::Owner(u) => format!("owner:{u}"),
+            Self::Owner { user_id, .. } => format!("owner:{user_id}"),
             Self::Guardian { guardian_id, .. } => format!("guardian:{guardian_id}"),
         }
     }
@@ -197,6 +209,7 @@ pub(crate) async fn state_caller(
         return Ok(StateCaller::Guardian {
             guardian_id: g.guardian_id,
             owner: g.owner,
+            public_key: g.public_key,
         });
     }
     let owner = crate::agent::authenticate_operator(
@@ -205,7 +218,10 @@ pub(crate) async fn state_caller(
         AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS,
     )
     .await?;
-    Ok(StateCaller::Owner(owner.user_id))
+    Ok(StateCaller::Owner {
+        user_id: owner.user_id,
+        issued_at: owner.issued_at,
+    })
 }
 
 /// The identity at `did`, which must belong to `owner`.
@@ -382,6 +398,127 @@ pub async fn recover_agent(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AppraisalRequest {
+    /// Unix seconds. Omitted: the caller's latest (see `appraisal_until`).
+    #[serde(default)]
+    pub appraised_until: Option<i64>,
+    /// Opaque reference to the evidence behind the appraisal (audit only).
+    #[serde(default)]
+    pub evidence_ref: Option<String>,
+}
+
+/// The `appraised_until` to store: the request's value, which must be in the
+/// future, clamped to `latest`; or `latest` when it names none. `latest` is
+/// the owner's deadline (`owner_appraisal_deadline`: the passkey assertion
+/// plus `owner_appraisal_ttl`) or a Guardian's `now + guardian_appraisal_max`.
+/// Clamping rather than refusing keeps a Guardian whose clock runs slightly
+/// ahead working; the answer reports the value stored.
+pub(crate) fn appraisal_until(
+    requested: Option<i64>,
+    now: i64,
+    latest: i64,
+) -> Result<i64, AgentError> {
+    match requested {
+        None => Ok(latest),
+        Some(t) if t <= now => Err(AgentError::InvalidRequest(
+            "appraised_until must be in the future".into(),
+        )),
+        Some(t) => Ok(t.min(latest)),
+    }
+}
+
+/// POST /agents/:did/appraisal — record a current appraisal: the identity
+/// becomes (or stays) `eligible` until `appraised_until`. An enrolled
+/// Guardian of the agent's owner may appraise for up to
+/// `guardian_appraisal_max` from now; the owner, for up to
+/// `owner_appraisal_ttl` from its passkey assertion, but
+/// never a key that has been recovered. Never clears a quarantine, and
+/// never appraises a revoked or expired delegation. Renewing an eligible
+/// identity keeps its `state_version`; making an unassessed one eligible
+/// bumps it.
+pub async fn appraise_agent(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    Path(did): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AgentError> {
+    let now = Utc::now().timestamp();
+    let caller = state_caller(&app_state, &headers, &method, uri.path(), &body, now).await?;
+    validate_did_key(&did)?;
+    let req: AppraisalRequest = serde_json::from_slice(&body)
+        .map_err(|e| AgentError::InvalidRequest(format!("appraisal body: {e}")))?;
+    if let Some(ev) = &req.evidence_ref {
+        validate_label("evidence_ref", ev, EVIDENCE_REF_MAX_LEN)?;
+    }
+    let latest = match &caller {
+        StateCaller::Owner { issued_at, .. } => {
+            owner_appraisal_deadline(*issued_at, app_state.appraisal.owner_ttl_seconds, now)?
+        }
+        StateCaller::Guardian { .. } => now + app_state.appraisal.guardian_max_seconds,
+    };
+    let until = appraisal_until(req.appraised_until, now, latest)?;
+    if let StateCaller::Guardian { public_key, .. } = &caller
+        && *public_key == extract_ed25519_pubkey(&did)?
+    {
+        return Err(AgentError::Forbidden(
+            "an agent cannot appraise itself".into(),
+        ));
+    }
+    for _ in 0..3 {
+        let d = owned_agent(&app_state, &did, caller.owner()).await?;
+        if d.trust.state == AgentState::Quarantined {
+            return Err(AgentError::WorkloadQuarantined);
+        }
+        if d.revoked_at.is_some() {
+            return Err(AgentError::DelegationRevoked);
+        }
+        if !is_live(&d, now) {
+            return Err(AgentError::DelegationExpired);
+        }
+        if matches!(caller, StateCaller::Owner { .. }) && d.trust.recovered() {
+            return Err(AgentError::Forbidden(REFUSE_RECOVERED.into()));
+        }
+        let read = d.trust.state_version;
+        let new_version = if d.trust.state == AgentState::Eligible {
+            read
+        } else {
+            read + 1
+        };
+        match app_state
+            .db_store
+            .appraise_agent(
+                &did,
+                read,
+                new_version,
+                until,
+                &caller.label(),
+                req.evidence_ref.as_deref(),
+                now,
+            )
+            .await
+        {
+            Ok(appraised) => {
+                info!(
+                    "Agent {} appraised by {} until {} (state_version {})",
+                    did,
+                    caller.label(),
+                    until,
+                    appraised.trust.state_version
+                );
+                return Ok(Json(AgentStatus::of(&appraised, now)));
+            }
+            Err(DynamoDBError::ConditionalConflict) => continue,
+            Err(e) => return Err(db_err(e)),
+        }
+    }
+    Err(AgentError::Conflict(
+        "agent changed concurrently; read its status and retry".into(),
+    ))
+}
+
 /// GET /agents/:did/status — what the platform checks before it lets an
 /// agent token's entitlements through. Served from a strongly consistent
 /// read with a 5-second lease, never from a cache. A revoked or expired
@@ -481,6 +618,19 @@ mod tests {
             let err = AppraisalConfig::parse(owner.map(Into::into), guardian.map(Into::into))
                 .unwrap_err();
             assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn appraisal_until_defaults_to_the_deadline_clamps_to_it_and_refuses_the_past() {
+        assert_eq!(appraisal_until(None, 1_000, 1_900).unwrap(), 1_900);
+        assert_eq!(appraisal_until(Some(1_300), 1_000, 1_900).unwrap(), 1_300);
+        assert_eq!(appraisal_until(Some(5_000), 1_000, 1_900).unwrap(), 1_900);
+        for past in [1_000, 999] {
+            assert!(matches!(
+                appraisal_until(Some(past), 1_000, 1_900),
+                Err(AgentError::InvalidRequest(_))
+            ));
         }
     }
 

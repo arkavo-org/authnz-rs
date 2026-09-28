@@ -54,6 +54,10 @@ pub(crate) fn router(state: AppState) -> Router {
             "/agents/:did/recover",
             post(crate::agent_state::recover_agent),
         )
+        .route(
+            "/agents/:did/appraisal",
+            post(crate::agent_state::appraise_agent),
+        )
         .route("/guardians", post(crate::guardian::enroll_guardian))
         .route(
             "/guardians/:guardian_id",
@@ -2285,7 +2289,7 @@ async fn guardian_cannot_quarantine_another_owners_agent() {
 }
 
 #[tokio::test]
-async fn guardians_get_403_everywhere_but_quarantine() {
+async fn guardians_get_403_everywhere_but_quarantine_and_appraisal() {
     let Some(p) = Plane::new().await else { return };
     let (_, _, agent, gid, gsk) = guarded(&p).await;
     let qpath = format!("/agents/{agent}/quarantine");
@@ -2725,4 +2729,355 @@ async fn garbage_guardian_ids_are_refused_before_storage() {
         assert_eq!(resp, unknown);
     }
     assert_eq!(p.trust(&agent).await.state, AgentState::Eligible);
+}
+
+/// A Guardian-signed appraisal of `did` with `body`, signed at `ts`.
+async fn guardian_appraisal(
+    p: &Plane,
+    gid: &str,
+    gsk: &SigningKey,
+    did: &str,
+    ts: i64,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let path = format!("/agents/{did}/appraisal");
+    let body = body.to_string();
+    let hdr = guardian_header(gid, gsk, "POST", &path, ts, body.as_bytes());
+    p.signed("POST", &path, &hdr, Some(&body)).await
+}
+
+#[tokio::test]
+async fn a_guardian_re_appraises_a_recovered_agent_within_its_cap() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let agent = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let gsk = fresh_agent();
+    let gid = p.enroll_guardian(owner, &cwt, &gsk).await;
+    assert_eq!(p.quarantine(&cwt, &agent, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &agent, "inc-1").await.0,
+        StatusCode::OK
+    );
+    let now = Utc::now().timestamp();
+    let (st, body) = guardian_appraisal(
+        &p,
+        &gid,
+        &gsk,
+        &agent,
+        now,
+        &json!({"appraised_until": now + 3_600, "evidence_ref": "ev-1"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "eligible");
+    assert_eq!(
+        body["state_version"], 4,
+        "unassessed → eligible is a state change"
+    );
+    assert_eq!(body["appraised_by"], "guardian");
+    let until = body["appraised_until"].as_i64().unwrap();
+    assert!(
+        until <= Utc::now().timestamp() + 900,
+        "clamped to 15 minutes"
+    );
+    assert_eq!(
+        p.trust(&agent).await.appraised_by,
+        Some(format!("guardian:{gid}"))
+    );
+
+    // The recovered key now mints, at the new version.
+    let (st, tok) = p.mint(&a).await;
+    assert_eq!(st, StatusCode::OK, "{tok}");
+    let claims = verify_token(&p, tok["token"].as_str().unwrap());
+    assert_eq!(claims.custom.arkavo_state_version, Some(4));
+    assert!(claims.exp <= until, "the token ends with the appraisal");
+
+    // A renewal keeps the version, so the token above stays good.
+    let (st, body) = guardian_appraisal(&p, &gid, &gsk, &agent, now + 1, &json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state_version"], 4);
+    assert_eq!(p.state_version(&agent).await, 4);
+}
+
+#[tokio::test]
+async fn the_owner_renews_by_appraisal_but_never_a_recovered_key() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    p.set_appraised_until(&did, Utc::now().timestamp() - 1)
+        .await;
+    assert_eq!(p.mint(&a).await.0, StatusCode::FORBIDDEN, "suspended");
+
+    let path = format!("/agents/{did}/appraisal");
+    // A passkey assertion ten minutes old: the renewal runs from it.
+    let before = Utc::now().timestamp();
+    let aged = crate::test_helpers::auth_cwt_aged(&p.state, owner, 600);
+    let (st, body) = p.post_json(&path, ("X-Auth-Token", &aged), json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "eligible");
+    assert_eq!(
+        body["state_version"], 1,
+        "suspended → eligible is a renewal"
+    );
+    assert_eq!(body["appraised_by"], "owner");
+    let until = body["appraised_until"].as_i64().unwrap();
+    assert!(
+        (before - 600 + 43_200..=Utc::now().timestamp() - 600 + 43_200).contains(&until),
+        "iat + 12 h: {until}"
+    );
+    assert_eq!(
+        p.trust(&did).await.appraised_by,
+        Some(format!("owner:{owner}"))
+    );
+    assert_eq!(p.mint(&a).await.0, StatusCode::OK);
+
+    // An agents:delegate Bearer token works too, within an hour of the tap.
+    let bearer = format!(
+        "Bearer {}",
+        p.delegate_token(
+            owner,
+            DELEGATE_CLIENT,
+            "openid agents:delegate",
+            "webauthn",
+            Some(Utc::now().timestamp() - 600)
+        )
+    );
+    assert_eq!(
+        p.post_json(&path, ("Authorization", &bearer), json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(
+        p.post_json(&path, ("X-Auth-Token", &cwt), json!({})).await,
+        (StatusCode::FORBIDDEN, json!("Workload quarantined")),
+        "an appraisal never clears quarantine"
+    );
+    assert_eq!(
+        p.recover(("X-Auth-Token", &cwt), &did, "inc-1").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        p.post_json(&path, ("X-Auth-Token", &cwt), json!({})).await,
+        (
+            StatusCode::FORBIDDEN,
+            json!("Forbidden: agent was recovered; only a Guardian may appraise it")
+        )
+    );
+    assert_eq!(p.trust(&did).await.state, AgentState::Unassessed);
+}
+
+#[tokio::test]
+async fn appraisal_is_refused_outside_the_callers_scope() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt, agent, gid, gsk) = guarded(&p).await;
+    let now = Utc::now().timestamp();
+    let ok = json!({});
+
+    // Another owner's agent.
+    let (_, c2) = p.user(&[READ]).await;
+    let other = fresh_agent();
+    assert_eq!(
+        p.authorize(
+            ("X-Auth-Token", &c2),
+            authorize_body(&other, "kit-1", false)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        guardian_appraisal(&p, &gid, &gsk, &did_key(&other), now, &ok)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (st, _) = p
+        .post_json(
+            &format!("/agents/{}/appraisal", did_key(&other)),
+            ("X-Auth-Token", &cwt),
+            ok.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "nor its owner's appraisal");
+
+    // Unknown, malformed and past.
+    assert_eq!(
+        guardian_appraisal(&p, &gid, &gsk, &did_key(&fresh_agent()), now + 1, &ok)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        guardian_appraisal(
+            &p,
+            &gid,
+            &gsk,
+            &agent,
+            now + 2,
+            &json!({"appraised_until": now})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        guardian_appraisal(
+            &p,
+            &gid,
+            &gsk,
+            &agent,
+            now + 3,
+            &json!({"evidence_ref": ""})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    // A revoked delegation.
+    let (st, _) = p
+        .send(
+            Request::delete(format!("/agents/delegations/{agent}"))
+                .header("X-Auth-Token", &cwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        guardian_appraisal(&p, &gid, &gsk, &agent, now + 4, &ok).await,
+        (StatusCode::FORBIDDEN, json!("Delegation revoked"))
+    );
+
+    // The subject's own key, enrolled as a Guardian.
+    let a = fresh_agent();
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let self_gid = p.enroll_guardian(owner, &cwt, &a).await;
+    assert_eq!(
+        guardian_appraisal(&p, &self_gid, &a, &did_key(&a), now, &ok).await,
+        (
+            StatusCode::FORBIDDEN,
+            json!("Forbidden: an agent cannot appraise itself")
+        )
+    );
+
+    // A revoked Guardian reads as unknown.
+    assert_eq!(
+        p.revoke_guardian(&cwt, &gid).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        guardian_appraisal(&p, &gid, &gsk, &did_key(&a), now + 5, &ok)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn an_owner_appraisal_runs_from_the_assertion_and_is_clamped_to_it() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let path = format!("/agents/{did}/appraisal");
+    // A refreshed agents:delegate token: minted now, its auth_time 50 minutes old.
+    let auth_time = Utc::now().timestamp() - 3_000;
+    let bearer = |auth_time: i64| {
+        format!(
+            "Bearer {}",
+            p.delegate_token(
+                owner,
+                DELEGATE_CLIENT,
+                "openid agents:delegate",
+                "webauthn",
+                Some(auth_time)
+            )
+        )
+    };
+    let deadline = auth_time + 43_200;
+    let (st, body) = p
+        .post_json(&path, ("Authorization", &bearer(auth_time)), json!({}))
+        .await;
+    assert_eq!(
+        (st, &body["appraised_until"]),
+        (StatusCode::OK, &json!(deadline))
+    );
+    let (st, body) = p
+        .post_json(
+            &path,
+            ("Authorization", &bearer(auth_time)),
+            json!({"appraised_until": deadline + 7_000}),
+        )
+        .await;
+    assert_eq!(
+        (st, &body["appraised_until"]),
+        (StatusCode::OK, &json!(deadline)),
+        "a later request is clamped to the deadline"
+    );
+    let sooner = Utc::now().timestamp() + 600;
+    let (st, body) = p
+        .post_json(
+            &path,
+            ("Authorization", &bearer(auth_time)),
+            json!({"appraised_until": sooner}),
+        )
+        .await;
+    assert_eq!(
+        (st, &body["appraised_until"]),
+        (StatusCode::OK, &json!(sooner))
+    );
+
+    // A configured lifetime shorter than the credential's age: refused.
+    let mut short = p.state.clone();
+    short.appraisal.owner_ttl_seconds = 600;
+    let resp = router(short)
+        .oneshot(
+            Request::post(path.as_str())
+                .header("Authorization", bearer(Utc::now().timestamp() - 900))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let st = resp.status();
+    assert_eq!(
+        (st, json_of(resp).await),
+        (
+            StatusCode::FORBIDDEN,
+            json!(
+                "Forbidden: passkey assertion is older than the owner appraisal lifetime; sign in again"
+            )
+        )
+    );
+    assert_eq!(p.trust(&did).await.appraised_until, Some(sooner));
 }
