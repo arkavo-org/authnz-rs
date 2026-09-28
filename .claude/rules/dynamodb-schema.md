@@ -55,8 +55,9 @@ paths:
   (List of String), created_at / expires_at / revoked_at (Number),
   short_lived (Boolean), swarm (String, absent while the agent has no kit —
   never an empty string), and the transient challenge triple `challenge`,
-  `challenge_nonce`, `challenge_issued_at` (set by `/agents/challenge`,
-  removed atomically by `/agents/token`)
+  `challenge_nonce`, `challenge_issued_at` (set by `/agents/challenge` only
+  while the row is `eligible` with `appraised_until` in the future, unrevoked
+  and unexpired; removed atomically by `/agents/token`)
 - **Trust state** (contract v2; the row is the agent identity, one key):
   state (`unassessed`|`eligible`|`quarantined`; absent on a row written before
   v2, which reads as `unassessed`), state_version (Number, +1 on every change
@@ -75,8 +76,11 @@ paths:
 - **Reads**: `get_agent_delegation` is `consistent_read(true)` (issuance and
   the status lease must see the latch).
 - **Writes**: every trust-state change is one conditional `UpdateItem` —
-  authorize on the `state_version` read (`attribute_not_exists` when 0) and
-  not quarantined (and not revoked when it keeps the version); quarantine on
+  authorize on what it read: a create on no row at all; a renewal of the
+  owner's own delegation on the `state_version` read (`attribute_not_exists`
+  when 0), not quarantined, the same owner, not revoked and not expired; a
+  new delegation over a revoked or expired one on the version read, not
+  quarantined, its previous owner, and still revoked or expired; quarantine on
   the owner and version read, not quarantined and the incident not being
   the one last cleared; recover on quarantined, the latched incident and the
   version read; appraisal on the version read, not quarantined and a live
