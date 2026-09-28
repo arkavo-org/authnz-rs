@@ -1813,6 +1813,42 @@ async fn a_quarantined_identity_is_refused_as_quarantined_once_revoked_or_expire
     }
 }
 
+/// After the challenge write has lost every retry, the endpoint reads the
+/// identity once more: a quarantine that won the race answers with its own
+/// refusal, and only an identity still issuable gets the 409.
+#[tokio::test]
+async fn a_challenge_that_loses_every_retry_answers_what_won() {
+    let Some(p) = Plane::new().await else { return };
+    let (_, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    assert_eq!(
+        p.authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let answer = |did: String| {
+        let state = p.state.clone();
+        async move {
+            crate::agent::challenge_contention(&state, &did)
+                .await
+                .to_string()
+        }
+    };
+    assert_eq!(
+        answer(did.clone()).await,
+        "Conflict: agent changed concurrently; retry",
+        "still issuable"
+    );
+    assert_eq!(p.quarantine(&cwt, &did, "inc-1").await.0, StatusCode::OK);
+    assert_eq!(answer(did.clone()).await, "Workload quarantined");
+    assert_eq!(
+        answer(did_key(&fresh_agent())).await,
+        "Delegation not found"
+    );
+}
+
 #[tokio::test]
 async fn state_version_increases_on_every_state_change_and_only_then() {
     let Some(p) = Plane::new().await else { return };

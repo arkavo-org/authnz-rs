@@ -905,8 +905,7 @@ pub async fn generate_agent_challenge(
     // lands; when it is not, re-read so the caller gets the refusal that
     // applies now (quarantined, revoked, expired, suspended).
     for _ in 0..3 {
-        let delegation = active_delegation(&app_state, &params.did).await?;
-        issuable(&delegation, Utc::now().timestamp())?;
+        challenge_refusal(&app_state, &params.did).await?;
 
         let challenge = base64::engine::general_purpose::STANDARD.encode(random_challenge_bytes());
         let nonce = Uuid::new_v4().to_string();
@@ -924,9 +923,25 @@ pub async fn generate_agent_challenge(
             Err(e) => return Err(db_err(e)),
         }
     }
-    Err(AgentError::Conflict(
-        "agent changed concurrently; retry".into(),
-    ))
+    Err(challenge_contention(&app_state, &params.did).await)
+}
+
+/// Why `did` may not be issued a challenge now, from a strongly consistent
+/// read: the pinned refusal for its state, `Delegation not found`, or none.
+async fn challenge_refusal(app_state: &AppState, did: &str) -> Result<(), AgentError> {
+    let delegation = active_delegation(app_state, did).await?;
+    issuable(&delegation, Utc::now().timestamp())
+}
+
+/// The answer once the conditioned challenge write has lost every retry: read
+/// the identity once more, so a quarantine (or revocation, expiry, lapsed
+/// appraisal) that won the race gets its own refusal; only an identity that
+/// still reads issuable gets the 409.
+pub(crate) async fn challenge_contention(app_state: &AppState, did: &str) -> AgentError {
+    match challenge_refusal(app_state, did).await {
+        Err(refusal) => refusal,
+        Ok(()) => AgentError::Conflict("agent changed concurrently; retry".into()),
+    }
 }
 
 /// POST /agents/token — verify the signed challenge, mint the agent CWT.
