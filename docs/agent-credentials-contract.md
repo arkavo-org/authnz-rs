@@ -36,7 +36,7 @@ v1 was never deployed. v2 replaces it:
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS` | how long an owner appraisal lasts, counted from the owner's passkey assertion (`auth_time`), not from the request | 43200 (12 h) | 1 to 86400 (24 h) |
 | `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | the latest `appraised_until` a Guardian may set, from now | 900 (15 min) | 1 to 900 |
 
-A value outside its range stops the server at startup. The bounds follow NIST SP 800-63B-4 reauthentication: 12 h is the AAL3 bound (§2.3.3), 24 h the AAL2 bound (§2.3.2, a synced passkey is at most AAL2), and 15 min the AAL3 inactivity bound, which is also the agent token's maximum lifetime.
+A value outside its range stops the server at startup. So does an `AGENT_TOKEN_AUDIENCES` list containing `arkavo` (the passkey auth CWT audience, which an agent token must never carry) or `https://kas.arkavo.net` (the KAS does not ask for agent status, so it must not accept agent tokens). The bounds follow NIST SP 800-63B-4 reauthentication: 12 h is the AAL3 bound (§2.3.3), 24 h the AAL2 bound (§2.3.2, a synced passkey is at most AAL2), and 15 min the AAL3 inactivity bound, which is also the agent token's maximum lifetime.
 
 **Operating without a Guardian.** Until a Guardian is enrolled for an owner, every agent of that owner needs an owner appraisal at least every `AGENT_OWNER_APPRAISAL_TTL_SECONDS` (12 h by default), counted from the owner's passkey tap; otherwise it becomes `suspended` and stops minting. The owner renews with `POST /agents/{did}/appraisal`, which resends no entitlements (authorizing again works too).
 

@@ -151,7 +151,22 @@ DYNAMODB_AGENT_DELEGATIONS_TABLE=agent_delegations
 DYNAMODB_GUARDIANS_TABLE=guardians
 
 # Agent credentials (docs/agent-credentials-contract.md v2)
+# Agent tokens go to every audience listed here, and only the platform checks
+# agent status, so list exactly these two. Never the KAS
+# (https://kas.arkavo.net) nor "arkavo": either one stops startup.
+AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kg.arkavo.net
+AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 AGENT_DELEGATE_CLIENT_IDS=arkavo-edge
+# The platform's status client: a confidential OIDC client that mints its
+# service CWT with client_credentials. Register it with the triple below
+# (_REDIRECT_URIS is required by the parser even for client_credentials; an
+# unused URI is fine) and list the same client_id in AGENT_STATUS_CLIENT_IDS.
+# Its secret goes into the platform's agent_status.client_secret. Without the
+# triple the platform cannot mint the CWT, every status call fails, and every
+# agent's entitlements are withheld.
+OIDC_CLIENT_PLATFORMSTATUS_ID=<platform agent_status client_id>
+OIDC_CLIENT_PLATFORMSTATUS_SECRET=<confidential; never paste>
+OIDC_CLIENT_PLATFORMSTATUS_REDIRECT_URIS=https://identity.arkavo.net/oauth/unused
 AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>
 # AGENT_OWNER_APPRAISAL_TTL_SECONDS=43200
 # AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS=900
@@ -241,18 +256,33 @@ only — but log integrity still matters for incident response.
 
 #### `guardians` Table and Agent Trust State
 
-Required before deploying 0.13.0: `POST /guardians` writes `guardians`. The
-agent trust state (contract v2) lives on the existing `agent_delegations`
-rows, so there is no other new table; `agent_workloads` is not used (v1 was
-never deployed; delete it if a staging environment created one). See
+Required before deploying 0.13.0: `POST /guardians` writes the table named
+by `DYNAMODB_GUARDIANS_TABLE`. Create it, and grant the IAM actions below,
+under exactly that name: `guardians` with the environment file above, or the
+prefixed name when the other tables are prefixed (`prod-guardians` alongside
+`prod-credentials` and `prod-agent-delegations`, as in the README). A table
+under any other name leaves the owner paths working while every Guardian
+enrollment and signed request fails with 503. The agent trust state
+(contract v2) lives on the existing `agent_delegations` rows, so there is no
+other new table; `agent_workloads` is not used (v1 was never deployed;
+delete it if a staging environment created one). See
 [docs/agent-credentials-contract.md](agent-credentials-contract.md) (v2) and
 `.claude/rules/dynamodb-schema.md` for the full attribute list.
 
 ```bash
-aws dynamodb create-table --table-name guardians \
+# The same value the server runs with, e.g. guardians or prod-guardians.
+DYNAMODB_GUARDIANS_TABLE=guardians
+aws dynamodb create-table --table-name "$DYNAMODB_GUARDIANS_TABLE" \
   --attribute-definitions AttributeName=guardian_id,AttributeType=S \
   --key-schema AttributeName=guardian_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
 ```
+
+`AGENT_TOKEN_AUDIENCES` must not list the KAS: agent status is checked by
+the platform's entity resolver, never by the KAS, so a KAS that accepted
+agent tokens would honour a quarantined or suspended agent's token until it
+expires. The server refuses to start when the list contains
+`https://kas.arkavo.net` or `arkavo` (the passkey CWT audience). Remove
+the KAS from a running environment's list before deploying this release.
 
 IAM: every trust-state write is a single conditional `UpdateItem`; nothing
 uses `TransactWriteItems`, so `ConditionCheckItem` is not needed. The service
@@ -263,7 +293,7 @@ role needs, in addition to the actions track 1 already uses on
 | Table | Actions |
 |---|---|
 | `agent_delegations` | nothing new (`UpdateItem` and `GetItem` carry authorize, quarantine, recovery and appraisal) |
-| `guardians` | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem` |
+| the `DYNAMODB_GUARDIANS_TABLE` table | `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem` |
 
 Existing (track-1) delegation rows carry no trust state. They read as
 `unassessed`: `/agents/challenge` and `/agents/token` answer 403

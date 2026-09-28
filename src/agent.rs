@@ -1049,6 +1049,11 @@ fn intersect_entitlements(delegated: &[String], stored: &[String]) -> Vec<String
 // Token minting
 // ============================================================================
 
+/// The Arkavo KAS audience. Agent status is checked by the platform's entity
+/// resolver, not by the KAS, so an agent token the KAS accepted would be a
+/// live bearer there with no status lease: refused at startup.
+const AGENT_TOKEN_REFUSED_KAS_AUDIENCE: &str = "https://kas.arkavo.net";
+
 /// Agent token issuance config (spec §1). Parsed once at startup.
 #[derive(Debug, Clone)]
 pub struct AgentTokenConfig {
@@ -1058,7 +1063,8 @@ pub struct AgentTokenConfig {
 }
 
 impl AgentTokenConfig {
-    /// `AGENT_TOKEN_AUDIENCES` (required, comma-separated), `AGENT_AUTHORIZED_ACTORS`
+    /// `AGENT_TOKEN_AUDIENCES` (required, comma-separated; never the passkey
+    /// CWT audience `arkavo` nor the KAS), `AGENT_AUTHORIZED_ACTORS`
     /// (optional, comma-separated), `AGENT_TOKEN_MINUTES` (optional, default 15, cap 15).
     pub fn parse(
         audiences: Option<String>,
@@ -1075,6 +1081,20 @@ impl AgentTokenConfig {
         let audiences = split(audiences);
         if audiences.is_empty() {
             return Err("AGENT_TOKEN_AUDIENCES must list at least one audience".into());
+        }
+        for aud in &audiences {
+            if aud == crate::constants::ARKAVO_CWT_AUDIENCE {
+                return Err(format!(
+                    "AGENT_TOKEN_AUDIENCES lists \"{aud}\", the audience of passkey auth CWTs; \
+                     an agent token must never pass for one"
+                ));
+            }
+            if aud == AGENT_TOKEN_REFUSED_KAS_AUDIENCE {
+                return Err(format!(
+                    "AGENT_TOKEN_AUDIENCES lists \"{aud}\": the KAS never asks for agent \
+                     status, so it must not accept agent tokens; remove it"
+                ));
+            }
         }
         let authorized_actors = split(actors);
         if authorized_actors.is_empty() {
@@ -1906,6 +1926,30 @@ mod tests {
             .await
             .expect_err("99-year registration CWT must not authorize agents");
         assert!(matches!(err, AgentError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn agent_token_config_refuses_the_passkey_and_kas_audiences() {
+        for listed in [
+            "arkavo",
+            "https://platform.arkavo.net,arkavo",
+            "https://kas.arkavo.net",
+            "https://platform.arkavo.net, https://kas.arkavo.net",
+        ] {
+            let err = AgentTokenConfig::parse(Some(listed.into()), None, None).unwrap_err();
+            assert!(
+                err.contains("AGENT_TOKEN_AUDIENCES lists"),
+                "{listed}: {err}"
+            );
+        }
+        assert!(
+            AgentTokenConfig::parse(
+                Some("https://platform.arkavo.net,https://kg.arkavo.net".into()),
+                None,
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]

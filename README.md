@@ -21,7 +21,7 @@ export DECODING_KEY_PATH=/path/to/decodekey.pem
 export DYNAMODB_CREDENTIALS_TABLE=prod-credentials
 export DYNAMODB_HANDLES_TABLE=prod-handles
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=prod-agent-delegations
-export DYNAMODB_GUARDIANS_TABLE=prod-guardians
+export DYNAMODB_GUARDIANS_TABLE=prod-guardians   # create the table under this name
 export AWS_REGION=your-region
 ```
 
@@ -281,6 +281,7 @@ export OIDC_CLIENT_OPENTDF_REDIRECT_URIS=https://opentdf.example/cb,https://open
 export APPLE_CLIENT_ID=com.arkavo.app,com.arkavo.web    # comma-separated; iOS bundle + web Service ID
 
 # Agent NPE access tokens (spec §1): aud is required, act/minutes are optional.
+# Never list the KAS (https://kas.arkavo.net) or "arkavo": startup refuses both.
 export AGENT_TOKEN_AUDIENCES=https://platform.arkavo.net,https://kg.arkavo.net
 export AGENT_AUTHORIZED_ACTORS=https://kg.arkavo.net
 export AGENT_TOKEN_MINUTES=15   # hard cap 15
@@ -289,6 +290,10 @@ export ADMIN_CLIENT_IDS=catalog-node
 # Agent credentials, appraisal and quarantine (docs/agent-credentials-contract.md v2).
 export AGENT_DELEGATE_CLIENT_IDS=arkavo-edge        # may request agents:delegate
 export AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>   # reads agent status
+# ... and register that client (client_credentials; the redirect URI is unused):
+# export OIDC_CLIENT_PLATFORMSTATUS_ID=<platform agent_status client_id>
+# export OIDC_CLIENT_PLATFORMSTATUS_SECRET=...
+# export OIDC_CLIENT_PLATFORMSTATUS_REDIRECT_URIS=https://identity.arkavo.net/oauth/unused
 # export AGENT_OWNER_APPRAISAL_TTL_SECONDS=43200     # default 12 h, at most 24 h, from the owner's passkey tap
 # export AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS=900    # default and maximum 15 min
 # Without an enrolled Guardian, every agent needs an owner passkey appraisal at
