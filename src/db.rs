@@ -9,6 +9,7 @@ use webauthn_rs::prelude::*;
 
 mod agent_state;
 mod guardians;
+mod publishing;
 #[cfg(test)]
 pub(crate) use agent_state::tests as agent_state_test_support;
 pub use agent_state::{
@@ -16,6 +17,7 @@ pub use agent_state::{
     SwarmWrite,
 };
 pub use guardians::Guardian;
+pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {

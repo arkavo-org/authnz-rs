@@ -280,3 +280,24 @@ pub const ATTEST_REG_WINDOW_SECONDS: i64 = 86_400;
 /// which is worth alerting on even though nothing forces an attacker to
 /// produce it.
 pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;
+
+/// Attribute FQN of the creator-publishing entitlement (#91).
+///
+/// Derived, never stored: computed at token mint from the account's Patreon
+/// membership of Arkavo's own campaign (`PATREON_PUBLISHER_CAMPAIGN_ID` /
+/// `PATREON_PUBLISHER_TIER_IDS`) and appended to `arkavo_entitlements` on
+/// short-lived tokens only. It must never be written to
+/// `credentials.entitlements` (so it is not delegable to agents and is not
+/// in `GET /entities`) and never put in the ~99-year registration token.
+pub const ENTITLEMENT_CREATOR_PUBLISH: &str =
+    "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
+
+/// Patreon OAuth scope a link must hold for its memberships to be readable.
+/// A creator linked without it gets no memberships (and so never qualifies
+/// for [`ENTITLEMENT_CREATOR_PUBLISH`]) until they re-link.
+pub const PATREON_MEMBERSHIPS_SCOPE: &str = "identity.memberships";
+
+/// Length limits (characters) on a publishing suspension's moderator-supplied
+/// `reason` and `reportId`.
+pub const SUSPENSION_REASON_MAX_LEN: usize = 1024;
+pub const SUSPENSION_REPORT_ID_MAX_LEN: usize = 256;

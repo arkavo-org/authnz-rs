@@ -1205,6 +1205,16 @@ async fn handle_authorization_code_grant(
         );
     }
 
+    // Derive the Arkavo custom claims (and materialize Patreon membership,
+    // if linked) for embedding in the access_token CWT. Per the architecture
+    // statement: "Patreon proves membership, authnz-rs materializes
+    // entitlement." Fails closed — the Patreon snapshot is None on any
+    // Patreon-side error so the resulting token simply omits the
+    // `arkavo_patreon` claim and downstream policy treats that as "no
+    // entitlement". Built before the id_token so both tokens carry the same
+    // `arkavo_entitlements` (including any derived entitlement, #91).
+    let arkavo_user = arkavo_user_claims(&app_state, &patreon, &record.user).await;
+
     let now = Utc::now().timestamp();
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
 
@@ -1221,7 +1231,7 @@ async fn handle_authorization_code_grant(
         idp: record.user.idp.clone(),
         arkavo_account_id: record.user.arkavo_account_id.clone(),
         arkavo_roles: record.user.roles.clone(),
-        arkavo_entitlements: record.user.entitlements.clone(),
+        arkavo_entitlements: arkavo_user.effective_entitlements(),
     };
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
@@ -1237,15 +1247,6 @@ async fn handle_authorization_code_grant(
             );
         }
     };
-    // Derive the Arkavo custom claims (and materialize Patreon membership,
-    // if linked) for embedding in the access_token CWT. Per the architecture
-    // statement: "Patreon proves membership, authnz-rs materializes
-    // entitlement." Fails closed — the Patreon snapshot is None on any
-    // Patreon-side error so the resulting token simply omits the
-    // `arkavo_patreon` claim and downstream policy treats that as "no
-    // entitlement".
-    let arkavo_user = arkavo_user_claims(&app_state, &patreon, &record.user).await;
-
     let access_token = {
         let extras = AccessTokenExtras {
             idp: record.user.idp.clone(),
@@ -1435,7 +1436,9 @@ async fn handle_client_credentials_grant(
                 account_id: id_claims.arkavo_account_id.clone(),
                 roles: id_claims.arkavo_roles.clone(),
                 entitlements: id_claims.arkavo_entitlements.clone(),
-                // Service accounts (client_credentials) have no Patreon link.
+                // Service accounts (client_credentials) have no Patreon link
+                // and so no derived entitlement.
+                derived_entitlements: vec![],
                 patreon: None,
             }),
             scope: None,
@@ -1660,6 +1663,28 @@ async fn handle_refresh_token_grant(
         )
     };
 
+    // One shared builder for every human token (#91): re-materialize Patreon
+    // membership on refresh so a downgrade/cancel since the original code
+    // exchange propagates within the 5-min cache TTL, and derive the
+    // creator-publishing entitlement from it exactly as the code exchange,
+    // passkey auth and DeviceCheck paths do. The builder keys off
+    // `arkavo_account_id` (the Arkavo user UUID), not the subject:
+    // `apple:<sub>` / `google:<sub>` subjects hold no UUID. Service-account
+    // (`client:<id>`) records have no UUID at all, so they get no Patreon
+    // snapshot and no derived entitlement.
+    let refreshed_user = AuthenticatedUser {
+        subject: record.subject.clone(),
+        arkavo_account_id: account_id,
+        email: record.email.clone(),
+        email_verified: record.email_verified,
+        name: record.name.clone(),
+        idp,
+        roles,
+        entitlements,
+        auth_time: record.auth_time,
+    };
+    let arkavo_user = arkavo_user_claims(&app_state, &patreon, &refreshed_user).await;
+
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
 
     let id_claims = OidcClaims {
@@ -1672,10 +1697,10 @@ async fn handle_refresh_token_grant(
         email: record.email.clone(),
         email_verified: record.email_verified,
         name: record.name.clone(),
-        idp,
-        arkavo_account_id: account_id,
-        arkavo_roles: roles,
-        arkavo_entitlements: entitlements,
+        idp: refreshed_user.idp.clone(),
+        arkavo_account_id: refreshed_user.arkavo_account_id.clone(),
+        arkavo_roles: refreshed_user.roles.clone(),
+        arkavo_entitlements: arkavo_user.effective_entitlements(),
     };
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(oidc.signing_kid.clone());
@@ -1691,31 +1716,12 @@ async fn handle_refresh_token_grant(
             );
         }
     };
-    // Re-materialize Patreon membership on refresh so a downgrade/cancel
-    // since the original code exchange propagates within the 5-min cache TTL.
-    // Key off the record's `arkavo_account_id` (the Arkavo user UUID), not the
-    // subject: `apple:<sub>` / `google:<sub>` subjects hold no UUID, so
-    // parsing the subject would silently drop `arkavo_patreon` on refresh for
-    // every non-WebAuthn user. Service-account (`client:<id>`) records have no
-    // UUID here either, so they still skip the lookup cleanly.
-    let arkavo_patreon = match Uuid::parse_str(&record.arkavo_account_id) {
-        Ok(user_id) => {
-            crate::patreon::materialize_for_user_bounded(&app_state, &patreon, user_id).await
-        }
-        Err(_) => None,
-    };
-
     let access_token = {
         let extras = AccessTokenExtras {
             idp: id_claims.idp.clone(),
             email: id_claims.email.clone(),
             email_verified: id_claims.email_verified,
-            arkavo_user: Some(crate::cwt::ArkavoUserClaims {
-                account_id: id_claims.arkavo_account_id.clone(),
-                roles: id_claims.arkavo_roles.clone(),
-                entitlements: id_claims.arkavo_entitlements.clone(),
-                patreon: arkavo_patreon,
-            }),
+            arkavo_user: Some(arkavo_user),
             scope: Some(record.scopes.clone()),
             auth_time: record.auth_time,
         };
@@ -2115,33 +2121,43 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 ///
 /// Patreon membership is materialized here (cached, fail-closed): "Patreon
 /// proves membership, authnz-rs materializes entitlement".
+///
+/// The derived creator-publishing entitlement (#91) is computed here too,
+/// from that same snapshot plus the account's suspension state, and carried
+/// in `derived_entitlements` — never in `entitlements`, which is the stored
+/// list. Every short-lived human token (passkey auth, DeviceCheck assertion,
+/// OIDC access token on code exchange *and* refresh) goes through this one
+/// builder; the registration token drops the derived part at mint.
 pub(crate) async fn arkavo_user_claims(
     app_state: &AppState,
     patreon: &crate::patreon::PatreonState,
     user: &AuthenticatedUser,
 ) -> crate::cwt::ArkavoUserClaims {
+    let user_id = arkavo_user_uuid(user);
+    let snap = match user_id {
+        Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
+        None => None,
+    };
+    let derived_entitlements =
+        crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
     crate::cwt::ArkavoUserClaims {
         account_id: user.arkavo_account_id.clone(),
         roles: user.roles.clone(),
         entitlements: user.entitlements.clone(),
-        patreon: resolve_arkavo_patreon(app_state, patreon, user).await,
+        derived_entitlements,
+        patreon: snap,
     }
 }
 
-/// Pull the arkavo `user_id` UUID off an [`AuthenticatedUser`] and run the
-/// Patreon materialization. We prefer `arkavo_account_id` (always set for
-/// user flows) but fall back to parsing the `arkavo:` subject so this stays
-/// resilient to refactors of `AuthenticatedUser`. Service-account subjects
-/// (`client:...`) don't have a Patreon link by construction — return None.
-async fn resolve_arkavo_patreon(
-    app_state: &AppState,
-    patreon: &crate::patreon::PatreonState,
-    user: &AuthenticatedUser,
-) -> Option<crate::cwt::ArkavoPatreon> {
-    let user_id = Uuid::parse_str(&user.arkavo_account_id)
+/// The arkavo `user_id` UUID of an [`AuthenticatedUser`]. We prefer
+/// `arkavo_account_id` (always set for user flows) but fall back to parsing
+/// the `arkavo:` subject so this stays resilient to refactors of
+/// `AuthenticatedUser`. Service-account subjects (`client:...`) have no
+/// UUID — no Patreon link and no derived entitlement by construction.
+fn arkavo_user_uuid(user: &AuthenticatedUser) -> Option<Uuid> {
+    Uuid::parse_str(&user.arkavo_account_id)
         .ok()
-        .or_else(|| parse_uuid_from_subject(&user.subject))?;
-    crate::patreon::materialize_for_user_bounded(app_state, patreon, user_id).await
+        .or_else(|| parse_uuid_from_subject(&user.subject))
 }
 
 /// Strip the `arkavo:` prefix (if present) and parse the remainder as a
@@ -2891,6 +2907,8 @@ mod tests {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            publisher: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -3013,6 +3031,8 @@ mod tests {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            publisher: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -4008,5 +4028,165 @@ mod tests {
         google.idp = Some("google".into());
         let resp = call_authorize(&app_state, HeaderMap::new(), google, &codes).await;
         assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_request"));
+    }
+
+    /// #91: the derived creator-publishing entitlement rides the code-grant
+    /// access token, its id_token and /userinfo, and every refresh — through
+    /// the one shared builder — and a suspension removes it at the next
+    /// refresh. DynamoDB Local only.
+    #[tokio::test]
+    async fn publish_entitlement_on_code_grant_userinfo_and_refresh() {
+        use crate::publishing_tests::{Fixture, decode, has_publish};
+        use base64::Engine;
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let publish = crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "rp".to_string(),
+            OidcClient {
+                client_id: "rp".to_string(),
+                client_secret: Some("rp-secret".to_string()),
+                redirect_uris: vec!["https://rp/cb".into()],
+            },
+        );
+        let oidc = Arc::new(oidc);
+        let codes = AuthorizationCodeStore::new(test_redis());
+        let refresh_store = RefreshTokenStore::new(test_redis());
+        codes
+            .insert(
+                "code-pub".into(),
+                AuthorizationCodeRecord {
+                    client_id: "rp".into(),
+                    redirect_uri: "https://rp/cb".into(),
+                    scope: "openid offline_access".into(),
+                    nonce: None,
+                    code_challenge: None,
+                    code_challenge_method: None,
+                    user: f.webauthn_user(),
+                    expires_at: Utc::now().timestamp() + 600,
+                },
+            )
+            .await
+            .unwrap();
+        let form = |grant: &str, code: Option<&str>, refresh: Option<&str>| TokenForm {
+            grant_type: grant.into(),
+            code: code.map(Into::into),
+            redirect_uri: code.map(|_| "https://rp/cb".to_string()),
+            client_id: Some("rp".into()),
+            client_secret: Some("rp-secret".into()),
+            code_verifier: None,
+            refresh_token: refresh.map(Into::into),
+            scope: None,
+            resource: None,
+        };
+        let id_has_publish = |body: &serde_json::Value| {
+            let payload = body["id_token"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .nth(1)
+                .unwrap();
+            let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap();
+            let claims: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            claims["arkavo_entitlements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == publish)
+        };
+        let json_of = |resp: Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        // Code exchange.
+        let body = json_of(
+            handle_authorization_code_grant(
+                f.state.clone(),
+                oidc.clone(),
+                codes.clone(),
+                refresh_store.clone(),
+                f.patreon.clone(),
+                HeaderMap::new(),
+                form("authorization_code", Some("code-pub"), None),
+            )
+            .await,
+        )
+        .await;
+        let access = body["access_token"].as_str().unwrap().to_string();
+        assert!(has_publish(&decode(&access)), "code-grant access token");
+        assert!(id_has_publish(&body), "code-grant id_token");
+
+        // /userinfo reflects the access token it is given.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {access}").parse().unwrap(),
+        );
+        let info =
+            json_of(userinfo(Extension(f.state.clone()), Extension(oidc.clone()), headers).await)
+                .await;
+        assert!(
+            info["arkavo_entitlements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == publish),
+            "userinfo"
+        );
+
+        // Refresh: same shared builder, same answer.
+        let rt = body["refresh_token"].as_str().unwrap().to_string();
+        let body = json_of(
+            handle_refresh_token_grant(
+                f.state.clone(),
+                oidc.clone(),
+                refresh_store.clone(),
+                f.patreon.clone(),
+                HeaderMap::new(),
+                form("refresh_token", None, Some(&rt)),
+            )
+            .await,
+        )
+        .await;
+        let refreshed = decode(body["access_token"].as_str().unwrap());
+        assert!(has_publish(&refreshed), "refreshed access token");
+        assert!(id_has_publish(&body), "refreshed id_token");
+        // The stored list still precedes it, unchanged.
+        assert!(
+            refreshed
+                .custom
+                .arkavo_entitlements
+                .as_ref()
+                .unwrap()
+                .starts_with(&f.stored)
+        );
+
+        // Suspended ⇒ the next refresh drops it from both tokens.
+        f.suspend().await;
+        let rt = body["refresh_token"].as_str().unwrap().to_string();
+        let body = json_of(
+            handle_refresh_token_grant(
+                f.state.clone(),
+                oidc.clone(),
+                refresh_store.clone(),
+                f.patreon.clone(),
+                HeaderMap::new(),
+                form("refresh_token", None, Some(&rt)),
+            )
+            .await,
+        )
+        .await;
+        assert!(!has_publish(&decode(
+            body["access_token"].as_str().unwrap()
+        )));
+        assert!(!id_has_publish(&body));
     }
 }
