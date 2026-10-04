@@ -2016,12 +2016,6 @@ fn item_to_patreon_link(
     })
 }
 
-/// Privacy-preserving subject masker used by `link_identity` logs.
-///
-/// Returns the first 8 *characters* of an opaque IdP subject (Apple `sub`,
-/// future Google `sub`, etc.) so log lines can be correlated end-to-end
-/// without disclosing the full pseudonymous identifier. `char_indices` is
-/// used so multi-byte UTF-8 subjects do not panic on a mid-codepoint slice.
 /// Remove derived-only entitlements from a stored list, logging when a row
 /// actually held one.
 pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Display) -> Vec<String> {
@@ -2036,6 +2030,12 @@ pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Displa
     list.into_iter().filter(|e| e != publish).collect()
 }
 
+/// Privacy-preserving subject masker used by `link_identity` logs.
+///
+/// Returns the first 8 *characters* of an opaque IdP subject (Apple `sub`,
+/// future Google `sub`, etc.) so log lines can be correlated end-to-end
+/// without disclosing the full pseudonymous identifier. `char_indices` is
+/// used so multi-byte UTF-8 subjects do not panic on a mid-codepoint slice.
 fn log_subject_prefix(subject: &str) -> &str {
     match subject.char_indices().nth(8) {
         Some((byte_idx, _)) => &subject[..byte_idx],

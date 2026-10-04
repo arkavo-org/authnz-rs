@@ -821,11 +821,6 @@ fn token_exchange_error(status: reqwest::StatusCode, body: &str) -> PatreonError
     }
 }
 
-/// Build the updated [`PatreonLink`] after a successful token refresh. Keeps
-/// the immutable identity fields (user, Patreon user/campaign, role,
-/// `linked_at`) and swaps in the freshly-sealed access/refresh ciphertexts,
-/// new scopes, and recomputed expiry. Patreon rotates the refresh token on
-/// every refresh, so both ciphertexts are replaced.
 /// The scopes to record after a refresh. Patreon may answer a refresh with
 /// an empty `scope` or a narrower echo; recording that would make a creator
 /// silently stop being queried for memberships (see
@@ -842,6 +837,11 @@ fn merged_scopes(stored: &str, refreshed: &str) -> String {
     }
 }
 
+/// Build the updated [`PatreonLink`] after a successful token refresh. Keeps
+/// the immutable identity fields (user, Patreon user/campaign, role,
+/// `linked_at`) and swaps in the freshly-sealed access/refresh ciphertexts,
+/// new scopes, and recomputed expiry. Patreon rotates the refresh token on
+/// every refresh, so both ciphertexts are replaced.
 fn merge_refreshed_link(
     old: &PatreonLink,
     new_tokens: &PatreonTokenResponse,
@@ -1125,6 +1125,36 @@ impl MembershipCache {
         }
     }
 
+    /// [`MembershipCache::put`], but only when no snapshot is cached for
+    /// `user_id` — atomically (Redis `SET NX`; one lock on the in-memory
+    /// fallback). For fallback snapshots, which must never replace a real one.
+    pub async fn put_if_absent(&self, user_id: Uuid, snap: &ArkavoPatreon) {
+        let key = Self::key(user_id);
+        let ser: SerializableMaterialized = snap.into();
+        if self.redis.is_connected() {
+            if let Ok(json) = serde_json::to_string(&ser) {
+                let ttl = (snap.cache_expires_at - Utc::now().timestamp()).max(1);
+                let _: Result<Option<String>, _> = self
+                    .redis
+                    .set(
+                        &key,
+                        json,
+                        Some(fred::types::Expiration::EX(ttl)),
+                        Some(fred::types::SetOptions::NX),
+                        false,
+                    )
+                    .await;
+            }
+        } else {
+            let mut map = self.local.lock().unwrap();
+            let now = Utc::now().timestamp();
+            map.retain(|_, (_, exp)| *exp > now);
+            if !map.contains_key(&key) && map.len() < MAX_LOCAL_CACHE_ENTRIES {
+                map.insert(key, (snap.clone(), snap.cache_expires_at));
+            }
+        }
+    }
+
     /// Remember that `user_id` has no Patreon link, so the next mint can skip
     /// the DynamoDB lookup. Cleared by [`MembershipCache::invalidate`], which
     /// the link handler calls, so linking takes effect immediately.
@@ -1337,8 +1367,10 @@ async fn materialize_link(
             // membership-derived is granted. Cached briefly so a creator with
             // a dead refresh token does not pay the Patreon round-trips on
             // every mint.
+            // Insert-if-absent: never overwrite a real snapshot a concurrent
+            // materialization already cached.
             let fallback = failure.fallback.map(|f| *f)?;
-            state.cache.put(user_id, &fallback).await;
+            state.cache.put_if_absent(user_id, &fallback).await;
             return Some(fallback);
         }
     };
@@ -1434,11 +1466,11 @@ pub async fn materialize_for_user_bounded(
                 }
             );
             // Cache the creator fallback briefly unless the background task
-            // has already cached a real answer. A later success overwrites it.
-            if let Some(f) = &fallback
-                && state.cache.get(user_id).await.is_none()
-            {
-                state.cache.put(user_id, f).await;
+            // has already cached a real answer. Insert-if-absent is atomic, so
+            // a success landing between a check and a write cannot be
+            // clobbered; a later success still overwrites the fallback.
+            if let Some(f) = &fallback {
+                state.cache.put_if_absent(user_id, f).await;
             }
             fallback
         }
@@ -1480,7 +1512,9 @@ struct MaterializeFailure {
     /// variants share a layout.
     refreshed: Option<Box<PatreonLink>>,
     /// Creator links only: the snapshot to embed despite the failure — the
-    /// stored campaign with an empty membership list. Never cached.
+    /// stored campaign with an empty membership list. Cached (insert-if-absent)
+    /// for [`PATREON_FAILURE_CACHE_TTL_SECONDS`], so a recovered creator regains
+    /// memberships within that window, not on the very next mint.
     fallback: Option<Box<ArkavoPatreon>>,
 }
 
@@ -2852,6 +2886,36 @@ mod tests {
         cache.put(user_id, &snap).await;
         // The retain-on-read sweep should drop the expired row.
         assert!(cache.get(user_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn membership_cache_fallback_never_overwrites_real_snapshot() {
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let cache = MembershipCache::new(redis);
+        let user_id = Uuid::new_v4();
+        let now = Utc::now().timestamp();
+        let real = ArkavoPatreon {
+            role: "creator".into(),
+            patreon_user_id: "p-1".into(),
+            campaign_id: Some("c-1".into()),
+            memberships: vec![],
+            verified_at: now,
+            cache_expires_at: now + 3600,
+        };
+        let fallback = ArkavoPatreon {
+            verified_at: now + 1,
+            cache_expires_at: now + PATREON_FAILURE_CACHE_TTL_SECONDS,
+            ..real.clone()
+        };
+        // The background task cached the real answer first: the fallback loses.
+        cache.put(user_id, &real).await;
+        cache.put_if_absent(user_id, &fallback).await;
+        assert_eq!(cache.get(user_id).await.unwrap().verified_at, now);
+        // Nothing cached: the fallback is written.
+        let other = Uuid::new_v4();
+        cache.put_if_absent(other, &fallback).await;
+        assert_eq!(cache.get(other).await.unwrap().verified_at, now + 1);
     }
 
     #[test]
