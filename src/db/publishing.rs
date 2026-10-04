@@ -42,6 +42,9 @@ pub enum SuspensionSet {
 pub enum SuspensionLift {
     /// The suspension was removed; this was the record.
     Lifted(PublishingSuspension),
+    /// The suspension was removed, but the old record could not be decoded
+    /// (the decode error). Still a lift.
+    LiftedMalformed(String),
     /// The account was not suspended (nothing changed).
     NotSuspended,
     /// No credentials row for this user.
@@ -163,7 +166,10 @@ impl DynamoDBStore {
             .await;
         match result {
             Ok(out) => match out.attributes.as_ref().and_then(|a| a.get(ATTR)) {
-                Some(v) => Ok(SuspensionLift::Lifted(from_attr(v)?)),
+                Some(v) => Ok(match from_attr(v) {
+                    Ok(old) => SuspensionLift::Lifted(old),
+                    Err(e) => SuspensionLift::LiftedMalformed(e.to_string()),
+                }),
                 None => Ok(SuspensionLift::NotSuspended),
             },
             Err(e) => match classify(e, &self.credentials_table) {
@@ -256,6 +262,53 @@ mod tests {
         );
         assert_eq!(
             store.get_publishing_suspension(&id).await.unwrap(),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn lifting_a_malformed_record_still_lifts() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let user = store
+            .create_user(
+                &format!("pubm-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPublishingMalformed",
+            )
+            .await
+            .unwrap();
+        store
+            .client
+            .update_item()
+            .table_name(&store.credentials_table)
+            .key("user_id", s(&user.user_id.to_string()))
+            .update_expression("SET #ps = :bad")
+            .expression_attribute_names("#ps", ATTR)
+            .expression_attribute_values(":bad", s("not-a-map"))
+            .send()
+            .await
+            .unwrap();
+        // A malformed record reads as an error (callers fail closed)...
+        assert!(
+            store
+                .get_publishing_suspension(&user.user_id)
+                .await
+                .is_err()
+        );
+        // ...and lifting it still removes it.
+        assert!(matches!(
+            store
+                .lift_publishing_suspension(&user.user_id)
+                .await
+                .unwrap(),
+            SuspensionLift::LiftedMalformed(_)
+        ));
+        assert_eq!(
+            store
+                .get_publishing_suspension(&user.user_id)
+                .await
+                .unwrap(),
             Some(None)
         );
     }

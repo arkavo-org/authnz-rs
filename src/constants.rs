@@ -123,6 +123,13 @@ pub const PATREON_UNLINKED_CACHE_TTL_SECONDS: i64 = 60;
 /// background and warms the cache for the next mint.
 pub const PATREON_MATERIALIZE_DEADLINE_SECONDS: u64 = 3;
 
+/// TTL of a creator's fallback snapshot (owned campaign, no memberships),
+/// cached when its membership query fails or misses the mint deadline. Short,
+/// so a recovered Patreon is picked up quickly, but long enough that a
+/// creator with a dead refresh token does not pay the Patreon round-trips on
+/// every mint. Holds no memberships, so nothing derived from it qualifies.
+pub const PATREON_FAILURE_CACHE_TTL_SECONDS: i64 = 60;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
@@ -298,6 +305,7 @@ pub const ENTITLEMENT_CREATOR_PUBLISH: &str =
 pub const PATREON_MEMBERSHIPS_SCOPE: &str = "identity.memberships";
 
 /// Length limits (characters) on a publishing suspension's moderator-supplied
-/// `reason` and `reportId`.
+/// `reason` and `reportId`. `reportId` is also restricted to
+/// `[A-Za-z0-9._:-]` because it is written into audit log lines.
 pub const SUSPENSION_REASON_MAX_LEN: usize = 1024;
-pub const SUSPENSION_REPORT_ID_MAX_LEN: usize = 256;
+pub const SUSPENSION_REPORT_ID_MAX_LEN: usize = 128;

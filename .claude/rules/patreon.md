@@ -46,9 +46,12 @@ paths:
 - **Creator links and `identity.memberships`**: a creator whose stored
   `scopes` are recorded and lack `identity.memberships` is not queried (the
   snapshot has the campaign and no memberships) and must re-link to qualify
-  for membership-derived entitlements. A creator whose fetch fails gets its
-  campaign claim with no memberships, **not cached**, so the next mint
-  retries.
+  for membership-derived entitlements. A creator whose fetch fails or misses
+  the mint deadline gets its campaign claim with no memberships (built before
+  the Patreon work is spawned), cached for `PATREON_FAILURE_CACHE_TTL_SECONDS`
+  (60 s). A refresh whose `scope` is empty or a strict subset of the stored
+  scopes keeps the stored scopes. A stored copy of the publish FQN in
+  `credentials.entitlements` is dropped on every read.
 - **Creator-publishing entitlement** (#91, `src/publishing.rs`):
   `https://patreon.arkavo.com/attr/arkavo-creator/value/publish` is appended
   to `arkavo_entitlements` at mint while a membership of Arkavo's campaign

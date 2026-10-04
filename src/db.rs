@@ -919,6 +919,12 @@ impl DynamoDBStore {
                 .collect(),
             None => default_entitlements.to_vec(),
         };
+        // The creator-publishing entitlement is derived at mint (#91). A
+        // stored copy (written before `validate_fqns` refused it) would
+        // bypass both lapse and suspension and be delegable, so it is
+        // dropped on read — every token, delegation and /entities path
+        // reads the list through here.
+        let entitlements = strip_derived_only(entitlements, &user_id);
         Ok(UserCredentials {
             user_id,
             username,
@@ -2016,6 +2022,20 @@ fn item_to_patreon_link(
 /// future Google `sub`, etc.) so log lines can be correlated end-to-end
 /// without disclosing the full pseudonymous identifier. `char_indices` is
 /// used so multi-byte UTF-8 subjects do not panic on a mid-codepoint slice.
+/// Remove derived-only entitlements from a stored list, logging when a row
+/// actually held one.
+pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Display) -> Vec<String> {
+    let publish = crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
+    if !list.iter().any(|e| e == publish) {
+        return list;
+    }
+    warn!(
+        "Stored entitlements for {} contain the derived-only {}; ignoring the stored copy",
+        owner, publish
+    );
+    list.into_iter().filter(|e| e != publish).collect()
+}
+
 fn log_subject_prefix(subject: &str) -> &str {
     match subject.char_indices().nth(8) {
         Some((byte_idx, _)) => &subject[..byte_idx],

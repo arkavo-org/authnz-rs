@@ -119,9 +119,16 @@ pub struct ArkavoUserClaims {
 
 impl ArkavoUserClaims {
     /// The `arkavo_entitlements` value: the stored list followed by every
-    /// derived entitlement not already in it.
+    /// derived entitlement not already in it. A derived-only FQN found in the
+    /// stored list is dropped, so only the mint-time derivation (which
+    /// honours lapse and suspension) can ever emit it.
     pub fn effective_entitlements(&self) -> Vec<String> {
-        let mut out = self.entitlements.clone();
+        let mut out: Vec<String> = self
+            .entitlements
+            .iter()
+            .filter(|e| *e != crate::constants::ENTITLEMENT_CREATOR_PUBLISH)
+            .cloned()
+            .collect();
         for e in &self.derived_entitlements {
             if !out.contains(e) {
                 out.push(e.clone());

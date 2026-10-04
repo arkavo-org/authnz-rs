@@ -245,6 +245,12 @@ impl IntoResponse for SuspensionError {
     }
 }
 
+fn is_valid_report_id(r: &str) -> bool {
+    (1..=SUSPENSION_REPORT_ID_MAX_LEN).contains(&r.len())
+        && r.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
 fn validate_request(req: SuspendRequest) -> Result<(String, Option<String>), SuspensionError> {
     let reason = req.reason.trim().to_string();
     if reason.is_empty() {
@@ -261,9 +267,11 @@ fn validate_request(req: SuspendRequest) -> Result<(String, Option<String>), Sus
                 "reportId must not be empty when present".into(),
             ));
         }
-        Some(r) if r.chars().count() > SUSPENSION_REPORT_ID_MAX_LEN => {
+        // Interpolated into `audit` log lines, so a restricted charset: no
+        // spaces, `=` or newlines that could forge fields or lines.
+        Some(r) if !is_valid_report_id(&r) => {
             return Err(SuspensionError::BadRequest(format!(
-                "reportId exceeds {SUSPENSION_REPORT_ID_MAX_LEN} characters"
+                "reportId must be 1-{SUSPENSION_REPORT_ID_MAX_LEN} characters of [A-Za-z0-9._:-]"
             )));
         }
         other => other,
@@ -358,7 +366,27 @@ pub async fn delete_publishing_suspension(
             );
             Ok(StatusCode::NO_CONTENT)
         }
-        SuspensionLift::NotSuspended => Ok(StatusCode::NO_CONTENT),
+        SuspensionLift::LiftedMalformed(decode_error) => {
+            // The removal happened; only the old record could not be read
+            // back for the log. Still a successful lift.
+            warn!(
+                "audit publishing_suspension outcome=lifted user_id={} lifted_by={} \
+                 previous_record=malformed",
+                user_id, claims.sub
+            );
+            warn!(
+                "publishing suspension record for {} was malformed: {}",
+                user_id, decode_error
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        SuspensionLift::NotSuspended => {
+            info!(
+                "audit publishing_suspension outcome=not_suspended user_id={} lifted_by={}",
+                user_id, claims.sub
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
         SuspensionLift::UserNotFound => Err(SuspensionError::UserNotFound),
     }
 }
@@ -513,6 +541,18 @@ mod tests {
         assert!(ok("spam", Some("")).is_err());
         assert!(ok(&"x".repeat(SUSPENSION_REASON_MAX_LEN + 1), None).is_err());
         assert!(ok("spam", Some(&"x".repeat(SUSPENSION_REPORT_ID_MAX_LEN + 1))).is_err());
+        // reportId charset: it lands in audit log lines.
+        assert!(ok("spam", Some("rpt-2026.04:12_a")).is_ok());
+        assert!(ok("spam", Some(&"x".repeat(SUSPENSION_REPORT_ID_MAX_LEN))).is_ok());
+        for forged in [
+            "r1\naudit publishing_suspension outcome=lifted",
+            "r1 suspended_by=client:ops",
+            "r1=x",
+            "rpt/1",
+            "rpt\u{00e9}",
+        ] {
+            assert!(ok("spam", Some(forged)).is_err(), "{forged:?}");
+        }
         let body: SuspendRequest =
             serde_json::from_str(r#"{"reason":"r","reportId":"rpt-9"}"#).unwrap();
         assert_eq!(body.report_id.as_deref(), Some("rpt-9"));

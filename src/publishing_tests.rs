@@ -361,6 +361,21 @@ async fn suspension_endpoint_auth_set_lift_and_audit_fields() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
+    // A reportId that could forge an audit line ⇒ 400.
+    let (s, _) = send(
+        &app,
+        req(
+            "PUT",
+            f.user_id,
+            Some(&moderator),
+            Some(
+                json!({"reason": "r", "reportId": "x\naudit publishing_suspension outcome=lifted"}),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
     // Set ⇒ 201 with the audit record.
     let (s, b) = send(
         &app,
@@ -449,6 +464,67 @@ async fn publish_is_never_delegable_to_an_agent() {
     let a = fresh_agent();
     let mut body = authorize_body(&a, "", false);
     body["entitlements"] = json!([ENTITLEMENT_CREATOR_PUBLISH]);
+    let (st, _) = send(
+        &app,
+        Request::post("/agents/authorize")
+            .header("X-Auth-Token", &cwt)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(
+        f.store
+            .get_agent_delegation(&did_key(&a))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_stored_copy_is_never_emitted_or_delegated() {
+    use crate::agent_plane_tests::{authorize_body, did_key, fresh_agent};
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let publish = ENTITLEMENT_CREATOR_PUBLISH.to_string();
+    let decrypt = "https://arkavo.ai/attr/tdf/value/decrypt".to_string();
+    // A row written before validate_fqns refused the FQN.
+    f.store
+        .put_user_entitlements(&f.user_id, &[decrypt.clone(), publish.clone()])
+        .await
+        .unwrap();
+
+    // Every read of the stored list drops it (tokens, delegation, /entities).
+    let row = f.store.get_user_by_id(&f.user_id).await.unwrap().unwrap();
+    assert_eq!(row.entitlements, vec![decrypt.clone()]);
+    assert_eq!(
+        f.store.get_user_entitlements(&f.user_id).await.unwrap(),
+        vec![decrypt.clone()]
+    );
+
+    // Even a stored copy that reached the builder is not emitted while the
+    // account is suspended or unqualified.
+    let leaked = AuthenticatedUser::webauthn(f.user_id, vec![decrypt.clone(), publish.clone()]);
+    f.suspend().await;
+    let suspended = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
+    assert_eq!(suspended.effective_entitlements(), vec![decrypt.clone()]);
+    f.store
+        .lift_publishing_suspension(&f.user_id)
+        .await
+        .unwrap();
+    f.state.publisher = Arc::new(None);
+    let unqualified = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
+    assert_eq!(unqualified.effective_entitlements(), vec![decrypt.clone()]);
+
+    // And it cannot be delegated.
+    let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, None, None).unwrap();
+    let app = crate::agent_plane_tests::router(f.state.clone());
+    let a = fresh_agent();
+    let mut body = authorize_body(&a, "", false);
+    body["entitlements"] = json!([publish]);
     let (st, _) = send(
         &app,
         Request::post("/agents/authorize")

@@ -44,7 +44,10 @@ The entitlement is **computed when a token is minted, and never stored**.
     entitlements, including when an existing account adds a passkey);
   - `credentials.entitlements`. `PUT /admin/users/:id/entitlements` and
     `USER_DEFAULT_ENTITLEMENTS` refuse this FQN, so it cannot be delegated to
-    agents and does not appear in `GET /entities/:id`.
+    agents and does not appear in `GET /entities/:id`. A copy already stored
+    on a row from before this change is dropped whenever the list is read
+    (tokens, agent delegation and re-mint, `/entities`), with a warning in
+    the log; only the mint-time derivation can emit the FQN.
 - **Fails closed.** Any of the following withholds the entitlement:
   - Patreon is unreachable;
   - the 3 s materialization deadline passes;
@@ -76,8 +79,16 @@ memberships.
   never qualifies. The creator must re-link (`POST /oauth/patreon/link`), and
   the app must request `identity.memberships` in the authorize step.
 - An empty `scopes` value (not recorded) is still queried.
-- If the creator fetch fails, the creator keeps its campaign claim, with no
-  memberships. That result is not cached, so the next mint tries again.
+- If the creator fetch fails, or misses the 3 s mint deadline, the creator
+  keeps its campaign claim with no memberships (as before creator memberships
+  were fetched). That fallback is cached for 60 s
+  (`PATREON_FAILURE_CACHE_TTL_SECONDS`), so a creator with a dead refresh
+  token or a slow Patreon does not pay the Patreon round-trips on every mint.
+  It has no memberships, so nothing membership-derived qualifies from it. A
+  background fetch that later succeeds replaces it with the real snapshot.
+- When a Patreon token refresh answers with an empty `scope`, or a strict
+  subset of the stored scopes, the stored scopes are kept, so a creator does
+  not silently stop being queried for memberships.
 
 ## Configuration
 
@@ -111,8 +122,8 @@ membership.
 
 | Method | Effect | Responses |
 |---|---|---|
-| `PUT /admin/users/:id/publishing-suspension` | Suspend. Body `{"reason": "...", "reportId": "..."}`. `reportId` is optional. Limits: `reason` ≤ 1024 characters, `reportId` ≤ 256 characters. | `201` with the new record. `200` with the **original** record if already suspended (a repeat never overwrites the audit record). `400` for a bad body, `401`/`403` for auth, `404` for an unknown account. |
-| `DELETE /admin/users/:id/publishing-suspension` | Lift. Idempotent. | `204`, or `404` for an unknown account. |
+| `PUT /admin/users/:id/publishing-suspension` | Suspend. Body `{"reason": "...", "reportId": "..."}`. `reportId` is optional. Limits: `reason` ≤ 1024 characters; `reportId` 1-128 characters of `[A-Za-z0-9._:-]` (it is written to audit log lines). | `201` with the new record. `200` with the **original** record if already suspended (a repeat never overwrites the audit record). `400` for a bad body, `401`/`403` for auth, `404` for an unknown account. |
+| `DELETE /admin/users/:id/publishing-suspension` | Lift. Idempotent. A malformed stored record is still removed. | `204` (lifted, malformed record removed, or not suspended), or `404` for an unknown account. |
 | `GET /admin/users/:id/publishing-suspension` | Read the suspension record. | `200` `{user_id, suspended, suspension?}`, or `404`. Returns nothing about Patreon membership: there is deliberately no Patreon status endpoint. |
 
 The record is stored on the account's `credentials` row as the map
@@ -124,6 +135,8 @@ writes one log line:
 audit publishing_suspension outcome=suspended user_id=<uuid> suspended_by=client:<id> report_id=<id|->
 audit publishing_suspension outcome=already_suspended user_id=<uuid> requested_by=… suspended_by=… report_id=…
 audit publishing_suspension outcome=lifted user_id=<uuid> lifted_by=… suspended_by=… suspended_at=… report_id=…
+audit publishing_suspension outcome=lifted user_id=<uuid> lifted_by=… previous_record=malformed
+audit publishing_suspension outcome=not_suspended user_id=<uuid> lifted_by=…
 ```
 
 The free-text reason is kept in the record only. It is never written to the log.
