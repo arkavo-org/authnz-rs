@@ -91,6 +91,12 @@ pub(crate) fn validate_fqns(list: &[String]) -> Result<(), EntitlementError> {
         if !is_attribute_fqn(f) {
             return Err(EntitlementError::InvalidFqn(f.clone()));
         }
+        // Derived at mint, never stored (#91): a stored copy would be
+        // delegable to agents, visible in /entities, and immune to both a
+        // membership lapse and a moderator's suspension.
+        if f == crate::constants::ENTITLEMENT_CREATOR_PUBLISH {
+            return Err(EntitlementError::DerivedOnly(f.clone()));
+        }
     }
     Ok(())
 }
@@ -177,6 +183,8 @@ pub enum EntitlementError {
     Empty,
     #[error("Invalid attribute FQN: {0}")]
     InvalidFqn(String),
+    #[error("Entitlement is derived at token mint and cannot be stored: {0}")]
+    DerivedOnly(String),
     #[error("User not found")]
     UserNotFound,
     #[error("Database error: {0}")]
@@ -190,9 +198,9 @@ impl IntoResponse for EntitlementError {
                 (StatusCode::UNAUTHORIZED, self.to_string())
             }
             EntitlementError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
-            EntitlementError::Empty | EntitlementError::InvalidFqn(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            EntitlementError::Empty
+            | EntitlementError::InvalidFqn(_)
+            | EntitlementError::DerivedOnly(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EntitlementError::UserNotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EntitlementError::Database(e) => match e.as_ref() {
                 DynamoDBError::TableNotExists(table) => (
@@ -237,6 +245,24 @@ mod tests {
             Err(EntitlementError::InvalidFqn(_))
         ));
     }
+
+    #[test]
+    fn creator_publish_entitlement_can_never_be_stored() {
+        let publish = crate::constants::ENTITLEMENT_CREATOR_PUBLISH.to_string();
+        assert!(matches!(
+            validate_fqns(&[ENTITLEMENT_READ.into(), publish.clone()]),
+            Err(EntitlementError::DerivedOnly(_))
+        ));
+        assert_eq!(
+            EntitlementError::DerivedOnly(publish.clone())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(parse_user_default_entitlements(Some(&publish)).is_err());
+    }
+
+    const ENTITLEMENT_READ: &str = "https://arkavo.ai/attr/action/value/read";
 
     #[test]
     fn parse_user_default_entitlements_unset_uses_constant() {

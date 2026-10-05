@@ -123,6 +123,13 @@ pub const PATREON_UNLINKED_CACHE_TTL_SECONDS: i64 = 60;
 /// background and warms the cache for the next mint.
 pub const PATREON_MATERIALIZE_DEADLINE_SECONDS: u64 = 3;
 
+/// TTL of a creator's fallback snapshot (owned campaign, no memberships),
+/// cached when its membership query fails or misses the mint deadline. Short,
+/// so a recovered Patreon is picked up quickly, but long enough that a
+/// creator with a dead refresh token does not pay the Patreon round-trips on
+/// every mint. Holds no memberships, so nothing derived from it qualifies.
+pub const PATREON_FAILURE_CACHE_TTL_SECONDS: i64 = 60;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
@@ -280,3 +287,25 @@ pub const ATTEST_REG_WINDOW_SECONDS: i64 = 86_400;
 /// which is worth alerting on even though nothing forces an attacker to
 /// produce it.
 pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;
+
+/// Attribute FQN of the creator-publishing entitlement (#91).
+///
+/// Derived, never stored: computed at token mint from the account's Patreon
+/// membership of Arkavo's own campaign (`PATREON_PUBLISHER_CAMPAIGN_ID` /
+/// `PATREON_PUBLISHER_TIER_IDS`) and appended to `arkavo_entitlements` on
+/// short-lived tokens only. It must never be written to
+/// `credentials.entitlements` (so it is not delegable to agents and is not
+/// in `GET /entities`) and never put in the ~99-year registration token.
+pub const ENTITLEMENT_CREATOR_PUBLISH: &str =
+    "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
+
+/// Patreon OAuth scope a link must hold for its memberships to be readable.
+/// A creator linked without it gets no memberships (and so never qualifies
+/// for [`ENTITLEMENT_CREATOR_PUBLISH`]) until they re-link.
+pub const PATREON_MEMBERSHIPS_SCOPE: &str = "identity.memberships";
+
+/// Length limits (characters) on a publishing suspension's moderator-supplied
+/// `reason` and `reportId`. `reportId` is also restricted to
+/// `[A-Za-z0-9._:-]` because it is written into audit log lines.
+pub const SUSPENSION_REASON_MAX_LEN: usize = 1024;
+pub const SUSPENSION_REPORT_ID_MAX_LEN: usize = 128;

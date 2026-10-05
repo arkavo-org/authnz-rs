@@ -1927,6 +1927,7 @@ mod tests {
             account_id: user_id.to_string(),
             roles: vec!["user".into()],
             entitlements: vec![],
+            derived_entitlements: vec![],
             patreon: None,
         };
         let token =
@@ -1955,6 +1956,7 @@ mod tests {
             account_id: user_id.to_string(),
             roles: vec!["user".into()],
             entitlements: vec![],
+            derived_entitlements: vec![],
             patreon: None,
         };
         let token = crate::authn::mint_registration_token(&app_state, &user_id, Some(&user), cnf)

@@ -104,11 +104,48 @@ pub struct ArkavoUserClaims {
     pub account_id: String,
     /// → `arkavo_roles`.
     pub roles: Vec<String>,
-    /// Attribute FQNs the user holds → `arkavo_entitlements`.
+    /// Attribute FQNs the user holds (the stored `credentials.entitlements`
+    /// list) → `arkavo_entitlements`.
     pub entitlements: Vec<String>,
+    /// Entitlements derived at mint time and never stored (today only
+    /// [`crate::constants::ENTITLEMENT_CREATOR_PUBLISH`]). Appended to
+    /// `arkavo_entitlements` by [`ArkavoClaims::with_arkavo_user`]; the
+    /// registration token drops them (see [`ArkavoUserClaims::stored_only`]).
+    pub derived_entitlements: Vec<String>,
     /// Materialized Patreon membership → `arkavo_patreon`; `None` when the
     /// user is unlinked, Patreon is disabled, or materialization failed.
     pub patreon: Option<ArkavoPatreon>,
+}
+
+impl ArkavoUserClaims {
+    /// The `arkavo_entitlements` value: the stored list followed by every
+    /// derived entitlement not already in it. A derived-only FQN found in the
+    /// stored list is dropped, so only the mint-time derivation (which
+    /// honours lapse and suspension) can ever emit it.
+    pub fn effective_entitlements(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .entitlements
+            .iter()
+            .filter(|e| *e != crate::constants::ENTITLEMENT_CREATOR_PUBLISH)
+            .cloned()
+            .collect();
+        for e in &self.derived_entitlements {
+            if !out.contains(e) {
+                out.push(e.clone());
+            }
+        }
+        out
+    }
+
+    /// These claims without the derived entitlements, for a token whose
+    /// lifetime outlives any membership check (the ~99-year registration
+    /// token).
+    pub fn stored_only(&self) -> Self {
+        Self {
+            derived_entitlements: Vec::new(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Materialized Patreon membership for embedding in a CWT access token.
@@ -129,7 +166,9 @@ pub struct ArkavoPatreon {
     /// Creator-only: the Patreon campaign id discovered at link time. None
     /// for consumers (their memberships are listed in `memberships`).
     pub campaign_id: Option<String>,
-    /// Consumer memberships. Empty for creators.
+    /// Campaigns this Patreon identity is a patron of — for consumer and
+    /// creator links alike (a creator's list is empty when its link lacks
+    /// the `identity.memberships` scope or the fetch failed).
     pub memberships: Vec<ArkavoPatreonMembership>,
     /// Unix timestamp when this snapshot was materialized.
     pub verified_at: i64,
@@ -334,7 +373,7 @@ impl ArkavoClaims {
         self = self
             .with_arkavo_account_id(&user.account_id)
             .with_arkavo_roles(user.roles.clone())
-            .with_arkavo_entitlements(user.entitlements.clone());
+            .with_arkavo_entitlements(user.effective_entitlements());
         if let Some(p) = &user.patreon {
             self = self.with_arkavo_patreon(p.clone());
         }

@@ -64,6 +64,9 @@ mod guardian;
 mod identity;
 mod oidc;
 mod patreon;
+mod publishing;
+#[cfg(test)]
+mod publishing_tests;
 #[cfg(test)]
 mod registration_gate_tests;
 mod webvh;
@@ -316,6 +319,14 @@ pub struct AppState {
     /// `GET /agents/:did/status` (`AGENT_STATUS_CLIENT_IDS`) — the
     /// platform KAS's `agent_status` client. Empty ⇒ 403.
     pub agent_status_client_ids: Arc<Vec<String>>,
+    /// client_ids whose service CWTs may set, lift and read publishing
+    /// suspensions at `/admin/users/:id/publishing-suspension`
+    /// (`MODERATION_CLIENT_IDS`). Empty ⇒ 403.
+    pub moderation_client_ids: Arc<Vec<String>>,
+    /// Arkavo's Patreon campaign + qualifying tier IDs for the derived
+    /// creator-publishing entitlement (`PATREON_PUBLISHER_CAMPAIGN_ID`,
+    /// `PATREON_PUBLISHER_TIER_IDS`). `None` ⇒ never granted.
+    pub publisher: Arc<Option<publishing::PublisherConfig>>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
     /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
     pub appraisal: agent_state::AppraisalConfig,
@@ -514,6 +525,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let moderation_client_ids = parse_id_list(env::var("MODERATION_CLIENT_IDS").ok());
+    if moderation_client_ids.is_empty() {
+        log::warn!(
+            "MODERATION_CLIENT_IDS is empty: /admin/users/:id/publishing-suspension will 403"
+        );
+    }
+    let publisher = publishing::PublisherConfig::from_env();
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -533,6 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_client_ids: Arc::new(admin_client_ids),
         agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
         agent_status_client_ids: Arc::new(agent_status_client_ids),
+        moderation_client_ids: Arc::new(moderation_client_ids),
+        publisher: Arc::new(publisher),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
@@ -644,6 +665,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/admin/users/:id/entitlements",
             axum::routing::put(entitlements::put_user_entitlements),
+        )
+        // Admin: moderator override of the derived creator-publishing
+        // entitlement (#91). Service CWT on MODERATION_CLIENT_IDS.
+        .route(
+            "/admin/users/:id/publishing-suspension",
+            get(publishing::get_publishing_suspension)
+                .put(publishing::put_publishing_suspension)
+                .delete(publishing::delete_publishing_suspension),
         )
         // Entity lookup (service CWT required). Spec §2.4.
         .route("/entities/:id", get(entities::get_entity))
@@ -1601,6 +1630,8 @@ pub(crate) mod test_helpers {
             admin_client_ids: Arc::new(vec!["it".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
+            moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            publisher: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }

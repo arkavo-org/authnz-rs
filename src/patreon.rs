@@ -62,8 +62,9 @@
 
 use crate::AppState;
 use crate::constants::{
-    PATREON_CACHE_TTL_SECONDS, PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE, PATREON_IDENTITY_URL,
-    PATREON_MATERIALIZE_DEADLINE_SECONDS, PATREON_TOKEN_URL, PATREON_UNLINKED_CACHE_TTL_SECONDS,
+    PATREON_CACHE_TTL_SECONDS, PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE,
+    PATREON_FAILURE_CACHE_TTL_SECONDS, PATREON_IDENTITY_URL, PATREON_MATERIALIZE_DEADLINE_SECONDS,
+    PATREON_TOKEN_URL, PATREON_UNLINKED_CACHE_TTL_SECONDS,
 };
 use crate::cwt::{ArkavoPatreon, ArkavoPatreonMembership};
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
@@ -820,6 +821,22 @@ fn token_exchange_error(status: reqwest::StatusCode, body: &str) -> PatreonError
     }
 }
 
+/// The scopes to record after a refresh. Patreon may answer a refresh with
+/// an empty `scope` or a narrower echo; recording that would make a creator
+/// silently stop being queried for memberships (see
+/// [`scopes_allow_memberships`]). A refresh token cannot widen the grant, so
+/// an empty or strictly narrower answer keeps the stored scopes; anything
+/// else (equal or not a subset) is taken as reported.
+fn merged_scopes(stored: &str, refreshed: &str) -> String {
+    let new: std::collections::HashSet<&str> = refreshed.split_whitespace().collect();
+    let old: std::collections::HashSet<&str> = stored.split_whitespace().collect();
+    if new.is_empty() || (new.is_subset(&old) && new.len() < old.len()) {
+        stored.to_string()
+    } else {
+        refreshed.to_string()
+    }
+}
+
 /// Build the updated [`PatreonLink`] after a successful token refresh. Keeps
 /// the immutable identity fields (user, Patreon user/campaign, role,
 /// `linked_at`) and swaps in the freshly-sealed access/refresh ciphertexts,
@@ -838,7 +855,7 @@ fn merge_refreshed_link(
         client_id: old.client_id.clone(),
         patreon_user_id: old.patreon_user_id.clone(),
         campaign_id: old.campaign_id.clone(),
-        scopes: new_tokens.scope.clone(),
+        scopes: merged_scopes(&old.scopes, &new_tokens.scope),
         access_token_ct: sealed_access.ciphertext,
         access_token_nonce: sealed_access.nonce,
         refresh_token_ct: sealed_refresh.ciphertext,
@@ -1108,6 +1125,36 @@ impl MembershipCache {
         }
     }
 
+    /// [`MembershipCache::put`], but only when no snapshot is cached for
+    /// `user_id` — atomically (Redis `SET NX`; one lock on the in-memory
+    /// fallback). For fallback snapshots, which must never replace a real one.
+    pub async fn put_if_absent(&self, user_id: Uuid, snap: &ArkavoPatreon) {
+        let key = Self::key(user_id);
+        let ser: SerializableMaterialized = snap.into();
+        if self.redis.is_connected() {
+            if let Ok(json) = serde_json::to_string(&ser) {
+                let ttl = (snap.cache_expires_at - Utc::now().timestamp()).max(1);
+                let _: Result<Option<String>, _> = self
+                    .redis
+                    .set(
+                        &key,
+                        json,
+                        Some(fred::types::Expiration::EX(ttl)),
+                        Some(fred::types::SetOptions::NX),
+                        false,
+                    )
+                    .await;
+            }
+        } else {
+            let mut map = self.local.lock().unwrap();
+            let now = Utc::now().timestamp();
+            map.retain(|_, (_, exp)| *exp > now);
+            if !map.contains_key(&key) && map.len() < MAX_LOCAL_CACHE_ENTRIES {
+                map.insert(key, (snap.clone(), snap.cache_expires_at));
+            }
+        }
+    }
+
     /// Remember that `user_id` has no Patreon link, so the next mint can skip
     /// the DynamoDB lookup. Cleared by [`MembershipCache::invalidate`], which
     /// the link handler calls, so linking takes effect immediately.
@@ -1230,6 +1277,11 @@ impl From<SerializableMaterialized> for ArkavoPatreon {
 /// Patreon link or Patreon support is disabled; returns `None` (with a
 /// warning) if Patreon is unreachable — per the fail-closed posture, the
 /// caller must treat absence of the claim as "no entitlement".
+///
+/// Unbounded: token mints use [`materialize_for_user_bounded`], which runs
+/// the same two steps ([`lookup_link`], [`materialize_link`]) under the mint
+/// deadline. Kept as the plain form for tests and future non-mint callers.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn materialize_for_user(
     app_state: &AppState,
     state: &PatreonState,
@@ -1238,47 +1290,88 @@ pub async fn materialize_for_user(
     if !state.is_enabled() {
         return None;
     }
+    match lookup_link(app_state, state, user_id).await {
+        LinkLookup::Cached(snap) => Some(snap),
+        LinkLookup::Absent => None,
+        LinkLookup::Link(link) => materialize_link(app_state, state, &link).await,
+    }
+}
 
+/// What a mint knows before any Patreon call: a cached snapshot, no link
+/// (or a failed lookup — both fail closed), or the stored link to query.
+enum LinkLookup {
+    Cached(ArkavoPatreon),
+    Absent,
+    Link(Box<PatreonLink>),
+}
+
+/// The cache and `patreon_tokens` reads that precede any Patreon call.
+async fn lookup_link(app_state: &AppState, state: &PatreonState, user_id: Uuid) -> LinkLookup {
     if let Some(cached) = state.cache.get(user_id).await {
         debug!("Patreon materialization cache HIT for user {}", user_id);
-        return Some(cached);
+        return LinkLookup::Cached(cached);
     }
 
     // Unlinked users are the common case and every mint would otherwise pay a
     // GetItem for them; the marker is cleared the moment they link.
     if state.cache.is_unlinked(user_id).await {
         debug!("Patreon link cache HIT (unlinked) for user {}", user_id);
-        return None;
+        return LinkLookup::Absent;
     }
 
-    let link = match app_state.db_store.get_patreon_link(user_id).await {
-        Ok(Some(link)) => link,
+    match app_state.db_store.get_patreon_link(user_id).await {
+        Ok(Some(link)) => LinkLookup::Link(Box::new(link)),
         Ok(None) => {
             state.cache.mark_unlinked(user_id).await;
-            return None;
+            LinkLookup::Absent
         }
         Err(e) => {
             warn!(
                 "Patreon link lookup failed for user {}: {} — failing closed (no claim)",
                 user_id, e
             );
-            return None;
+            LinkLookup::Absent
         }
-    };
+    }
+}
 
-    let (snap, refreshed) = match materialize_from_link(state, &link).await {
+/// The Patreon half of materialization: query, persist any rotated tokens,
+/// cache. A creator whose query fails gets (and caches, for
+/// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]) its fallback snapshot.
+async fn materialize_link(
+    app_state: &AppState,
+    state: &PatreonState,
+    link: &PatreonLink,
+) -> Option<ArkavoPatreon> {
+    let user_id = link.user_id;
+    let (snap, refreshed) = match materialize_from_link(state, link).await {
         Ok(v) => v,
         Err(failure) => {
             warn!(
-                "Patreon materialization failed for user {}: {} — failing closed (no claim)",
-                user_id, failure.error
+                "Patreon materialization failed for user {}: {} — failing closed ({})",
+                user_id,
+                failure.error,
+                if failure.fallback.is_some() {
+                    "creator claim without memberships"
+                } else {
+                    "no claim"
+                }
             );
             // Even on failure, a refresh may have succeeded before the retry
             // fetch broke. Patreon consumed the old refresh token the moment
             // the refresh went through — persisting the rotated link is the
             // only way the next mint can refresh at all.
             persist_rotated_tokens(app_state, user_id, failure.refreshed.map(|l| *l)).await;
-            return None;
+            // A creator keeps its campaign claim (what it had before creator
+            // memberships were fetched) with no memberships, so nothing
+            // membership-derived is granted. Cached briefly so a creator with
+            // a dead refresh token does not pay the Patreon round-trips on
+            // every mint.
+            // Insert-if-absent: never overwrite a real snapshot a concurrent
+            // materialization already cached.
+            let fallback = failure.fallback.map(|f| *f)?;
+            state.cache.put_if_absent(user_id, &fallback).await;
+            return Some(fallback);
         }
     };
 
@@ -1286,6 +1379,22 @@ pub async fn materialize_for_user(
 
     state.cache.put(user_id, &snap).await;
     Some(snap)
+}
+
+/// The snapshot a creator link falls back to when its membership query fails
+/// or misses the mint deadline: the stored owned campaign, no memberships
+/// (so nothing membership-derived qualifies), valid for
+/// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]. `None` for consumer links, which
+/// fail closed with no claim at all.
+fn creator_fallback(link: &PatreonLink, now: i64) -> Option<ArkavoPatreon> {
+    (link.role == "creator").then(|| ArkavoPatreon {
+        role: "creator".into(),
+        patreon_user_id: link.patreon_user_id.clone(),
+        campaign_id: link.campaign_id.clone(),
+        memberships: Vec::new(),
+        verified_at: now,
+        cache_expires_at: now + PATREON_FAILURE_CACHE_TTL_SECONDS,
+    })
 }
 
 /// [`materialize_for_user`] under a wall-clock deadline, for the token-mint
@@ -1298,6 +1407,12 @@ pub async fn materialize_for_user(
 /// fail-closed until they re-link. Detaching lets it run to completion (and
 /// warm the cache for the next mint) while the caller stops waiting after
 /// [`PATREON_MATERIALIZE_DEADLINE_SECONDS`] and mints without the claim.
+///
+/// The cache and link lookup run under the same deadline. Once the link is
+/// known, a creator's fallback snapshot is built *before* the Patreon work is
+/// spawned, so a creator that misses the deadline still keeps its campaign
+/// claim (as it did before creator memberships were fetched), and that
+/// fallback is cached briefly so the next mints don't each wait again.
 pub async fn materialize_for_user_bounded(
     app_state: &AppState,
     state: &PatreonState,
@@ -1306,30 +1421,58 @@ pub async fn materialize_for_user_bounded(
     if !state.is_enabled() {
         return None;
     }
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(PATREON_MATERIALIZE_DEADLINE_SECONDS);
+
+    // Cancelling the lookup is safe: it only reads.
+    let link = match tokio::time::timeout_at(deadline, lookup_link(app_state, state, user_id)).await
+    {
+        Ok(LinkLookup::Cached(snap)) => return Some(snap),
+        Ok(LinkLookup::Absent) => return None,
+        Ok(LinkLookup::Link(link)) => link,
+        Err(_) => {
+            warn!(
+                "Patreon link lookup for user {} exceeded the {}s mint deadline — failing \
+                 closed (no claim)",
+                user_id, PATREON_MATERIALIZE_DEADLINE_SECONDS
+            );
+            return None;
+        }
+    };
+    let fallback = creator_fallback(&link, Utc::now().timestamp());
+
     let app = app_state.clone();
     let patreon = state.clone();
-    let handle = tokio::spawn(async move { materialize_for_user(&app, &patreon, user_id).await });
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(PATREON_MATERIALIZE_DEADLINE_SECONDS),
-        handle,
-    )
-    .await
-    {
+    let handle = tokio::spawn(async move { materialize_link(&app, &patreon, &link).await });
+    match tokio::time::timeout_at(deadline, handle).await {
         Ok(Ok(snap)) => snap,
         Ok(Err(e)) => {
             warn!(
-                "Patreon materialization task failed for user {}: {} — failing closed (no claim)",
+                "Patreon materialization task failed for user {}: {} — failing closed",
                 user_id, e
             );
-            None
+            fallback
         }
         Err(_) => {
             warn!(
                 "Patreon materialization for user {} exceeded the {}s mint deadline — failing \
-                 closed (no claim); it continues in the background and will warm the cache",
-                user_id, PATREON_MATERIALIZE_DEADLINE_SECONDS
+                 closed ({}); it continues in the background and will warm the cache",
+                user_id,
+                PATREON_MATERIALIZE_DEADLINE_SECONDS,
+                if fallback.is_some() {
+                    "creator claim without memberships"
+                } else {
+                    "no claim"
+                }
             );
-            None
+            // Cache the creator fallback briefly unless the background task
+            // has already cached a real answer. Insert-if-absent is atomic, so
+            // a success landing between a check and a write cannot be
+            // clobbered; a later success still overwrites the fallback.
+            if let Some(f) = &fallback {
+                state.cache.put_if_absent(user_id, f).await;
+            }
+            fallback
         }
     }
 }
@@ -1368,6 +1511,11 @@ struct MaterializeFailure {
     /// module to ~304 bytes on the error path — paid on success too, since the
     /// variants share a layout.
     refreshed: Option<Box<PatreonLink>>,
+    /// Creator links only: the snapshot to embed despite the failure — the
+    /// stored campaign with an empty membership list. Cached (insert-if-absent)
+    /// for [`PATREON_FAILURE_CACHE_TTL_SECONDS`], so a recovered creator regains
+    /// memberships within that window, not on the very next mint.
+    fallback: Option<Box<ArkavoPatreon>>,
 }
 
 impl From<PatreonError> for MaterializeFailure {
@@ -1375,8 +1523,22 @@ impl From<PatreonError> for MaterializeFailure {
         Self {
             error,
             refreshed: None,
+            fallback: None,
         }
     }
+}
+
+/// Whether a link's granted scopes let `/identity` return memberships. An
+/// empty scope string (not recorded) is given the benefit of the doubt; a
+/// recorded list without `identity.memberships` skips the call, since
+/// Patreon cannot return memberships for it and re-asking on every mint
+/// would only add latency. Such a creator must re-link to qualify for
+/// membership-derived entitlements.
+fn scopes_allow_memberships(scopes: &str) -> bool {
+    scopes.trim().is_empty()
+        || scopes
+            .split_whitespace()
+            .any(|s| s == crate::constants::PATREON_MEMBERSHIPS_SCOPE)
 }
 
 /// Produce the membership snapshot for a link. The returned `Option<PatreonLink>`
@@ -1404,19 +1566,37 @@ async fn materialize_from_link(
 
     match link.role.as_str() {
         "creator" => {
-            // For creators, the snapshot is informational — the relevant
-            // membership data is the consumer's, not the creator's. Embed the
-            // campaign id so RPs can look up "which creator does this user own".
-            // No Patreon call is made, so no refresh is possible or needed.
-            let snap = ArkavoPatreon {
+            // A creator's snapshot embeds the campaign it owns (so RPs can
+            // look up "which creator does this user own") AND the campaigns
+            // it is itself a patron of — a creator is a patron of Arkavo's
+            // campaign to publish (#91). Same identity call, same
+            // refresh-on-401 path as consumers.
+            let creator_snap = |memberships| ArkavoPatreon {
                 role: "creator".into(),
                 patreon_user_id: link.patreon_user_id.clone(),
                 campaign_id: link.campaign_id.clone(),
-                memberships: Vec::new(),
+                memberships,
                 verified_at: now,
                 cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
             };
-            Ok((snap, None))
+            if !scopes_allow_memberships(&link.scopes) {
+                // info, not debug: an operator needs to see which creators
+                // must re-link. Cached, so at most once per cache TTL.
+                info!(
+                    "Patreon creator link for patreon_user_id_prefix={} lacks the {} scope; \
+                     skipping the membership fetch (re-link to grant it)",
+                    subject_prefix(&link.patreon_user_id),
+                    crate::constants::PATREON_MEMBERSHIPS_SCOPE
+                );
+                return Ok((creator_snap(Vec::new()), None));
+            }
+            match fetch_memberships_with_refresh(state, link, &access_token).await {
+                Ok((memberships, refreshed)) => Ok((creator_snap(memberships), refreshed)),
+                Err(failure) => Err(MaterializeFailure {
+                    fallback: creator_fallback(link, now).map(Box::new),
+                    ..failure
+                }),
+            }
         }
         _ => {
             // Consumer: query Patreon for memberships, refreshing the access
@@ -1438,7 +1618,8 @@ async fn materialize_from_link(
     }
 }
 
-/// Fetch consumer memberships, transparently refreshing the access token once
+/// Fetch the linked identity's memberships (consumer or creator link),
+/// transparently refreshing the access token once
 /// if Patreon returns 401 (token expired/revoked). On refresh, returns the
 /// rotated [`PatreonLink`] so the caller can persist it; the retry fetch is
 /// authoritative (a second 401 propagates rather than looping). If the retry
@@ -1519,6 +1700,7 @@ async fn fetch_memberships_with_refresh(
                 Err(error) => Err(MaterializeFailure {
                     error,
                     refreshed: Some(Box::new(refreshed_link)),
+                    fallback: None,
                 }),
             }
         }
@@ -1526,7 +1708,9 @@ async fn fetch_memberships_with_refresh(
     }
 }
 
-/// Pull the consumer's memberships from Patreon's `/identity` endpoint.
+/// Pull the linked identity's memberships (the campaigns it is a patron of)
+/// from Patreon's `/identity` endpoint. Used for consumer and creator links
+/// alike; needs the `identity.memberships` scope.
 ///
 /// We request `include=memberships,memberships.currently_entitled_tiers,memberships.campaign`
 /// so a single round-trip returns campaign id + patron_status + tier ids.
@@ -2410,6 +2594,255 @@ mod tests {
         assert_eq!(opened, b"new-refresh");
     }
 
+    async fn creator_link_with_token(
+        sealer: &TokenSealer,
+        token: &[u8],
+        scopes: &str,
+    ) -> PatreonLink {
+        PatreonLink {
+            role: "creator".into(),
+            campaign_id: Some("creators-own".into()),
+            scopes: scopes.into(),
+            ..consumer_link_with_token(sealer, token).await
+        }
+    }
+
+    fn enabled_state(
+        sealer: &TokenSealer,
+        http: reqwest::Client,
+        token_url: String,
+        identity_url: String,
+    ) -> PatreonState {
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        PatreonState {
+            oauth: Some(PatreonOAuthConfig {
+                clients: vec![PatreonClient {
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    redirect_uris: vec!["https://x/cb".into()],
+                }],
+            }),
+            sealer: Some(sealer.clone()),
+            http,
+            cache: MembershipCache::new(redis),
+            token_url,
+            identity_url,
+        }
+    }
+
+    #[test]
+    fn memberships_scope_check() {
+        assert!(scopes_allow_memberships(""));
+        assert!(scopes_allow_memberships(
+            "identity identity.memberships campaigns"
+        ));
+        assert!(!scopes_allow_memberships("identity campaigns"));
+        assert!(!scopes_allow_memberships("identity.memberships.extra"));
+    }
+
+    #[tokio::test]
+    async fn creator_link_fetches_memberships_with_refresh_and_keeps_campaign() {
+        // #91: a creator is a patron of Arkavo's campaign to publish, so its
+        // memberships are fetched exactly like a consumer's — same identity
+        // call, same refresh-on-401 — while the owned campaign is kept.
+        let (token_url, identity_url) = spawn_patreon_mock(true).await;
+        let sealer = TokenSealer::Plaintext;
+        let link = creator_link_with_token(
+            &sealer,
+            b"old-access",
+            "identity identity.memberships campaigns",
+        )
+        .await;
+        let state = enabled_state(&sealer, reqwest::Client::new(), token_url, identity_url);
+
+        let (snap, refreshed) = materialize_from_link(&state, &link)
+            .await
+            .expect("creator materialization should succeed after refresh");
+        assert_eq!(snap.role, "creator");
+        assert_eq!(snap.campaign_id.as_deref(), Some("creators-own"));
+        assert_eq!(snap.memberships.len(), 1);
+        assert_eq!(snap.memberships[0].campaign_id, "camp-1");
+        assert_eq!(
+            snap.memberships[0].patron_status.as_deref(),
+            Some("active_patron")
+        );
+        assert_eq!(snap.memberships[0].tier_ids, vec!["tier-gold"]);
+        let new_link = refreshed.expect("the 401 must have refreshed");
+        assert_eq!(new_link.role, "creator");
+        assert_eq!(new_link.campaign_id.as_deref(), Some("creators-own"));
+    }
+
+    #[tokio::test]
+    async fn creator_link_without_memberships_scope_skips_the_call() {
+        // Linked before the scope was requested: no Patreon call (the
+        // unreachable client would fail it), the campaign claim as before,
+        // no memberships — so nothing membership-derived. Re-link to fix.
+        let sealer = TokenSealer::Plaintext;
+        let link = creator_link_with_token(&sealer, b"access", "identity campaigns").await;
+        let state = enabled_state(
+            &sealer,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        );
+        let (snap, refreshed) = materialize_from_link(&state, &link).await.unwrap();
+        assert_eq!(snap.campaign_id.as_deref(), Some("creators-own"));
+        assert!(snap.memberships.is_empty());
+        assert!(refreshed.is_none());
+    }
+
+    #[tokio::test]
+    async fn creator_fetch_failure_fails_closed_but_keeps_the_campaign_claim() {
+        let sealer = TokenSealer::Plaintext;
+        let link = creator_link_with_token(&sealer, b"access", "").await;
+        let state = enabled_state(
+            &sealer,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        );
+        let failure = materialize_from_link(&state, &link)
+            .await
+            .expect_err("unreachable Patreon must fail the fetch");
+        let fallback = failure.fallback.expect("creator fallback snapshot");
+        assert_eq!(fallback.role, "creator");
+        assert_eq!(fallback.campaign_id.as_deref(), Some("creators-own"));
+        assert!(fallback.memberships.is_empty());
+    }
+
+    #[tokio::test]
+    async fn creator_fetch_failure_is_cached_briefly_without_memberships() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let app_state =
+            crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
+        let sealer = TokenSealer::Plaintext;
+        let link = creator_link_with_token(&sealer, b"access", "").await;
+        app_state.db_store.put_patreon_link(&link).await.unwrap();
+        let state = enabled_state(
+            &sealer,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        );
+        let snap = materialize_for_user(&app_state, &state, link.user_id)
+            .await
+            .expect("creator keeps its claim");
+        assert_eq!(snap.campaign_id.as_deref(), Some("creators-own"));
+        assert!(snap.memberships.is_empty());
+        // Cached, but only for the short failure TTL, and with no memberships
+        // (so nothing membership-derived can qualify from it).
+        let cached = state
+            .cache
+            .get(link.user_id)
+            .await
+            .expect("cached fallback");
+        assert!(cached.memberships.is_empty());
+        assert!(
+            cached.cache_expires_at <= Utc::now().timestamp() + PATREON_FAILURE_CACHE_TTL_SECONDS
+        );
+    }
+
+    /// A Patreon stand-in that answers every request only after `delay`,
+    /// counting requests.
+    async fn spawn_slow_patreon_mock(
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let body = r#"{"data":{"id":"p-1"},"included":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/v2/identity"), hits)
+    }
+
+    #[tokio::test]
+    async fn creator_past_the_mint_deadline_keeps_campaign_and_is_not_requeried() {
+        // Review finding on #92: before creator memberships were fetched a
+        // creator always had its campaign claim; a slow Patreon must not take
+        // it away, and must not cost every following mint another wait.
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let app_state =
+            crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
+        let (identity_url, hits) = spawn_slow_patreon_mock(std::time::Duration::from_secs(
+            PATREON_MATERIALIZE_DEADLINE_SECONDS + 3,
+        ))
+        .await;
+        let sealer = TokenSealer::Plaintext;
+        let link =
+            creator_link_with_token(&sealer, b"access", "identity identity.memberships").await;
+        app_state.db_store.put_patreon_link(&link).await.unwrap();
+        let state = enabled_state(
+            &sealer,
+            reqwest::Client::new(),
+            PATREON_TOKEN_URL.into(),
+            identity_url,
+        );
+
+        let started = std::time::Instant::now();
+        let snap = materialize_for_user_bounded(&app_state, &state, link.user_id)
+            .await
+            .expect("a creator keeps its claim past the deadline");
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_secs(PATREON_MATERIALIZE_DEADLINE_SECONDS + 2)
+        );
+        assert_eq!(snap.role, "creator");
+        assert_eq!(snap.campaign_id.as_deref(), Some("creators-own"));
+        assert!(snap.memberships.is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A second mint within the TTL is answered from the cache: no call.
+        let again = materialize_for_user_bounded(&app_state, &state, link.user_id)
+            .await
+            .expect("cached creator fallback");
+        assert_eq!(again.campaign_id.as_deref(), Some("creators-own"));
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second mint must not query Patreon"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_stored_scopes_when_patreon_echoes_less() {
+        let stored = "identity identity.memberships campaigns";
+        assert_eq!(merged_scopes(stored, ""), stored);
+        assert_eq!(merged_scopes(stored, "identity"), stored);
+        assert_eq!(merged_scopes(stored, "identity campaigns"), stored);
+        assert_eq!(
+            merged_scopes(stored, "campaigns identity identity.memberships"),
+            "campaigns identity identity.memberships"
+        );
+        assert_eq!(
+            merged_scopes(stored, "identity identity.memberships campaigns w"),
+            "identity identity.memberships campaigns w"
+        );
+        // Not a subset: taken as reported.
+        assert_eq!(merged_scopes("identity", "campaigns"), "campaigns");
+        assert_eq!(merged_scopes("", "identity"), "identity");
+    }
+
     #[tokio::test]
     async fn in_memory_cache_fallback_is_bounded() {
         // Redis disconnected → local fallback. Inserting more distinct,
@@ -2453,6 +2886,36 @@ mod tests {
         cache.put(user_id, &snap).await;
         // The retain-on-read sweep should drop the expired row.
         assert!(cache.get(user_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn membership_cache_fallback_never_overwrites_real_snapshot() {
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let cache = MembershipCache::new(redis);
+        let user_id = Uuid::new_v4();
+        let now = Utc::now().timestamp();
+        let real = ArkavoPatreon {
+            role: "creator".into(),
+            patreon_user_id: "p-1".into(),
+            campaign_id: Some("c-1".into()),
+            memberships: vec![],
+            verified_at: now,
+            cache_expires_at: now + 3600,
+        };
+        let fallback = ArkavoPatreon {
+            verified_at: now + 1,
+            cache_expires_at: now + PATREON_FAILURE_CACHE_TTL_SECONDS,
+            ..real.clone()
+        };
+        // The background task cached the real answer first: the fallback loses.
+        cache.put(user_id, &real).await;
+        cache.put_if_absent(user_id, &fallback).await;
+        assert_eq!(cache.get(user_id).await.unwrap().verified_at, now);
+        // Nothing cached: the fallback is written.
+        let other = Uuid::new_v4();
+        cache.put_if_absent(other, &fallback).await;
+        assert_eq!(cache.get(other).await.unwrap().verified_at, now + 1);
     }
 
     #[test]

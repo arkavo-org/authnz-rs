@@ -31,15 +31,37 @@ paths:
 - **Token sealing**: AES-256-GCM under a per-row 256-bit DEK; the DEK is
   KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
   GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
-- **Membership materialization**: surfaced *only* on the OIDC access_token
-  CWT as the `arkavo_patreon` claim. The OIDC token endpoint
-  (`handle_authorization_code_grant` and `handle_refresh_token_grant`) calls
-  [`materialize_for_user`] before minting; for consumers this queries
-  Patreon's `/identity?include=memberships,...` and builds an
-  `ArkavoPatreon { role, patreon_user_id, campaign_id?, memberships,
-  verified_at, cache_expires_at }` snapshot; for creators it just embeds the
-  stored `campaign_id`. Results are cached in Redis (with in-memory
+- **Membership materialization**: surfaced *only* in tokens, as the
+  `arkavo_patreon` claim, never through an endpoint. Every human token goes
+  through the one builder `oidc::arkavo_user_claims` (passkey auth CWT,
+  DeviceCheck CWT, OIDC access token on code exchange and refresh), which
+  calls [`materialize_for_user_bounded`] (3 s deadline) before minting. For
+  **both roles** this queries Patreon's
+  `/identity?include=memberships,memberships.currently_entitled_tiers,memberships.campaign`
+  (refresh once on 401) and builds an `ArkavoPatreon { role,
+  patreon_user_id, campaign_id?, memberships, verified_at,
+  cache_expires_at }` snapshot; a creator's snapshot also keeps its stored
+  owned `campaign_id`. Results are cached in Redis (with in-memory
   fallback) for `PATREON_CACHE_TTL_SECONDS` (5 min).
+- **Creator links and `identity.memberships`**: a creator whose stored
+  `scopes` are recorded and lack `identity.memberships` is not queried (the
+  snapshot has the campaign and no memberships) and must re-link to qualify
+  for membership-derived entitlements. A creator whose fetch fails or misses
+  the mint deadline gets its campaign claim with no memberships (built before
+  the Patreon work is spawned), cached for `PATREON_FAILURE_CACHE_TTL_SECONDS`
+  (60 s). A refresh whose `scope` is empty or a strict subset of the stored
+  scopes keeps the stored scopes. A stored copy of the publish FQN in
+  `credentials.entitlements` is dropped on every read.
+- **Creator-publishing entitlement** (#91, `src/publishing.rs`):
+  `https://patreon.arkavo.com/attr/arkavo-creator/value/publish` is appended
+  to `arkavo_entitlements` at mint while a membership of Arkavo's campaign
+  (`PATREON_PUBLISHER_CAMPAIGN_ID`) is `active_patron` at a tier ID in
+  `PATREON_PUBLISHER_TIER_IDS` and the account is not suspended. Only
+  `memberships[]` counts — owning the campaign is not membership. Derived,
+  never stored in `credentials.entitlements`, never in the registration
+  token; a suspension (`/admin/users/:id/publishing-suspension`, moderation
+  service CWT) overrides membership. The suspension GET returns the
+  suspension record only, never membership state.
 - **Fail-closed**: when Patreon is unreachable, the link is absent, or the
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of

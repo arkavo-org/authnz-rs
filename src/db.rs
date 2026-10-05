@@ -9,6 +9,7 @@ use webauthn_rs::prelude::*;
 
 mod agent_state;
 mod guardians;
+mod publishing;
 #[cfg(test)]
 pub(crate) use agent_state::tests as agent_state_test_support;
 pub use agent_state::{
@@ -16,6 +17,7 @@ pub use agent_state::{
     SwarmWrite,
 };
 pub use guardians::Guardian;
+pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {
@@ -917,6 +919,12 @@ impl DynamoDBStore {
                 .collect(),
             None => default_entitlements.to_vec(),
         };
+        // The creator-publishing entitlement is derived at mint (#91). A
+        // stored copy (written before `validate_fqns` refused it) would
+        // bypass both lapse and suspension and be delegable, so it is
+        // dropped on read — every token, delegation and /entities path
+        // reads the list through here.
+        let entitlements = strip_derived_only(entitlements, &user_id);
         Ok(UserCredentials {
             user_id,
             username,
@@ -2006,6 +2014,20 @@ fn item_to_patreon_link(
         token_expires_at,
         linked_at,
     })
+}
+
+/// Remove derived-only entitlements from a stored list, logging when a row
+/// actually held one.
+pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Display) -> Vec<String> {
+    let publish = crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
+    if !list.iter().any(|e| e == publish) {
+        return list;
+    }
+    warn!(
+        "Stored entitlements for {} contain the derived-only {}; ignoring the stored copy",
+        owner, publish
+    );
+    list.into_iter().filter(|e| e != publish).collect()
 }
 
 /// Privacy-preserving subject masker used by `link_identity` logs.

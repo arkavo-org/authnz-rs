@@ -91,7 +91,7 @@ pub async fn get_entity(
                     "sub": d.agent_did,
                     "arkavo_account_id": d.root_user_id,
                     "arkavo_roles": ["agent"],
-                    "arkavo_entitlements": d.entitlements,
+                    "arkavo_entitlements": crate::db::strip_derived_only(d.entitlements.clone(), &d.agent_did),
                     "arkavo_npe": {"type": "agent", "delegation_id": d.agent_did, "depth": d.depth, "chain": d.chain},
                     "revoked": d.revoked_at.is_some(),
                     "expires_at": d.expires_at,

@@ -8,7 +8,18 @@ paths:
 
 ### credentials table
 - **Primary Key**: user_id (String/UUID)
-- **Attributes**: username (String), credentials (List of JSON strings), did (String)
+- **Attributes**: username (String), credentials (List of JSON strings), did (String),
+  entitlements (List of String, attribute FQNs; never contains the derived
+  creator-publishing FQN), webvh_log (String, optional)
+- **publishing_suspension** (Map, optional; #91): present only while a
+  moderator has suspended publishing. Keys: `reason` (String),
+  `report_id` (String, optional), `suspended_by` (String, the service
+  client's `client:<id>`), `suspended_at` (Number). The map is the audit
+  record. Set by one conditional `UpdateItem` on
+  `attribute_exists(user_id) AND attribute_not_exists(publishing_suspension)`
+  (a repeat keeps the first record); lifted by a `REMOVE` conditional on
+  `attribute_exists(user_id)` (returns the old map for the audit log). Read
+  with `consistent_read(true)` on every mint whose membership qualifies.
 - **GSI**: username-index (partition key: username)
 
 ### handles table

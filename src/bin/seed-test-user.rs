@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            derived_entitlements: vec![],
             patreon: None,
         });
     let human_cwt = cwt::mint(&human_claims, &signing_key, &kid)?;

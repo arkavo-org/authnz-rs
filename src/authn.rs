@@ -680,6 +680,12 @@ pub fn mint_auth_token(
 /// would make every KAS rewrap fail with `missing authn idP clientID` until
 /// the user happened to re-authenticate. `POST /register` always passes them;
 /// `None` (tests) mints registered-claims-only.
+///
+/// Derived entitlements (the creator-publishing entitlement, #91) are
+/// dropped here, whatever the caller passes: they are granted only while a
+/// membership holds, and this token lives ~99 years. `finish_register` also
+/// runs when an existing account adds a passkey, so a qualifying user does
+/// reach this function.
 pub fn mint_registration_token(
     app_state: &AppState,
     user_id: &Uuid,
@@ -694,7 +700,7 @@ pub fn mint_registration_token(
     .with_idp(IDP_WEBAUTHN)
     .with_cnf(cnf);
     if let Some(u) = arkavo_user {
-        claims = claims.with_arkavo_user(u);
+        claims = claims.with_arkavo_user(&u.stored_only());
     }
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
@@ -1161,6 +1167,7 @@ mod tests {
                 "https://arkavo.ai/attr/tdf/value/create".into(),
                 "https://arkavo.ai/attr/tdf/value/decrypt".into(),
             ],
+            derived_entitlements: vec![crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into()],
             patreon: Some(sample_patreon()),
         };
 
@@ -1200,6 +1207,15 @@ mod tests {
             access.custom.arkavo_entitlements
         );
         assert_eq!(auth.custom.arkavo_patreon, access.custom.arkavo_patreon);
+        // The derived creator-publishing entitlement (#91) rides both
+        // short-lived tokens, after the stored list.
+        assert_eq!(
+            auth.custom
+                .arkavo_entitlements
+                .as_ref()
+                .and_then(|e| e.last()),
+            Some(&crate::constants::ENTITLEMENT_CREATOR_PUBLISH.to_string())
+        );
         // `idp` too — the access token always carries it, so a verifier that
         // keys on it must see the same value from the auth token.
         assert_eq!(auth.custom.idp.as_deref(), Some(IDP_WEBAUTHN));
@@ -1229,6 +1245,9 @@ mod tests {
             account_id: user_id.to_string(),
             roles: vec!["user".into()],
             entitlements: vec!["https://arkavo.ai/attr/tdf/value/decrypt".into()],
+            // A qualifying user adding a passkey reaches this mint with the
+            // derived publishing entitlement; the ~99-year token must drop it.
+            derived_entitlements: vec![crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into()],
             patreon: Some(sample_patreon()),
         };
 

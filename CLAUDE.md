@@ -41,7 +41,9 @@ when unset.
 | `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine, recover and appraisal) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
 | `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/:did/status` (intended for the platform entity resolver's `agent_status` client). Empty ⇒ 403, and the platform withholds every agent's entitlements. |
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
-| `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. |
+| `MODERATION_CLIENT_IDS` | client_ids whose service CWTs may set, lift and read publishing suspensions (`PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`). Empty ⇒ 403. See `docs/creator-publishing-entitlement.md`. |
+| `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
+| `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
 | `ENABLE_HTTP3` | QUIC listener on UDP/`PORT` (binary built with `--features http3`, TLS required). |
@@ -307,6 +309,23 @@ appraisal, status)
   a check shadowed by `NonceMismatch` cannot be tested.
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
+
+**publishing.rs** - Creator-publishing entitlement (#91)
+- `https://patreon.arkavo.com/attr/arkavo-creator/value/publish` is **derived
+  at mint, never stored**: `oidc::arkavo_user_claims` (the one builder behind
+  the passkey auth CWT, the DeviceCheck CWT and OIDC access tokens on code
+  exchange *and* refresh) appends it to `arkavo_entitlements` while the
+  account's Patreon snapshot shows an `active_patron` membership of
+  `PATREON_PUBLISHER_CAMPAIGN_ID` at a tier in `PATREON_PUBLISHER_TIER_IDS`,
+  and the account has no publishing suspension. Fails closed.
+- Carried in `ArkavoUserClaims::derived_entitlements`, so
+  `mint_registration_token` drops it (~99-year token), and
+  `entitlements::validate_fqns` refuses to store it (never delegable to
+  agents, never in `GET /entities`).
+- `PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`: service CWT on
+  `MODERATION_CLIENT_IDS`; the suspension (`suspended_by`, `suspended_at`,
+  `reason`, `report_id`) is a map attribute on the `credentials` row and is
+  the audit record. See [docs/creator-publishing-entitlement.md](docs/creator-publishing-entitlement.md).
 
 **entities.rs** - Service-gated entity lookup (spec §2.4)
 - `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace
