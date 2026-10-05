@@ -95,13 +95,14 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.credentials_table)
             .key("user_id", s(&user_id.to_string()))
-            .projection_expression("user_id, #ps")
+            .projection_expression("user_id, #ps, deleted_at")
             .expression_attribute_names("#ps", ATTR)
             .consistent_read(true)
             .send()
             .await
             .map_err(|e| classify(e, &self.credentials_table))?;
-        let Some(item) = out.item else {
+        // A deleted account's tombstone is not an account (#88).
+        let Some(item) = out.item.filter(|i| !super::account::is_tombstone(i)) else {
             return Ok(None);
         };
         match item.get(ATTR) {
@@ -124,7 +125,10 @@ impl DynamoDBStore {
             .table_name(&self.credentials_table)
             .key("user_id", s(&user_id.to_string()))
             .update_expression("SET #ps = :ps")
-            .condition_expression("attribute_exists(user_id) AND attribute_not_exists(#ps)")
+            .condition_expression(
+                "attribute_exists(user_id) AND attribute_not_exists(deleted_at) \
+                 AND attribute_not_exists(#ps)",
+            )
             .expression_attribute_names("#ps", ATTR)
             .expression_attribute_values(":ps", to_attr(suspension))
             .send()
@@ -159,7 +163,7 @@ impl DynamoDBStore {
             .table_name(&self.credentials_table)
             .key("user_id", s(&user_id.to_string()))
             .update_expression("REMOVE #ps")
-            .condition_expression("attribute_exists(user_id)")
+            .condition_expression(super::account::LIVE_ROW)
             .expression_attribute_names("#ps", ATTR)
             .return_values(ReturnValue::UpdatedOld)
             .send()

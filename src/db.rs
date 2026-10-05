@@ -7,9 +7,11 @@ use thiserror::Error;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
+mod account;
 mod agent_state;
 mod guardians;
 mod publishing;
+pub use account::{AccountDeletion, DeletionState, Tombstoned};
 #[cfg(test)]
 pub(crate) use agent_state::tests as agent_state_test_support;
 pub use agent_state::{
@@ -692,7 +694,7 @@ impl DynamoDBStore {
         };
 
         if let Some(items) = result.items {
-            if let Some(item) = items.first() {
+            if let Some(item) = items.iter().find(|i| !account::is_tombstone(i)) {
                 match self.item_to_user_credentials(item) {
                     Ok(user) => {
                         info!("Found user: {}", username);
@@ -725,10 +727,16 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
+            // Strongly consistent: this is the check that a deleted account's
+            // tokens fail, and must not see the row as it was a moment before
+            // the tombstone (#88).
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| self.map_get_item_err(&self.credentials_table, e))?;
         match result.item {
+            // A deleted account's tombstone is not an account (#88).
+            Some(item) if account::is_tombstone(&item) => Ok(None),
             Some(item) => self.item_to_user_credentials(&item).map(Some),
             None => Ok(None),
         }
@@ -758,7 +766,7 @@ impl DynamoDBStore {
             .update_item()
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
-            .condition_expression("attribute_exists(user_id)")
+            .condition_expression(account::LIVE_ROW)
             .update_expression("SET entitlements = :e")
             .expression_attribute_values(
                 ":e",
@@ -828,7 +836,9 @@ impl DynamoDBStore {
             .update_expression(
                 "SET credentials = list_append(if_not_exists(credentials, :empty), :new)",
             )
-            .condition_expression("attribute_exists(user_id)")
+            // Not on a deleted account's tombstone: a ceremony begun before
+            // the deletion must not enroll a passkey on it (#88).
+            .condition_expression(account::LIVE_ROW)
             .expression_attribute_values(":empty", AttributeValue::L(vec![]))
             .expression_attribute_values(":new", AttributeValue::L(vec![serialized]))
             .send()
@@ -951,10 +961,13 @@ impl DynamoDBStore {
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
             .update_expression("SET webvh_log = :log")
+            // Only onto a live account: unconditioned, this upserted a row
+            // for any user_id, recreating a deleted account (#88).
+            .condition_expression(account::LIVE_ROW)
             .expression_attribute_values(":log", AttributeValue::S(log.to_string()))
             .send()
             .await
-            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+            .map_err(|e| agent_state::classify(e, &self.credentials_table))?;
         Ok(())
     }
 

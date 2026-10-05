@@ -643,6 +643,15 @@ pub async fn apple_link_handler(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    // The CWT outlives a deleted account; never link onto one (#88).
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return AppleSigninError::InvalidAuth.into_response(),
+        Err(e) => {
+            error!("Account lookup for Apple link failed: {}", e);
+            return AppleSigninError::Internal("account_lookup_failed".to_string()).into_response();
+        }
+    }
 
     // 2. Same nonce dance as the bootstrap endpoint — single-use consume,
     //    bound to this session.

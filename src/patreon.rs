@@ -603,6 +603,12 @@ pub async fn patreon_link_handler(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    // The CWT outlives a deleted account; never link onto one (#88).
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return PatreonError::MissingAuth.into_response(),
+        Err(e) => return PatreonError::Db(e.to_string()).into_response(),
+    }
 
     if !state.is_enabled() {
         return PatreonError::NotConfigured.into_response();

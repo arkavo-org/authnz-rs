@@ -1205,6 +1205,28 @@ async fn handle_authorization_code_grant(
         );
     }
 
+    // The code was minted before the account may have been deleted (#88).
+    if let Ok(user_id) = Uuid::parse_str(&record.user.arkavo_account_id) {
+        match app_state.db_store.is_account_live(&user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return oidc_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "account does not exist",
+                );
+            }
+            Err(e) => {
+                error!("authorization_code grant: account lookup failed: {}", e);
+                return oidc_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "account lookup failed",
+                );
+            }
+        }
+    }
+
     // Derive the Arkavo custom claims (and materialize Patreon membership,
     // if linked) for embedding in the access_token CWT. Per the architecture
     // statement: "Patreon proves membership, authnz-rs materializes
@@ -1615,8 +1637,16 @@ async fn handle_refresh_token_grant(
             // decrypts nothing for its full lifetime, with no error to react
             // to. Surface it as retryable, the same way the authorize path
             // does, and let the client retry the refresh.
-            Ok(user_id) => match app_state.db_store.get_user_entitlements(&user_id).await {
-                Ok(list) => list,
+            Ok(user_id) => match app_state.db_store.get_user_by_id(&user_id).await {
+                Ok(Some(user)) => user.entitlements,
+                // Deleted (#88): the consumed refresh token stays consumed.
+                Ok(None) => {
+                    return oidc_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "account does not exist",
+                    );
+                }
                 Err(e) => {
                     // The token was already consumed by `take()` above, so a
                     // bare 503 would tell the client to retry with a token
@@ -1878,6 +1908,33 @@ pub async fn userinfo(
         }
     };
 
+    // A deleted account's access token still verifies until it expires (#88).
+    if let Some(user_id) = claims
+        .custom
+        .arkavo_account_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        match app_state.db_store.is_account_live(&user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return oidc_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_token",
+                    "Access token is invalid or expired",
+                );
+            }
+            Err(e) => {
+                error!("UserInfo account lookup failed: {}", e);
+                return oidc_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "account lookup failed",
+                );
+            }
+        }
+    }
+
     let sub = claims.sub.clone();
     let email = claims.custom.email.clone();
     let email_verified = claims.custom.email_verified;
@@ -2061,11 +2118,15 @@ pub(crate) async fn resolve_from_arkavo_jwt(
 
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AuthorizeError::InvalidArkavoJwt("sub is not a uuid".into()))?;
+    // The row, not just the entitlements: a deleted account's tokens still
+    // verify, and an empty entitlement list would otherwise pass (#88).
     let entitlements = app_state
         .db_store
-        .get_user_entitlements(&user_id)
+        .get_user_by_id(&user_id)
         .await
-        .map_err(|e| AuthorizeError::Database(e.to_string()))?;
+        .map_err(|e| AuthorizeError::Database(e.to_string()))?
+        .ok_or_else(|| AuthorizeError::InvalidArkavoJwt("account does not exist".into()))?
+        .entitlements;
     Ok(AuthenticatedUser::webauthn(user_id, entitlements)
         .with_auth_time(webauthn_auth_time(&claims)))
 }
@@ -2095,7 +2156,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -2279,7 +2340,7 @@ pub fn mint_access_token(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::Router;
     use axum::body::Body;
@@ -2296,7 +2357,7 @@ mod tests {
         ec_public_key_to_jwk(&pub_key).unwrap()
     }
 
-    fn test_oidc_config() -> Arc<OidcConfig> {
+    pub(crate) fn test_oidc_config() -> Arc<OidcConfig> {
         let jwk = test_jwk();
         let signing_kid = jwk.kid.clone();
         Arc::new(OidcConfig {

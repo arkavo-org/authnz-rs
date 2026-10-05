@@ -296,6 +296,32 @@ pub(crate) async fn authenticate_human(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<HumanDelegator, AgentError> {
+    let (user_id, issued_at) = verify_passkey_auth_token(app_state, headers)?;
+    Ok(HumanDelegator {
+        user_id,
+        username: Some(live_username(app_state, &user_id).await?),
+        issued_at,
+    })
+}
+
+/// The username of a live account. A deleted (or never-created) account is
+/// 401: its tokens outlive it, and must not keep acting for it (#88).
+async fn live_username(app_state: &AppState, user_id: &Uuid) -> Result<String, AgentError> {
+    match app_state.db_store.get_user_by_id(user_id).await {
+        Ok(Some(u)) => Ok(u.username),
+        Ok(None) => Err(AgentError::Unauthorized("account does not exist".into())),
+        Err(e) => Err(AgentError::DatabaseError(Box::new(e))),
+    }
+}
+
+/// [`authenticate_human`]'s token checks alone, without the account lookup:
+/// the subject and `iat` of a verified passkey auth CWT. Account deletion
+/// uses it directly, so a retried deletion still verifies after the account
+/// is gone.
+pub(crate) fn verify_passkey_auth_token(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, i64), AgentError> {
     let token = headers
         .get("X-Auth-Token")
         .ok_or(AgentError::MissingToken)?
@@ -332,20 +358,7 @@ pub(crate) async fn authenticate_human(
         ));
     }
 
-    let user_id = user_id_from_claims(&claims)?;
-    let username = app_state
-        .db_store
-        .get_user_by_id(&user_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.username);
-
-    Ok(HumanDelegator {
-        user_id,
-        username,
-        issued_at: claims.iat,
-    })
+    Ok((user_id_from_claims(&claims)?, claims.iat))
 }
 
 /// The operator authorizing an agent: a passkey auth CWT in `X-Auth-Token`
@@ -388,16 +401,9 @@ pub(crate) async fn authenticate_operator(
         max_auth_age,
     )?;
     let user_id = user_id_from_claims(&claims)?;
-    let username = app_state
-        .db_store
-        .get_user_by_id(&user_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.username);
     Ok(HumanDelegator {
         user_id,
-        username,
+        username: Some(live_username(app_state, &user_id).await?),
         issued_at: auth_time,
     })
 }
@@ -1934,10 +1940,11 @@ mod tests {
             crate::authn::mint_auth_token(&app_state, &user_id, Some(&user), None).expect("mint");
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", token.parse().unwrap());
-        let human = authenticate_human(&app_state, &headers)
-            .await
+        // The token checks alone: the account lookup that follows them in
+        // authenticate_human needs DynamoDB (agent_plane_tests cover it).
+        let (subject, _) = verify_passkey_auth_token(&app_state, &headers)
             .expect("a real WebAuthn auth CWT must be accepted");
-        assert_eq!(human.user_id, user_id);
+        assert_eq!(subject, user_id);
     }
 
     #[tokio::test]
