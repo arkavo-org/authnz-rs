@@ -49,6 +49,9 @@ use crate::oidc::{
 use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
 use authnz_rs::{constants, cwt, keys};
 
+mod account;
+#[cfg(test)]
+mod account_tests;
 mod agent;
 #[cfg(test)]
 mod agent_plane_tests;
@@ -608,6 +611,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let patreon_state = PatreonState::new(patreon_oauth, patreon_sealer, redis_client);
 
+    // Account deletions whose sweep never completed (#88): the process
+    // stopped during the grace or the retries. Background; boot does not wait.
+    tokio::spawn(account::resume_unfinished(
+        app_state.db_store.clone(),
+        patreon_state.clone(),
+    ));
+
     let session_store = MemoryStore::default();
     let session_service = ServiceBuilder::new().layer(
         SessionManagerLayer::new(session_store)
@@ -674,6 +684,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .put(publishing::put_publishing_suspension)
                 .delete(publishing::delete_publishing_suspension),
         )
+        // Account deletion (#88): fresh passkey auth CWT; status by the
+        // unguessable deletion id, no token (the account's tokens are dead).
+        .route("/account", axum::routing::delete(account::delete_account))
+        .route("/account/deletions/:id", get(account::get_deletion_status))
         // Entity lookup (service CWT required). Spec §2.4.
         .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)

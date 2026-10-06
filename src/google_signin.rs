@@ -267,6 +267,15 @@ pub async fn google_link_handler(
         },
         Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
     };
+    // The CWT outlives a deleted account; never link onto one (#88).
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return GoogleSigninError::Unauthenticated.into_response(),
+        Err(e) => {
+            error!("Account lookup for Google link failed: {}", e);
+            return GoogleSigninError::Storage.into_response();
+        }
+    }
 
     let raw_nonce = match consume_google_nonce(&session).await {
         Ok(n) => n,

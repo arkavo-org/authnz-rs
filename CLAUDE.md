@@ -327,6 +327,42 @@ appraisal, status)
   `reason`, `report_id`) is a map attribute on the `credentials` row and is
   the audit record. See [docs/creator-publishing-entitlement.md](docs/creator-publishing-entitlement.md).
 
+**account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
+- `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
+  `ACCOUNT_DELETION_TOKEN_MAX_AGE_SECONDS` (300 s); `agent::verify_passkey_auth_token`
+  (token checks only, no account lookup, so a retry still verifies). 202
+  `{deletion_id, status, requested_at, completes_by}`; a retry returns the same id.
+- **At once**: the `credentials` row is replaced by a tombstone (`db/account.rs`,
+  one put on `LIVE_ROW`) holding only `user_id`, `deleted_at`, `deletion_id`,
+  `deletion_state`, `deletion_attempts` and, until the sweep completes,
+  `deletion_handle`. `get_user_by_id` reports a tombstone as absent, and with
+  no `username` it leaves the `username-index` GSI, so the name is
+  **reusable immediately**. The handle row is deleted in the request too.
+- **Every write to a credentials row carries `LIVE_ROW`**
+  (`attribute_exists(user_id) AND attribute_not_exists(deleted_at)`):
+  `add_credential`, `put_user_entitlements`, `put_webvh_log` (was an upsert),
+  publishing suspension set/lift. Keep it on any new write to that table.
+- **Tokens outlive the account, so every path that trusts a token re-checks
+  the row** (`DynamoDBStore::is_account_live` / `get_user_by_id`):
+  `agent::authenticate_human` / `authenticate_operator` (whole agent plane and
+  Guardians), Apple/Google/Patreon link, `/oauth/authorize` with
+  `X-Auth-Token`, the code and refresh grants, `/oauth/userinfo`,
+  `/device-check/attest`; and for agent tokens, which name the agent not the
+  owner, `agent::active_delegation` and `GET /agents/:did/status` check the
+  delegation's `root_user_id`. A new token-accepting path must do the same.
+- **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` deletes
+  the handle, device bindings, identity links (scan: no `user_id` GSI) and the
+  Patreon token row (Patreon has no revocation endpoint), invalidates the
+  Patreon cache, revokes agent delegations (+ chain cascade; also done in the
+  request itself) and Guardians and blanks their `name` / `delegator_username`
+  (rows stay: a revoked or
+  recovered key must never come back fresh). Retries `[30, 60, 120]` s, then
+  `failed`; `resume_unfinished` restarts pending/failed sweeps at boot.
+  `device_attest_keys` is not touched (no account link).
+- `GET /account/deletions/:id`: no token; the id is `<user_id>.<128-bit hex>`,
+  compared constant-time. `pending | failed | completed`. Contract:
+  [docs/account-deletion.md](docs/account-deletion.md).
+
 **entities.rs** - Service-gated entity lookup (spec §2.4)
 - `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace
 - Id namespaces: `arkavo:<uuid>` (person), `did:key:…` (agent), `device:<key_id>` (device)
@@ -344,6 +380,8 @@ appraisal, status)
      `device_attest_keys` budget, and removes it: one attestation, one account.
    - Client requests `/register/:username?handle=...&did=...`
    - Validates DID format and handle consistency
+   - A deleted account's username is free at once (its tombstone has no
+     `username`); a new registrant gets a new `user_id` and DID
    - Rejects the `apple-` / `google-` username namespace (HTTP 403): those rows
      are IdP-provisioned with zero credentials, and the zero-credential
      exemption below would otherwise let anyone knowing the IdP `sub` enroll a

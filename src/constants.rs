@@ -309,3 +309,32 @@ pub const PATREON_MEMBERSHIPS_SCOPE: &str = "identity.memberships";
 /// `[A-Za-z0-9._:-]` because it is written into audit log lines.
 pub const SUSPENSION_REASON_MAX_LEN: usize = 1024;
 pub const SUSPENSION_REPORT_ID_MAX_LEN: usize = 128;
+
+/// Maximum age (seconds) of the passkey auth CWT that deletes an account
+/// (#88): deletion needs a fresh assertion, as recovery does.
+pub const ACCOUNT_DELETION_TOKEN_MAX_AGE_SECONDS: i64 = 300;
+
+/// Seconds between accepting an account deletion and sweeping the data bound
+/// to the account in other tables. A request that passed its account check
+/// just before the deletion may still be writing; the grace lets it land
+/// first, so the sweep removes it rather than racing it (#88).
+pub const ACCOUNT_DELETION_GRACE_SECONDS: i64 = 60;
+
+/// Delays (seconds) before each retry of a failed deletion sweep. After the
+/// last one the deletion is reported `failed`; it is tried once more at the
+/// next startup.
+pub const ACCOUNT_DELETION_RETRY_SECONDS: [i64; 3] = [30, 60, 120];
+
+/// The completion time the deletion endpoint promises (`completes_by`). It
+/// covers the grace and every retry: 60 + 30 + 60 + 120 = 270 s.
+pub const ACCOUNT_DELETION_COMPLETES_WITHIN_SECONDS: i64 = 300;
+
+const _: () = {
+    let mut total = ACCOUNT_DELETION_GRACE_SECONDS;
+    let mut i = 0;
+    while i < ACCOUNT_DELETION_RETRY_SECONDS.len() {
+        total += ACCOUNT_DELETION_RETRY_SECONDS[i];
+        i += 1;
+    }
+    assert!(total < ACCOUNT_DELETION_COMPLETES_WITHIN_SECONDS);
+};

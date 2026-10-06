@@ -675,6 +675,16 @@ pub async fn finish_attestation(
 
     let public_key = attested.public_key.clone();
 
+    // The account may have been deleted since the challenge was issued (#88).
+    if !app_state
+        .db_store
+        .is_account_live(&user_id)
+        .await
+        .map_err(|e| DeviceCheckError::DynamoDBOperationError(Box::new(e)))?
+    {
+        return Err(DeviceCheckError::UserNotFound);
+    }
+
     info!("Binding device {} to user {}", request.key_id, username);
 
     // Create device binding

@@ -15,16 +15,27 @@ paths:
   moderator has suspended publishing. Keys: `reason` (String),
   `report_id` (String, optional), `suspended_by` (String, the service
   client's `client:<id>`), `suspended_at` (Number). The map is the audit
-  record. Set by one conditional `UpdateItem` on
-  `attribute_exists(user_id) AND attribute_not_exists(publishing_suspension)`
-  (a repeat keeps the first record); lifted by a `REMOVE` conditional on
-  `attribute_exists(user_id)` (returns the old map for the audit log). Read
+  record. Set by one conditional `UpdateItem` on `LIVE_ROW AND
+  attribute_not_exists(publishing_suspension)` (a repeat keeps the first
+  record); lifted by a `REMOVE` conditional on `LIVE_ROW` (returns the old
+  map for the audit log). Read
   with `consistent_read(true)` on every mint whose membership qualifies.
+- **Tombstone** (#88): a deleted account's row is replaced, in one put on
+  `attribute_exists(user_id) AND attribute_not_exists(deleted_at)`, by
+  `user_id`, `deleted_at` (Number; its presence makes the row a tombstone),
+  `deletion_id` (String, `<user_id>.<32 hex>`), `deletion_state`
+  (`pending`|`failed`|`completed`), `deletion_attempts` (Number),
+  `deletion_completed_at` (Number) and `deletion_handle` (String, removed when
+  the sweep completes). No `username`, so it is not in `username-index`.
+  `get_user_by_id` / `get_user_by_name` read a tombstone as absent. **Every
+  write to this table is conditional on `LIVE_ROW`** (same expression), so
+  nothing lands on a tombstone or recreates a deleted row.
 - **GSI**: username-index (partition key: username)
 
 ### handles table
 - **Primary Key**: handle (String)
-- **Attributes**: did (String)
+- **Attributes**: did (String), user_id (String/UUID, the owning account;
+  `put_handle` and the deletion sweep's delete are both conditional on it)
 - **Format**: Handles are "{username}.arkavo.social"
 
 ### device_bindings table
@@ -55,8 +66,9 @@ paths:
 - **PII**: Deliberately minimal. No email, display name, relay address, or
   `real_user_status` is stored here, even if the IdP returns them.
 - **Future GSI** `user_id-index`: Add when an endpoint needs to enumerate
-  "which providers has this user linked?" — not required by the current
-  endpoint surface.
+  "which providers has this user linked?". Account deletion (#88) finds a
+  user's links with a paginated scan instead (deletions are rare); add the
+  GSI if the table grows enough for that to matter.
 
 ### agent_delegations table
 - **Primary Key**: agent_did (String) - `did:key:z6Mk…`
