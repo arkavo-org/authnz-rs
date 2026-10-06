@@ -844,6 +844,16 @@ async fn active_delegation(
     {
         return Err(AgentError::DelegationExpired);
     }
+    // The owner's account was deleted (#88): its delegations die with it,
+    // before the deletion's revocation reaches this row or if it never does.
+    if !app_state
+        .db_store
+        .is_account_live(&delegation.root_user_id)
+        .await
+        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
+    {
+        return Err(AgentError::DelegationRevoked);
+    }
     for ancestor_did in &delegation.chain {
         // Every chain entry is an agent DID with its own delegation row
         // (that is what `revoke_delegations_with_chain` cascades over), so a

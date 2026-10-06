@@ -184,6 +184,12 @@ pub async fn delete_account(
         warn!("Deleting the handle of deleted account {user_id} failed (sweep retries): {e}");
     }
     patreon.cache.invalidate(user_id).await;
+    // Revoke the account's agents now, not after the grace: the status
+    // endpoint the platform checks also refuses them by the tombstone, so a
+    // failure here is logged and left to the sweep.
+    if let Err(e) = db.revoke_and_scrub_delegations_of(&user_id, now).await {
+        warn!("Revoking the agents of deleted account {user_id} failed (sweep retries): {e}");
+    }
 
     schedule_sweep(
         app_state.db_store.clone(),

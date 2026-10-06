@@ -549,6 +549,18 @@ pub async fn agent_status(
         .map_err(db_err)?
         .filter(|d| d.trust.state == AgentState::Quarantined || is_live(d, now))
         .ok_or(AgentError::DelegationNotFound)?;
+    // An agent of a deleted account is gone with it, whether or not the
+    // deletion has revoked its row yet (#88). A quarantine is still reported:
+    // the platform refuses it either way.
+    if d.trust.state != AgentState::Quarantined
+        && !app_state
+            .db_store
+            .is_account_live(&d.root_user_id)
+            .await
+            .map_err(db_err)?
+    {
+        return Err(AgentError::DelegationNotFound);
+    }
     let mut resp = Json(AgentStatus::of(&d, now)).into_response();
     resp.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,

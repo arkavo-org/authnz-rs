@@ -424,3 +424,57 @@ async fn oidc_refuses_a_deleted_accounts_tokens() {
     );
     assert_eq!(userinfo(access).await, StatusCode::UNAUTHORIZED);
 }
+
+/// An agent token minted before the deletion stops working at once: the
+/// request revokes the delegation, and the status the platform checks refuses
+/// an agent whose owner is deleted even where the row was not revoked.
+#[tokio::test]
+async fn a_deleted_accounts_agents_stop_at_once() {
+    use crate::agent_plane_tests::{STATUS_CLIENT, service_cwt};
+    let Some(p) = Plane::new().await else { return };
+    let app = router(&p);
+    let status_cwt = service_cwt(&p, STATUS_CLIENT);
+
+    // Through the endpoint: revoked in the request, before any sweep.
+    let (_, cwt) = p.user(&[READ]).await;
+    let agent = fresh_agent();
+    let did = crate::agent_plane_tests::did_key(&agent);
+    let (st, body) = p
+        .authorize(("X-Auth-Token", &cwt), authorize_body(&agent, "", false))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        p.status(&did, Some(&status_cwt)).await.status(),
+        StatusCode::OK
+    );
+    let (st, _) = delete_account(&app, &cwt).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let d = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
+    assert!(d.revoked_at.is_some(), "not revoked by the request");
+    assert_eq!(
+        p.status(&did, Some(&status_cwt)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // A tombstone whose revocation never happened (it failed, or raced a
+    // late authorize): the status and the token path still refuse it.
+    let (uid, cwt) = p.user(&[READ]).await;
+    let agent = fresh_agent();
+    let did = crate::agent_plane_tests::did_key(&agent);
+    let (st, body) = p
+        .authorize(("X-Auth-Token", &cwt), authorize_body(&agent, "", false))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    p.store
+        .tombstone_account(&uid, &format!("{uid}.{}", "a".repeat(32)), None, 1)
+        .await
+        .unwrap();
+    let d = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
+    assert!(d.revoked_at.is_none());
+    assert_eq!(
+        p.status(&did, Some(&status_cwt)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let (st, body) = p.mint(&agent).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+}

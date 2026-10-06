@@ -62,7 +62,10 @@ credential (128 random bits), so keep it private.
 - The handle `<username>.arkavo.social` is released.
 - **Every token the account holds stops working**, in every app, whatever its
   expiry: the long-lived registration token, auth tokens, OIDC access and
-  refresh tokens, and agent credentials.
+  refresh tokens, and agent credentials. The account's agent delegations are
+  revoked in the same request, and the agent status the platform checks
+  (`GET /agents/:did/status`) refuses any agent whose owner is deleted, so an
+  agent token minted before the deletion stops working too.
 - The username can be registered again by anyone. A new registrant gets a new
   account id and a new DID; nothing of the old account carries over.
 
@@ -75,8 +78,8 @@ credential (128 random bits), so keep it private.
   that encrypted them. Patreon has no token-revocation endpoint, so the
   authorization also remains listed on the person's Patreon account until
   they remove Arkavo under Patreon's connected apps.
-- Agent delegations and Guardians the account set up are revoked, and their
-  labels and the owner's username are erased. The revoked records stay,
+- Guardians the account set up are revoked, and the labels of its agents and
+  Guardians and the owner's username are erased. The revoked records stay,
   holding only the agent's or Guardian's public key, so those keys can never
   be reused to impersonate a fresh identity.
 

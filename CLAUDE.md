@@ -347,12 +347,15 @@ appraisal, status)
   `agent::authenticate_human` / `authenticate_operator` (whole agent plane and
   Guardians), Apple/Google/Patreon link, `/oauth/authorize` with
   `X-Auth-Token`, the code and refresh grants, `/oauth/userinfo`,
-  `/device-check/attest`. A new token-accepting path must do the same.
+  `/device-check/attest`; and for agent tokens, which name the agent not the
+  owner, `agent::active_delegation` and `GET /agents/:did/status` check the
+  delegation's `root_user_id`. A new token-accepting path must do the same.
 - **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` deletes
   the handle, device bindings, identity links (scan: no `user_id` GSI) and the
   Patreon token row (Patreon has no revocation endpoint), invalidates the
-  Patreon cache, revokes agent delegations (+ chain cascade) and Guardians and
-  blanks their `name` / `delegator_username` (rows stay: a revoked or
+  Patreon cache, revokes agent delegations (+ chain cascade; also done in the
+  request itself) and Guardians and blanks their `name` / `delegator_username`
+  (rows stay: a revoked or
   recovered key must never come back fresh). Retries `[30, 60, 120]` s, then
   `failed`; `resume_unfinished` restarts pending/failed sweeps at boot.
   `device_attest_keys` is not touched (no account link).
