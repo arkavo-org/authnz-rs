@@ -2183,9 +2183,10 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 /// Patreon membership is materialized here (cached, fail-closed): "Patreon
 /// proves membership, authnz-rs materializes entitlement".
 ///
-/// The derived creator-publishing entitlement (#91) is computed here too,
-/// from that same snapshot plus the account's suspension state, and carried
-/// in `derived_entitlements` — never in `entitlements`, which is the stored
+/// The derived Patreon campaign entitlements and the creator-publishing
+/// entitlement (#91) are computed here too, from that same snapshot (plus,
+/// for publishing, the account's suspension state), and carried in
+/// `derived_entitlements` — never in `entitlements`, which is the stored
 /// list. Every short-lived human token (passkey auth, DeviceCheck assertion,
 /// OIDC access token on code exchange *and* refresh) goes through this one
 /// builder; the registration token drops the derived part at mint.
@@ -2199,8 +2200,12 @@ pub(crate) async fn arkavo_user_claims(
         Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
         None => None,
     };
-    let derived_entitlements =
-        crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
+    let mut derived_entitlements = snap
+        .as_ref()
+        .map(|s| crate::patreon::campaign_entitlements(s, Utc::now().timestamp()))
+        .unwrap_or_default();
+    derived_entitlements
+        .extend(crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await);
     crate::cwt::ArkavoUserClaims {
         account_id: user.arkavo_account_id.clone(),
         roles: user.roles.clone(),

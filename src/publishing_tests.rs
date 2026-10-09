@@ -491,9 +491,13 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     };
     let publish = ENTITLEMENT_CREATOR_PUBLISH.to_string();
     let decrypt = "https://arkavo.ai/attr/tdf/value/decrypt".to_string();
-    // A row written before validate_fqns refused the FQN.
+    let campaign = "https://patreon.arkavo.com/attr/campaign/value/123".to_string();
+    // A row written before validate_fqns refused the FQNs.
     f.store
-        .put_user_entitlements(&f.user_id, &[decrypt.clone(), publish.clone()])
+        .put_user_entitlements(
+            &f.user_id,
+            &[decrypt.clone(), publish.clone(), campaign.clone()],
+        )
         .await
         .unwrap();
 
@@ -507,7 +511,10 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
 
     // Even a stored copy that reached the builder is not emitted while the
     // account is suspended or unqualified.
-    let leaked = AuthenticatedUser::webauthn(f.user_id, vec![decrypt.clone(), publish.clone()]);
+    let leaked = AuthenticatedUser::webauthn(
+        f.user_id,
+        vec![decrypt.clone(), publish.clone(), campaign.clone()],
+    );
     f.suspend().await;
     let suspended = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
     assert_eq!(suspended.effective_entitlements(), vec![decrypt.clone()]);

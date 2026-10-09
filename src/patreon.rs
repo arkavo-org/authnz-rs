@@ -1868,6 +1868,67 @@ pub(crate) fn slugify_tier(title: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Patreon `patron_status` that confers entitlement. `declined_patron`
+/// (failed payment) and `former_patron` get nothing.
+const ACTIVE_PATRON: &str = "active_patron";
+
+/// The Patreon campaign entitlements for a materialized snapshot — what the
+/// platform's arkavo-mode ERS passes through as direct entitlements in place
+/// of deriving them from `arkavo_patreon` itself. That ERS only lowercases,
+/// so every value here must already be canonical.
+///
+/// - each `active_patron` membership with a numeric campaign id gets
+///   `campaign/value/<cid>` and, per currently entitled tier, both
+///   `campaign-tier/value/<cid>_<slug>` (the creator's vocabulary) and
+///   `campaign-tier/value/<cid>_tier-<tier_id>` (rename-proof, #42);
+/// - a `role=creator` link gets `campaign/value/<cid>` for the campaign it
+///   owns. Its tiers are not in the snapshot yet.
+///
+/// A stale snapshot yields nothing, as does any id or slug that is not in
+/// canonical form (it could only come from a corrupt cache row, and would
+/// otherwise put a `/` or `_` inside an FQN). Order is stable; no duplicates.
+pub(crate) fn campaign_entitlements(snap: &ArkavoPatreon, now: i64) -> Vec<String> {
+    use crate::constants::{PATREON_CAMPAIGN_FQN_PREFIX, PATREON_CAMPAIGN_TIER_FQN_PREFIX};
+    if snap.cache_expires_at < now {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    if snap.role == "creator"
+        && let Some(cid) = snap.campaign_id.as_deref().filter(|c| is_patreon_id(c))
+    {
+        push(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"));
+    }
+    for m in &snap.memberships {
+        if m.patron_status.as_deref() != Some(ACTIVE_PATRON) || !is_patreon_id(&m.campaign_id) {
+            continue;
+        }
+        let cid = &m.campaign_id;
+        push(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"));
+        for slug in m.tier_slugs.iter().filter(|s| is_canonical_slug(s)) {
+            push(format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_{slug}"));
+        }
+        for id in m.tier_ids.iter().filter(|t| is_patreon_id(t)) {
+            push(format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_tier-{id}"));
+        }
+    }
+    out
+}
+
+/// Patreon campaign and tier ids are decimal strings.
+fn is_patreon_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Exactly what [`slugify_tier`] can produce (non-empty).
+fn is_canonical_slug(s: &str) -> bool {
+    !s.is_empty() && slugify_tier(s) == s
+}
+
 fn subject_prefix(sub: &str) -> &str {
     match sub.char_indices().nth(8) {
         Some((byte_idx, _)) => &sub[..byte_idx],
@@ -1944,6 +2005,171 @@ mod tests {
         // Tier titles are slugified into the creator's vocabulary, in the
         // same order as the entitled tiers.
         assert_eq!(parsed[0].tier_slugs, vec!["gold-tier", "vip-access"]);
+    }
+
+    fn campaign_snap(
+        role: &str,
+        campaign_id: Option<&str>,
+        memberships: Vec<ArkavoPatreonMembership>,
+    ) -> ArkavoPatreon {
+        ArkavoPatreon {
+            role: role.into(),
+            patreon_user_id: "999".into(),
+            campaign_id: campaign_id.map(Into::into),
+            memberships,
+            verified_at: 1_000,
+            cache_expires_at: 2_000,
+        }
+    }
+
+    fn membership(
+        cid: &str,
+        status: Option<&str>,
+        ids: &[&str],
+        slugs: &[&str],
+    ) -> ArkavoPatreonMembership {
+        ArkavoPatreonMembership {
+            campaign_id: cid.into(),
+            patron_status: status.map(Into::into),
+            tier_ids: ids.iter().map(|t| t.to_string()).collect(),
+            tier_slugs: slugs.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    const C: &str = "https://patreon.arkavo.com/attr/campaign/value/";
+    const CT: &str = "https://patreon.arkavo.com/attr/campaign-tier/value/";
+
+    #[test]
+    fn active_patron_gets_campaign_and_both_tier_forms() {
+        let snap = campaign_snap(
+            "consumer",
+            None,
+            vec![membership(
+                "123",
+                Some("active_patron"),
+                &["55"],
+                &["gold-tier"],
+            )],
+        );
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![
+                format!("{C}123"),
+                format!("{CT}123_gold-tier"),
+                format!("{CT}123_tier-55"),
+            ]
+        );
+    }
+
+    #[test]
+    fn free_follower_gets_campaign_only() {
+        let snap = campaign_snap(
+            "consumer",
+            None,
+            vec![membership("123", Some("active_patron"), &[], &[])],
+        );
+        assert_eq!(campaign_entitlements(&snap, 1_500), vec![format!("{C}123")]);
+    }
+
+    #[test]
+    fn only_active_patrons_qualify() {
+        let snap = campaign_snap(
+            "consumer",
+            None,
+            vec![
+                membership("1", Some("declined_patron"), &["5"], &["gold"]),
+                membership("2", Some("former_patron"), &["6"], &["gold"]),
+                membership("3", None, &["7"], &["gold"]),
+            ],
+        );
+        assert!(campaign_entitlements(&snap, 1_500).is_empty());
+    }
+
+    #[test]
+    fn stale_snapshot_yields_nothing() {
+        let snap = campaign_snap(
+            "creator",
+            Some("42"),
+            vec![membership("123", Some("active_patron"), &["55"], &["gold"])],
+        );
+        assert!(campaign_entitlements(&snap, 2_001).is_empty());
+    }
+
+    #[test]
+    fn creator_gets_owned_campaign_plus_own_memberships() {
+        let snap = campaign_snap(
+            "creator",
+            Some("42"),
+            vec![membership("123", Some("active_patron"), &[], &[])],
+        );
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![format!("{C}42"), format!("{C}123")]
+        );
+        // A consumer's snapshot never carries an owned campaign, but even a
+        // stray one is not honoured without role=creator.
+        let consumer = campaign_snap("consumer", Some("42"), vec![]);
+        assert!(campaign_entitlements(&consumer, 1_500).is_empty());
+    }
+
+    #[test]
+    fn non_canonical_values_are_dropped() {
+        let snap = campaign_snap(
+            "creator",
+            Some("42/x"),
+            vec![
+                membership("12a", Some("active_patron"), &["5"], &["gold"]),
+                membership(
+                    "123",
+                    Some("active_patron"),
+                    &["5/../6", ""],
+                    &["Gold", "gold_tier", "-gold", "", "ok"],
+                ),
+            ],
+        );
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![format!("{C}123"), format!("{CT}123_ok")]
+        );
+    }
+
+    #[test]
+    fn id_fallback_slug_and_id_form_are_not_duplicated() {
+        // An all-non-ASCII title slugifies to the `tier-<id>` fallback, which
+        // is exactly the id form.
+        let snap = campaign_snap(
+            "consumer",
+            None,
+            vec![membership(
+                "123",
+                Some("active_patron"),
+                &["55"],
+                &["tier-55"],
+            )],
+        );
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![format!("{C}123"), format!("{CT}123_tier-55")]
+        );
+    }
+
+    #[test]
+    fn campaign_entitlements_are_valid_derived_only_fqns() {
+        let snap = campaign_snap(
+            "creator",
+            Some("42"),
+            vec![membership("123", Some("active_patron"), &["55"], &["gold"])],
+        );
+        for f in campaign_entitlements(&snap, 1_500) {
+            assert!(crate::constants::is_derived_only(&f), "{f}");
+            assert!(
+                matches!(
+                    crate::entitlements::validate_fqns(std::slice::from_ref(&f)),
+                    Err(crate::entitlements::EntitlementError::DerivedOnly(_))
+                ),
+                "{f} must be a well-formed FQN refused only for being derived"
+            );
+        }
     }
 
     #[test]

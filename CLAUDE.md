@@ -326,6 +326,18 @@ appraisal, status)
   `MODERATION_CLIENT_IDS`; the suspension (`suspended_by`, `suspended_at`,
   `reason`, `report_id`) is a map attribute on the `credentials` row and is
   the audit record. See [docs/creator-publishing-entitlement.md](docs/creator-publishing-entitlement.md).
+- **Patreon campaign entitlements** (`patreon::campaign_entitlements`, the
+  same builder): for each `active_patron` membership with a numeric campaign
+  id, `https://patreon.arkavo.com/attr/campaign/value/<campaign_id>` plus
+  `.../attr/campaign-tier/value/<campaign_id>_<slug>` for every entitled tier,
+  in **both** the title-slug form and the rename-proof `tier-<tier_id>` form
+  (#42). A `role=creator` link adds its own campaign value (not yet its
+  tiers). What the platform's arkavo-mode ERS consumes in place of
+  `arkavo_patreon`, which is still minted until the platform cuts over.
+- **The whole `https://patreon.arkavo.com/` namespace is derived-only**
+  (`constants::is_derived_only`): refused by `validate_fqns`, stripped from
+  stored lists on read and from `effective_entitlements`, so none of it is
+  ever stored, delegated to an agent, or listed by `GET /entities`.
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
