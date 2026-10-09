@@ -331,7 +331,9 @@ appraisal, status)
   id, `https://patreon.arkavo.com/attr/campaign/value/<campaign_id>` plus
   `.../attr/campaign-tier/value/<campaign_id>_<slug>` for every entitled tier,
   in **both** the title-slug form and the rename-proof `tier-<tier_id>` form
-  (#42). A `role=creator` link adds its own campaign value (not yet its
+  (#42). A title slug shaped like the id form (`^tier-[0-9]+$`, e.g. a tier
+  titled "Tier 10234567") is never emitted: it would unlock that other
+  tier's id-tagged content. A `role=creator` link adds its own campaign value (not yet its
   tiers). What the platform's arkavo-mode ERS consumes in place of
   `arkavo_patreon`, which is still minted until the platform cuts over.
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**

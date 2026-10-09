@@ -1884,8 +1884,9 @@ const ACTIVE_PATRON: &str = "active_patron";
 /// - a `role=creator` link gets `campaign/value/<cid>` for the campaign it
 ///   owns. Its tiers are not in the snapshot yet.
 ///
-/// A stale snapshot yields nothing, as does any id or slug that is not in
-/// canonical form (it could only come from a corrupt cache row, and would
+/// A title slug shaped like the id form (`tier-<digits>`) is never emitted
+/// as a slug (see [`is_emittable_slug`]). A stale snapshot yields nothing,
+/// as does any id or slug that is not in canonical form (it could only come from a corrupt cache row, and would
 /// otherwise put a `/` or `_` inside an FQN). Order is stable; no duplicates.
 pub(crate) fn campaign_entitlements(snap: &ArkavoPatreon, now: i64) -> Vec<String> {
     use crate::constants::{PATREON_CAMPAIGN_FQN_PREFIX, PATREON_CAMPAIGN_TIER_FQN_PREFIX};
@@ -1909,7 +1910,7 @@ pub(crate) fn campaign_entitlements(snap: &ArkavoPatreon, now: i64) -> Vec<Strin
         }
         let cid = &m.campaign_id;
         push(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"));
-        for slug in m.tier_slugs.iter().filter(|s| is_canonical_slug(s)) {
+        for slug in m.tier_slugs.iter().filter(|s| is_emittable_slug(s)) {
             push(format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_{slug}"));
         }
         for id in m.tier_ids.iter().filter(|t| is_patreon_id(t)) {
@@ -1924,9 +1925,14 @@ fn is_patreon_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Exactly what [`slugify_tier`] can produce (non-empty).
-fn is_canonical_slug(s: &str) -> bool {
-    !s.is_empty() && slugify_tier(s) == s
+/// A title slug that may be emitted: exactly what [`slugify_tier`] can
+/// produce (non-empty), and not shaped like the id form. A tier titled
+/// "Tier 10234567" slugifies to `tier-10234567`, which is the id form of
+/// tier 10234567 — emitting it would let that tier's patrons open the other
+/// tier's id-tagged content. Nothing legitimate is lost: the non-ASCII
+/// fallback slug `tier-<own id>` is already emitted by the id form.
+fn is_emittable_slug(s: &str) -> bool {
+    !s.is_empty() && slugify_tier(s) == s && !s.strip_prefix("tier-").is_some_and(is_patreon_id)
 }
 
 fn subject_prefix(sub: &str) -> &str {
@@ -2150,6 +2156,31 @@ mod tests {
         assert_eq!(
             campaign_entitlements(&snap, 1_500),
             vec![format!("{C}123"), format!("{CT}123_tier-55")]
+        );
+    }
+
+    #[test]
+    fn id_shaped_title_slug_cannot_impersonate_another_tier() {
+        // Tier 55 titled "Tier 10234567" must not unlock tier 10234567's
+        // id-tagged content.
+        let snap = campaign_snap(
+            "consumer",
+            None,
+            vec![membership(
+                "123",
+                Some("active_patron"),
+                &["55"],
+                &["tier-10234567", "tier-", "tier-x1", "tiers-9"],
+            )],
+        );
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![
+                format!("{C}123"),
+                format!("{CT}123_tier-x1"),
+                format!("{CT}123_tiers-9"),
+                format!("{CT}123_tier-55"),
+            ]
         );
     }
 
