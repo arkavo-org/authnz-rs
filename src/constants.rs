@@ -299,6 +299,25 @@ pub const ATTEST_REG_LIFETIME_CAP: u32 = 10;
 pub const ENTITLEMENT_CREATOR_PUBLISH: &str =
     "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
 
+/// Attribute namespace of every Patreon-derived entitlement. The whole
+/// namespace is derived at mint from the materialized snapshot and never
+/// stored: a stored copy would outlive a lapsed membership and be delegable
+/// to agents, and the platform's arkavo-mode ERS does not filter agents by
+/// namespace — keeping these off agent tokens is authnz-rs's job.
+pub const PATREON_ENTITLEMENT_NAMESPACE: &str = "https://patreon.arkavo.com/";
+
+/// `<prefix><campaign_id>`: an active patron (or the owner) of the campaign.
+pub const PATREON_CAMPAIGN_FQN_PREFIX: &str = "https://patreon.arkavo.com/attr/campaign/value/";
+
+/// `<prefix><campaign_id>_<tier_slug>`: entitled to that tier of the campaign.
+pub const PATREON_CAMPAIGN_TIER_FQN_PREFIX: &str =
+    "https://patreon.arkavo.com/attr/campaign-tier/value/";
+
+/// Whether `fqn` may only be derived at mint, never stored or delegated.
+pub fn is_derived_only(fqn: &str) -> bool {
+    fqn.starts_with(PATREON_ENTITLEMENT_NAMESPACE)
+}
+
 /// Patreon OAuth scope a link must hold for its memberships to be readable.
 /// A creator linked without it gets no memberships (and so never qualifies
 /// for [`ENTITLEMENT_CREATOR_PUBLISH`]) until they re-link.

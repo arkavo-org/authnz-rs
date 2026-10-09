@@ -91,10 +91,11 @@ pub(crate) fn validate_fqns(list: &[String]) -> Result<(), EntitlementError> {
         if !is_attribute_fqn(f) {
             return Err(EntitlementError::InvalidFqn(f.clone()));
         }
-        // Derived at mint, never stored (#91): a stored copy would be
-        // delegable to agents, visible in /entities, and immune to both a
-        // membership lapse and a moderator's suspension.
-        if f == crate::constants::ENTITLEMENT_CREATOR_PUBLISH {
+        // Derived at mint, never stored (#91, and every Patreon campaign
+        // value): a stored copy would be delegable to agents, visible in
+        // /entities, and immune to both a membership lapse and a moderator's
+        // suspension.
+        if crate::constants::is_derived_only(f) {
             return Err(EntitlementError::DerivedOnly(f.clone()));
         }
     }
@@ -260,6 +261,12 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(parse_user_default_entitlements(Some(&publish)).is_err());
+        let campaign = "https://patreon.arkavo.com/attr/campaign/value/123".to_string();
+        assert!(matches!(
+            validate_fqns(&[ENTITLEMENT_READ.into(), campaign.clone()]),
+            Err(EntitlementError::DerivedOnly(_))
+        ));
+        assert!(parse_user_default_entitlements(Some(&campaign)).is_err());
     }
 
     const ENTITLEMENT_READ: &str = "https://arkavo.ai/attr/action/value/read";

@@ -62,6 +62,16 @@ paths:
   token; a suspension (`/admin/users/:id/publishing-suspension`, moderation
   service CWT) overrides membership. The suspension GET returns the
   suspension record only, never membership state.
+- **Campaign entitlements** (`campaign_entitlements`, same builder): every
+  `active_patron` membership with a numeric campaign id yields
+  `https://patreon.arkavo.com/attr/campaign/value/<cid>` and, per entitled
+  tier, `.../campaign-tier/value/<cid>_<slug>` **and**
+  `.../campaign-tier/value/<cid>_tier-<tier_id>` (#42: a tier rename must not
+  strand content tagged with the id form). A creator link adds its owned
+  campaign value. The platform's arkavo-mode ERS only lowercases, so values
+  must be canonical: non-numeric ids and non-`slugify_tier` slugs are
+  dropped. The whole `https://patreon.arkavo.com/` namespace is derived-only
+  (`constants::is_derived_only`).
 - **Fail-closed**: when Patreon is unreachable, the link is absent, or the
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of

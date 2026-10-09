@@ -929,7 +929,7 @@ impl DynamoDBStore {
                 .collect(),
             None => default_entitlements.to_vec(),
         };
-        // The creator-publishing entitlement is derived at mint (#91). A
+        // Patreon-namespace entitlements are derived at mint (#91). A
         // stored copy (written before `validate_fqns` refused it) would
         // bypass both lapse and suspension and be delegable, so it is
         // dropped on read — every token, delegation and /entities path
@@ -2032,15 +2032,16 @@ fn item_to_patreon_link(
 /// Remove derived-only entitlements from a stored list, logging when a row
 /// actually held one.
 pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Display) -> Vec<String> {
-    let publish = crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
-    if !list.iter().any(|e| e == publish) {
+    use crate::constants::is_derived_only;
+    if !list.iter().any(|e| is_derived_only(e)) {
         return list;
     }
     warn!(
-        "Stored entitlements for {} contain the derived-only {}; ignoring the stored copy",
-        owner, publish
+        "Stored entitlements for {} contain derived-only {} values; ignoring the stored copies",
+        owner,
+        crate::constants::PATREON_ENTITLEMENT_NAMESPACE
     );
-    list.into_iter().filter(|e| e != publish).collect()
+    list.into_iter().filter(|e| !is_derived_only(e)).collect()
 }
 
 /// Privacy-preserving subject masker used by `link_identity` logs.

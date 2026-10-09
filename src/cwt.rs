@@ -107,7 +107,8 @@ pub struct ArkavoUserClaims {
     /// Attribute FQNs the user holds (the stored `credentials.entitlements`
     /// list) → `arkavo_entitlements`.
     pub entitlements: Vec<String>,
-    /// Entitlements derived at mint time and never stored (today only
+    /// Entitlements derived at mint time and never stored (the
+    /// `https://patreon.arkavo.com/` namespace: Patreon campaign values and
     /// [`crate::constants::ENTITLEMENT_CREATOR_PUBLISH`]). Appended to
     /// `arkavo_entitlements` by [`ArkavoClaims::with_arkavo_user`]; the
     /// registration token drops them (see [`ArkavoUserClaims::stored_only`]).
@@ -126,7 +127,7 @@ impl ArkavoUserClaims {
         let mut out: Vec<String> = self
             .entitlements
             .iter()
-            .filter(|e| *e != crate::constants::ENTITLEMENT_CREATOR_PUBLISH)
+            .filter(|e| !crate::constants::is_derived_only(e))
             .cloned()
             .collect();
         for e in &self.derived_entitlements {
