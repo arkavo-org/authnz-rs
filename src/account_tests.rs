@@ -14,7 +14,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn patreon_off() -> PatreonState {
+pub(crate) fn patreon_off() -> PatreonState {
     PatreonState::new(
         None,
         None,
@@ -32,7 +32,8 @@ fn router(p: &Plane) -> Router {
                 get(crate::account::get_deletion_status),
             )
             .layer(Extension(p.state.clone()))
-            .layer(Extension(patreon_off())),
+            .layer(Extension(patreon_off()))
+            .layer(Extension(crate::apple_tokens::AppleTokens::disabled())),
     )
 }
 
@@ -182,9 +183,14 @@ async fn deletion_removes_the_account_then_everything_bound_to_it() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // Sweep (the handler schedules it after the grace; run it now).
-    crate::account::run_once(&p.store, &patreon_off(), &uid)
-        .await
-        .unwrap();
+    crate::account::run_once(
+        &p.store,
+        &patreon_off(),
+        &crate::apple_tokens::AppleTokens::disabled(),
+        &uid,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         p.store
             .get_identity_link("apple", &format!("apple-{suffix}"))
@@ -220,9 +226,14 @@ async fn deletion_removes_the_account_then_everything_bound_to_it() {
     );
 
     // A second sweep is a no-op.
-    crate::account::run_once(&p.store, &patreon_off(), &uid)
-        .await
-        .unwrap();
+    crate::account::run_once(
+        &p.store,
+        &patreon_off(),
+        &crate::apple_tokens::AppleTokens::disabled(),
+        &uid,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         p.store
             .get_account_deletion(&uid)
@@ -359,9 +370,14 @@ async fn a_deleted_username_can_be_registered_again() {
         .await
         .unwrap();
 
-    crate::account::run_once(&p.store, &patreon_off(), &uid)
-        .await
-        .unwrap();
+    crate::account::run_once(
+        &p.store,
+        &patreon_off(),
+        &crate::apple_tokens::AppleTokens::disabled(),
+        &uid,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         p.store.handle_owner(&handle).await,
         Some(newcomer.user_id.to_string())

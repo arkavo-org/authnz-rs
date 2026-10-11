@@ -4,10 +4,14 @@
 //! `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it.
 
 use crate::AppState;
+use crate::account::{run_once, schedule_sweep};
+use crate::account_tests::patreon_off;
 use crate::apple_signin::{AppleJwksCache, apple_link_handler, apple_nonce_handler};
 use crate::apple_tokens::test_support::{self as ts, StubApple};
-use crate::apple_tokens::{AppleTokens, apple_link_key};
-use crate::db::DynamoDBStore;
+use crate::apple_tokens::{AppleTokenRow, AppleTokens, apple_link_key};
+use crate::db::{DeletionState, DynamoDBStore};
+use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::AttributeValue;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
@@ -15,6 +19,7 @@ use axum::{Extension, Router};
 use jsonwebtoken::EncodingKey;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use uuid::Uuid;
@@ -568,4 +573,241 @@ async fn a_transient_jwks_failure_after_the_exchange_does_not_revoke() {
             .await
             .is_none()
     );
+}
+
+/// A deleted account (tombstone in place, sweep not yet run) that linked one
+/// Apple ID per token in `tokens`, each with its token stored.
+async fn deleted_account_with_tokens(h: &Harness, tokens: &[&str]) -> (Uuid, Vec<String>) {
+    let (uid, _) = h.user().await;
+    let apple = ts::tokens(&h.stub);
+    let mut subs = Vec::new();
+    for t in tokens {
+        let sub = new_sub();
+        h.store.link_identity(uid, "apple", &sub).await.unwrap();
+        h.store
+            .put_apple_token(&AppleTokenRow {
+                link_key: apple_link_key(&sub),
+                user_id: uid,
+                client_id: ts::CLIENT_ID.into(),
+                sealed: apple.seal(t).await.unwrap(),
+                stored_at: 1,
+            })
+            .await
+            .unwrap();
+        subs.push(sub);
+    }
+    h.store
+        .tombstone_account(&uid, &format!("{uid}.{}", "a".repeat(32)), None, 1)
+        .await
+        .unwrap();
+    (uid, subs)
+}
+
+async fn state_of(h: &Harness, uid: &Uuid) -> (DeletionState, u32) {
+    let d = h.store.get_account_deletion(uid).await.unwrap().unwrap();
+    (d.state, d.attempts)
+}
+
+#[tokio::test]
+async fn the_sweep_revokes_every_apple_token_and_removes_the_rows() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, subs) = deleted_account_with_tokens(&h, &["rt-a", "rt-b"]).await;
+    h.stub.reply_revoke(200, json!(null));
+
+    run_once(&h.store, &patreon_off(), &ts::tokens(&h.stub), &uid)
+        .await
+        .unwrap();
+
+    let mut revoked = h.stub.revoked();
+    revoked.sort();
+    assert_eq!(revoked, vec!["rt-a".to_string(), "rt-b".to_string()]);
+    for call in h.stub.calls("/auth/revoke") {
+        assert_eq!(call["client_id"], ts::CLIENT_ID);
+        assert_eq!(call["token_type_hint"], "refresh_token");
+    }
+    for sub in &subs {
+        assert_eq!(h.store.get_identity_link("apple", sub).await.unwrap(), None);
+        assert!(
+            h.store
+                .get_apple_token(&apple_link_key(sub))
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Completed);
+}
+
+#[tokio::test]
+async fn an_apple_refusal_keeps_the_token_and_fails_the_deletion_at_once() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, subs) = deleted_account_with_tokens(&h, &["rt-a"]).await;
+    let apple = ts::tokens(&h.stub);
+    h.stub.reply_revoke(400, json!({"error": "invalid_client"}));
+
+    let err = run_once(&h.store, &patreon_off(), &apple, &uid)
+        .await
+        .unwrap_err();
+    assert!(err.is_permanent(), "{err}");
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
+    // Everything else is gone; only the token still to revoke stays.
+    assert_eq!(
+        h.store.get_identity_link("apple", &subs[0]).await.unwrap(),
+        None
+    );
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&subs[0]))
+            .await
+            .is_some()
+    );
+
+    // The scheduler does not wait for a retry: one attempt, then it ends.
+    let before = h.stub.calls("/auth/revoke").len();
+    let handle = schedule_sweep(h.store.clone(), patreon_off(), apple.clone(), uid, 0);
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("a refused revocation must not be retried on the schedule")
+        .unwrap();
+    assert_eq!(h.stub.calls("/auth/revoke").len(), before + 1);
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
+
+    // Once the configuration is fixed, the startup resume (run_once) finishes it.
+    h.stub.reply_revoke(200, json!(null));
+    run_once(&h.store, &patreon_off(), &apple, &uid)
+        .await
+        .unwrap();
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Completed);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&subs[0]))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_apple_outage_keeps_the_token_and_retries_on_the_schedule() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, subs) = deleted_account_with_tokens(&h, &["rt-a"]).await;
+    let apple = ts::tokens(&h.stub);
+    h.stub.reply_revoke(503, json!({}));
+
+    let err = run_once(&h.store, &patreon_off(), &apple, &uid)
+        .await
+        .unwrap_err();
+    assert!(!err.is_permanent(), "{err}");
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Pending);
+    // Revocation ran after every other step: the link is already gone.
+    assert_eq!(
+        h.store.get_identity_link("apple", &subs[0]).await.unwrap(),
+        None
+    );
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&subs[0]))
+            .await
+            .is_some()
+    );
+
+    // The scheduler records the failure and waits to retry.
+    let handle = schedule_sweep(h.store.clone(), patreon_off(), apple, uid, 0);
+    let mut attempts = 0;
+    for _ in 0..100 {
+        attempts = state_of(&h, &uid).await.1;
+        if attempts >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(attempts, 1);
+    assert!(
+        !handle.is_finished(),
+        "a transient failure must be retried on the schedule"
+    );
+    handle.abort();
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Pending);
+}
+
+#[tokio::test]
+async fn stored_tokens_without_revocation_configured_fail_the_deletion() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, subs) = deleted_account_with_tokens(&h, &["rt-a"]).await;
+
+    let err = run_once(&h.store, &patreon_off(), &AppleTokens::disabled(), &uid)
+        .await
+        .unwrap_err();
+    assert!(err.is_permanent(), "{err}");
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&subs[0]))
+            .await
+            .is_some()
+    );
+    assert!(h.stub.calls("/auth/revoke").is_empty());
+}
+
+/// A row that matches the account but cannot be read is a permanent failure,
+/// reached after every readable row was revoked: retrying cannot repair it.
+#[tokio::test]
+async fn an_unreadable_apple_token_row_fails_the_deletion_at_once() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, subs) = deleted_account_with_tokens(&h, &["rt-good"]).await;
+    let apple = ts::tokens(&h.stub);
+    // Right key and owner, but no `token_ct`: the row cannot be parsed.
+    let bad_key = apple_link_key(&new_sub());
+    h.store
+        .raw_apple_tokens_put(
+            [
+                ("link_key", AttributeValue::S(bad_key.clone())),
+                ("user_id", AttributeValue::S(uid.to_string())),
+                ("client_id", AttributeValue::S(ts::CLIENT_ID.into())),
+                ("wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
+                ("token_nonce", AttributeValue::B(Blob::new(vec![2u8]))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+    h.stub.reply_revoke(200, json!(null));
+
+    let err = run_once(&h.store, &patreon_off(), &apple, &uid)
+        .await
+        .unwrap_err();
+    assert!(err.is_permanent(), "{err}");
+    assert!(
+        !err.to_string().contains(&bad_key),
+        "the error must not carry the link key"
+    );
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
+    // The readable row was revoked and removed; the unreadable one stays.
+    assert_eq!(h.stub.revoked(), vec!["rt-good".to_string()]);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&subs[0]))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        h.store.apple_tokens_of(&uid).await.unwrap().unreadable,
+        vec![bad_key]
+    );
+
+    // The scheduler does not retry it: one attempt, then it ends.
+    let handle = schedule_sweep(h.store.clone(), patreon_off(), apple, uid, 0);
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("an unreadable row must not be retried on the schedule")
+        .unwrap();
+    assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
 }

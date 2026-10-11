@@ -627,6 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(account::resume_unfinished(
         app_state.db_store.clone(),
         patreon_state.clone(),
+        apple_tokens.clone(),
     ));
 
     let session_store = MemoryStore::default();

@@ -656,11 +656,16 @@ pub(crate) mod test_support {
         jsonwebtoken::encode(&header, claims, key).unwrap()
     }
 
+    /// One scripted reply: status and JSON body.
+    type Reply = Arc<Mutex<(u16, Value)>>;
+    /// The form fields of each call, by path.
+    type Calls = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
     #[derive(Clone)]
     struct StubState {
-        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
-        token_reply: Arc<Mutex<(u16, Value)>>,
-        revoke_reply: Arc<Mutex<(u16, Value)>>,
+        calls: Calls,
+        token_reply: Reply,
+        revoke_reply: Reply,
         /// When set, the token / revoke endpoint answers 307 to this path
         /// instead of its scripted reply.
         token_redirect: Arc<Mutex<Option<String>>>,

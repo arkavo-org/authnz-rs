@@ -30,8 +30,10 @@ pub enum DeletionState {
     /// The account is gone; the sweep of the data bound to it is still to
     /// run (or running, or being retried).
     Pending,
-    /// The sweep ran out of retries. The account itself stays deleted; an
-    /// operator must look at the logs (the sweep also resumes at startup).
+    /// The sweep stopped: it ran out of retries, or Apple refused to revoke a
+    /// Sign in with Apple token for a reason retrying cannot fix (a
+    /// configuration problem). The account itself stays deleted; an operator
+    /// must look at the logs (the sweep also resumes at startup).
     Failed,
     /// Everything bound to the account has been removed.
     Completed,
@@ -267,20 +269,27 @@ impl DynamoDBStore {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(give_up);
         if attempts >= give_up {
-            self.client
-                .update_item()
-                .table_name(&self.credentials_table)
-                .key("user_id", s(&user_id.to_string()))
-                .condition_expression("attribute_exists(#d) AND deletion_state <> :done")
-                .update_expression("SET deletion_state = :failed")
-                .expression_attribute_names("#d", DELETED_AT)
-                .expression_attribute_values(":done", s(DeletionState::Completed.as_str()))
-                .expression_attribute_values(":failed", s(DeletionState::Failed.as_str()))
-                .send()
-                .await
-                .map_err(|e| classify(e, &self.credentials_table))?;
+            self.mark_deletion_failed(user_id).await?;
         }
         Ok(attempts)
+    }
+
+    /// Mark the deletion `failed` (unless it completed meanwhile). The startup
+    /// resume (`account::resume_unfinished`) picks it up again.
+    pub async fn mark_deletion_failed(&self, user_id: &Uuid) -> Result<(), DynamoDBError> {
+        self.client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", s(&user_id.to_string()))
+            .condition_expression("attribute_exists(#d) AND deletion_state <> :done")
+            .update_expression("SET deletion_state = :failed")
+            .expression_attribute_names("#d", DELETED_AT)
+            .expression_attribute_values(":done", s(DeletionState::Completed.as_str()))
+            .expression_attribute_values(":failed", s(DeletionState::Failed.as_str()))
+            .send()
+            .await
+            .map_err(|e| classify(e, &self.credentials_table))?;
+        Ok(())
     }
 
     /// Remove the account's Patreon link row: the sealed access and refresh
