@@ -152,6 +152,10 @@ pub enum AppleSigninError {
     InvalidAuth,
     #[error("Apple identity already linked to a different account")]
     LinkConflict,
+    /// The id_token Apple returned for the authorization code is not the
+    /// identity (or client) the submitted id_token proved.
+    #[error("apple_token_binding_mismatch")]
+    ReturnedTokenMismatch,
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -170,6 +174,7 @@ impl IntoResponse for AppleSigninError {
             // 403, not 401: Apple authentication succeeded; there is simply no
             // Arkavo account bound to this identity yet.
             AppleSigninError::IdentityNotLinked => StatusCode::FORBIDDEN,
+            AppleSigninError::ReturnedTokenMismatch => StatusCode::UNAUTHORIZED,
             _ => StatusCode::UNAUTHORIZED,
         };
         (status, self.to_string()).into_response()
@@ -189,6 +194,8 @@ pub struct AppleJwksCache {
     /// connection pool survives cache refreshes, and so a stalled
     /// `appleid.apple.com` can't hang the `/oauth/apple/*` / `idp=apple` paths.
     client: reqwest::Client,
+    /// Apple's JWKS. [`APPLE_JWKS_URL`] except in tests ([`Self::for_tests`]).
+    jwks_url: String,
 }
 
 struct CacheState {
@@ -225,6 +232,7 @@ impl AppleJwksCache {
             }),
             client_ids,
             client,
+            jwks_url: APPLE_JWKS_URL.to_string(),
         }
     }
 
@@ -242,7 +250,7 @@ impl AppleJwksCache {
             }
         }
 
-        let keys = fetch_jwks(&self.client, APPLE_JWKS_URL).await?;
+        let keys = fetch_jwks(&self.client, &self.jwks_url).await?;
 
         let mut state = self.inner.write().await;
         state.keys = keys;
@@ -254,6 +262,23 @@ impl AppleJwksCache {
         let mut state = self.inner.write().await;
         state.fetched_at = 0;
         state.keys.clear();
+    }
+
+    /// A cache for tests: these client ids, and the JWKS of a stub Apple.
+    #[cfg(test)]
+    pub(crate) fn for_tests(client_ids: &[&str], jwks_url: &str) -> Self {
+        Self {
+            inner: RwLock::new(CacheState {
+                keys: Vec::new(),
+                fetched_at: 0,
+            }),
+            client_ids: client_ids.iter().map(|s| s.to_string()).collect(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            jwks_url: jwks_url.to_string(),
+        }
     }
 }
 
@@ -290,6 +315,17 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Vec<Jwk>, App
     Ok(body.keys)
 }
 
+/// How an id_token's `nonce` claim must relate to the server-issued nonce.
+#[derive(Clone, Copy)]
+enum NonceRule<'a> {
+    /// Present, and equal to the raw nonce or its hex SHA-256. Every
+    /// id_token a client submits.
+    Required(&'a str),
+    /// Equal as above when present. The id_token Apple's token endpoint
+    /// returns for an authorization code may omit it.
+    IfPresent(&'a str),
+}
+
 /// Verify an Apple-issued id_token against the configured Apple client IDs,
 /// Apple's published JWKS, and the supplied server-issued nonce.
 ///
@@ -307,14 +343,53 @@ pub async fn verify_apple_id_token(
     if client_ids.is_empty() {
         return Err(AppleSigninError::MissingClientId);
     }
+    verify_with(
+        cache,
+        id_token,
+        client_ids,
+        NonceRule::Required(expected_raw_nonce),
+    )
+    .await
+}
 
+/// Verify the id_token Apple's token endpoint returned for an authorization
+/// code, and bind it to the id_token the client submitted. It must be signed
+/// by Apple, issued to `client_id` (the client that exchanged the code, not
+/// merely any configured one), name `submitted_sub`, and carry the session
+/// nonce when it carries one.
+pub(crate) async fn verify_returned_id_token(
+    cache: &AppleJwksCache,
+    id_token: &str,
+    client_id: &str,
+    submitted_sub: &str,
+    raw_nonce: &str,
+) -> Result<AppleIdTokenClaims, AppleSigninError> {
+    let claims = verify_with(
+        cache,
+        id_token,
+        &[client_id.to_string()],
+        NonceRule::IfPresent(raw_nonce),
+    )
+    .await?;
+    if !constant_time_eq(&claims.sub, submitted_sub) {
+        return Err(AppleSigninError::ReturnedTokenMismatch);
+    }
+    Ok(claims)
+}
+
+async fn verify_with(
+    cache: &AppleJwksCache,
+    id_token: &str,
+    client_ids: &[String],
+    nonce: NonceRule<'_>,
+) -> Result<AppleIdTokenClaims, AppleSigninError> {
     let header = decode_header(id_token)
         .map_err(|e| AppleSigninError::InvalidToken(format!("header decode: {}", e)))?;
     let kid = header.kid.ok_or(AppleSigninError::MissingKid)?;
 
     let keys = cache.get_keys().await?;
     if let Some(jwk) = find_jwk(&keys, &kid) {
-        return verify_apple_id_token_with_jwk(jwk, id_token, client_ids, expected_raw_nonce);
+        return verify_apple_id_token_with_jwk(jwk, id_token, client_ids, nonce);
     }
 
     // Cache miss: force a refresh in case Apple rotated keys.
@@ -322,7 +397,7 @@ pub async fn verify_apple_id_token(
     cache.invalidate().await;
     let keys = cache.get_keys().await?;
     let jwk = find_jwk(&keys, &kid).ok_or_else(|| AppleSigninError::UnknownKid(kid.clone()))?;
-    verify_apple_id_token_with_jwk(jwk, id_token, client_ids, expected_raw_nonce)
+    verify_apple_id_token_with_jwk(jwk, id_token, client_ids, nonce)
 }
 
 fn find_jwk<'a>(keys: &'a [Jwk], kid: &str) -> Option<&'a Jwk> {
@@ -339,7 +414,7 @@ fn verify_apple_id_token_with_jwk(
     jwk: &Jwk,
     id_token: &str,
     client_ids: &[String],
-    expected_raw_nonce: &str,
+    nonce: NonceRule<'_>,
 ) -> Result<AppleIdTokenClaims, AppleSigninError> {
     let alg = match &jwk.algorithm {
         AlgorithmParameters::RSA(_) => Algorithm::RS256,
@@ -377,7 +452,14 @@ fn verify_apple_id_token_with_jwk(
         return Err(AppleSigninError::IssuerMismatch(claims.iss));
     }
 
-    check_nonce(claims.nonce.as_deref(), expected_raw_nonce)?;
+    match nonce {
+        NonceRule::Required(raw) => check_nonce(claims.nonce.as_deref(), raw)?,
+        NonceRule::IfPresent(raw) => {
+            if claims.nonce.is_some() {
+                check_nonce(claims.nonce.as_deref(), raw)?;
+            }
+        }
+    }
 
     Ok(claims)
 }
@@ -1231,6 +1313,108 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "fetch should fail fast via timeout ({elapsed:?}), not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_returned_id_token_must_be_the_submitted_identity_for_this_client() {
+        use crate::apple_tokens::test_support as ts;
+        let (_, key, jwk) = ts::p256_key(ts::APPLE_KID);
+        let stub = ts::StubApple::start(vec![jwk]).await;
+        let cache = AppleJwksCache::for_tests(&[ts::CLIENT_ID, "com.arkavo.web"], &stub.jwks_url());
+        let sign = |sub: &str, aud: &str, nonce: Option<&str>| {
+            ts::sign_apple_id_token(&key, &ts::apple_claims(sub, aud, nonce))
+        };
+
+        // Same identity and client, with the session's nonce raw, hashed, or absent.
+        for nonce in [Some("n-1".to_string()), Some(sha256_hex("n-1")), None] {
+            let t = sign("sub-1", ts::CLIENT_ID, nonce.as_deref());
+            let claims = verify_returned_id_token(&cache, &t, ts::CLIENT_ID, "sub-1", "n-1")
+                .await
+                .unwrap();
+            assert_eq!(claims.sub, "sub-1");
+        }
+        // Another Apple identity.
+        assert!(matches!(
+            verify_returned_id_token(
+                &cache,
+                &sign("sub-2", ts::CLIENT_ID, None),
+                ts::CLIENT_ID,
+                "sub-1",
+                "n-1"
+            )
+            .await,
+            Err(AppleSigninError::ReturnedTokenMismatch)
+        ));
+        // Another ceremony's nonce.
+        assert!(matches!(
+            verify_returned_id_token(
+                &cache,
+                &sign("sub-1", ts::CLIENT_ID, Some("n-2")),
+                ts::CLIENT_ID,
+                "sub-1",
+                "n-1"
+            )
+            .await,
+            Err(AppleSigninError::NonceMismatch)
+        ));
+        // Issued to another configured client than the one that exchanged the code.
+        assert!(matches!(
+            verify_returned_id_token(
+                &cache,
+                &sign("sub-1", "com.arkavo.web", None),
+                ts::CLIENT_ID,
+                "sub-1",
+                "n-1"
+            )
+            .await,
+            Err(AppleSigninError::InvalidToken(_))
+        ));
+        // Not signed by Apple's key.
+        let (_, rogue, _) = ts::p256_key(ts::APPLE_KID);
+        let forged =
+            ts::sign_apple_id_token(&rogue, &ts::apple_claims("sub-1", ts::CLIENT_ID, None));
+        assert!(
+            verify_returned_id_token(&cache, &forged, ts::CLIENT_ID, "sub-1", "n-1")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_submitted_id_token_still_needs_a_nonce() {
+        use crate::apple_tokens::test_support as ts;
+        let (_, key, jwk) = ts::p256_key(ts::APPLE_KID);
+        let stub = ts::StubApple::start(vec![jwk]).await;
+        let cache = AppleJwksCache::for_tests(&[ts::CLIENT_ID], &stub.jwks_url());
+        let without =
+            ts::sign_apple_id_token(&key, &ts::apple_claims("sub-1", ts::CLIENT_ID, None));
+        assert!(matches!(
+            verify_apple_id_token(&cache, &without, "n-1").await,
+            Err(AppleSigninError::MissingTokenNonce)
+        ));
+        let with =
+            ts::sign_apple_id_token(&key, &ts::apple_claims("sub-1", ts::CLIENT_ID, Some("n-1")));
+        assert_eq!(
+            verify_apple_id_token(&cache, &with, "n-1")
+                .await
+                .unwrap()
+                .sub,
+            "sub-1"
+        );
+    }
+
+    #[test]
+    fn a_binding_mismatch_is_401_with_a_stable_body() {
+        assert_eq!(
+            AppleSigninError::ReturnedTokenMismatch.to_string(),
+            "apple_token_binding_mismatch"
+        );
+        assert_eq!(
+            AppleSigninError::ReturnedTokenMismatch
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 }
