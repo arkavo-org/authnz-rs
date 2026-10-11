@@ -391,12 +391,21 @@ mod tests {
             ("APPLE_SIWA_KEY_ID", KEY_ID),
             ("APPLE_SIWA_PRIVATE_KEY", "not a pem"),
         ]));
-        assert!(invalid(&[
+        // Both forms given, each valid on its own: only the "not both" rule
+        // can refuse this.
+        let path = std::env::temp_dir().join(format!("siwa-{}.p8", uuid::Uuid::new_v4()));
+        std::fs::write(&path, &pem).unwrap();
+        let both = siwa_config_from_vars(vars(&[
             ("APPLE_TEAM_ID", TEAM_ID),
             ("APPLE_SIWA_KEY_ID", KEY_ID),
             ("APPLE_SIWA_PRIVATE_KEY", &pem),
-            ("APPLE_SIWA_PRIVATE_KEY_PATH", "/tmp/x.p8"),
+            ("APPLE_SIWA_PRIVATE_KEY_PATH", path.to_str().unwrap()),
         ]));
+        std::fs::remove_file(&path).ok();
+        match both {
+            SiwaConfig::Invalid(why) => assert!(why.contains("not both"), "{why}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
         match siwa_config_from_vars(vars(&[
             ("APPLE_TEAM_ID", TEAM_ID),
             ("APPLE_SIWA_KEY_ID", KEY_ID),
