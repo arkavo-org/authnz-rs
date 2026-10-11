@@ -202,6 +202,19 @@ AWS_REGION=us-east-1
 # redirect. Access tokens carry aud = [client_id, OIDC_PLATFORM_AUDIENCE].
 # OIDC_CLIENT_CLOSUREKB_ID=closurekb-android
 # OIDC_CLIENT_CLOSUREKB_REDIRECT_URIS=com.closurekb:/oauth2redirect
+
+# Sign in with Apple token revocation (TN3194; docs/account-deletion.md).
+# The team's Sign in with Apple key (Certificates, IDs & Profiles → Keys,
+# "Sign in with Apple" enabled for com.arkavo.ArkavoCreator). Needs
+# PATREON_KMS_KEY_ID too: the refresh tokens are sealed with that key.
+# Create the apple_tokens table first (see below).
+# All unset ⇒ links are stored without a token and cannot be revoked
+# (startup warns). Once set, a client that does not send authorization_code
+# cannot link Apple.
+# APPLE_TEAM_ID=M8GS7ZT95Y
+# APPLE_SIWA_KEY_ID=<10-character key id>
+# APPLE_SIWA_PRIVATE_KEY_PATH=/etc/authnz-rs/keys/AuthKey_<key id>.p8   # chmod 600
+# DYNAMODB_APPLE_TOKENS_TABLE=apple_tokens
 ```
 
 #### `identity_links` Table
@@ -253,6 +266,45 @@ prepends the real peer address. If clients can reach authnz-rs directly,
 they can forge this header and poison the audit log. The audit value is
 not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
+
+#### `apple_tokens` Table
+
+Required before deploying 0.17.0, whether or not you set the Sign in with
+Apple key variables: the table and its IAM grant (below) must exist first.
+`POST /oauth/apple/link` stores one sealed Apple refresh token per linked
+Apple identity here, and the account-deletion sweep scans the table on every
+deletion, revokes the account's tokens with Apple and deletes the rows. Name
+it like the other tables (`apple_tokens`, or `prod-apple-tokens` alongside
+`prod-credentials`) and set `DYNAMODB_APPLE_TOKENS_TABLE` to that name.
+
+Without the IAM grant the sweep's scan is refused with access denied, which
+is retried and ends the deletion `failed`. A table that does not exist reads
+as empty, so deletions complete; but once revocation is enabled every Apple
+link fails with 502 `apple_token_store_failed`, because the token cannot be
+stored.
+
+```bash
+DYNAMODB_APPLE_TOKENS_TABLE=apple_tokens
+aws dynamodb create-table --table-name "$DYNAMODB_APPLE_TOKENS_TABLE" \
+  --attribute-definitions AttributeName=link_key,AttributeType=S \
+  --key-schema AttributeName=link_key,KeyType=HASH --billing-mode PAY_PER_REQUEST
+```
+
+| Resource | Actions |
+|---|---|
+| the `DYNAMODB_APPLE_TOKENS_TABLE` table | `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:Scan` |
+| `PATREON_KMS_KEY_ID` | nothing new (`kms:Encrypt` and `kms:Decrypt`, as Patreon linking uses) |
+
+Check the startup log for `Sign in with Apple token revocation enabled`. A
+`warn`/`error` line naming the missing or invalid variable means links are
+still stored without a token.
+
+A deletion that ends `failed` for a reason retrying cannot fix (Apple refused
+a revocation with a 4xx other than 429, which is a key, client id or secret
+problem; the account has stored tokens but revocation is not configured; or a
+stored token row is unreadable) has already removed the account and every
+other datum. Only the sealed tokens remain. Fix the problem and restart: the
+server retries unfinished deletions at startup.
 
 #### `guardians` Table and Agent Trust State
 

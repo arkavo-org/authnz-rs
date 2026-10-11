@@ -46,9 +46,16 @@ credential (128 random bits), so keep it private.
   - `pending`: the account is deleted; the data bound to it is still being
     removed.
   - `completed`: everything is removed.
-  - `failed`: removal ran out of retries. The account itself is deleted and
-    stays deleted; the server retries at its next restart and the failure is
-    logged for an operator. Tell the person their account is deleted and the
+  - `failed`: the remaining cleanup stopped. Either it ran out of retries, or
+    it hit a problem that retrying cannot fix. The permanent causes all concern
+    the Sign in with Apple tokens, which are revoked last: Apple refused a
+    revocation (a 4xx other than 429, which means a server configuration
+    problem: key, client id or secret), the account has stored tokens but the
+    server has no revocation configured, or a stored token row is unreadable.
+    In each case the account itself is deleted and stays deleted, and every
+    other datum is already removed; only the sealed Apple tokens remain. The
+    server retries at its next restart, once an operator has fixed the problem,
+    and logs the failure. Tell the person their account is deleted and the
     remaining cleanup is in progress.
 - **404**: unknown id.
 
@@ -82,12 +89,61 @@ credential (128 random bits), so keep it private.
   Guardians and the owner's username are erased. The revoked records stay,
   holding only the agent's or Guardian's public key, so those keys can never
   be reused to impersonate a fresh identity.
+- **Sign in with Apple** (last, after everything above): for every Apple ID
+  the account linked with an authorization code, the server revokes the
+  refresh token it holds at Apple, then deletes it. Revocation removes the
+  app from the person's Apple Account → Sign in with Apple list (TN3194).
+  A link made before the server held tokens (no authorization code) is
+  removed without a revocation. The app should tell the person they can
+  remove it in their Apple Account settings.
 
 **Kept:** a tombstone holding the random account id, the deletion id, its
 status and timestamps. It holds no personal data; it is what makes the
 account's old tokens fail and what the status endpoint reads. App Attest
 registration counters (keyed by device key, not by account) are kept for abuse
 prevention.
+
+## Sign in with Apple links
+
+So that the server has an Apple token to revoke when the account is deleted,
+an app that links Sign in with Apple sends the ceremony's authorization code
+with the id_token:
+
+```
+POST /oauth/apple/link
+X-Auth-Token: <Arkavo CWT>
+{"id_token": "<Apple id_token>", "authorization_code": "<UTF-8 of credential.authorizationCode>"}
+```
+
+When the server has token revocation configured:
+
+- **200**: linked, and the token is kept for revocation. Linking the same
+  Apple ID again replaces the stored token and does not revoke the old one:
+  Apple's revoke ends the whole authorization, and account deletion revokes
+  it.
+- **400** `authorization_code_required`: the code is missing or empty.
+  Nothing is stored. A build that does not send the code cannot link Apple.
+- **401** `apple_token_binding_mismatch`: the id_token Apple returned for the
+  code could not be verified as this Apple ID in this ceremony (another Apple
+  ID, another ceremony, audience or signature). The token Apple issued is
+  revoked, and nothing is stored.
+- **409**: that Apple ID is linked to another Arkavo account. Nothing is
+  stored or revoked.
+- **502** `apple_token_exchange_failed`: Apple did not accept the code (codes
+  are single-use and expire after 5 minutes). Nothing is stored. Run the
+  ceremony again (new nonce, new code).
+- **502** `apple_token_store_failed`: the token could not be sealed or
+  stored. If this request created the link, the new token is revoked and the
+  link taken back. On a re-link of an already linked Apple ID nothing is
+  revoked, and the existing link and token stay. Run the ceremony again.
+- **502** when Apple's keys could not be fetched to check the returned
+  id_token (a transient failure): nothing is stored or revoked. Run the
+  ceremony again.
+- **500** when the link itself could not be written: the new token is revoked
+  and nothing is stored. Run the ceremony again.
+
+Without that configuration the code is ignored and the link behaves as
+before.
 
 ## Other Arkavo apps
 

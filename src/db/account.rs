@@ -30,9 +30,12 @@ pub enum DeletionState {
     /// The account is gone; the sweep of the data bound to it is still to
     /// run (or running, or being retried).
     Pending,
-    /// The sweep stopped: it ran out of retries, or Apple refused to revoke a
-    /// Sign in with Apple token for a reason retrying cannot fix (a
-    /// configuration problem). The account itself stays deleted; an operator
+    /// The sweep stopped: it ran out of retries, or it hit one of three
+    /// causes retrying cannot fix, all in the last step (Sign in with Apple
+    /// revocation): Apple refused a revocation (a 4xx other than 429, a
+    /// configuration problem), stored tokens exist but revocation is not
+    /// configured, or a stored token row is unreadable. In those cases only
+    /// the sealed tokens remain. The account itself stays deleted; an operator
     /// must look at the logs (the sweep also resumes at startup).
     Failed,
     /// Everything bound to the account has been removed.

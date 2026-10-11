@@ -758,9 +758,10 @@ pub async fn apple_idtoken_handler(
 ///    arkavo user. The conflicting user_id is **not** disclosed. Nothing is
 ///    revoked or stored.
 ///  - `502 Bad Gateway`: Apple did not exchange the code
-///    (`apple_token_exchange_failed`) or the token could not be stored
+///    (`apple_token_exchange_failed`), the token could not be stored
 ///    (`apple_token_store_failed`; a link this request created is taken back
-///    and its token revoked).
+///    and its token revoked), or Apple's keys could not be fetched to check
+///    the id_token it returned (nothing is stored or revoked).
 ///  - `500 Internal Server Error`: DynamoDB or configuration failure.
 pub async fn apple_link_handler(
     Extension(app_state): Extension<AppState>,

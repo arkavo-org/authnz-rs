@@ -16,11 +16,14 @@
 //!    row (sealed tokens and wrapped key; Patreon has no revocation endpoint)
 //!    and its cache, and it revokes the account's agent delegations and
 //!    Guardians, stripping their labels. Last, it revokes the account's
-//!    Sign in with Apple refresh tokens with Apple (TN3194); a refusal that
-//!    retrying cannot fix marks the deletion `failed` at once, and the startup
-//!    resume tries again. The grace lets a request that
-//!    passed its account check just before the deletion finish its write, so
-//!    the sweep removes that write instead of racing it.
+//!    Sign in with Apple refresh tokens with Apple (TN3194) and deletes their
+//!    rows. Three causes retrying cannot fix mark the deletion `failed` at
+//!    once: Apple refused a revocation (a 4xx other than 429, a configuration
+//!    problem), stored tokens exist but revocation is not configured, or a
+//!    stored token row is unreadable. By then everything else is removed, and
+//!    the startup resume tries again once the problem is fixed. The grace lets
+//!    a request that passed its account check just before the deletion finish
+//!    its write, so the sweep removes that write instead of racing it.
 //!
 //! The response carries a `deletion_id`; `GET /account/deletions/:id` reports
 //! `pending`, `failed` or `completed`. That endpoint takes no token (the
@@ -255,7 +258,10 @@ pub async fn get_deletion_status(
 }
 
 /// Remove everything bound to a deleted account outside its own row. Each
-/// step is idempotent; the first failure stops the sweep and is returned.
+/// step is idempotent. A failure stops the sweep and is returned, so the steps
+/// after it do not run. The one step that does not stop at its first failure
+/// is the last: [`revoke_apple_tokens`] tries every readable token row before
+/// it reports a failure.
 pub(crate) async fn sweep(
     db: &DynamoDBStore,
     patreon: &PatreonState,
@@ -416,9 +422,11 @@ pub(crate) async fn run_once(
     Ok(())
 }
 
-/// At startup: resume every deletion whose sweep never completed (the
-/// process stopped during the grace or the retries, they ran out, or Apple
-/// refused a revocation).
+/// At startup: resume every deletion whose sweep never completed: the
+/// process stopped during the grace or the retries, the retries ran out, or
+/// the sweep hit a permanent cause (Apple refused a revocation, stored tokens
+/// exist while revocation is not configured, or a stored token row is
+/// unreadable) and marked the deletion `failed`.
 pub(crate) async fn resume_unfinished(
     db: Arc<DynamoDBStore>,
     patreon: PatreonState,
