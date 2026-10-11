@@ -673,6 +673,9 @@ pub(crate) mod test_support {
         /// How many more `GET /auth/keys` are served; after that, 503.
         /// `None`: unlimited.
         keys_budget: Arc<Mutex<Option<usize>>>,
+        /// When set, the next token call waits at this two-party barrier
+        /// twice before answering (see [`StubApple::hold_next_token_reply`]).
+        token_gate: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         jwks: Value,
     }
 
@@ -713,6 +716,11 @@ pub(crate) mod test_support {
         axum::Form(form): axum::Form<HashMap<String, String>>,
     ) -> axum::response::Response {
         s.calls.lock().unwrap().push(("/auth/token".into(), form));
+        let gate = s.token_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         if let Some(to) = s.token_redirect.lock().unwrap().clone() {
             return temporary_redirect(&to);
         }
@@ -759,6 +767,7 @@ pub(crate) mod test_support {
                 token_redirect: Arc::new(Mutex::new(None)),
                 revoke_redirect: Arc::new(Mutex::new(None)),
                 keys_budget: Arc::new(Mutex::new(None)),
+                token_gate: Arc::new(Mutex::new(None)),
                 jwks: json!({ "keys": keys }),
             };
             let app = axum::Router::new()
@@ -805,6 +814,16 @@ pub(crate) mod test_support {
         /// Serve `GET /auth/keys` `n` more times, then answer 503.
         pub(crate) fn serve_keys_only(&self, n: usize) {
             *self.state.keys_budget.lock().unwrap() = Some(n);
+        }
+
+        /// Hold the next token call before it answers. The returned
+        /// two-party barrier is waited on twice by the stub: once when the
+        /// call arrives, once before the reply. A test does its work between
+        /// its own two waits, while the exchange is in flight.
+        pub(crate) fn hold_next_token_reply(&self) -> Arc<tokio::sync::Barrier> {
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            *self.state.token_gate.lock().unwrap() = Some(gate.clone());
+            gate
         }
 
         /// The forms posted to `path`, oldest first.

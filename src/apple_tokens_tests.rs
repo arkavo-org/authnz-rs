@@ -575,6 +575,128 @@ async fn a_transient_jwks_failure_after_the_exchange_does_not_revoke() {
     );
 }
 
+/// Tombstone `uid`, as `DELETE /account` does (the sweep is not run).
+async fn tombstone(h: &Harness, uid: &Uuid) {
+    h.store
+        .tombstone_account(uid, &format!("{uid}.{}", "a".repeat(32)), None, 1)
+        .await
+        .unwrap();
+}
+
+/// Link `sub` to `uid` with Apple returning `refresh_token`, and delete the
+/// account while the exchange is in flight: after the handler's account
+/// check, before the token is stored.
+async fn link_while_deleting(
+    h: &Harness,
+    uid: &Uuid,
+    cwt: &str,
+    sub: &str,
+    refresh_token: &str,
+) -> (StatusCode, String) {
+    let (cookie, nonce) = h.nonce().await;
+    h.apple_returns(refresh_token, sub, Some(&nonce));
+    let id_token = h.id_token(sub, Some(&nonce));
+    let exchanges = h.stub.calls("/auth/token").len();
+    let gate = h.stub.hold_next_token_reply();
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(h.post_link(&cookie, cwt, &id_token, Some("code")), async {
+            gate.wait().await; // the exchange is in flight
+            tombstone(h, uid).await;
+            gate.wait().await;
+        })
+    })
+    .await
+    .expect("the link request never reached Apple's token endpoint");
+    assert_eq!(
+        h.stub.calls("/auth/token").len(),
+        exchanges + 1,
+        "the account check at the start of the request passed"
+    );
+    reply
+}
+
+/// The deletion's sweep may already have passed the identity links and the
+/// token rows: the link must neither keep a live token nor leave an identity
+/// link that would 409 every other account.
+#[tokio::test]
+async fn an_account_deleted_during_the_link_keeps_no_link_and_its_token_is_revoked() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+
+    let (st, body) = link_while_deleting(&h, &uid, &cwt, &sub, "rt-1").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(h.stub.revoked(), vec!["rt-1".to_string()]);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&sub))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        None
+    );
+}
+
+/// On a re-link the link is the deleted account's own, which the sweep
+/// removes; the new token is revoked and its row removed all the same.
+#[tokio::test]
+async fn an_account_deleted_during_a_relink_has_the_new_token_revoked() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+    assert_eq!(
+        h.link(&cwt, &sub, Some("code-1"), "rt-1").await.0,
+        StatusCode::OK
+    );
+
+    let (st, body) = link_while_deleting(&h, &uid, &cwt, &sub, "rt-2").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(h.stub.revoked(), vec!["rt-2".to_string()]);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&sub))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        Some(uid),
+        "a link this request did not create is left to the sweep"
+    );
+}
+
+/// A token Apple did not revoke keeps its row, so that the sweep (or an
+/// operator) can still revoke it; the link this request created goes.
+#[tokio::test]
+async fn an_account_deleted_during_the_link_keeps_a_token_apple_did_not_revoke() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+    h.stub.reply_revoke(503, json!({}));
+
+    let (st, body) = link_while_deleting(&h, &uid, &cwt, &sub, "rt-1").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(h.stub.revoked(), vec!["rt-1".to_string()]);
+    let row = h
+        .store
+        .get_apple_token(&apple_link_key(&sub))
+        .await
+        .expect("the unrevoked token's row");
+    assert_eq!(row.user_id, uid);
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        None
+    );
+}
+
 /// A deleted account (tombstone in place, sweep not yet run) that linked one
 /// Apple ID per token in `tokens`, each with its token stored.
 async fn deleted_account_with_tokens(h: &Harness, tokens: &[&str]) -> (Uuid, Vec<String>) {

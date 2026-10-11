@@ -68,10 +68,11 @@ pub const APPLE_CLIENT_SECRET_AUDIENCE: &str = "https://appleid.apple.com";
 /// minted per call, so a short one leaves nothing worth stealing.
 pub const APPLE_CLIENT_SECRET_LIFETIME_SECONDS: i64 = 300;
 
-/// Bound on every call to Apple's token and revoke endpoints. It keeps a
-/// link request well inside `ACCOUNT_DELETION_GRACE_SECONDS`, so a token row
-/// written by a link in flight when the account is deleted is there for the
-/// sweep to find.
+/// Bound on every call to Apple's token and revoke endpoints, so a stalled
+/// Apple cannot hold a link request or a deletion sweep. A link does not
+/// depend on it to finish inside `ACCOUNT_DELETION_GRACE_SECONDS`: after
+/// storing the token it checks the account again, and if the account was
+/// deleted meanwhile it revokes the token and takes the link back.
 pub const APPLE_TOKEN_HTTP_TIMEOUT_SECS: u64 = 10;
 
 /// Google JWKS cache TTL in seconds (1 hour).

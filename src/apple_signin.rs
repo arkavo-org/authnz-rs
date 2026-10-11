@@ -164,7 +164,8 @@ pub enum AppleSigninError {
     /// account is deleted.
     #[error("authorization_code_required")]
     AuthorizationCodeRequired,
-    /// Apple's token endpoint did not exchange the authorization code.
+    /// Apple did not take the authorization code (a refusal, or a response
+    /// that is not a token pair) or could not be reached.
     #[error("apple_token_exchange_failed")]
     TokenExchangeFailed,
     /// The refresh token could not be sealed or stored.
@@ -735,14 +736,24 @@ pub async fn apple_idtoken_handler(
 /// the token sealed in `apple_tokens` so that account deletion can revoke it
 /// (TN3194). Without that configuration a code is ignored.
 ///
-/// Apple's revoke ends the whole authorization for an Apple ID and client, so
-/// the new token is revoked only where no other token for that authorization
-/// is, or may be, in use: when the code is for another identity or ceremony
-/// (401), when the link write fails, and when storing the token fails on a
-/// link this request created. A 409 link conflict and a failed store on a
-/// re-link revoke nothing: the authorization belongs to the account that is
-/// linked, and its deletion revokes it. A successful re-link replaces the
-/// stored token without revoking the old one.
+/// Apple's revoke ends the whole authorization for an Apple ID and client,
+/// including a token stored for it earlier, so the cases differ:
+///  - a code for another identity or ceremony (401): the new token is revoked;
+///  - a link conflict (409): nothing is revoked; the authorization is the
+///    linked account's, and its deletion revokes it if that link stored a
+///    token;
+///  - the link write fails (500): the new token is revoked, even on a re-link,
+///    where that ends the existing authorization;
+///  - storing the token fails (502): the new token is revoked and the link
+///    taken back only if this request created the link; on a re-link nothing
+///    is revoked;
+///  - Apple's keys could not be fetched or read to check the returned
+///    id_token (502): nothing is revoked;
+///  - the account was deleted while the request was in flight (401): the new
+///    token is revoked and its row removed (kept if Apple did not revoke it),
+///    and a link this request created is taken back;
+///  - a re-link succeeds (200): the stored token is replaced, and the old one
+///    is not revoked.
 ///
 /// Responses:
 ///  - `200 OK`: identity successfully linked (or re-linked to the same user;
@@ -750,19 +761,20 @@ pub async fn apple_idtoken_handler(
 ///  - `400 Bad Request`: no session nonce, or expired session nonce; or, with
 ///    revocation configured, no `authorization_code`
 ///    (`authorization_code_required`).
-///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, Apple id_token
-///    validation failure (signature, iss, aud, nonce, exp, iat), or a code
-///    whose id_token is another identity or ceremony
-///    (`apple_token_binding_mismatch`; the new token is revoked).
+///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, a deleted
+///    account (checked at the start and, with revocation configured, again
+///    after the token is stored), Apple id_token validation failure
+///    (signature, iss, aud, nonce, exp, iat), or a code whose id_token is
+///    another identity or ceremony (`apple_token_binding_mismatch`).
 ///  - `409 Conflict`: this Apple `sub` is already linked to a *different*
 ///    arkavo user. The conflicting user_id is **not** disclosed. Nothing is
 ///    revoked or stored.
-///  - `502 Bad Gateway`: Apple did not exchange the code
-///    (`apple_token_exchange_failed`), the token could not be stored
-///    (`apple_token_store_failed`; a link this request created is taken back
-///    and its token revoked), or Apple's keys could not be fetched to check
-///    the id_token it returned (nothing is stored or revoked).
-///  - `500 Internal Server Error`: DynamoDB or configuration failure.
+///  - `502 Bad Gateway`: Apple did not take the code or could not be reached
+///    (`apple_token_exchange_failed`), the token could not be sealed or
+///    stored (`apple_token_store_failed`), or Apple's keys could not be
+///    fetched or read to check the id_token it returned.
+///  - `500 Internal Server Error`: DynamoDB or configuration failure,
+///    including a failed link write.
 pub async fn apple_link_handler(
     Extension(app_state): Extension<AppState>,
     Extension(cache): Extension<Arc<AppleJwksCache>>,
@@ -867,14 +879,9 @@ async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Re
     }
 }
 
-/// Exchange the code, bind the result to the verified identity, link, and
-/// keep the refresh token for revocation.
-///
-/// Apple's revoke is authorization-wide, so the new token is revoked only
-/// when nothing else may depend on the authorization: a code for another
-/// identity or ceremony, a failed link write, or a failed store on a link
-/// this request created. A link conflict and a failed store on a re-link
-/// revoke nothing; the linked account's deletion revokes the authorization.
+/// Exchange the code, bind the result to the verified identity, link, keep
+/// the refresh token for revocation, and check the account is still there.
+/// Which failures revoke the new token: see [`apple_link_handler`].
 async fn link_with_token(
     db: &crate::db::DynamoDBStore,
     cache: &AppleJwksCache,
@@ -946,7 +953,8 @@ async fn link_with_token(
         Ok(linked) => linked == crate::db::Linked::Created,
         Err(crate::db::DynamoDBError::LinkConflict) => {
             // Another account's link holds this Apple authorization, and that
-            // account's deletion revokes it. Revoking here would end it now.
+            // account's deletion revokes it if the link stored a token.
+            // Revoking here would end it now.
             warn!(
                 "audit identity_link outcome=conflict user_id={} provider=apple subject_prefix={} client_ip={}",
                 user_id, sub_prefix, client_ip
@@ -955,7 +963,8 @@ async fn link_with_token(
         }
         Err(e) => {
             // No link was written by this request, so nothing will hold the
-            // new token.
+            // new token. On a re-link this revoke also ends the authorization
+            // of the existing link's stored token.
             error!("Failed to link Apple identity: {}", e);
             apple
                 .revoke_quietly(client_id, &tokens.refresh_token, "link write failed")
@@ -990,6 +999,31 @@ async fn link_with_token(
             return AppleSigninError::TokenStoreFailed.into_response();
         }
     };
+
+    // 6. The account check at the top of the handler may be long stale: the
+    //    Apple calls, the JWKS and untimed DynamoDB and KMS calls came after
+    //    it. A deletion that landed meanwhile may have swept the links and
+    //    token rows before this request wrote its own, so check again now that
+    //    both are written. A deletion after this check finds them both.
+    match db.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                "audit identity_link outcome=account_deleted user_id={} provider=apple subject_prefix={} client_ip={}",
+                user_id, sub_prefix, client_ip
+            );
+            take_back_from_deleted_account(db, apple, link, &tokens.refresh_token, created).await;
+            return AppleSigninError::InvalidAuth.into_response();
+        }
+        Err(e) => {
+            // The account most likely exists: keep the link and the token,
+            // which a later deletion's sweep revokes.
+            warn!(
+                "Account re-check after linking Apple to {} failed; the link and token stay: {}",
+                user_id, e
+            );
+        }
+    }
     info!(
         "audit identity_link outcome=linked user_id={} provider=apple subject_prefix={} client_ip={} apple_token=stored",
         user_id, sub_prefix, client_ip
@@ -1000,6 +1034,40 @@ async fn link_with_token(
     // also end the token just stored. The revoke at account deletion covers
     // every older token.
     StatusCode::OK.into_response()
+}
+
+/// Undo a link whose account was deleted while the request was in flight.
+/// The new token is revoked, and its row removed once Apple has revoked it: a
+/// token Apple did not revoke keeps its row, for a sweep still to come or an
+/// operator. The identity link goes only if this request created it; an
+/// existing link is the deleted account's, which its sweep removes.
+async fn take_back_from_deleted_account(
+    db: &crate::db::DynamoDBStore,
+    apple: &AppleTokens,
+    link: &VerifiedLink<'_>,
+    refresh_token: &str,
+    created: bool,
+) {
+    let (user_id, sub, client_id) = (link.user_id, &link.claims.sub, &link.claims.aud);
+    match apple.revoke(client_id, refresh_token).await {
+        Ok(()) => {
+            if let Err(e) = db.delete_apple_token(&apple_link_key(sub), &user_id).await {
+                error!(
+                    "Removing the revoked Apple token of deleted account {} failed: {}",
+                    user_id, e
+                );
+            }
+        }
+        Err(e) => error!(
+            "audit apple_token outcome=revoke_failed reason=account deleted during link, row kept: {e}"
+        ),
+    }
+    if created && let Err(e) = db.delete_identity_link("apple", sub, &user_id).await {
+        error!(
+            "Taking back the Apple link of deleted account {} failed: {}",
+            user_id, e
+        );
+    }
 }
 
 /// Seal `refresh_token` and store it under the identity's link key, replacing
