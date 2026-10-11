@@ -88,4 +88,12 @@ aws dynamodb create-table \
     --attribute-definitions AttributeName=key_id,AttributeType=S \
     --key-schema AttributeName=key_id,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST
+
+# Create apple_tokens table (sealed Sign in with Apple refresh tokens, revoked on account deletion)
+aws dynamodb create-table \
+    --endpoint-url http://localhost:8000 \
+    --table-name apple_tokens \
+    --attribute-definitions AttributeName=link_key,AttributeType=S \
+    --key-schema AttributeName=link_key,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
 ```

@@ -9,6 +9,7 @@ use webauthn_rs::prelude::*;
 
 mod account;
 mod agent_state;
+mod apple_tokens;
 mod guardians;
 mod publishing;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
@@ -213,6 +214,15 @@ where
     }
 }
 
+/// What [`DynamoDBStore::link_identity_reporting`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linked {
+    /// This call wrote the link.
+    Created,
+    /// The identity was already linked to this account.
+    Existing,
+}
+
 pub struct DynamoDBStore {
     client: Client,
     credentials_table: String,
@@ -223,6 +233,10 @@ pub struct DynamoDBStore {
     agent_delegations_table: String,
     device_attest_keys_table: String,
     guardians_table: String,
+    /// Sealed Sign in with Apple refresh tokens (`db::apple_tokens`). Not a
+    /// constructor argument: `apple_tokens` unless
+    /// [`Self::with_apple_tokens_table`] says otherwise.
+    apple_tokens_table: String,
     default_entitlements: Vec<String>,
 }
 
@@ -284,6 +298,7 @@ impl DynamoDBStore {
             agent_delegations_table,
             device_attest_keys_table,
             guardians_table,
+            apple_tokens_table: "apple_tokens".to_string(),
             default_entitlements,
         }
     }
@@ -505,12 +520,28 @@ impl DynamoDBStore {
         Ok(Some(Uuid::parse_str(user_id)?))
     }
 
+    /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
+    /// See [`Self::link_identity_reporting`].
     pub async fn link_identity(
         &self,
         user_id: Uuid,
         provider: &str,
         subject: &str,
     ) -> Result<(), DynamoDBError> {
+        self.link_identity_reporting(user_id, provider, subject)
+            .await
+            .map(|_| ())
+    }
+
+    /// Link a third-party identity to an existing user, and say whether this
+    /// call wrote the link or it was already there for this account. A link to
+    /// a different account is `LinkConflict`.
+    pub async fn link_identity_reporting(
+        &self,
+        user_id: Uuid,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Linked, DynamoDBError> {
         let link_pk = format!("{}#{}", provider, subject);
         let now = chrono::Utc::now().timestamp();
 
@@ -539,16 +570,21 @@ impl DynamoDBStore {
             // different user — that's the cross-account hijack case.
             .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
             .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
             .send()
             .await;
 
         match result {
-            Ok(_) => {
+            Ok(out) => {
                 info!(
                     "Linked identity provider={} subject_prefix={} to user {}",
                     provider, subject_log, user_id
                 );
-                Ok(())
+                // ALL_OLD returns the previous item: present only on a re-link.
+                Ok(match out.attributes() {
+                    Some(old) if !old.is_empty() => Linked::Existing,
+                    _ => Linked::Created,
+                })
             }
             Err(err) => match err {
                 SdkError::ServiceError(ref service_error) => {
@@ -582,6 +618,35 @@ impl DynamoDBStore {
                     );
                     Err(DynamoDBError::SdkError(err.to_string()))
                 }
+            },
+        }
+    }
+
+    /// Remove one identity link, only while it still names `user_id`: a link
+    /// the caller wrote and must take back. Absent, or someone else's: Ok.
+    pub async fn delete_identity_link(
+        &self,
+        provider: &str,
+        subject: &str,
+        user_id: &Uuid,
+    ) -> Result<(), DynamoDBError> {
+        let result = self
+            .client
+            .delete_item()
+            .table_name(&self.identity_links_table)
+            .key(
+                "link_pk",
+                AttributeValue::S(format!("{}#{}", provider, subject)),
+            )
+            .condition_expression("user_id = :uid")
+            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => match agent_state::classify(e, &self.identity_links_table) {
+                DynamoDBError::ConditionalConflict => Ok(()),
+                other => Err(other),
             },
         }
     }
@@ -2341,6 +2406,63 @@ pub(crate) mod tests {
             store.get_identity_link("apple", &subject).await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn link_identity_reports_whether_it_created_the_link() {
+        let Some(store) = local_store() else { return };
+        let (uid, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let subject = format!("sub-{}", Uuid::new_v4());
+        assert_eq!(
+            store
+                .link_identity_reporting(uid, "apple", &subject)
+                .await
+                .unwrap(),
+            Linked::Created
+        );
+        assert_eq!(
+            store
+                .link_identity_reporting(uid, "apple", &subject)
+                .await
+                .unwrap(),
+            Linked::Existing
+        );
+        assert!(matches!(
+            store
+                .link_identity_reporting(other, "apple", &subject)
+                .await,
+            Err(DynamoDBError::LinkConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_identity_link_takes_back_only_the_callers_link() {
+        let Some(store) = local_store() else { return };
+        let (uid, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let subject = format!("sub-{}", Uuid::new_v4());
+        store.link_identity(uid, "apple", &subject).await.unwrap();
+
+        store
+            .delete_identity_link("apple", &subject, &other)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_identity_link("apple", &subject).await.unwrap(),
+            Some(uid)
+        );
+
+        store
+            .delete_identity_link("apple", &subject, &uid)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_identity_link("apple", &subject).await.unwrap(),
+            None
+        );
+        store
+            .delete_identity_link("apple", &subject, &uid)
+            .await
+            .unwrap();
     }
 
     #[test]
