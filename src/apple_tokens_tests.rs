@@ -328,7 +328,7 @@ async fn a_code_for_another_identity_or_ceremony_is_revoked_and_refused() {
     // Same Apple ID, but the code came from another ceremony (its nonce).
     let (cookie, nonce) = h.nonce().await;
     h.apple_returns("rt-stale", &sub, Some("another-ceremony"));
-    let (st, _) = h
+    let (st, body) = h
         .post_link(
             &cookie,
             &cwt,
@@ -337,6 +337,7 @@ async fn a_code_for_another_identity_or_ceremony_is_revoked_and_refused() {
         )
         .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, "apple_token_binding_mismatch");
     assert!(h.stub.revoked().contains(&"rt-stale".to_string()));
 
     assert_eq!(
@@ -510,5 +511,61 @@ async fn a_failed_token_store_on_a_relink_revokes_nothing() {
     assert_eq!(
         ts::tokens(&ok.stub).open(&row.sealed).await.unwrap(),
         "rt-1"
+    );
+}
+
+/// The returned id_token cannot be checked because Apple's JWKS is
+/// unreachable: nothing says the code is foreign, and a revoke could end an
+/// authorization that an existing link's token holds.
+#[tokio::test]
+async fn a_transient_jwks_failure_after_the_exchange_does_not_revoke() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (_, cwt) = h.user().await;
+    let sub = new_sub();
+    let (cookie, nonce) = h.nonce().await;
+
+    // The returned id_token is signed with a kid the JWKS does not serve, so
+    // verifying it refetches the JWKS; the stub serves the submitted token's
+    // fetch and then fails.
+    let (_, other_key, _) = ts::p256_key("rotated-kid");
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some("rotated-kid".into());
+    let returned = jsonwebtoken::encode(
+        &header,
+        &ts::apple_claims(&sub, ts::CLIENT_ID, Some(&nonce)),
+        &other_key,
+    )
+    .unwrap();
+    h.stub.reply_token(
+        200,
+        json!({"access_token": "at", "token_type": "Bearer", "expires_in": 3600,
+               "refresh_token": "rt-1", "id_token": returned}),
+    );
+    h.stub.serve_keys_only(1);
+
+    let (st, body) = h
+        .post_link(
+            &cookie,
+            &cwt,
+            &h.id_token(&sub, Some(&nonce)),
+            Some("code-1"),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        h.stub.revoked().is_empty(),
+        "a transient failure must not revoke"
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        None
+    );
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&sub))
+            .await
+            .is_none()
     );
 }

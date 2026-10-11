@@ -665,6 +665,9 @@ pub(crate) mod test_support {
         /// instead of its scripted reply.
         token_redirect: Arc<Mutex<Option<String>>>,
         revoke_redirect: Arc<Mutex<Option<String>>>,
+        /// How many more `GET /auth/keys` are served; after that, 503.
+        /// `None`: unlimited.
+        keys_budget: Arc<Mutex<Option<usize>>>,
         jwks: Value,
     }
 
@@ -687,8 +690,17 @@ pub(crate) mod test_support {
         axum::http::StatusCode::OK
     }
 
-    async fn stub_keys(State(s): State<StubState>) -> axum::Json<Value> {
-        axum::Json(s.jwks)
+    async fn stub_keys(State(s): State<StubState>) -> axum::response::Response {
+        {
+            let mut budget = s.keys_budget.lock().unwrap();
+            if let Some(left) = budget.as_mut() {
+                if *left == 0 {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                *left -= 1;
+            }
+        }
+        axum::Json(s.jwks).into_response()
     }
 
     async fn stub_token(
@@ -741,6 +753,7 @@ pub(crate) mod test_support {
                 revoke_reply: Arc::new(Mutex::new((200, Value::Null))),
                 token_redirect: Arc::new(Mutex::new(None)),
                 revoke_redirect: Arc::new(Mutex::new(None)),
+                keys_budget: Arc::new(Mutex::new(None)),
                 jwks: json!({ "keys": keys }),
             };
             let app = axum::Router::new()
@@ -782,6 +795,11 @@ pub(crate) mod test_support {
         /// Answer the revoke endpoint with a 307 to `/auth/elsewhere`.
         pub(crate) fn redirect_revoke(&self) {
             *self.state.revoke_redirect.lock().unwrap() = Some("/auth/elsewhere".into());
+        }
+
+        /// Serve `GET /auth/keys` `n` more times, then answer 503.
+        pub(crate) fn serve_keys_only(&self, n: usize) {
+            *self.state.keys_budget.lock().unwrap() = Some(n);
         }
 
         /// The forms posted to `path`, oldest first.

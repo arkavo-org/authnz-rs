@@ -174,9 +174,10 @@ pub enum AppleSigninError {
     Internal(String),
 }
 
-impl IntoResponse for AppleSigninError {
-    fn into_response(self) -> Response {
-        let status = match &self {
+impl AppleSigninError {
+    /// The HTTP status this error is answered with.
+    fn status(&self) -> StatusCode {
+        match self {
             AppleSigninError::JwksFetch(_)
             | AppleSigninError::JwksParse(_)
             | AppleSigninError::TokenExchangeFailed
@@ -193,8 +194,13 @@ impl IntoResponse for AppleSigninError {
             AppleSigninError::IdentityNotLinked => StatusCode::FORBIDDEN,
             AppleSigninError::ReturnedTokenMismatch => StatusCode::UNAUTHORIZED,
             _ => StatusCode::UNAUTHORIZED,
-        };
-        (status, self.to_string()).into_response()
+        }
+    }
+}
+
+impl IntoResponse for AppleSigninError {
+    fn into_response(self) -> Response {
+        (self.status(), self.to_string()).into_response()
     }
 }
 
@@ -903,10 +909,27 @@ async fn link_with_token(
     };
 
     // 3. The code must be for the identity the client proved, in this ceremony.
-    //    If not, the token belongs to nobody we know: revoke it.
+    //    Two kinds of failure:
+    //    - The returned token could not be checked for a reason on our side or
+    //      Apple's (JWKS unreachable, a 5xx class error). Nothing says the code
+    //      is foreign, and Apple's revoke is authorization-wide: on a re-link
+    //      it would end the authorization the stored token belongs to. Revoke
+    //      nothing and answer the error's own 502; the token is neither stored
+    //      nor revoked, and any later link stores one for the same
+    //      authorization, which account deletion revokes.
+    //    - Anything else (nonce, audience, signature, another sub): the code is
+    //      for another identity or ceremony. Revoke the new token and answer
+    //      with the one wire body for it, `apple_token_binding_mismatch`.
     if let Err(e) =
         verify_returned_id_token(cache, &tokens.id_token, client_id, sub, link.raw_nonce).await
     {
+        if e.status().is_server_error() {
+            warn!(
+                "audit identity_link outcome=returned_token_unverifiable user_id={} provider=apple subject_prefix={} client_ip={}: {}",
+                user_id, sub_prefix, client_ip, e
+            );
+            return e.into_response();
+        }
         warn!(
             "audit identity_link outcome=binding_mismatch user_id={} provider=apple subject_prefix={} client_ip={}: {}",
             user_id, sub_prefix, client_ip, e
@@ -914,7 +937,7 @@ async fn link_with_token(
         apple
             .revoke_quietly(client_id, &tokens.refresh_token, "binding mismatch")
             .await;
-        return e.into_response();
+        return AppleSigninError::ReturnedTokenMismatch.into_response();
     }
 
     // 4. Link, remembering whether this request created the link.
