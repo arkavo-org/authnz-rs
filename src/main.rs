@@ -57,6 +57,7 @@ mod agent;
 mod agent_plane_tests;
 mod agent_state;
 mod apple_signin;
+mod apple_tokens;
 mod authn;
 mod db;
 mod device_check;
