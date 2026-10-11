@@ -192,11 +192,14 @@ paths:
   a re-link replaces it without revoking the old token (Apple's revoke is
   authorization-wide; the deletion-time revoke covers it). The deletion sweep
   deletes a row after Apple revoked its token, conditional on `user_id` (the
-  identity may have been linked by another account since).
+  identity may have been linked by another account since). A link whose
+  account was deleted while it was in flight deletes its own row the same
+  way, once Apple revoked the token.
 - **Reads**: the sweep's paginated, consistent scan on `user_id` (no GSI;
   deletions are rare). A missing table reads as empty. A row that cannot be
   read keeps the deletion `failed` (permanent).
-- **Deploy order**: the table and its IAM grant (GetItem, PutItem, DeleteItem,
-  Scan) must exist before this version is deployed at all; the sweep scans
-  the table on every deletion, whether or not revocation is configured.
+- **Deploy order**: the table and its IAM grant (PutItem, DeleteItem, Scan;
+  production never reads a single row) must exist before this version is
+  deployed at all; the sweep scans the table on every deletion, whether or
+  not revocation is configured.
 - **PII**: the Apple `sub` (in the key) and a sealed token; no email or name.

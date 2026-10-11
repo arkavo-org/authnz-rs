@@ -214,6 +214,9 @@ AWS_REGION=us-east-1
 # APPLE_TEAM_ID=M8GS7ZT95Y
 # APPLE_SIWA_KEY_ID=<10-character key id>
 # APPLE_SIWA_PRIVATE_KEY_PATH=/etc/authnz-rs/keys/AuthKey_<key id>.p8   # chmod 600
+# Or, instead of the path, the PEM itself (newlines may be written as \n).
+# Setting both is rejected: startup logs an error and revocation stays off.
+# APPLE_SIWA_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 # DYNAMODB_APPLE_TOKENS_TABLE=apple_tokens
 ```
 
@@ -292,7 +295,7 @@ aws dynamodb create-table --table-name "$DYNAMODB_APPLE_TOKENS_TABLE" \
 
 | Resource | Actions |
 |---|---|
-| the `DYNAMODB_APPLE_TOKENS_TABLE` table | `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:Scan` |
+| the `DYNAMODB_APPLE_TOKENS_TABLE` table | `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:Scan` |
 | `PATREON_KMS_KEY_ID` | nothing new (`kms:Encrypt` and `kms:Decrypt`, as Patreon linking uses) |
 
 Check the startup log for `Sign in with Apple token revocation enabled`. A
@@ -305,6 +308,34 @@ problem; the account has stored tokens but revocation is not configured; or a
 stored token row is unreadable) has already removed the account and every
 other datum. Only the sealed tokens remain. Fix the problem and restart: the
 server retries unfinished deletions at startup.
+
+When Apple keeps refusing a token for a reason configuration cannot fix (for
+example its row's `client_id` is a bundle id or Service ID the key no longer
+covers), the token cannot be revoked from here. The log names the account
+(`apple_token=revoke_failed user_id=<user_id>: Apple refused the request:
+HTTP 400 <error>`). Confirm the refusal, and that the `apple_tokens` row's
+`user_id` is that account and its `credentials` row is a tombstone (it has
+`deleted_at`); then delete that `apple_tokens` row by hand and restart. The
+startup resume completes the deletion. The person can still remove Arkavo
+under Apple Account → Sign in with Apple.
+
+Rolling back to 0.16.1: a deletion that completes under 0.16.1 leaves the
+`apple_tokens` rows 0.17.0 stored for the account, and 0.17.0 never revisits
+a completed deletion. After rolling forward, scan `apple_tokens` for rows
+whose `user_id` has a tombstone `credentials` row, set each such
+tombstone's `deletion_state` to `failed`, and restart: the startup resume
+sweeps it again and revokes the tokens. The same applies to a row a link
+kept when its account was deleted while the link was in flight and Apple did
+not take the revoke (logged as `reason=account deleted during link, row
+kept`).
+
+```bash
+aws dynamodb update-item --table-name "$DYNAMODB_CREDENTIALS_TABLE" \
+  --key '{"user_id": {"S": "<user_id>"}}' \
+  --condition-expression 'attribute_exists(deleted_at)' \
+  --update-expression 'SET deletion_state = :f' \
+  --expression-attribute-values '{":f": {"S": "failed"}}'
+```
 
 #### `guardians` Table and Agent Trust State
 

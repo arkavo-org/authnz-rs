@@ -2,7 +2,8 @@
 //! table). There is one row per linked Apple identity, keyed by its
 //! identity-link key `apple#<sub>`, holding the token sealed by the Patreon
 //! KMS envelope. `POST /oauth/apple/link` writes the rows; the
-//! account-deletion sweep removes each one after Apple revoked its token.
+//! account-deletion sweep removes each one after Apple revoked its token, as
+//! does a link whose account was deleted while it was in flight.
 
 use super::agent_state::{classify, n, s};
 use super::{DynamoDBError, DynamoDBStore};

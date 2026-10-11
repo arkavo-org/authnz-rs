@@ -122,25 +122,36 @@ When the server has token revocation configured:
   Apple's revoke ends the whole authorization, and account deletion revokes
   it.
 - **400** `authorization_code_required`: the code is missing or empty.
-  Nothing is stored. A build that does not send the code cannot link Apple.
+  Nothing is stored. The request used up the session nonce, so a retry is a
+  new ceremony (`GET /oauth/apple/nonce`, then a new code). A build that does
+  not send the code cannot link Apple.
 - **401** `apple_token_binding_mismatch`: the id_token Apple returned for the
   code could not be verified as this Apple ID in this ceremony (another Apple
   ID, another ceremony, audience or signature). The token Apple issued is
   revoked, and nothing is stored.
+- **401** `Invalid X-Auth-Token`: among the other auth failures, the Arkavo
+  account does not exist, also when it was deleted while the link was in
+  flight. A token already exchanged for the code is revoked, and the link
+  goes with the account.
 - **409**: that Apple ID is linked to another Arkavo account. Nothing is
   stored or revoked.
-- **502** `apple_token_exchange_failed`: Apple did not accept the code (codes
-  are single-use and expire after 5 minutes). Nothing is stored. Run the
-  ceremony again (new nonce, new code).
+- **502** `apple_token_exchange_failed`: Apple did not take the code (codes
+  are single-use and expire after 5 minutes) or could not be reached.
+  Nothing is stored. Run the ceremony again (new nonce, new code).
 - **502** `apple_token_store_failed`: the token could not be sealed or
   stored. If this request created the link, the new token is revoked and the
   link taken back. On a re-link of an already linked Apple ID nothing is
-  revoked, and the existing link and token stay. Run the ceremony again.
-- **502** when Apple's keys could not be fetched to check the returned
-  id_token (a transient failure): nothing is stored or revoked. Run the
+  revoked, and the existing link stays, with its stored token if it has one
+  (a link made before the server held tokens has none). Run the ceremony
+  again.
+- **502** when Apple's keys could not be fetched or read to check the
+  returned id_token (a transient failure): nothing is stored or revoked. Run
+  the ceremony again.
+- **500** when the link itself could not be written: the new token is
+  revoked and nothing is stored. Apple's revoke ends the whole
+  authorization, so on a re-link this also ends the existing link's: Arkavo
+  leaves the person's Sign in with Apple list until they link again. Run the
   ceremony again.
-- **500** when the link itself could not be written: the new token is revoked
-  and nothing is stored. Run the ceremony again.
 
 Without that configuration the code is ignored and the link behaves as
 before.

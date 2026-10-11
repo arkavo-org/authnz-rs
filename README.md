@@ -28,6 +28,8 @@ export DYNAMODB_APPLE_TOKENS_TABLE=prod-apple-tokens   # Sign in with Apple toke
 export APPLE_TEAM_ID=M8GS7ZT95Y
 export APPLE_SIWA_KEY_ID=<key id>
 export APPLE_SIWA_PRIVATE_KEY_PATH=/path/to/AuthKey_<key id>.p8
+# or the PEM itself: export APPLE_SIWA_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+# (not both: setting both is rejected and revocation stays off)
 export AWS_REGION=your-region
 ```
 

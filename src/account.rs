@@ -261,7 +261,8 @@ pub async fn get_deletion_status(
 /// step is idempotent. A failure stops the sweep and is returned, so the steps
 /// after it do not run. The one step that does not stop at its first failure
 /// is the last: [`revoke_apple_tokens`] tries every readable token row before
-/// it reports a failure.
+/// it reports what Apple refused or could not take. A DynamoDB error there
+/// still stops it at once.
 pub(crate) async fn sweep(
     db: &DynamoDBStore,
     patreon: &PatreonState,
