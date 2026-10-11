@@ -88,3 +88,6 @@ paths:
   duplicate client_id, a redirect URI claimed by two clients) also disable
   Patreon entirely — loud warn, fail-closed — rather than guessing which
   credentials to use.
+- **The sealer is shared**: `apple_tokens.rs` seals Sign in with Apple refresh
+  tokens with the same `TokenSealer` (same `PATREON_KMS_KEY_ID`). Without
+  that key, Apple token revocation is off too.
