@@ -911,7 +911,7 @@ pub async fn google_callback_handler(
 
 /// Keep upstream error codes to the RFC 6749 token character set before
 /// echoing them into an RP redirect.
-fn sanitize_error(s: &str) -> String {
+pub(crate) fn sanitize_error(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .take(64)
