@@ -58,6 +58,8 @@ mod agent_plane_tests;
 mod agent_state;
 mod apple_signin;
 mod apple_tokens;
+#[cfg(test)]
+mod apple_tokens_tests;
 mod authn;
 mod db;
 mod device_check;
@@ -488,7 +490,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_entitlements,
     )
     .await
-    .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
+    .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?
+    .with_apple_tokens_table(
+        env::var("DYNAMODB_APPLE_TOKENS_TABLE").unwrap_or_else(|_| "apple_tokens".to_string()),
+    );
 
     // Resolve the issuer once so mint and verify in every handler agree on a
     // single value (eliminates per-request env reads and runtime-mutation
@@ -611,6 +616,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let patreon_state = PatreonState::new(patreon_oauth, patreon_sealer, redis_client);
+
+    // Sign in with Apple token revocation (TN3194): needs the Sign in with
+    // Apple key and the Patreon KMS sealer, which seals the refresh tokens.
+    // Logs why it is off when it is.
+    let apple_tokens = apple_tokens::from_env(patreon_state.sealer.clone());
 
     // Account deletions whose sweep never completed (#88): the process
     // stopped during the grace or the retries. Background; boot does not wait.
@@ -760,6 +770,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(oidc_code_store))
         .layer(Extension(oidc_refresh_store))
         .layer(Extension(apple_jwks_cache))
+        .layer(Extension(apple_tokens.clone()))
         .layer(Extension(google_signin))
         .layer(Extension(patreon_state))
         .layer(session_service)

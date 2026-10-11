@@ -42,13 +42,16 @@
 //!
 //! # Persistence
 //!
-//! [`map_apple_user`] persists the `apple:<sub> → arkavo_account_id` mapping
-//! in DynamoDB (via the existing credentials table, keyed by an
-//! `apple-<sanitized_sub>` username). Email is treated as optional metadata;
-//! the account key is always Apple's `sub`, so private-relay address changes
-//! do not break identity continuity.
+//! Link-only: `POST /oauth/apple/link` writes `apple#<sub> → user_id` to the
+//! `identity_links` table, and sign-in resolves through it
+//! ([`resolve_apple_user`]). Email is never stored or used to locate an
+//! account. With token revocation configured (`apple_tokens.rs`), the link
+//! also exchanges the ceremony's authorization code and keeps the refresh
+//! token, sealed, in `apple_tokens`, so that account deletion can revoke it
+//! with Apple (TN3194).
 
 use crate::AppState;
+use crate::apple_tokens::{AppleTokenRow, AppleTokens, apple_link_key};
 use crate::constants::{
     APPLE_ISSUER, APPLE_JWKS_CACHE_TTL_SECONDS, APPLE_JWKS_HTTP_TIMEOUT_SECS, APPLE_JWKS_URL,
 };
@@ -156,6 +159,17 @@ pub enum AppleSigninError {
     /// identity (or client) the submitted id_token proved.
     #[error("apple_token_binding_mismatch")]
     ReturnedTokenMismatch,
+    /// Token revocation is configured and the link request carries no
+    /// authorization code: without it there is no token to revoke when the
+    /// account is deleted.
+    #[error("authorization_code_required")]
+    AuthorizationCodeRequired,
+    /// Apple's token endpoint did not exchange the authorization code.
+    #[error("apple_token_exchange_failed")]
+    TokenExchangeFailed,
+    /// The refresh token could not be sealed or stored.
+    #[error("apple_token_store_failed")]
+    TokenStoreFailed,
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -163,13 +177,16 @@ pub enum AppleSigninError {
 impl IntoResponse for AppleSigninError {
     fn into_response(self) -> Response {
         let status = match &self {
-            AppleSigninError::JwksFetch(_) | AppleSigninError::JwksParse(_) => {
-                StatusCode::BAD_GATEWAY
-            }
+            AppleSigninError::JwksFetch(_)
+            | AppleSigninError::JwksParse(_)
+            | AppleSigninError::TokenExchangeFailed
+            | AppleSigninError::TokenStoreFailed => StatusCode::BAD_GATEWAY,
             AppleSigninError::MissingClientId
             | AppleSigninError::SessionError(_)
             | AppleSigninError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AppleSigninError::MissingSessionNonce => StatusCode::BAD_REQUEST,
+            AppleSigninError::MissingSessionNonce | AppleSigninError::AuthorizationCodeRequired => {
+                StatusCode::BAD_REQUEST
+            }
             AppleSigninError::LinkConflict => StatusCode::CONFLICT,
             // 403, not 401: Apple authentication succeeded; there is simply no
             // Arkavo account bound to this identity yet.
@@ -625,6 +642,11 @@ pub async fn apple_nonce_handler(session: Session) -> Response {
 #[derive(Debug, Deserialize)]
 pub struct AppleIdTokenRequest {
     pub id_token: String,
+    /// The authorization code from the same Sign in with Apple ceremony.
+    /// `POST /oauth/apple/link` requires it while token revocation is
+    /// configured; `POST /oauth/apple/idtoken` ignores it.
+    #[serde(default)]
+    pub authorization_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -701,18 +723,43 @@ pub async fn apple_idtoken_handler(
 /// authentication signal, not an identity source. Callers who want PII must
 /// request and store it on a separate code path.
 ///
+/// With token revocation configured ([`AppleTokens`]), the body must also
+/// carry `authorization_code`. The server exchanges it for a refresh token,
+/// checks the id_token Apple returns is the same identity, links, and keeps
+/// the token sealed in `apple_tokens` so that account deletion can revoke it
+/// (TN3194). Without that configuration a code is ignored.
+///
+/// Apple's revoke ends the whole authorization for an Apple ID and client, so
+/// the new token is revoked only where no other token for that authorization
+/// is, or may be, in use: when the code is for another identity or ceremony
+/// (401), when the link write fails, and when storing the token fails on a
+/// link this request created. A 409 link conflict and a failed store on a
+/// re-link revoke nothing: the authorization belongs to the account that is
+/// linked, and its deletion revokes it. A successful re-link replaces the
+/// stored token without revoking the old one.
+///
 /// Responses:
 ///  - `200 OK`: identity successfully linked (or re-linked to the same user;
 ///    the operation is idempotent on `(provider, subject) → user_id`).
-///  - `400 Bad Request`: no session nonce, or expired session nonce.
-///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, or Apple id_token
-///    validation failure (signature, iss, aud, nonce, exp, iat).
+///  - `400 Bad Request`: no session nonce, or expired session nonce; or, with
+///    revocation configured, no `authorization_code`
+///    (`authorization_code_required`).
+///  - `401 Unauthorized`: missing or invalid `X-Auth-Token`, Apple id_token
+///    validation failure (signature, iss, aud, nonce, exp, iat), or a code
+///    whose id_token is another identity or ceremony
+///    (`apple_token_binding_mismatch`; the new token is revoked).
 ///  - `409 Conflict`: this Apple `sub` is already linked to a *different*
-///    arkavo user. The conflicting user_id is **not** disclosed.
+///    arkavo user. The conflicting user_id is **not** disclosed. Nothing is
+///    revoked or stored.
+///  - `502 Bad Gateway`: Apple did not exchange the code
+///    (`apple_token_exchange_failed`) or the token could not be stored
+///    (`apple_token_store_failed`; a link this request created is taken back
+///    and its token revoked).
 ///  - `500 Internal Server Error`: DynamoDB or configuration failure.
 pub async fn apple_link_handler(
     Extension(app_state): Extension<AppState>,
     Extension(cache): Extension<Arc<AppleJwksCache>>,
+    Extension(apple_tokens): Extension<AppleTokens>,
     session: Session,
     headers: HeaderMap,
     Json(req): Json<AppleIdTokenRequest>,
@@ -742,24 +789,50 @@ pub async fn apple_link_handler(
         Err(e) => return e.into_response(),
     };
 
-    // 3. Validate the Apple id_token. We only consume `sub` from the result;
-    //    any email/name claims that snuck through with non-empty scopes are
-    //    discarded below.
+    // 3. Validate the Apple id_token. We only consume `sub` (and `aud`, the
+    //    client) from the result; any email/name claims that snuck through
+    //    with non-empty scopes are discarded.
     let claims = match verify_apple_id_token(&cache, &req.id_token, &raw_nonce).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
 
-    // 4. Persist the link. The conditional put gives us per-subject uniqueness;
-    //    a 409 here means this Apple `sub` is already bound to a different
-    //    arkavo user — typically an account-hijack attempt or a user who has
-    //    already registered with us via the Apple-bootstrap path.
-    let sub_prefix = subject_prefix(&claims.sub);
-    match app_state
-        .db_store
-        .link_identity(user_id, "apple", &claims.sub)
-        .await
-    {
+    let link = VerifiedLink {
+        user_id,
+        claims: &claims,
+        raw_nonce: &raw_nonce,
+        client_ip: &client_ip,
+    };
+    if !apple_tokens.is_enabled() {
+        // Revocation is not configured: link only, as before. A code is ignored.
+        return link_only(&app_state.db_store, &link).await;
+    }
+    link_with_token(
+        &app_state.db_store,
+        &cache,
+        &apple_tokens,
+        &link,
+        req.authorization_code.as_deref(),
+    )
+    .await
+}
+
+/// A link request whose caller, nonce and id_token have been verified.
+struct VerifiedLink<'a> {
+    user_id: Uuid,
+    claims: &'a AppleIdTokenClaims,
+    raw_nonce: &'a str,
+    client_ip: &'a str,
+}
+
+/// Persist the link and nothing else. The conditional put gives per-subject
+/// uniqueness; a 409 means this Apple `sub` is bound to a different user —
+/// typically an account-hijack attempt or a user who has already registered
+/// with us via the Apple-bootstrap path.
+async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Response {
+    let (user_id, client_ip) = (link.user_id, link.client_ip);
+    let sub_prefix = subject_prefix(&link.claims.sub);
+    match db.link_identity(user_id, "apple", &link.claims.sub).await {
         Ok(()) => {
             // Audit trail: subject_prefix (not full sub) is enough to triangulate
             // with the DDB row during incident response without leaking the
@@ -785,6 +858,145 @@ pub async fn apple_link_handler(
             AppleSigninError::Internal("identity_link_write_failed".to_string()).into_response()
         }
     }
+}
+
+/// Exchange the code, bind the result to the verified identity, link, and
+/// keep the refresh token for revocation.
+///
+/// Apple's revoke is authorization-wide, so the new token is revoked only
+/// when nothing else may depend on the authorization: a code for another
+/// identity or ceremony, a failed link write, or a failed store on a link
+/// this request created. A link conflict and a failed store on a re-link
+/// revoke nothing; the linked account's deletion revokes the authorization.
+async fn link_with_token(
+    db: &crate::db::DynamoDBStore,
+    cache: &AppleJwksCache,
+    apple: &AppleTokens,
+    link: &VerifiedLink<'_>,
+    code: Option<&str>,
+) -> Response {
+    let (user_id, client_ip) = (link.user_id, link.client_ip);
+    let sub = link.claims.sub.as_str();
+    let sub_prefix = subject_prefix(sub);
+    // The token's client: the submitted id_token's audience, one of APPLE_CLIENT_ID.
+    let client_id = link.claims.aud.as_str();
+
+    // 1. A code is required: without it there is no token to revoke later.
+    let Some(code) = code.map(str::trim).filter(|c| !c.is_empty()) else {
+        warn!(
+            "audit identity_link outcome=no_code user_id={} provider=apple subject_prefix={} client_ip={}",
+            user_id, sub_prefix, client_ip
+        );
+        return AppleSigninError::AuthorizationCodeRequired.into_response();
+    };
+
+    // 2. Exchange it.
+    let tokens = match apple.exchange_code(client_id, code).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "audit identity_link outcome=exchange_failed user_id={} provider=apple subject_prefix={} client_ip={}: {}",
+                user_id, sub_prefix, client_ip, e
+            );
+            return AppleSigninError::TokenExchangeFailed.into_response();
+        }
+    };
+
+    // 3. The code must be for the identity the client proved, in this ceremony.
+    //    If not, the token belongs to nobody we know: revoke it.
+    if let Err(e) =
+        verify_returned_id_token(cache, &tokens.id_token, client_id, sub, link.raw_nonce).await
+    {
+        warn!(
+            "audit identity_link outcome=binding_mismatch user_id={} provider=apple subject_prefix={} client_ip={}: {}",
+            user_id, sub_prefix, client_ip, e
+        );
+        apple
+            .revoke_quietly(client_id, &tokens.refresh_token, "binding mismatch")
+            .await;
+        return e.into_response();
+    }
+
+    // 4. Link, remembering whether this request created the link.
+    let created = match db.link_identity_reporting(user_id, "apple", sub).await {
+        Ok(linked) => linked == crate::db::Linked::Created,
+        Err(crate::db::DynamoDBError::LinkConflict) => {
+            // Another account's link holds this Apple authorization, and that
+            // account's deletion revokes it. Revoking here would end it now.
+            warn!(
+                "audit identity_link outcome=conflict user_id={} provider=apple subject_prefix={} client_ip={}",
+                user_id, sub_prefix, client_ip
+            );
+            return AppleSigninError::LinkConflict.into_response();
+        }
+        Err(e) => {
+            // No link was written by this request, so nothing will hold the
+            // new token.
+            error!("Failed to link Apple identity: {}", e);
+            apple
+                .revoke_quietly(client_id, &tokens.refresh_token, "link write failed")
+                .await;
+            return AppleSigninError::Internal("identity_link_write_failed".to_string())
+                .into_response();
+        }
+    };
+
+    // 5. Keep the token, sealed, for revocation when the account is deleted.
+    match store_token(db, apple, user_id, sub, client_id, &tokens.refresh_token).await {
+        Ok(()) => {}
+        Err(e) => {
+            error!(
+                "audit identity_link outcome=token_store_failed user_id={} provider=apple subject_prefix={} client_ip={}: {}",
+                user_id, sub_prefix, client_ip, e
+            );
+            // Only a link this request created is undone, with its token. On a
+            // re-link the authorization is already held by the existing link
+            // (and its stored token), and a revoke would end it.
+            if created {
+                apple
+                    .revoke_quietly(client_id, &tokens.refresh_token, "token store failed")
+                    .await;
+                if let Err(e) = db.delete_identity_link("apple", sub, &user_id).await {
+                    error!(
+                        "Taking back the Apple link of {} after a failed token store failed: {}",
+                        user_id, e
+                    );
+                }
+            }
+            return AppleSigninError::TokenStoreFailed.into_response();
+        }
+    };
+    info!(
+        "audit identity_link outcome=linked user_id={} provider=apple subject_prefix={} client_ip={} apple_token=stored",
+        user_id, sub_prefix, client_ip
+    );
+
+    // A re-link replaced an older token and does not revoke it: Apple's revoke
+    // ends the whole authorization for this Apple ID and client, which would
+    // also end the token just stored. The revoke at account deletion covers
+    // every older token.
+    StatusCode::OK.into_response()
+}
+
+/// Seal `refresh_token` and store it under the identity's link key, replacing
+/// any token already stored for it.
+async fn store_token(
+    db: &crate::db::DynamoDBStore,
+    apple: &AppleTokens,
+    user_id: Uuid,
+    sub: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<(), String> {
+    let sealed = apple.seal(refresh_token).await.map_err(|e| e.to_string())?;
+    let row = AppleTokenRow {
+        link_key: apple_link_key(sub),
+        user_id,
+        client_id: client_id.to_string(),
+        sealed,
+        stored_at: Utc::now().timestamp(),
+    };
+    db.put_apple_token(&row).await.map_err(|e| e.to_string())
 }
 
 /// First 8 *characters* of an opaque subject. Enough to correlate with a
@@ -1416,5 +1628,39 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn token_revocation_errors_have_stable_statuses_and_bodies() {
+        // ArkavoKit / Creator match these bodies; they are part of the wire contract.
+        for (e, status, body) in [
+            (
+                AppleSigninError::AuthorizationCodeRequired,
+                StatusCode::BAD_REQUEST,
+                "authorization_code_required",
+            ),
+            (
+                AppleSigninError::TokenExchangeFailed,
+                StatusCode::BAD_GATEWAY,
+                "apple_token_exchange_failed",
+            ),
+            (
+                AppleSigninError::TokenStoreFailed,
+                StatusCode::BAD_GATEWAY,
+                "apple_token_store_failed",
+            ),
+        ] {
+            assert_eq!(e.to_string(), body);
+            assert_eq!(e.into_response().status(), status, "{body}");
+        }
+    }
+
+    #[test]
+    fn the_link_body_takes_an_optional_authorization_code() {
+        let r: AppleIdTokenRequest = serde_json::from_str(r#"{"id_token":"t"}"#).unwrap();
+        assert_eq!(r.authorization_code, None);
+        let r: AppleIdTokenRequest =
+            serde_json::from_str(r#"{"id_token":"t","authorization_code":"c"}"#).unwrap();
+        assert_eq!(r.authorization_code.as_deref(), Some("c"));
     }
 }
