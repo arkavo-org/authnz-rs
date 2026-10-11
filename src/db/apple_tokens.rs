@@ -12,6 +12,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use log::{error, warn};
 use std::collections::HashMap;
+use std::fmt;
 use uuid::Uuid;
 
 fn parse_row(item: &HashMap<String, AttributeValue>) -> Option<AppleTokenRow> {
@@ -36,6 +37,26 @@ fn parse_row(item: &HashMap<String, AttributeValue>) -> Option<AppleTokenRow> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
     })
+}
+
+/// An account's stored Apple tokens, as `apple_tokens_of` found them.
+pub struct AppleTokensOfUser {
+    /// The rows that could be read.
+    pub rows: Vec<AppleTokenRow>,
+    /// The `link_key` of each row that matched the account but could not be
+    /// read (`"<unknown>"` when even the key is missing). Its token cannot be
+    /// revoked, so a caller must not treat the account as holding none.
+    pub unreadable: Vec<String>,
+}
+
+impl fmt::Debug for AppleTokensOfUser {
+    // Counts only: a link key holds the full Apple `sub`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppleTokensOfUser")
+            .field("rows", &self.rows)
+            .field("unreadable", &self.unreadable.len())
+            .finish()
+    }
 }
 
 impl DynamoDBStore {
@@ -78,14 +99,19 @@ impl DynamoDBStore {
 
     /// Every stored Apple token of the account. A paginated, consistent scan
     /// (no `user_id` index; deletions are rare). A missing table holds none.
-    /// An unreadable row is logged and left in place.
+    /// A row that matches the account but cannot be read is logged, left in
+    /// place and named in `unreadable`, so the caller can tell it from "no
+    /// rows" and fail rather than finish without revoking its token.
     pub async fn apple_tokens_of(
         &self,
         user_id: &Uuid,
-    ) -> Result<Vec<AppleTokenRow>, DynamoDBError> {
+    ) -> Result<AppleTokensOfUser, DynamoDBError> {
         let table = &self.apple_tokens_table;
         let uid = s(&user_id.to_string());
-        let mut rows = Vec::new();
+        let mut found = AppleTokensOfUser {
+            rows: Vec::new(),
+            unreadable: Vec::new(),
+        };
         let mut start = None;
         loop {
             let page = match self
@@ -103,15 +129,23 @@ impl DynamoDBStore {
                 Err(e) => match classify(e, table) {
                     DynamoDBError::TableNotExists(t) => {
                         warn!("Apple token table {t} does not exist; no Apple tokens to revoke");
-                        return Ok(Vec::new());
+                        return Ok(found);
                     }
                     other => return Err(other),
                 },
             };
             for item in page.items() {
                 match parse_row(item) {
-                    Some(row) => rows.push(row),
-                    None => error!("Unreadable {table} row of {user_id} left in place"),
+                    Some(row) => found.rows.push(row),
+                    None => {
+                        error!("Unreadable {table} row of {user_id} left in place");
+                        found.unreadable.push(
+                            item.get("link_key")
+                                .and_then(|v| v.as_s().ok())
+                                .cloned()
+                                .unwrap_or_else(|| "<unknown>".to_string()),
+                        );
+                    }
                 }
             }
             match page.last_evaluated_key {
@@ -119,7 +153,7 @@ impl DynamoDBStore {
                 None => break,
             }
         }
-        Ok(rows)
+        Ok(found)
     }
 
     /// Remove a stored token once Apple has revoked it, only while the row
@@ -149,6 +183,20 @@ impl DynamoDBStore {
         }
     }
 
+    /// Write an arbitrary item, to plant a malformed row.
+    #[cfg(test)]
+    pub(crate) async fn raw_apple_tokens_put(&self, item: HashMap<&str, AttributeValue>) {
+        self.client
+            .put_item()
+            .table_name(&self.apple_tokens_table)
+            .set_item(Some(
+                item.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            ))
+            .send()
+            .await
+            .unwrap();
+    }
+
     /// The stored row for an identity, if any.
     #[cfg(test)]
     pub(crate) async fn get_apple_token(&self, link_key: &str) -> Option<AppleTokenRow> {
@@ -172,6 +220,8 @@ mod tests {
     use crate::db::DynamoDBError;
     use crate::db::tests::local_store;
     use crate::patreon::TokenSealer;
+    use aws_sdk_dynamodb::primitives::Blob;
+    use aws_sdk_dynamodb::types::AttributeValue;
     use uuid::Uuid;
 
     fn sub() -> String {
@@ -215,7 +265,9 @@ mod tests {
             .unwrap();
         let now = store.get_apple_token(&apple_link_key(&s)).await.unwrap();
         assert_eq!(opened(&now).await, b"rt-2");
-        let rows = store.apple_tokens_of(&uid).await.unwrap();
+        let found = store.apple_tokens_of(&uid).await.unwrap();
+        assert!(found.unreadable.is_empty());
+        let rows = found.rows;
         assert_eq!(
             rows.len(),
             1,
@@ -242,25 +294,16 @@ mod tests {
             .await
             .unwrap();
 
-        let mut keys: Vec<String> = store
-            .apple_tokens_of(&a)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.link_key)
-            .collect();
+        let found = store.apple_tokens_of(&a).await.unwrap();
+        assert!(found.unreadable.is_empty());
+        let mut keys: Vec<String> = found.rows.into_iter().map(|r| r.link_key).collect();
         keys.sort();
         let mut want = vec![apple_link_key(&s1), apple_link_key(&s2)];
         want.sort();
         assert_eq!(keys, want);
-        assert_eq!(store.apple_tokens_of(&b).await.unwrap().len(), 1);
-        assert!(
-            store
-                .apple_tokens_of(&Uuid::new_v4())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(store.apple_tokens_of(&b).await.unwrap().rows.len(), 1);
+        let none = store.apple_tokens_of(&Uuid::new_v4()).await.unwrap();
+        assert!(none.rows.is_empty() && none.unreadable.is_empty());
     }
 
     /// Review Focus 4: the Apple ID was re-linked by a new account between
@@ -300,18 +343,53 @@ mod tests {
     async fn a_missing_table_holds_no_tokens_and_refuses_writes() {
         let Some(store) = local_store() else { return };
         let store = store.with_apple_tokens_table(format!("missing-{}", Uuid::new_v4()));
-        assert!(
-            store
-                .apple_tokens_of(&Uuid::new_v4())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let none = store.apple_tokens_of(&Uuid::new_v4()).await.unwrap();
+        assert!(none.rows.is_empty() && none.unreadable.is_empty());
         assert!(matches!(
             store
                 .put_apple_token(&row(Uuid::new_v4(), &sub(), "rt").await)
                 .await,
             Err(DynamoDBError::TableNotExists(_))
         ));
+    }
+
+    /// A row that matches the account but cannot be read must not look like
+    /// "no rows": the sweep would finish without revoking its token.
+    #[tokio::test]
+    async fn an_unreadable_row_is_reported_not_dropped() {
+        let Some(store) = local_store() else { return };
+        let (uid, s) = (Uuid::new_v4(), sub());
+        let key = apple_link_key(&s);
+        // Right key and owner, but no `token_ct`.
+        store
+            .raw_apple_tokens_put(
+                [
+                    ("link_key", AttributeValue::S(key.clone())),
+                    ("user_id", AttributeValue::S(uid.to_string())),
+                    (
+                        "client_id",
+                        AttributeValue::S("com.arkavo.ArkavoCreator".into()),
+                    ),
+                    ("wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
+                    ("token_nonce", AttributeValue::B(Blob::new(vec![2u8]))),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .await;
+        let good = sub();
+        store
+            .put_apple_token(&row(uid, &good, "rt").await)
+            .await
+            .unwrap();
+
+        let found = store.apple_tokens_of(&uid).await.unwrap();
+        assert_eq!(found.unreadable, vec![key.clone()]);
+        assert_eq!(found.rows.len(), 1);
+        assert_eq!(found.rows[0].link_key, apple_link_key(&good));
+        assert!(
+            !format!("{found:?}").contains(&s),
+            "Debug leaks the Apple sub"
+        );
     }
 }
