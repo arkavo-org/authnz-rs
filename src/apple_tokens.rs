@@ -350,6 +350,9 @@ impl AppleTokens {
         let http = reqwest::Client::builder()
             .user_agent(concat!("authnz-rs/", env!("CARGO_PKG_VERSION")))
             .timeout(timeout)
+            // The forms carry the client secret and a code or refresh token:
+            // a 3xx is never followed. It lands in `apple_failure` as transient.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             // Only fails when the TLS backend cannot initialize: fatal at startup.
             .expect("failed to build the Apple token HTTP client");
@@ -396,10 +399,12 @@ impl AppleTokens {
             .await
             .map_err(transport)?;
         let status = resp.status();
-        let body = resp.text().await.map_err(transport)?;
         if !status.is_success() {
+            // A refusal stays a refusal even when its body cannot be read.
+            let body = resp.text().await.unwrap_or_default();
             return Err(apple_failure(status, &body));
         }
+        let body = resp.text().await.map_err(transport)?;
         let parsed: TokenResponse = serde_json::from_str(&body).map_err(|_| {
             AppleTokenError::Malformed("token response is not the documented JSON".into())
         })?;
@@ -656,7 +661,30 @@ pub(crate) mod test_support {
         calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
         token_reply: Arc<Mutex<(u16, Value)>>,
         revoke_reply: Arc<Mutex<(u16, Value)>>,
+        /// When set, the token / revoke endpoint answers 307 to this path
+        /// instead of its scripted reply.
+        token_redirect: Arc<Mutex<Option<String>>>,
+        revoke_redirect: Arc<Mutex<Option<String>>>,
         jwks: Value,
+    }
+
+    fn temporary_redirect(to: &str) -> axum::response::Response {
+        (
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, to.to_string())],
+        )
+            .into_response()
+    }
+
+    async fn stub_elsewhere(
+        State(s): State<StubState>,
+        axum::Form(form): axum::Form<HashMap<String, String>>,
+    ) -> axum::http::StatusCode {
+        s.calls
+            .lock()
+            .unwrap()
+            .push(("/auth/elsewhere".into(), form));
+        axum::http::StatusCode::OK
     }
 
     async fn stub_keys(State(s): State<StubState>) -> axum::Json<Value> {
@@ -668,6 +696,9 @@ pub(crate) mod test_support {
         axum::Form(form): axum::Form<HashMap<String, String>>,
     ) -> axum::response::Response {
         s.calls.lock().unwrap().push(("/auth/token".into(), form));
+        if let Some(to) = s.token_redirect.lock().unwrap().clone() {
+            return temporary_redirect(&to);
+        }
         let (status, body) = s.token_reply.lock().unwrap().clone();
         (
             axum::http::StatusCode::from_u16(status).unwrap(),
@@ -681,6 +712,9 @@ pub(crate) mod test_support {
         axum::Form(form): axum::Form<HashMap<String, String>>,
     ) -> axum::response::Response {
         s.calls.lock().unwrap().push(("/auth/revoke".into(), form));
+        if let Some(to) = s.revoke_redirect.lock().unwrap().clone() {
+            return temporary_redirect(&to);
+        }
         let (status, body) = s.revoke_reply.lock().unwrap().clone();
         (
             axum::http::StatusCode::from_u16(status).unwrap(),
@@ -705,12 +739,15 @@ pub(crate) mod test_support {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 token_reply: Arc::new(Mutex::new((500, json!({"error": "server_error"})))),
                 revoke_reply: Arc::new(Mutex::new((200, Value::Null))),
+                token_redirect: Arc::new(Mutex::new(None)),
+                revoke_redirect: Arc::new(Mutex::new(None)),
                 jwks: json!({ "keys": keys }),
             };
             let app = axum::Router::new()
                 .route("/auth/keys", axum::routing::get(stub_keys))
                 .route("/auth/token", axum::routing::post(stub_token))
                 .route("/auth/revoke", axum::routing::post(stub_revoke))
+                .route("/auth/elsewhere", axum::routing::post(stub_elsewhere))
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -735,6 +772,16 @@ pub(crate) mod test_support {
 
         pub(crate) fn reply_revoke(&self, status: u16, body: Value) {
             *self.state.revoke_reply.lock().unwrap() = (status, body);
+        }
+
+        /// Answer the token endpoint with a 307 to `/auth/elsewhere`.
+        pub(crate) fn redirect_token(&self) {
+            *self.state.token_redirect.lock().unwrap() = Some("/auth/elsewhere".into());
+        }
+
+        /// Answer the revoke endpoint with a 307 to `/auth/elsewhere`.
+        pub(crate) fn redirect_revoke(&self) {
+            *self.state.revoke_redirect.lock().unwrap() = Some("/auth/elsewhere".into());
         }
 
         /// The forms posted to `path`, oldest first.
@@ -1003,6 +1050,28 @@ mod tests {
             apple.exchange_code(CLIENT_ID, "c").await,
             Err(AppleTokenError::Malformed(_))
         ));
+    }
+
+    /// The form carries the client secret and a code or refresh token, so a
+    /// 3xx is never followed. It is "later", not "never".
+    #[tokio::test]
+    async fn a_redirect_from_apple_is_not_followed() {
+        let stub = StubApple::start(vec![]).await;
+        let apple = tokens(&stub);
+
+        stub.redirect_token();
+        let err = apple.exchange_code(CLIENT_ID, "c").await.unwrap_err();
+        assert!(matches!(err, AppleTokenError::Unavailable(_)), "{err:?}");
+        assert!(!err.is_permanent());
+        assert_eq!(stub.calls("/auth/token").len(), 1);
+
+        stub.redirect_revoke();
+        let err = apple.revoke(CLIENT_ID, "rt").await.unwrap_err();
+        assert!(matches!(err, AppleTokenError::Unavailable(_)), "{err:?}");
+        assert!(!err.is_permanent());
+        assert_eq!(stub.calls("/auth/revoke").len(), 1);
+
+        assert!(stub.calls("/auth/elsewhere").is_empty());
     }
 
     /// Review Focus 2: a 429 is "later", not "never".
