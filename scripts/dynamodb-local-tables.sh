@@ -62,7 +62,6 @@ mk --table-name handles --attribute-definitions AttributeName=handle,AttributeTy
 mk --table-name device_bindings --attribute-definitions AttributeName=device_id,AttributeType=S --key-schema AttributeName=device_id,KeyType=HASH
 mk --table-name identity_links --attribute-definitions AttributeName=link_pk,AttributeType=S --key-schema AttributeName=link_pk,KeyType=HASH
 mk --table-name patreon_tokens --attribute-definitions AttributeName=user_id,AttributeType=S --key-schema AttributeName=user_id,KeyType=HASH
-mk --table-name apple_tokens --attribute-definitions AttributeName=link_key,AttributeType=S --key-schema AttributeName=link_key,KeyType=HASH
 mk --table-name agent_delegations --attribute-definitions AttributeName=agent_did,AttributeType=S AttributeName=root_user_id,AttributeType=S \
    --key-schema AttributeName=agent_did,KeyType=HASH \
    --global-secondary-indexes '[{"IndexName":"root_user_id-index","KeySchema":[{"AttributeName":"root_user_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]'
