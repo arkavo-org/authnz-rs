@@ -336,7 +336,8 @@ impl DynamoDBStore {
         }
     }
 
-    /// Delete every row of `table` whose `user_id` attribute is this account.
+    /// Delete every row of `table` whose `user_id` attribute is this account
+    /// and that meets `also` (a condition expression), if given.
     /// `identity_links` and `device_bindings` have no index on `user_id`, so
     /// this is a paginated scan; each delete is conditional on the row still
     /// naming the account. Returns how many rows were removed.
@@ -345,7 +346,12 @@ impl DynamoDBStore {
         table: &str,
         key: &str,
         user_id: &Uuid,
+        also: Option<&str>,
     ) -> Result<u32, DynamoDBError> {
+        let condition = match also {
+            Some(c) => format!("user_id = :uid AND {c}"),
+            None => "user_id = :uid".to_string(),
+        };
         let uid = s(&user_id.to_string());
         let mut removed = 0;
         let mut start = None;
@@ -369,7 +375,7 @@ impl DynamoDBStore {
                     .delete_item()
                     .table_name(table)
                     .key(key, k.clone())
-                    .condition_expression("user_id = :uid")
+                    .condition_expression(&condition)
                     .expression_attribute_values(":uid", uid.clone())
                     .send()
                     .await;
@@ -389,16 +395,25 @@ impl DynamoDBStore {
         Ok(removed)
     }
 
-    /// Remove every Apple, Google and Patreon identity link of the account.
+    /// Remove every Apple, Google and Patreon identity link of the account,
+    /// except an Apple link that holds a token (`db::apple_tokens`): that one
+    /// stays until Apple has revoked the token, and the sweep's last step
+    /// deletes it.
     pub async fn delete_identity_links_of(&self, user_id: &Uuid) -> Result<u32, DynamoDBError> {
         let table = self.identity_links_table.clone();
-        self.delete_rows_owned_by(&table, "link_pk", user_id).await
+        self.delete_rows_owned_by(
+            &table,
+            "link_pk",
+            user_id,
+            Some(super::apple_tokens::HOLDS_NO_TOKEN),
+        )
+        .await
     }
 
     /// Remove every App Attest device binding of the account.
     pub async fn delete_device_bindings_of(&self, user_id: &Uuid) -> Result<u32, DynamoDBError> {
         let table = self.device_bindings_table.clone();
-        self.delete_rows_owned_by(&table, "device_id", user_id)
+        self.delete_rows_owned_by(&table, "device_id", user_id, None)
             .await
     }
 

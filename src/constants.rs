@@ -72,7 +72,7 @@ pub const APPLE_CLIENT_SECRET_LIFETIME_SECONDS: i64 = 300;
 /// Apple cannot hold a link request or a deletion sweep. A link does not
 /// depend on it to finish inside `ACCOUNT_DELETION_GRACE_SECONDS`: after
 /// storing the token it checks the account again, and if the account was
-/// deleted meanwhile it revokes the token and takes the link back.
+/// deleted meanwhile it revokes the token and deletes the link.
 pub const APPLE_TOKEN_HTTP_TIMEOUT_SECS: u64 = 10;
 
 /// Google JWKS cache TTL in seconds (1 hour).

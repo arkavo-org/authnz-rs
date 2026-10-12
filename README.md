@@ -22,7 +22,6 @@ export DYNAMODB_CREDENTIALS_TABLE=prod-credentials
 export DYNAMODB_HANDLES_TABLE=prod-handles
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=prod-agent-delegations
 export DYNAMODB_GUARDIANS_TABLE=prod-guardians   # create the table under this name
-export DYNAMODB_APPLE_TOKENS_TABLE=prod-apple-tokens   # Sign in with Apple tokens; create the table (and its IAM grant) before deploying 0.17.0
 
 # Sign in with Apple token revocation on account deletion (needs PATREON_KMS_KEY_ID)
 export APPLE_TEAM_ID=M8GS7ZT95Y

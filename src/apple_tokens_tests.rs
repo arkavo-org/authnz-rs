@@ -8,7 +8,7 @@ use crate::account::{run_once, schedule_sweep};
 use crate::account_tests::patreon_off;
 use crate::apple_signin::{AppleJwksCache, apple_link_handler, apple_nonce_handler};
 use crate::apple_tokens::test_support::{self as ts, StubApple};
-use crate::apple_tokens::{AppleTokenRow, AppleTokens, apple_link_key};
+use crate::apple_tokens::{AppleTokens, apple_link_key};
 use crate::db::{DeletionState, DynamoDBStore};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -28,6 +28,14 @@ pub(crate) fn new_sub() -> String {
     format!("001234.{}", Uuid::new_v4().simple())
 }
 
+/// How the harness configures token revocation.
+pub(crate) enum Tokens {
+    On,
+    Off,
+    /// Configured, but sealing a token fails.
+    DeadKms,
+}
+
 pub(crate) struct Harness {
     pub app: Router,
     pub store: Arc<DynamoDBStore>,
@@ -45,6 +53,11 @@ impl Harness {
     }
 
     pub(crate) async fn build(store: DynamoDBStore, tokens_on: bool) -> Self {
+        let mode = if tokens_on { Tokens::On } else { Tokens::Off };
+        Self::build_with(store, mode).await
+    }
+
+    pub(crate) async fn build_with(store: DynamoDBStore, mode: Tokens) -> Self {
         let store = Arc::new(store);
         let state = crate::test_helpers::build_test_app_state_with_store(store.clone());
         let (_, apple_key, apple_jwk) = ts::p256_key(ts::APPLE_KID);
@@ -53,10 +66,10 @@ impl Harness {
             &[ts::CLIENT_ID],
             &stub.jwks_url(),
         ));
-        let tokens = if tokens_on {
-            ts::tokens(&stub)
-        } else {
-            AppleTokens::disabled()
+        let tokens = match mode {
+            Tokens::On => ts::tokens(&stub),
+            Tokens::Off => AppleTokens::disabled(),
+            Tokens::DeadKms => ts::tokens_with_dead_kms(&stub),
         };
         let app = Router::new()
             .route("/oauth/apple/nonce", get(apple_nonce_handler))
@@ -409,21 +422,17 @@ async fn a_link_conflict_revokes_nothing() {
     assert!(row.is_none_or(|r| r.user_id != requester));
 }
 
-/// Review Focus 5: no token table; the link fails closed.
+/// The token cannot be sealed: nothing is written, and the token of an
+/// identity no account holds is revoked.
 #[tokio::test]
-async fn a_failed_token_store_revokes_the_token_and_takes_back_a_new_link() {
+async fn a_failed_seal_revokes_the_token_of_an_unlinked_identity() {
     let Some(store) = crate::db::tests::local_store() else {
         return;
     };
-    let h = Harness::build(
-        store.with_apple_tokens_table(format!("missing-{}", Uuid::new_v4())),
-        true,
-    )
-    .await;
-    let (uid, cwt) = h.user().await;
-
-    // A link this request created is taken back.
+    let h = Harness::build_with(store, Tokens::DeadKms).await;
+    let (_, cwt) = h.user().await;
     let sub = new_sub();
+
     let (st, body) = h.link(&cwt, &sub, Some("code-1"), "rt-1").await;
     assert_eq!(st, StatusCode::BAD_GATEWAY);
     assert_eq!(body, "apple_token_store_failed");
@@ -432,18 +441,25 @@ async fn a_failed_token_store_revokes_the_token_and_takes_back_a_new_link() {
         h.store.get_identity_link("apple", &sub).await.unwrap(),
         None
     );
+}
 
-    // A link that was already there stays, and its new token is not revoked
-    // (a re-link; the authorization is the existing link's).
-    let sub2 = new_sub();
-    h.store.link_identity(uid, "apple", &sub2).await.unwrap();
-    let (st, _) = h.link(&cwt, &sub2, Some("code-2"), "rt-2").await;
-    assert_eq!(st, StatusCode::BAD_GATEWAY);
+/// The link and its token are one write; when it fails nothing holds the new
+/// token, so it is revoked.
+#[tokio::test]
+async fn a_failed_link_write_revokes_the_token() {
+    let Some(store) = crate::db::tests::local_store() else {
+        return;
+    };
+    let h = Harness::build(
+        store.with_identity_links_table(format!("missing-{}", Uuid::new_v4())),
+        true,
+    )
+    .await;
+    let (_, cwt) = h.user().await;
+
+    let (st, body) = h.link(&cwt, &new_sub(), Some("code-1"), "rt-1").await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(h.stub.revoked(), vec!["rt-1".to_string()]);
-    assert_eq!(
-        h.store.get_identity_link("apple", &sub2).await.unwrap(),
-        Some(uid)
-    );
 }
 
 #[tokio::test]
@@ -478,7 +494,7 @@ async fn re_linking_the_same_identity_replaces_the_token_without_revoking() {
 /// A re-link's authorization is already held by the existing link and its
 /// stored token; revoking the new token would end it.
 #[tokio::test]
-async fn a_failed_token_store_on_a_relink_revokes_nothing() {
+async fn a_failed_seal_on_a_relink_revokes_nothing() {
     let Some(ok) = Harness::new(true).await else {
         return;
     };
@@ -489,15 +505,11 @@ async fn a_failed_token_store_on_a_relink_revokes_nothing() {
         StatusCode::OK
     );
 
-    // Same account and identity, but the token table is gone.
+    // Same account and identity, but sealing fails.
     let Some(store) = crate::db::tests::local_store() else {
         return;
     };
-    let bad = Harness::build(
-        store.with_apple_tokens_table(format!("missing-{}", Uuid::new_v4())),
-        true,
-    )
-    .await;
+    let bad = Harness::build_with(store, Tokens::DeadKms).await;
     let (st, body) = bad.link(&cwt, &sub, Some("code-2"), "rt-2").await;
     assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body, "apple_token_store_failed");
@@ -615,9 +627,9 @@ async fn link_while_deleting(
     reply
 }
 
-/// The deletion's sweep may already have passed the identity links and the
-/// token rows: the link must neither keep a live token nor leave an identity
-/// link that would 409 every other account.
+/// The deletion's sweep may already have passed the identity links: the link
+/// must neither keep a live token nor leave an identity link that would 409
+/// every other account.
 #[tokio::test]
 async fn an_account_deleted_during_the_link_keeps_no_link_and_its_token_is_revoked() {
     let Some(h) = Harness::new(true).await else {
@@ -641,8 +653,8 @@ async fn an_account_deleted_during_the_link_keeps_no_link_and_its_token_is_revok
     );
 }
 
-/// On a re-link the link is the deleted account's own, which the sweep
-/// removes; the new token is revoked and its row removed all the same.
+/// On a re-link the new token is revoked and the link holding it removed
+/// all the same.
 #[tokio::test]
 async fn an_account_deleted_during_a_relink_has_the_new_token_revoked() {
     let Some(h) = Harness::new(true).await else {
@@ -666,13 +678,13 @@ async fn an_account_deleted_during_a_relink_has_the_new_token_revoked() {
     );
     assert_eq!(
         h.store.get_identity_link("apple", &sub).await.unwrap(),
-        Some(uid),
-        "a link this request did not create is left to the sweep"
+        None,
+        "the link goes with its revoked token"
     );
 }
 
-/// A token Apple did not revoke keeps its row, so that the sweep (or an
-/// operator) can still revoke it; the link this request created goes.
+/// A token Apple did not revoke keeps its link, so that the sweep (or an
+/// operator) can still revoke it.
 #[tokio::test]
 async fn an_account_deleted_during_the_link_keeps_a_token_apple_did_not_revoke() {
     let Some(h) = Harness::new(true).await else {
@@ -689,12 +701,8 @@ async fn an_account_deleted_during_the_link_keeps_a_token_apple_did_not_revoke()
         .store
         .get_apple_token(&apple_link_key(&sub))
         .await
-        .expect("the unrevoked token's row");
+        .expect("the unrevoked token's link");
     assert_eq!(row.user_id, uid);
-    assert_eq!(
-        h.store.get_identity_link("apple", &sub).await.unwrap(),
-        None
-    );
 }
 
 /// A deleted account (tombstone in place, sweep not yet run) that linked one
@@ -705,15 +713,8 @@ async fn deleted_account_with_tokens(h: &Harness, tokens: &[&str]) -> (Uuid, Vec
     let mut subs = Vec::new();
     for t in tokens {
         let sub = new_sub();
-        h.store.link_identity(uid, "apple", &sub).await.unwrap();
         h.store
-            .put_apple_token(&AppleTokenRow {
-                link_key: apple_link_key(&sub),
-                user_id: uid,
-                client_id: ts::CLIENT_ID.into(),
-                sealed: apple.seal(t).await.unwrap(),
-                stored_at: 1,
-            })
+            .link_apple_with_token(uid, &sub, ts::CLIENT_ID, &apple.seal(t).await.unwrap(), 1)
             .await
             .unwrap();
         subs.push(sub);
@@ -775,11 +776,8 @@ async fn an_apple_refusal_keeps_the_token_and_fails_the_deletion_at_once() {
         .unwrap_err();
     assert!(err.is_permanent(), "{err}");
     assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
-    // Everything else is gone; only the token still to revoke stays.
-    assert_eq!(
-        h.store.get_identity_link("apple", &subs[0]).await.unwrap(),
-        None
-    );
+    // Everything else is gone; only the link holding the token still to
+    // revoke stays.
     assert!(
         h.store
             .get_apple_token(&apple_link_key(&subs[0]))
@@ -825,11 +823,6 @@ async fn an_apple_outage_keeps_the_token_and_retries_on_the_schedule() {
         .unwrap_err();
     assert!(!err.is_permanent(), "{err}");
     assert_eq!(state_of(&h, &uid).await.0, DeletionState::Pending);
-    // Revocation ran after every other step: the link is already gone.
-    assert_eq!(
-        h.store.get_identity_link("apple", &subs[0]).await.unwrap(),
-        None
-    );
     assert!(
         h.store
             .get_apple_token(&apple_link_key(&subs[0]))
@@ -886,15 +879,18 @@ async fn an_unreadable_apple_token_row_fails_the_deletion_at_once() {
     };
     let (uid, subs) = deleted_account_with_tokens(&h, &["rt-good"]).await;
     let apple = ts::tokens(&h.stub);
-    // Right key and owner, but no `token_ct`: the row cannot be parsed.
-    let bad_key = apple_link_key(&new_sub());
+    // Right key and owner, but no `token_ct`: the token cannot be read.
+    let bad_sub = new_sub();
+    let bad_key = apple_link_key(&bad_sub);
     h.store
-        .raw_apple_tokens_put(
+        .raw_identity_link_put(
             [
-                ("link_key", AttributeValue::S(bad_key.clone())),
+                ("link_pk", AttributeValue::S(bad_key.clone())),
                 ("user_id", AttributeValue::S(uid.to_string())),
-                ("client_id", AttributeValue::S(ts::CLIENT_ID.into())),
-                ("wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
+                ("provider", AttributeValue::S("apple".into())),
+                ("subject", AttributeValue::S(bad_sub)),
+                ("token_client_id", AttributeValue::S(ts::CLIENT_ID.into())),
+                ("token_wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
                 ("token_nonce", AttributeValue::B(Blob::new(vec![2u8]))),
             ]
             .into_iter()

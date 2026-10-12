@@ -490,10 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_entitlements,
     )
     .await
-    .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?
-    .with_apple_tokens_table(
-        env::var("DYNAMODB_APPLE_TOKENS_TABLE").unwrap_or_else(|_| "apple_tokens".to_string()),
-    );
+    .map_err(|e| format!("Failed to initialize DynamoDB store: {}", e))?;
 
     // Resolve the issuer once so mint and verify in every handler agree on a
     // single value (eliminates per-request env reads and runtime-mutation

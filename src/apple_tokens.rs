@@ -5,8 +5,8 @@
 //! app sends the authorization code from the same ceremony with the
 //! id_token. The server exchanges the code at Apple's token endpoint for a
 //! refresh token, seals it with the Patreon KMS envelope
-//! ([`crate::patreon::TokenSealer`]) and keeps it in the `apple_tokens`
-//! table under the identity-link key `apple#<sub>`. When the account is
+//! ([`crate::patreon::TokenSealer`]) and keeps it on the identity link
+//! itself, the `identity_links` row `apple#<sub>`, written with the link. When the account is
 //! deleted, the sweep (`account::sweep`) revokes each token at Apple's
 //! revoke endpoint. That removes the app from the person's Sign in with
 //! Apple list.
@@ -241,7 +241,7 @@ impl fmt::Debug for ExchangedTokens {
     }
 }
 
-/// A stored refresh token (`apple_tokens` table, `db::apple_tokens`).
+/// A refresh token stored on an Apple identity link (`db::apple_tokens`).
 #[derive(Clone)]
 pub struct AppleTokenRow {
     /// `apple#<sub>`: the identity-link key ([`apple_link_key`]).
@@ -266,8 +266,7 @@ impl fmt::Debug for AppleTokenRow {
     }
 }
 
-/// The identity-link key of an Apple `sub`: the `identity_links` `link_pk`,
-/// and the `apple_tokens` `link_key`.
+/// The identity-link key of an Apple `sub`: the `identity_links` `link_pk`.
 pub fn apple_link_key(sub: &str) -> String {
     format!("apple#{sub}")
 }
@@ -633,6 +632,29 @@ pub(crate) mod test_support {
 
     pub(crate) fn tokens(stub: &StubApple) -> AppleTokens {
         tokens_and_key(stub).0
+    }
+
+    /// Revocation configured, but every seal fails: the KMS sealer points at
+    /// nothing, with retries off.
+    pub(crate) fn tokens_with_dead_kms(stub: &StubApple) -> AppleTokens {
+        let conf = aws_sdk_kms::config::Builder::new()
+            .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())
+            .region(aws_sdk_kms::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_kms::config::Credentials::new(
+                "local", "local", None, None, "dead-kms",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .retry_config(aws_sdk_kms::config::retry::RetryConfig::disabled())
+            .build();
+        AppleTokens::new(
+            siwa_key().0,
+            TokenSealer::Kms {
+                client: aws_sdk_kms::Client::from_conf(conf),
+                key_id: "dead".into(),
+            },
+            stub.endpoints(),
+            Duration::from_secs(5),
+        )
     }
 
     /// Claims of an Apple id_token for `sub`, issued to `aud`, with `nonce`

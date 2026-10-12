@@ -51,9 +51,12 @@ credential (128 random bits), so keep it private.
     the Sign in with Apple tokens, which are revoked last: Apple refused a
     revocation (a 4xx other than 429, which means a server configuration
     problem: key, client id or secret), the account has stored tokens but the
-    server has no revocation configured, or a stored token row is unreadable.
+    server has no revocation configured, or a stored token is unreadable.
     In each case the account itself is deleted and stays deleted, and every
-    other datum is already removed; only the sealed Apple tokens remain. The
+    other datum is already removed; only the Apple links holding the sealed
+    tokens remain (no Apple sign-in reaches the deleted account through them,
+    and they keep that Apple ID from being linked to another account until
+    revoked). The
     server retries at its next restart, once an operator has fixed the problem,
     and logs the failure. Tell the person their account is deleted and the
     remaining cleanup is in progress.
@@ -91,7 +94,8 @@ credential (128 random bits), so keep it private.
   be reused to impersonate a fresh identity.
 - **Sign in with Apple** (last, after everything above): for every Apple ID
   the account linked with an authorization code, the server revokes the
-  refresh token it holds at Apple, then deletes it. Revocation removes the
+  refresh token it holds at Apple, then deletes it with the link. Until then
+  that link stays (all other identity links go earlier). Revocation removes the
   app from the person's Apple Account → Sign in with Apple list (TN3194).
   A link made before the server held tokens (no authorization code) is
   removed without a revocation. The app should tell the person they can
@@ -138,16 +142,15 @@ When the server has token revocation configured:
 - **502** `apple_token_exchange_failed`: Apple did not take the code (codes
   are single-use and expire after 5 minutes) or could not be reached.
   Nothing is stored. Run the ceremony again (new nonce, new code).
-- **502** `apple_token_store_failed`: the token could not be sealed or
-  stored. If this request created the link, the new token is revoked and the
-  link taken back. On a re-link of an already linked Apple ID nothing is
-  revoked, and the existing link stays, with its stored token if it has one
-  (a link made before the server held tokens has none). Run the ceremony
-  again.
+- **502** `apple_token_store_failed`: the token could not be sealed.
+  Nothing is written. If the Apple ID was linked to no account, the new token
+  is revoked. On a re-link of an already linked Apple ID nothing is revoked,
+  and the existing link stays, with its stored token if it has one (a link
+  made before the server held tokens has none). Run the ceremony again.
 - **502** when Apple's keys could not be fetched or read to check the
   returned id_token (a transient failure): nothing is stored or revoked. Run
   the ceremony again.
-- **500** when the link itself could not be written: the new token is
+- **500** when the link and its token could not be written (one write): the new token is
   revoked and nothing is stored. Apple's revoke ends the whole
   authorization, so on a re-link this also ends the existing link's: Arkavo
   leaves the person's Sign in with Apple list until they link again. Run the

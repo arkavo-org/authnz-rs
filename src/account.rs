@@ -12,15 +12,16 @@
 //!    tokens, and the agent plane. The username is free to register again.
 //! 2. **After [`ACCOUNT_DELETION_GRACE_SECONDS`]:** [`sweep`] removes what is
 //!    bound to the account in other tables: the handle, App Attest device
-//!    bindings, every Apple/Google/Patreon identity link, the Patreon token
-//!    row (sealed tokens and wrapped key; Patreon has no revocation endpoint)
-//!    and its cache, and it revokes the account's agent delegations and
-//!    Guardians, stripping their labels. Last, it revokes the account's
-//!    Sign in with Apple refresh tokens with Apple (TN3194) and deletes their
-//!    rows. Three causes retrying cannot fix mark the deletion `failed` at
-//!    once: Apple refused a revocation (a 4xx other than 429, a configuration
-//!    problem), stored tokens exist but revocation is not configured, or a
-//!    stored token row is unreadable. By then everything else is removed, and
+//!    bindings, every Apple/Google/Patreon identity link except an Apple link
+//!    holding a token, the Patreon token row (sealed tokens and wrapped key;
+//!    Patreon has no revocation endpoint) and its cache, and it revokes the
+//!    account's agent delegations and Guardians, stripping their labels.
+//!    Last, it revokes the account's Sign in with Apple refresh tokens with
+//!    Apple (TN3194) and deletes the links that held them. Three causes
+//!    retrying cannot fix mark the deletion `failed` at once: Apple refused a
+//!    revocation (a 4xx other than 429, a configuration problem), stored
+//!    tokens exist but revocation is not configured, or a stored token is
+//!    unreadable. By then everything else is removed, and
 //!    the startup resume tries again once the problem is fixed. The grace lets
 //!    a request that passed its account check just before the deletion finish
 //!    its write, so the sweep removes that write instead of racing it.
@@ -292,7 +293,8 @@ pub(crate) async fn sweep(
 }
 
 /// Revoke every stored Sign in with Apple token of the account at Apple,
-/// deleting each row once revoked. Apple's answer is per row: every readable
+/// deleting each Apple link that holds one once its token is revoked (the
+/// link step left those in place). Apple's answer is per row: every readable
 /// row is attempted, and one Apple refused or could not take stays. A
 /// DynamoDB error while scanning or deleting a row aborts the sweep (the `?`):
 /// it is transient and retried on the schedule. After the rows are attempted,
@@ -311,7 +313,7 @@ async fn revoke_apple_tokens(
     for row in &found.rows {
         match apple.revoke_stored(row).await {
             Ok(()) => {
-                db.delete_apple_token(&row.link_key, uid).await?;
+                db.delete_apple_link(&row.link_key, uid).await?;
                 revoked += 1;
             }
             Err(e) => {
