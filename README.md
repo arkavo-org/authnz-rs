@@ -22,6 +22,13 @@ export DYNAMODB_CREDENTIALS_TABLE=prod-credentials
 export DYNAMODB_HANDLES_TABLE=prod-handles
 export DYNAMODB_AGENT_DELEGATIONS_TABLE=prod-agent-delegations
 export DYNAMODB_GUARDIANS_TABLE=prod-guardians   # create the table under this name
+
+# Sign in with Apple token revocation on account deletion (needs PATREON_KMS_KEY_ID)
+export APPLE_TEAM_ID=M8GS7ZT95Y
+export APPLE_SIWA_KEY_ID=<key id>
+export APPLE_SIWA_PRIVATE_KEY_PATH=/path/to/AuthKey_<key id>.p8
+# or the PEM itself: export APPLE_SIWA_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+# (not both: setting both is rejected and revocation stays off)
 export AWS_REGION=your-region
 ```
 
@@ -204,6 +211,7 @@ other relying parties.
 | `GET /oauth/userinfo`                   | UserInfo endpoint                           |
 | `GET /oauth/apple/nonce`                | Issue server-side nonce for Apple native flow |
 | `POST /oauth/apple/idtoken`             | Native Sign in with Apple (id_token + nonce)|
+| `POST /oauth/apple/link`                | Link Sign in with Apple to the signed-in account (`X-Auth-Token`); with revocation configured, also exchanges `authorization_code` and keeps the refresh token so account deletion can revoke it |
 | `POST /oauth/apple/callback`            | Web-flow Apple callback — **disabled (501)** until full code-exchange + state-bound nonce land |
 
 ### Apple Sign In security gates

@@ -9,6 +9,7 @@ use webauthn_rs::prelude::*;
 
 mod account;
 mod agent_state;
+mod apple_tokens;
 mod guardians;
 mod publishing;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
@@ -465,6 +466,13 @@ impl DynamoDBStore {
         }
     }
 
+    /// Point identity links at another table, to make their writes fail.
+    #[cfg(test)]
+    pub(crate) fn with_identity_links_table(mut self, table: String) -> Self {
+        self.identity_links_table = table;
+        self
+    }
+
     /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
     ///
     /// Idempotent on (provider, subject): re-linking the same identity to the
@@ -505,6 +513,10 @@ impl DynamoDBStore {
         Ok(Some(Uuid::parse_str(user_id)?))
     }
 
+    /// Link a third-party identity (e.g. Apple `sub`) to an existing user.
+    /// An update, not a put: a re-link keeps the other attributes of the row,
+    /// such as a stored Sign in with Apple token (`db::apple_tokens`), which
+    /// account deletion still has to revoke.
     pub async fn link_identity(
         &self,
         user_id: Uuid,
@@ -528,17 +540,19 @@ impl DynamoDBStore {
 
         let result = self
             .client
-            .put_item()
+            .update_item()
             .table_name(&self.identity_links_table)
-            .item("link_pk", AttributeValue::S(link_pk.clone()))
-            .item("user_id", AttributeValue::S(user_id.to_string()))
-            .item("provider", AttributeValue::S(provider.to_string()))
-            .item("subject", AttributeValue::S(subject.to_string()))
-            .item("linked_at", AttributeValue::N(now.to_string()))
+            .key("link_pk", AttributeValue::S(link_pk.clone()))
+            .update_expression(
+                "SET user_id = :uid, provider = :provider, subject = :subject, linked_at = :now",
+            )
             // Allow idempotent re-link (same user) but reject linking to a
             // different user — that's the cross-account hijack case.
             .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
             .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .expression_attribute_values(":provider", AttributeValue::S(provider.to_string()))
+            .expression_attribute_values(":subject", AttributeValue::S(subject.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
             .send()
             .await;
 

@@ -202,6 +202,21 @@ AWS_REGION=us-east-1
 # redirect. Access tokens carry aud = [client_id, OIDC_PLATFORM_AUDIENCE].
 # OIDC_CLIENT_CLOSUREKB_ID=closurekb-android
 # OIDC_CLIENT_CLOSUREKB_REDIRECT_URIS=com.closurekb:/oauth2redirect
+
+# Sign in with Apple token revocation (TN3194; docs/account-deletion.md).
+# The team's Sign in with Apple key (Certificates, IDs & Profiles → Keys,
+# "Sign in with Apple" enabled for com.arkavo.ArkavoCreator). Needs
+# PATREON_KMS_KEY_ID too: the refresh tokens are sealed with that key.
+# The tokens live on the identity_links rows: no new table or IAM grant.
+# All unset ⇒ links are stored without a token and cannot be revoked
+# (startup warns). Once set, a client that does not send authorization_code
+# cannot link Apple.
+# APPLE_TEAM_ID=M8GS7ZT95Y
+# APPLE_SIWA_KEY_ID=<10-character key id>
+# APPLE_SIWA_PRIVATE_KEY_PATH=/etc/authnz-rs/keys/AuthKey_<key id>.p8   # chmod 600
+# Or, instead of the path, the PEM itself (newlines may be written as \n).
+# Setting both is rejected: startup logs an error and revocation stays off.
+# APPLE_SIWA_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 ```
 
 #### `identity_links` Table
@@ -253,6 +268,65 @@ prepends the real peer address. If clients can reach authnz-rs directly,
 they can forge this header and poison the audit log. The audit value is
 not used for any authorization decision — it is operator-correlation
 only — but log integrity still matters for incident response.
+
+#### Sign in with Apple tokens (0.17.0)
+
+Nothing to create. With revocation configured, `POST /oauth/apple/link`
+stores the sealed Apple refresh token on the identity's own `identity_links`
+row (`apple#<sub>`), in the same write as the link. The account-deletion
+sweep leaves a link that holds a token until its last step, revokes the token
+with Apple, then deletes the link. IAM on the identity links table needs
+`dynamodb:UpdateItem`, `GetItem`, `DeleteItem` and `Scan` (links are now
+written with `UpdateItem`, so a re-link keeps a stored token).
+
+| Resource | Actions |
+|---|---|
+| the `DYNAMODB_IDENTITY_LINKS_TABLE` table | `dynamodb:UpdateItem`, `dynamodb:GetItem`, `dynamodb:DeleteItem`, `dynamodb:Scan` |
+| `PATREON_KMS_KEY_ID` | nothing new (`kms:Encrypt` and `kms:Decrypt`, as Patreon linking uses) |
+
+Check the startup log for `Sign in with Apple token revocation enabled`. A
+`warn`/`error` line naming the missing or invalid variable means links are
+still stored without a token.
+
+A deletion that ends `failed` for a reason retrying cannot fix (Apple refused
+a revocation with a 4xx other than 429, which is a key, client id or secret
+problem; the account has stored tokens but revocation is not configured; or a
+stored token is unreadable) has already removed the account and every other
+datum. Only the Apple links holding the sealed tokens remain; sign-in through
+them fails closed, and they keep those Apple IDs from being linked to another
+account until revoked. Fix the problem and restart: the server retries
+unfinished deletions at startup.
+
+When Apple keeps refusing a token for a reason configuration cannot fix (for
+example its `token_client_id` is a bundle id or Service ID the key no longer
+covers), the token cannot be revoked from here. The log names the account
+(`apple_token=revoke_failed user_id=<user_id>: Apple refused the request:
+HTTP 400 <error>`). Confirm the refusal, and that the `identity_links` row's
+`user_id` is that account and its `credentials` row is a tombstone (it has
+`deleted_at`); then delete that `identity_links` row by hand and restart. The
+startup resume completes the deletion. The person can still remove Arkavo
+under Apple Account → Sign in with Apple.
+
+A link whose account was deleted while the link was in flight, and whose
+token Apple did not take back, keeps its row (logged as `reason=account
+deleted during link, link kept`). The deletion may already be `completed`; to
+revoke that token, set the tombstone's `deletion_state` to `failed` and
+restart, so the startup resume sweeps it again:
+
+```bash
+aws dynamodb update-item --table-name "$DYNAMODB_CREDENTIALS_TABLE" \
+  --key '{"user_id": {"S": "<user_id>"}}' \
+  --condition-expression 'attribute_exists(deleted_at)' \
+  --update-expression 'SET deletion_state = :f' \
+  --expression-attribute-values '{":f": {"S": "failed"}}'
+```
+
+Rolling back to 0.16.1 after revocation was enabled: 0.16.1 does not know the
+tokens. Its sweep deletes every identity link, token and all, and its link
+write is a put that drops a stored token on a re-link. Tokens lost that way
+are never revoked by the server (the person can still remove Arkavo under
+Apple Account → Sign in with Apple). Nothing needs repairing after rolling
+forward.
 
 #### `guardians` Table and Agent Trust State
 

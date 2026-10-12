@@ -54,6 +54,7 @@ when unset.
 | `OIDC_CLIENT_<TAG>_ID`, `_REDIRECT_URIS`, `_SECRET` | One relying party per tag. `<TAG>` is operator-chosen and never appears in tokens. Omit `_SECRET` for public PKCE-S256 clients. A client_id of `arkavo` (the passkey CWT audience) fails startup. `_REDIRECT_URIS` is exact-match and required even for `client_credentials` service clients (use a dummy URI). See `docs/pep-service-clients.md`, `docs/google-signin.md`. |
 | `OIDC_PLATFORM_AUDIENCE` | Extra `aud` appended to every OIDC access token so any RP's token passes the OpenTDF platform's single-audience check. Also the only `resource` value (besides the client id) accepted under RFC 8707. `arkavo` (the passkey CWT audience) fails startup. |
 | `APPLE_CLIENT_ID` | Comma-separated iOS bundle ids / web Service IDs whose id_tokens are accepted. |
+| `APPLE_TEAM_ID`, `APPLE_SIWA_KEY_ID`, `APPLE_SIWA_PRIVATE_KEY_PATH` (or `APPLE_SIWA_PRIVATE_KEY`, the PEM itself; not both) | Sign in with Apple token revocation (TN3194, `apple_tokens.rs`). The team's Sign in with Apple key signs the ES256 client secret for Apple's `/auth/token` and `/auth/revoke`. Needs `PATREON_KMS_KEY_ID` too: the refresh tokens are sealed with the Patreon KMS sealer. All set ⇒ `POST /oauth/apple/link` requires `authorization_code` and account deletion revokes the stored tokens. Otherwise links are stored without a token, as before (startup warns; logs an error when the key is set but invalid, or the sealer is missing). The token is stored on the `identity_links` row; no table of its own. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Sign in with Google for `idp=google`. Both id and secret required or the flow fails closed. Redirect defaults to `<OIDC_ISSUER>/oauth/google/callback`. |
 | `PATREON_CLIENT_<TAG>_ID`, `_SECRET`, `_REDIRECT_URIS`; `PATREON_KMS_KEY_ID` | One Patreon OAuth client per tag (legacy untagged `PATREON_CLIENT_ID/_SECRET/_REDIRECT_URIS` still works). A redirect URI may belong to one client only. Any malformed registration or missing KMS key disables Patreon entirely (link endpoint ⇒ 503). |
 | `APP_ATTEST_APP_ID` | **Comma-separated set** of hex SHA-256 of `<TeamID>.<BundleID>`, one per app that registers users. An attestation is accepted when its `rpIdHash` matches any member; a single value is a one-element set. When non-empty, `POST /device-check/attest` enforces the match. Unset ⇒ recorded but not enforced (warns). **Mandatory on the registration-gate path**, where unset fails closed. |
@@ -120,6 +121,40 @@ when unset.
   `identity_links` table. Idempotent on repeat; returns HTTP 409 if the same
   Apple `sub` is already linked to a different arkavo user. **Minimum-PII**:
   no email/name/relay claims are persisted, even if Apple sends them.
+  With token revocation configured (`apple_tokens.rs`) the body must also
+  carry `authorization_code` (400 `authorization_code_required` otherwise).
+  The server exchanges it at Apple's `/auth/token` (client secret: ES256,
+  `kid` = key id, `iss` = team, `sub` = the id_token's `aud`, 300 s; no
+  `redirect_uri`, native codes have none), verifies the returned id_token is
+  the same `sub` for the same client (`nonce` checked when present), seals
+  the refresh token, writes the link and the token to the `identity_links`
+  row `apple#<sub>` in **one** conditional `UpdateItem`
+  (`link_apple_with_token`), then checks `is_account_live` again. Apple's `/auth/revoke` ends the whole
+  authorization for that Apple ID and client, including a token stored for
+  it earlier, so the cases differ:
+  - binding mismatch (401 `apple_token_binding_mismatch`): the returned
+    token is revoked;
+  - conflict (409): nothing is revoked (the authorization is the linked
+    account's; its deletion revokes it if that link stored a token);
+  - the link + token write fails (500): the new token is revoked, even on
+    a re-link, where that ends the existing authorization;
+  - sealing fails (502 `apple_token_store_failed`): nothing is written; the
+    new token is revoked only if the identity is linked to no account;
+  - the exchange fails (502 `apple_token_exchange_failed`): nothing to
+    revoke;
+  - Apple's keys cannot be fetched or read to check the returned id_token
+    (502): nothing is revoked;
+  - the account was deleted while the request was in flight (the re-check
+    sees a tombstone; 401): the new token is revoked and the link holding
+    it deleted (kept if Apple did not revoke it). A failed re-check keeps it
+    and answers 200;
+  - a re-link succeeds (200): the stored token is replaced and the old one
+    is not revoked (the revoke at deletion ends the whole authorization).
+
+  Every Apple call has a 10 s timeout. The re-check, not a timing bound,
+  keeps a link in flight from outliving a deletion's sweep: the request can
+  take longer than `ACCOUNT_DELETION_GRACE_SECONDS` (untimed DynamoDB and
+  KMS calls).
 - `POST /oauth/apple/callback`: **explicitly disabled** (HTTP 501). Apple web
   callback requires both code-exchange (signed client-secret JWT against
   Apple's token endpoint) *and* state-bound nonce verification. Until both
@@ -359,19 +394,31 @@ appraisal, status)
 - **Tokens outlive the account, so every path that trusts a token re-checks
   the row** (`DynamoDBStore::is_account_live` / `get_user_by_id`):
   `agent::authenticate_human` / `authenticate_operator` (whole agent plane and
-  Guardians), Apple/Google/Patreon link, `/oauth/authorize` with
-  `X-Auth-Token`, the code and refresh grants, `/oauth/userinfo`,
+  Guardians), Apple/Google/Patreon link (the Apple link with a token checks
+  again after storing it), `/oauth/authorize` with `X-Auth-Token`, the code
+  and refresh grants, `/oauth/userinfo`,
   `/device-check/attest`; and for agent tokens, which name the agent not the
   owner, `agent::active_delegation` and `GET /agents/:did/status` check the
   delegation's `root_user_id`. A new token-accepting path must do the same.
 - **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` deletes
-  the handle, device bindings, identity links (scan: no `user_id` GSI) and the
+  the handle, device bindings, identity links (scan: no `user_id` GSI; an
+  Apple link holding a token is left for the last step) and the
   Patreon token row (Patreon has no revocation endpoint), invalidates the
   Patreon cache, revokes agent delegations (+ chain cascade; also done in the
   request itself) and Guardians and blanks their `name` / `delegator_username`
   (rows stay: a revoked or
-  recovered key must never come back fresh). Retries `[30, 60, 120]` s, then
-  `failed`; `resume_unfinished` restarts pending/failed sweeps at boot.
+  recovered key must never come back fresh). **Last**, it revokes the
+  account's Sign in with Apple refresh tokens (the `token_*` attributes of
+  its Apple `identity_links` rows, scan on `user_id`) at Apple's
+  `/auth/revoke` and deletes each link on 200. A 4xx
+  other than 429 (a configuration problem: key, client id, secret), a stored
+  token that cannot be read, or stored tokens while revocation is
+  unconfigured, keeps the rows and marks the deletion `failed` at once
+  (`SweepError::is_permanent`; no schedule retries). A 429, 5xx, transport or
+  KMS failure keeps the rows and retries; a DynamoDB error while scanning or
+  deleting a row stops the step at once and retries. Retries
+  `[30, 60, 120]` s, then `failed`; `resume_unfinished` restarts
+  pending/failed sweeps at boot.
   `device_attest_keys` is not touched (no account link).
 - `GET /account/deletions/:id`: no token; the id is `<user_id>.<128-bit hex>`,
   compared constant-time. `pending | failed | completed`. Contract:

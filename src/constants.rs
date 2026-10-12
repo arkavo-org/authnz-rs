@@ -53,6 +53,28 @@ pub const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 /// Apple OIDC issuer (used to validate `iss` claim on Apple id_tokens)
 pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
+/// Apple's token endpoint: exchanges a Sign in with Apple authorization code
+/// for a refresh token (`apple_tokens.rs`). Fixed; tests use a stub.
+pub const APPLE_TOKEN_URL: &str = "https://appleid.apple.com/auth/token";
+
+/// Apple's token revocation endpoint (TN3194: revoke on account deletion).
+pub const APPLE_REVOKE_URL: &str = "https://appleid.apple.com/auth/revoke";
+
+/// `aud` of the client-secret JWT that Apple's token and revoke endpoints
+/// accept.
+pub const APPLE_CLIENT_SECRET_AUDIENCE: &str = "https://appleid.apple.com";
+
+/// Lifetime of each client secret. Apple allows up to six months; one is
+/// minted per call, so a short one leaves nothing worth stealing.
+pub const APPLE_CLIENT_SECRET_LIFETIME_SECONDS: i64 = 300;
+
+/// Bound on every call to Apple's token and revoke endpoints, so a stalled
+/// Apple cannot hold a link request or a deletion sweep. A link does not
+/// depend on it to finish inside `ACCOUNT_DELETION_GRACE_SECONDS`: after
+/// storing the token it checks the account again, and if the account was
+/// deleted meanwhile it revokes the token and deletes the link.
+pub const APPLE_TOKEN_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Google JWKS cache TTL in seconds (1 hour).
 pub const GOOGLE_JWKS_CACHE_TTL_SECONDS: i64 = 3600;
 

@@ -12,12 +12,19 @@
 //!    tokens, and the agent plane. The username is free to register again.
 //! 2. **After [`ACCOUNT_DELETION_GRACE_SECONDS`]:** [`sweep`] removes what is
 //!    bound to the account in other tables: the handle, App Attest device
-//!    bindings, every Apple/Google/Patreon identity link, the Patreon token
-//!    row (sealed tokens and wrapped key; Patreon has no revocation endpoint)
-//!    and its cache, and it revokes the account's agent delegations and
-//!    Guardians, stripping their labels. The grace lets a request that
-//!    passed its account check just before the deletion finish its write, so
-//!    the sweep removes that write instead of racing it.
+//!    bindings, every Apple/Google/Patreon identity link except an Apple link
+//!    holding a token, the Patreon token row (sealed tokens and wrapped key;
+//!    Patreon has no revocation endpoint) and its cache, and it revokes the
+//!    account's agent delegations and Guardians, stripping their labels.
+//!    Last, it revokes the account's Sign in with Apple refresh tokens with
+//!    Apple (TN3194) and deletes the links that held them. Three causes
+//!    retrying cannot fix mark the deletion `failed` at once: Apple refused a
+//!    revocation (a 4xx other than 429, a configuration problem), stored
+//!    tokens exist but revocation is not configured, or a stored token is
+//!    unreadable. By then everything else is removed, and
+//!    the startup resume tries again once the problem is fixed. The grace lets
+//!    a request that passed its account check just before the deletion finish
+//!    its write, so the sweep removes that write instead of racing it.
 //!
 //! The response carries a `deletion_id`; `GET /account/deletions/:id` reports
 //! `pending`, `failed` or `completed`. That endpoint takes no token (the
@@ -29,6 +36,7 @@
 //! resumed at startup.
 
 use crate::AppState;
+use crate::apple_tokens::{AppleTokenError, AppleTokens};
 use crate::constants::{
     ACCOUNT_DELETION_COMPLETES_WITHIN_SECONDS, ACCOUNT_DELETION_GRACE_SECONDS,
     ACCOUNT_DELETION_RETRY_SECONDS, ACCOUNT_DELETION_TOKEN_MAX_AGE_SECONDS,
@@ -130,6 +138,35 @@ impl From<DynamoDBError> for AccountError {
     }
 }
 
+/// Why a sweep attempt stopped.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SweepError {
+    #[error(transparent)]
+    Db(#[from] DynamoDBError),
+    #[error("Apple token revocation: {0}")]
+    Apple(#[from] AppleTokenError),
+    /// Stored Apple token rows of the account could not be read, so their
+    /// tokens cannot be revoked. The count only: a link key holds the Apple
+    /// `sub`.
+    #[error("{0} stored Apple token row(s) are unreadable")]
+    UnreadableAppleTokens(usize),
+}
+
+impl SweepError {
+    /// Retrying on the schedule cannot fix it: Apple refused a revocation (a
+    /// configuration problem: key, client id or secret), tokens are stored
+    /// while revocation is not configured, or a stored row is unreadable. The
+    /// deletion is marked `failed` at once; the startup resume tries again
+    /// once the configuration is fixed.
+    pub(crate) fn is_permanent(&self) -> bool {
+        match self {
+            Self::Db(_) => false,
+            Self::Apple(e) => e.is_permanent(),
+            Self::UnreadableAppleTokens(_) => true,
+        }
+    }
+}
+
 /// `DELETE /account`: delete the account named by the passkey auth CWT in
 /// `X-Auth-Token`. 202 with the deletion's status, on the first request and
 /// on every retry; 401 for a missing, invalid or stale token, or an account
@@ -137,6 +174,7 @@ impl From<DynamoDBError> for AccountError {
 pub async fn delete_account(
     Extension(app_state): Extension<AppState>,
     Extension(patreon): Extension<PatreonState>,
+    Extension(apple): Extension<AppleTokens>,
     headers: HeaderMap,
 ) -> Result<Response, AccountError> {
     let now = Utc::now().timestamp();
@@ -194,6 +232,7 @@ pub async fn delete_account(
     schedule_sweep(
         app_state.db_store.clone(),
         patreon,
+        apple,
         user_id,
         ACCOUNT_DELETION_GRACE_SECONDS,
     );
@@ -220,13 +259,18 @@ pub async fn get_deletion_status(
 }
 
 /// Remove everything bound to a deleted account outside its own row. Each
-/// step is idempotent; the first failure stops the sweep and is returned.
+/// step is idempotent. A failure stops the sweep and is returned, so the steps
+/// after it do not run. The one step that does not stop at its first failure
+/// is the last: [`revoke_apple_tokens`] tries every readable token row before
+/// it reports what Apple refused or could not take. A DynamoDB error there
+/// still stops it at once.
 pub(crate) async fn sweep(
     db: &DynamoDBStore,
     patreon: &PatreonState,
+    apple: &AppleTokens,
     deletion: &AccountDeletion,
     now: i64,
-) -> Result<(), DynamoDBError> {
+) -> Result<(), SweepError> {
     let uid = &deletion.user_id;
     if let Some(handle) = &deletion.handle {
         db.delete_handle_if_owned(handle, uid).await?;
@@ -237,28 +281,92 @@ pub(crate) async fn sweep(
     let devices = db.delete_device_bindings_of(uid).await?;
     let agents = db.revoke_and_scrub_delegations_of(uid, now).await?;
     let guardians = db.revoke_and_scrub_guardians_of(uid, now).await?;
+    // Last: a deletion that stops here holds nothing but the sealed tokens
+    // it still has to revoke.
+    let apple_tokens = revoke_apple_tokens(db, apple, uid).await?;
     info!(
         "audit account_deletion outcome=swept user_id={uid} identity_links={links} \
-         device_bindings={devices} agents={agents} guardians={guardians}"
+         device_bindings={devices} agents={agents} guardians={guardians} \
+         apple_tokens={apple_tokens}"
     );
     Ok(())
 }
 
-/// Run the sweep for `user_id` after `delay` seconds, retrying on failure,
-/// in the background.
+/// Revoke every stored Sign in with Apple token of the account at Apple,
+/// deleting each Apple link that holds one once its token is revoked (the
+/// link step left those in place). Apple's answer is per row: every readable
+/// row is attempted, and one Apple refused or could not take stays. A
+/// DynamoDB error while scanning or deleting a row aborts the sweep (the `?`):
+/// it is transient and retried on the schedule. After the rows are attempted,
+/// rows that matched the account but could not be read fail the sweep
+/// permanently. A permanent failure (a refusal or unreadable rows) is
+/// reported ahead of a transient one, since retrying cannot fix it.
+async fn revoke_apple_tokens(
+    db: &DynamoDBStore,
+    apple: &AppleTokens,
+    uid: &Uuid,
+) -> Result<u32, SweepError> {
+    let found = db.apple_tokens_of(uid).await?;
+    let mut revoked = 0;
+    let mut permanent = None;
+    let mut transient = None;
+    for row in &found.rows {
+        match apple.revoke_stored(row).await {
+            Ok(()) => {
+                db.delete_apple_link(&row.link_key, uid).await?;
+                revoked += 1;
+            }
+            Err(e) => {
+                // Status and Apple's error code only (AppleTokenError's Display).
+                error!("audit account_deletion apple_token=revoke_failed user_id={uid}: {e}");
+                let first = if e.is_permanent() {
+                    &mut permanent
+                } else {
+                    &mut transient
+                };
+                if first.is_none() {
+                    *first = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = permanent {
+        return Err(e.into());
+    }
+    if !found.unreadable.is_empty() {
+        // The count only: the link keys contain the Apple sub.
+        let count = found.unreadable.len();
+        error!(
+            "audit account_deletion apple_token=unreadable user_id={uid} count={count}: \
+             rows kept"
+        );
+        return Err(SweepError::UnreadableAppleTokens(count));
+    }
+    match transient {
+        Some(e) => Err(e.into()),
+        None => Ok(revoked),
+    }
+}
+
+/// Run the sweep for `user_id` after `delay` seconds, in the background,
+/// retrying a transient failure on [`ACCOUNT_DELETION_RETRY_SECONDS`]. A
+/// permanent failure ([`SweepError::is_permanent`]) is not retried here.
 pub(crate) fn schedule_sweep(
     db: Arc<DynamoDBStore>,
     patreon: PatreonState,
+    apple: AppleTokens,
     user_id: Uuid,
     delay: i64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut wait = delay.max(0);
         let mut retries = ACCOUNT_DELETION_RETRY_SECONDS.iter();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
-            match run_once(&db, &patreon, &user_id).await {
+            match run_once(&db, &patreon, &apple, &user_id).await {
                 Ok(()) => return,
+                // `run_once` marked it failed; the startup resume retries it.
+                Err(e) if e.is_permanent() => return,
                 Err(e) => {
                     warn!("Account deletion sweep for {user_id} failed: {e}");
                     let give_up = ACCOUNT_DELETION_RETRY_SECONDS.len() as u32 + 1;
@@ -280,16 +388,18 @@ pub(crate) fn schedule_sweep(
                 }
             }
         }
-    });
+    })
 }
 
 /// One sweep attempt: re-read the tombstone (another instance may have
-/// finished it), sweep, mark it complete.
+/// finished it), sweep, mark it complete. A permanent failure marks the
+/// deletion `failed` before it is returned.
 pub(crate) async fn run_once(
     db: &DynamoDBStore,
     patreon: &PatreonState,
+    apple: &AppleTokens,
     user_id: &Uuid,
-) -> Result<(), DynamoDBError> {
+) -> Result<(), SweepError> {
     let Some(deletion) = db.get_account_deletion(user_id).await? else {
         warn!("Account deletion sweep for {user_id}: no tombstone; nothing to do");
         return Ok(());
@@ -298,15 +408,33 @@ pub(crate) async fn run_once(
         return Ok(());
     }
     let now = Utc::now().timestamp();
-    sweep(db, patreon, &deletion, now).await?;
+    if let Err(e) = sweep(db, patreon, apple, &deletion, now).await {
+        if e.is_permanent() {
+            error!(
+                "audit account_deletion outcome=failed user_id={user_id}: {e}; \
+                 not retried before the next startup"
+            );
+            if let Err(m) = db.mark_deletion_failed(user_id).await {
+                warn!("Marking the deletion of {user_id} failed did not stick: {m}");
+            }
+        }
+        return Err(e);
+    }
     db.complete_account_deletion(user_id, now).await?;
     info!("audit account_deletion outcome=completed user_id={user_id}");
     Ok(())
 }
 
-/// At startup: resume every deletion whose sweep never completed (the
-/// process stopped during the grace or the retries, or they ran out).
-pub(crate) async fn resume_unfinished(db: Arc<DynamoDBStore>, patreon: PatreonState) {
+/// At startup: resume every deletion whose sweep never completed: the
+/// process stopped during the grace or the retries, the retries ran out, or
+/// the sweep hit a permanent cause (Apple refused a revocation, stored tokens
+/// exist while revocation is not configured, or a stored token row is
+/// unreadable) and marked the deletion `failed`.
+pub(crate) async fn resume_unfinished(
+    db: Arc<DynamoDBStore>,
+    patreon: PatreonState,
+    apple: AppleTokens,
+) {
     let unfinished = match db.list_unfinished_deletions().await {
         Ok(v) => v,
         Err(e) => {
@@ -323,7 +451,7 @@ pub(crate) async fn resume_unfinished(db: Arc<DynamoDBStore>, patreon: PatreonSt
     let now = Utc::now().timestamp();
     for d in unfinished {
         let delay = d.deleted_at + ACCOUNT_DELETION_GRACE_SECONDS - now;
-        schedule_sweep(db.clone(), patreon.clone(), d.user_id, delay);
+        schedule_sweep(db.clone(), patreon.clone(), apple.clone(), d.user_id, delay);
     }
 }
 

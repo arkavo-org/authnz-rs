@@ -63,8 +63,28 @@ paths:
 - **Uniqueness**: Conditional put on `link_pk` enforces per-(provider, subject) uniqueness.
   Re-linking the same identity to the same user is idempotent; binding to a
   different user returns `DynamoDBError::LinkConflict` (HTTP 409 upstream).
+- **Sign in with Apple token** (optional, Apple rows only; `db/apple_tokens.rs`):
+  token_client_id (String, the bundle id / Service ID the token was issued
+  to; revocation presents it), token_wrapped_dek (Binary, DEK wrapped by
+  `PATREON_KMS_KEY_ID`), token_nonce (Binary, 12-byte GCM nonce), token_ct
+  (Binary, AES-256-GCM ciphertext of Apple's refresh token), token_stored_at
+  (Number). Present only when the link was made with revocation configured.
+  - **Writes**: `POST /oauth/apple/link` writes the link and the token in one
+    conditional `UpdateItem` (same condition as the link). A re-link replaces
+    the token without revoking the old one (Apple's revoke is
+    authorization-wide; the deletion-time revoke covers it). `link_identity`
+    is an `UpdateItem` too, so a re-link without a token keeps a stored one.
+  - **Deletion**: the sweep's link step deletes every link of the account
+    *except* one holding any `token_*` attribute. Its last step revokes each
+    token with Apple, then deletes that link, conditional on `user_id`. A link
+    whose token Apple did not revoke stays (the deletion is `failed` or
+    retried); sign-in through it fails closed, since the account is a
+    tombstone, and it 409s a new account linking the same Apple ID until
+    revoked. A row with some but not all `token_*` attributes is unreadable
+    and keeps the deletion `failed` (permanent).
 - **PII**: Deliberately minimal. No email, display name, relay address, or
-  `real_user_status` is stored here, even if the IdP returns them.
+  `real_user_status` is stored here, even if the IdP returns them. A sealed
+  Apple refresh token is not PII.
 - **Future GSI** `user_id-index`: Add when an endpoint needs to enumerate
   "which providers has this user linked?". Account deletion (#88) finds a
   user's links with a paginated scan instead (deletions are rare); add the
