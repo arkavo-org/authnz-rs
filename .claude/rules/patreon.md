@@ -71,7 +71,19 @@ paths:
   `^tier-[0-9]+$` is dropped — "Tier 10234567" would otherwise impersonate
   tier 10234567's id form; the id form already covers the non-ASCII
   fallback. A creator link adds its owned
-  campaign value. The platform's arkavo-mode ERS only lowercases, so values
+  campaign value and **every tier of that campaign** in both forms (#99:
+  Creator gates every archive on a tier, so the campaign value alone opens
+  nothing). The tiers come from
+  `GET /api/oauth2/v2/campaigns/<cid>?include=tiers&fields[tier]=title`
+  (needs the `campaigns` scope; a recorded scope list without it skips the
+  call), run concurrently with the membership fetch with the same access
+  token (no refresh of its own: a 401 waits for the next materialization).
+  A fetched list that differs from the stored one is written to the
+  `patreon_tokens` row (`campaign_tier_ids` / `campaign_tier_slugs`, one
+  conditional `UpdateItem` on the same `campaign_id`); a failed fetch, the
+  creator fallback and a missed mint deadline all use the stored list, so a
+  creator is never locked out of their own content by a Patreon outage. The
+  owned tiers are not in the `arkavo_patreon` claim. The platform's arkavo-mode ERS only lowercases, so values
   must be canonical: non-numeric ids and non-`slugify_tier` slugs are
   dropped. The whole `https://patreon.arkavo.com/` namespace is derived-only
   (`constants::is_derived_only`).
