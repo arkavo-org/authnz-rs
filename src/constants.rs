@@ -115,6 +115,11 @@ pub const PATREON_TOKEN_URL: &str = "https://www.patreon.com/api/oauth2/token";
 /// id and — for creators — their owned campaign).
 pub const PATREON_IDENTITY_URL: &str = "https://www.patreon.com/api/oauth2/v2/identity";
 
+/// Patreon API v2 campaigns collection (base, without the campaign id). A
+/// creator's own campaign is read at `<this>/<campaign_id>?include=tiers`
+/// for its tier ladder (#99).
+pub const PATREON_CAMPAIGNS_URL: &str = "https://www.patreon.com/api/oauth2/v2/campaigns";
+
 /// Patreon API v2 campaign members endpoint (templated with `{campaign_id}`).
 /// Used by membership materialization to read a creator's campaign roster
 /// and resolve a consumer's `patron_status`/tiers.
@@ -344,6 +349,11 @@ pub fn is_derived_only(fqn: &str) -> bool {
 /// A creator linked without it gets no memberships (and so never qualifies
 /// for [`ENTITLEMENT_CREATOR_PUBLISH`]) until they re-link.
 pub const PATREON_MEMBERSHIPS_SCOPE: &str = "identity.memberships";
+
+/// Patreon OAuth scope a creator link must hold for its own campaign's tiers
+/// to be readable. Without it the creator keeps the campaign value and any
+/// tiers stored earlier, and gains new tiers only after re-linking.
+pub const PATREON_CAMPAIGNS_SCOPE: &str = "campaigns";
 
 /// Length limits (characters) on a publishing suspension's moderator-supplied
 /// `reason` and `reportId`. `reportId` is also restricted to

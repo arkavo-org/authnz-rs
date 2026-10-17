@@ -46,6 +46,7 @@ pub(crate) fn qualifying_snapshot(role: &str) -> ArkavoPatreon {
             tier_ids: vec![PUBLISH_TIER.into()],
             tier_slugs: vec!["publisher".into()],
         }],
+        owned_tiers: Default::default(),
         verified_at: now,
         cache_expires_at: now + 300,
     }

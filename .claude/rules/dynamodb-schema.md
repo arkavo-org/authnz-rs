@@ -174,6 +174,13 @@ paths:
   - token_expires_at (Number) - Unix timestamp the Patreon access token
     expires at (per Patreon's `expires_in`)
   - linked_at (Number) - Unix timestamp of original link
+  - campaign_tier_ids / campaign_tier_slugs (List of String, optional;
+    creator only, #99) - The owned campaign's tiers as last fetched from
+    `GET /campaigns/<cid>?include=tiers` (ids; deduplicated title slugs).
+    Written by one conditional `UpdateItem` on `attribute_exists(user_id) AND
+    campaign_id = :cid` when a fetch differs from the stored list; carried
+    forward by every whole-row put (token rotation). Absent or malformed
+    reads as empty. A re-link writes them empty until the next fetch.
 - **Encryption**: Envelope. A DynamoDB-only compromise yields ciphertext
   blobs but no plaintext tokens — recovery additionally requires
   `kms:Decrypt` on the configured key.

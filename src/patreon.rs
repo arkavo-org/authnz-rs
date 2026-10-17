@@ -62,11 +62,12 @@
 
 use crate::AppState;
 use crate::constants::{
-    PATREON_CACHE_TTL_SECONDS, PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE,
-    PATREON_FAILURE_CACHE_TTL_SECONDS, PATREON_IDENTITY_URL, PATREON_MATERIALIZE_DEADLINE_SECONDS,
-    PATREON_TOKEN_URL, PATREON_UNLINKED_CACHE_TTL_SECONDS,
+    PATREON_CACHE_TTL_SECONDS, PATREON_CAMPAIGN_MEMBERS_URL_TEMPLATE, PATREON_CAMPAIGNS_SCOPE,
+    PATREON_CAMPAIGNS_URL, PATREON_FAILURE_CACHE_TTL_SECONDS, PATREON_IDENTITY_URL,
+    PATREON_MATERIALIZE_DEADLINE_SECONDS, PATREON_MEMBERSHIPS_SCOPE, PATREON_TOKEN_URL,
+    PATREON_UNLINKED_CACHE_TTL_SECONDS,
 };
-use crate::cwt::{ArkavoPatreon, ArkavoPatreonMembership};
+use crate::cwt::{ArkavoPatreon, ArkavoPatreonMembership, OwnedCampaignTiers};
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aws_sdk_kms::primitives::Blob;
@@ -420,6 +421,8 @@ pub struct PatreonState {
     pub token_url: String,
     /// Patreon API v2 identity endpoint (base, without query). See `token_url`.
     pub identity_url: String,
+    /// Patreon API v2 campaigns collection (base, no id or query). See `token_url`.
+    pub campaigns_url: String,
 }
 
 impl PatreonState {
@@ -439,6 +442,7 @@ impl PatreonState {
             cache: MembershipCache::new(redis),
             token_url: PATREON_TOKEN_URL.to_string(),
             identity_url: PATREON_IDENTITY_URL.to_string(),
+            campaigns_url: PATREON_CAMPAIGNS_URL.to_string(),
         }
     }
 
@@ -553,6 +557,10 @@ pub struct PatreonLink {
     pub wrapped_dek: Vec<u8>,
     pub token_expires_at: i64,
     pub linked_at: i64,
+    /// Creator only: the owned campaign's tiers as last fetched (#99). What
+    /// a creator keeps when a tier fetch fails, and in its fallback snapshot.
+    /// Empty until the first fetch after linking.
+    pub owned_tiers: OwnedCampaignTiers,
 }
 
 // --------- Linking endpoint ---------
@@ -731,6 +739,7 @@ pub async fn patreon_link_handler(
         wrapped_dek: sealed_access.wrapped_dek,
         token_expires_at,
         linked_at: now,
+        owned_tiers: OwnedCampaignTiers::default(),
     };
 
     if let Err(e) = app_state.db_store.put_patreon_link(&link).await {
@@ -830,7 +839,7 @@ fn token_exchange_error(status: reqwest::StatusCode, body: &str) -> PatreonError
 /// The scopes to record after a refresh. Patreon may answer a refresh with
 /// an empty `scope` or a narrower echo; recording that would make a creator
 /// silently stop being queried for memberships (see
-/// [`scopes_allow_memberships`]). A refresh token cannot widen the grant, so
+/// [`scopes_allow`]). A refresh token cannot widen the grant, so
 /// an empty or strictly narrower answer keeps the stored scopes; anything
 /// else (equal or not a subset) is taken as reported.
 fn merged_scopes(stored: &str, refreshed: &str) -> String {
@@ -869,6 +878,7 @@ fn merge_refreshed_link(
         wrapped_dek: sealed_access.wrapped_dek,
         token_expires_at: now + new_tokens.expires_in,
         linked_at: old.linked_at,
+        owned_tiers: old.owned_tiers.clone(),
     }
 }
 
@@ -1221,6 +1231,10 @@ struct SerializableMaterialized {
     patreon_user_id: String,
     campaign_id: Option<String>,
     memberships: Vec<SerializableMembership>,
+    #[serde(default)]
+    owned_tier_ids: Vec<String>,
+    #[serde(default)]
+    owned_tier_slugs: Vec<String>,
     verified_at: i64,
     cache_expires_at: i64,
 }
@@ -1250,6 +1264,8 @@ impl From<&ArkavoPatreon> for SerializableMaterialized {
                     tier_slugs: m.tier_slugs.clone(),
                 })
                 .collect(),
+            owned_tier_ids: p.owned_tiers.ids.clone(),
+            owned_tier_slugs: p.owned_tiers.slugs.clone(),
             verified_at: p.verified_at,
             cache_expires_at: p.cache_expires_at,
         }
@@ -1272,6 +1288,10 @@ impl From<SerializableMaterialized> for ArkavoPatreon {
                     tier_slugs: m.tier_slugs,
                 })
                 .collect(),
+            owned_tiers: OwnedCampaignTiers {
+                ids: s.owned_tier_ids,
+                slugs: s.owned_tier_slugs,
+            },
             verified_at: s.verified_at,
             cache_expires_at: s.cache_expires_at,
         }
@@ -1368,6 +1388,9 @@ async fn materialize_link(
             // the refresh went through — persisting the rotated link is the
             // only way the next mint can refresh at all.
             persist_rotated_tokens(app_state, user_id, failure.refreshed.map(|l| *l)).await;
+            if let Some(fallback) = &failure.fallback {
+                persist_owned_tiers(app_state, link, fallback).await;
+            }
             // A creator keeps its campaign claim (what it had before creator
             // memberships were fetched) with no memberships, so nothing
             // membership-derived is granted. Cached briefly so a creator with
@@ -1382,13 +1405,15 @@ async fn materialize_link(
     };
 
     persist_rotated_tokens(app_state, user_id, refreshed).await;
+    persist_owned_tiers(app_state, link, &snap).await;
 
     state.cache.put(user_id, &snap).await;
     Some(snap)
 }
 
 /// The snapshot a creator link falls back to when its membership query fails
-/// or misses the mint deadline: the stored owned campaign, no memberships
+/// or misses the mint deadline: the stored owned campaign and its stored
+/// tiers (so the creator can still open its own content), no memberships
 /// (so nothing membership-derived qualifies), valid for
 /// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]. `None` for consumer links, which
 /// fail closed with no claim at all.
@@ -1398,6 +1423,7 @@ fn creator_fallback(link: &PatreonLink, now: i64) -> Option<ArkavoPatreon> {
         patreon_user_id: link.patreon_user_id.clone(),
         campaign_id: link.campaign_id.clone(),
         memberships: Vec::new(),
+        owned_tiers: link.owned_tiers.clone(),
         verified_at: now,
         cache_expires_at: now + PATREON_FAILURE_CACHE_TTL_SECONDS,
     })
@@ -1504,6 +1530,38 @@ async fn persist_rotated_tokens(
     }
 }
 
+/// Store a creator snapshot's owned tiers on the link row when they differ
+/// from the stored ones, so the next fallback keeps them. Runs after
+/// [`persist_rotated_tokens`], whose whole-row put carries the old list.
+/// Best-effort: a failed write only means the fallback keeps an older list.
+async fn persist_owned_tiers(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) {
+    let Some(cid) = link.campaign_id.as_deref() else {
+        return;
+    };
+    if link.role != "creator" || snap.owned_tiers == link.owned_tiers {
+        return;
+    }
+    match app_state
+        .db_store
+        .put_patreon_owned_tiers(link.user_id, cid, &snap.owned_tiers)
+        .await
+    {
+        Ok(true) => debug!(
+            "Stored {} owned tiers for user {}",
+            snap.owned_tiers.ids.len(),
+            link.user_id
+        ),
+        Ok(false) => debug!(
+            "Patreon link for user {} changed campaign or went away; owned tiers not stored",
+            link.user_id
+        ),
+        Err(e) => warn!(
+            "Failed to store owned tiers for user {}: {} — the fallback keeps the older list",
+            link.user_id, e
+        ),
+    }
+}
+
 /// A materialization failure that may still carry a successfully rotated
 /// token bundle. Patreon consumes the old refresh token the moment a refresh
 /// succeeds, so if the post-refresh retry fetch then fails, the rotated link
@@ -1534,17 +1592,13 @@ impl From<PatreonError> for MaterializeFailure {
     }
 }
 
-/// Whether a link's granted scopes let `/identity` return memberships. An
-/// empty scope string (not recorded) is given the benefit of the doubt; a
-/// recorded list without `identity.memberships` skips the call, since
-/// Patreon cannot return memberships for it and re-asking on every mint
-/// would only add latency. Such a creator must re-link to qualify for
-/// membership-derived entitlements.
-fn scopes_allow_memberships(scopes: &str) -> bool {
-    scopes.trim().is_empty()
-        || scopes
-            .split_whitespace()
-            .any(|s| s == crate::constants::PATREON_MEMBERSHIPS_SCOPE)
+/// Whether a link's granted scopes include `scope` (`identity.memberships`
+/// for memberships, `campaigns` for a creator's own tiers). An empty scope
+/// string (not recorded) is given the benefit of the doubt; a recorded list
+/// without it skips the call, since Patreon cannot answer it and re-asking
+/// on every mint would only add latency. Such a creator must re-link.
+fn scopes_allow(scopes: &str, scope: &str) -> bool {
+    scopes.trim().is_empty() || scopes.split_whitespace().any(|s| s == scope)
 }
 
 /// Produce the membership snapshot for a link. The returned `Option<PatreonLink>`
@@ -1573,33 +1627,51 @@ async fn materialize_from_link(
     match link.role.as_str() {
         "creator" => {
             // A creator's snapshot embeds the campaign it owns (so RPs can
-            // look up "which creator does this user own") AND the campaigns
-            // it is itself a patron of — a creator is a patron of Arkavo's
-            // campaign to publish (#91). Same identity call, same
-            // refresh-on-401 path as consumers.
+            // look up "which creator does this user own") and every tier of
+            // it (#99: Creator gates each archive on a tier, so the campaign
+            // value alone opens none of the creator's own content), AND the
+            // campaigns it is itself a patron of — a creator is a patron of
+            // Arkavo's campaign to publish (#91). Memberships use the same
+            // identity call and refresh-on-401 path as consumers; the tier
+            // read runs alongside on the same access token and never fails
+            // the snapshot (see [`owned_campaign_tiers`]).
+            let memberships = async {
+                if !scopes_allow(&link.scopes, PATREON_MEMBERSHIPS_SCOPE) {
+                    // info, not debug: an operator needs to see which creators
+                    // must re-link. Cached, so at most once per cache TTL.
+                    info!(
+                        "Patreon creator link for patreon_user_id_prefix={} lacks the {} scope; \
+                         skipping the membership fetch (re-link to grant it)",
+                        subject_prefix(&link.patreon_user_id),
+                        PATREON_MEMBERSHIPS_SCOPE
+                    );
+                    return None;
+                }
+                Some(fetch_memberships_with_refresh(state, link, &access_token).await)
+            };
+            let (memberships, owned_tiers) = tokio::join!(
+                memberships,
+                owned_campaign_tiers(state, link, &access_token)
+            );
             let creator_snap = |memberships| ArkavoPatreon {
                 role: "creator".into(),
                 patreon_user_id: link.patreon_user_id.clone(),
                 campaign_id: link.campaign_id.clone(),
                 memberships,
+                owned_tiers: owned_tiers.clone(),
                 verified_at: now,
                 cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
             };
-            if !scopes_allow_memberships(&link.scopes) {
-                // info, not debug: an operator needs to see which creators
-                // must re-link. Cached, so at most once per cache TTL.
-                info!(
-                    "Patreon creator link for patreon_user_id_prefix={} lacks the {} scope; \
-                     skipping the membership fetch (re-link to grant it)",
-                    subject_prefix(&link.patreon_user_id),
-                    crate::constants::PATREON_MEMBERSHIPS_SCOPE
-                );
-                return Ok((creator_snap(Vec::new()), None));
-            }
-            match fetch_memberships_with_refresh(state, link, &access_token).await {
-                Ok((memberships, refreshed)) => Ok((creator_snap(memberships), refreshed)),
-                Err(failure) => Err(MaterializeFailure {
-                    fallback: creator_fallback(link, now).map(Box::new),
+            match memberships {
+                None => Ok((creator_snap(Vec::new()), None)),
+                Some(Ok((memberships, refreshed))) => Ok((creator_snap(memberships), refreshed)),
+                Some(Err(failure)) => Err(MaterializeFailure {
+                    fallback: creator_fallback(link, now).map(|f| {
+                        Box::new(ArkavoPatreon {
+                            owned_tiers: owned_tiers.clone(),
+                            ..f
+                        })
+                    }),
                     ..failure
                 }),
             }
@@ -1616,6 +1688,7 @@ async fn materialize_from_link(
                 patreon_user_id: link.patreon_user_id.clone(),
                 campaign_id: None,
                 memberships,
+                owned_tiers: OwnedCampaignTiers::default(),
                 verified_at: now,
                 cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
             };
@@ -1748,6 +1821,149 @@ async fn fetch_consumer_memberships(
     Ok(parse_memberships_from_identity(&body))
 }
 
+/// The owned campaign's tiers for a creator link: fetched from Patreon, or
+/// the stored ones when the fetch cannot run (no numeric campaign id, a
+/// recorded scope list without `campaigns`) or fails. Never an error: a
+/// Patreon outage must not lock a creator out of their own content. No
+/// refresh of its own — a 401 here (the membership read refreshes the token
+/// concurrently) keeps the stored tiers until the next materialization.
+async fn owned_campaign_tiers(
+    state: &PatreonState,
+    link: &PatreonLink,
+    access_token: &str,
+) -> OwnedCampaignTiers {
+    let Some(cid) = link.campaign_id.as_deref().filter(|c| is_patreon_id(c)) else {
+        return link.owned_tiers.clone();
+    };
+    if !scopes_allow(&link.scopes, PATREON_CAMPAIGNS_SCOPE) {
+        info!(
+            "Patreon creator link for patreon_user_id_prefix={} lacks the {} scope; keeping its \
+             {} stored tiers (re-link to grant it)",
+            subject_prefix(&link.patreon_user_id),
+            PATREON_CAMPAIGNS_SCOPE,
+            link.owned_tiers.ids.len()
+        );
+        return link.owned_tiers.clone();
+    }
+    match fetch_campaign_tiers(&state.http, access_token, &state.campaigns_url, cid).await {
+        Ok(tiers) => tiers,
+        Err(e) => {
+            warn!(
+                "Patreon tier fetch failed for campaign {}: {} — keeping the {} stored tiers",
+                cid,
+                e,
+                link.owned_tiers.ids.len()
+            );
+            link.owned_tiers.clone()
+        }
+    }
+}
+
+/// Read a campaign's tier ladder: `GET <campaigns_url>/<cid>?include=tiers`
+/// with tier titles — the same ladder Creator's protect sheet loads. Needs
+/// the `campaigns` scope.
+async fn fetch_campaign_tiers(
+    http: &reqwest::Client,
+    access_token: &str,
+    campaigns_url: &str,
+    campaign_id: &str,
+) -> Result<OwnedCampaignTiers, PatreonError> {
+    let url = format!("{campaigns_url}/{campaign_id}?include=tiers&fields%5Btier%5D=title");
+    let resp = http
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| PatreonError::Api(format!("campaign GET: {}", e)))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(identity_fetch_error(status, &body));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| PatreonError::Api(format!("campaign JSON parse: {}", e)))?;
+    parse_campaign_tiers(&body, campaign_id)
+        .ok_or_else(|| PatreonError::Api("campaign response has no tiers for the campaign".into()))
+}
+
+/// Parse a `/campaigns/<cid>?include=tiers` document. The tier list is the
+/// campaign's `tiers` relationship; titles come from the `included` tier
+/// entries and slugify exactly as a membership's do. `None` when the
+/// document is not the requested campaign or has no `tiers` relationship
+/// (keep the stored tiers rather than replace them with nothing); a present
+/// but empty relationship is a campaign with no tiers.
+pub(crate) fn parse_campaign_tiers(
+    body: &serde_json::Value,
+    campaign_id: &str,
+) -> Option<OwnedCampaignTiers> {
+    let data = body.get("data")?;
+    if data.get("id").and_then(|v| v.as_str()) != Some(campaign_id) {
+        return None;
+    }
+    let listed = data
+        .get("relationships")?
+        .get("tiers")?
+        .get("data")?
+        .as_array()?;
+    let empty = Vec::new();
+    let included = body
+        .get("included")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let slug_by_id = tier_slugs_by_id(included);
+    let mut tiers = OwnedCampaignTiers::default();
+    for id in listed
+        .iter()
+        .filter_map(|t| t.get("id").and_then(|v| v.as_str()))
+    {
+        if !tiers.ids.iter().any(|t| t == id) {
+            tiers.ids.push(id.to_string());
+        }
+        if let Some(slug) = slug_by_id.get(id)
+            && !tiers.slugs.contains(slug)
+        {
+            tiers.slugs.push(slug.clone());
+        }
+    }
+    Some(tiers)
+}
+
+/// Index the `tier` entries of a JSON:API `included` array by id, to the
+/// slug each title contributes. Every tier with a (non-blank) title gets a
+/// non-empty, stable slug. Latin titles slugify to the creator's vocabulary;
+/// a title that is all non-ASCII (e.g. Japanese/emoji) slugifies to empty, so
+/// fall back to the numeric tier id — deterministic and unique, so
+/// international creators' tiers are still gateable. The Creator app applies
+/// the same fallback at tag time.
+fn tier_slugs_by_id(included: &[serde_json::Value]) -> HashMap<&str, String> {
+    let mut out = HashMap::new();
+    for entry in included {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("tier") {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(title) = entry
+            .get("attributes")
+            .and_then(|a| a.get("title"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if !title.trim().is_empty() {
+            let mut slug = slugify_tier(title);
+            if slug.is_empty() {
+                slug = format!("tier-{id}");
+            }
+            out.insert(id, slug);
+        }
+    }
+    out
+}
+
 /// Parse the Patreon JSON:API document into our membership shape.
 ///
 /// JSON:API stores memberships in the `included` array (type=`member`), with
@@ -1764,35 +1980,7 @@ pub(crate) fn parse_memberships_from_identity(
 
     // First pass: index tier id -> slugified title so each membership can
     // surface the creator's own tier vocabulary, not just opaque ids.
-    let mut tier_slug_by_id: std::collections::HashMap<&str, String> =
-        std::collections::HashMap::new();
-    for entry in included {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("tier") {
-            continue;
-        }
-        let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if let Some(title) = entry
-            .get("attributes")
-            .and_then(|a| a.get("title"))
-            .and_then(|v| v.as_str())
-        {
-            // Every tier with a (non-blank) title gets a non-empty, stable
-            // slug. Latin titles slugify to the creator's vocabulary; a
-            // title that is all non-ASCII (e.g. Japanese/emoji) slugifies to
-            // empty, so fall back to the numeric tier id — deterministic and
-            // unique, so international creators' tiers are still gateable.
-            // The Creator app applies the same fallback at tag time.
-            if !title.trim().is_empty() {
-                let mut slug = slugify_tier(title);
-                if slug.is_empty() {
-                    slug = format!("tier-{id}");
-                }
-                tier_slug_by_id.insert(id, slug);
-            }
-        }
-    }
+    let tier_slug_by_id = tier_slugs_by_id(included);
 
     let mut out = Vec::new();
     for entry in included {
@@ -1882,7 +2070,8 @@ const ACTIVE_PATRON: &str = "active_patron";
 ///   `campaign-tier/value/<cid>_<slug>` (the creator's vocabulary) and
 ///   `campaign-tier/value/<cid>_tier-<tier_id>` (rename-proof, #42);
 /// - a `role=creator` link gets `campaign/value/<cid>` for the campaign it
-///   owns. Its tiers are not in the snapshot yet.
+///   owns and, for every tier of it, the same two `campaign-tier` forms (#99:
+///   every archive Creator protects requires a tier).
 ///
 /// A title slug shaped like the id form (`tier-<digits>`) is never emitted
 /// as a slug (see [`is_emittable_slug`]). A stale snapshot yields nothing,
@@ -1894,28 +2083,35 @@ pub(crate) fn campaign_entitlements(snap: &ArkavoPatreon, now: i64) -> Vec<Strin
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
-    let mut push = |v: String| {
-        if !out.contains(&v) {
-            out.push(v);
+    let mut push_campaign = |cid: &str, slugs: &[String], ids: &[String]| {
+        let values = std::iter::once(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"))
+            .chain(
+                slugs
+                    .iter()
+                    .filter(|s| is_emittable_slug(s))
+                    .map(|slug| format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_{slug}")),
+            )
+            .chain(
+                ids.iter()
+                    .filter(|t| is_patreon_id(t))
+                    .map(|id| format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_tier-{id}")),
+            );
+        for v in values {
+            if !out.contains(&v) {
+                out.push(v);
+            }
         }
     };
     if snap.role == "creator"
         && let Some(cid) = snap.campaign_id.as_deref().filter(|c| is_patreon_id(c))
     {
-        push(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"));
+        push_campaign(cid, &snap.owned_tiers.slugs, &snap.owned_tiers.ids);
     }
     for m in &snap.memberships {
         if m.patron_status.as_deref() != Some(ACTIVE_PATRON) || !is_patreon_id(&m.campaign_id) {
             continue;
         }
-        let cid = &m.campaign_id;
-        push(format!("{PATREON_CAMPAIGN_FQN_PREFIX}{cid}"));
-        for slug in m.tier_slugs.iter().filter(|s| is_emittable_slug(s)) {
-            push(format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_{slug}"));
-        }
-        for id in m.tier_ids.iter().filter(|t| is_patreon_id(t)) {
-            push(format!("{PATREON_CAMPAIGN_TIER_FQN_PREFIX}{cid}_tier-{id}"));
-        }
+        push_campaign(&m.campaign_id, &m.tier_slugs, &m.tier_ids);
     }
     out
 }
@@ -2023,6 +2219,7 @@ mod tests {
             patreon_user_id: "999".into(),
             campaign_id: campaign_id.map(Into::into),
             memberships,
+            owned_tiers: Default::default(),
             verified_at: 1_000,
             cache_expires_at: 2_000,
         }
@@ -2116,6 +2313,121 @@ mod tests {
         // stray one is not honoured without role=creator.
         let consumer = campaign_snap("consumer", Some("42"), vec![]);
         assert!(campaign_entitlements(&consumer, 1_500).is_empty());
+    }
+
+    fn owned(ids: &[&str], slugs: &[&str]) -> OwnedCampaignTiers {
+        OwnedCampaignTiers {
+            ids: ids.iter().map(|t| t.to_string()).collect(),
+            slugs: slugs.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn creator_gets_every_owned_tier_in_both_forms() {
+        // #99: Creator gates every archive on campaign + a tier, so the
+        // campaign value alone opens none of the creator's own content.
+        let snap = ArkavoPatreon {
+            owned_tiers: owned(&["10", "11"], &["free", "supporter"]),
+            ..campaign_snap(
+                "creator",
+                Some("42"),
+                vec![membership("123", Some("active_patron"), &["55"], &["gold"])],
+            )
+        };
+        assert_eq!(
+            campaign_entitlements(&snap, 1_500),
+            vec![
+                format!("{C}42"),
+                format!("{CT}42_free"),
+                format!("{CT}42_supporter"),
+                format!("{CT}42_tier-10"),
+                format!("{CT}42_tier-11"),
+                format!("{C}123"),
+                format!("{CT}123_gold"),
+                format!("{CT}123_tier-55"),
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_tiers_need_role_creator_and_a_canonical_campaign() {
+        let tiers = owned(&["10"], &["free"]);
+        // A stray owned list on a consumer snapshot is not honoured.
+        let consumer = ArkavoPatreon {
+            owned_tiers: tiers.clone(),
+            ..campaign_snap("consumer", Some("42"), vec![])
+        };
+        assert!(campaign_entitlements(&consumer, 1_500).is_empty());
+        // Nor on a creator whose campaign id is not canonical.
+        let odd = ArkavoPatreon {
+            owned_tiers: tiers.clone(),
+            ..campaign_snap("creator", Some("42/x"), vec![])
+        };
+        assert!(campaign_entitlements(&odd, 1_500).is_empty());
+        // Non-canonical ids and slugs, and an id-shaped slug, are dropped as
+        // for memberships.
+        let creator = ArkavoPatreon {
+            owned_tiers: owned(&["10", "x1"], &["free", "Gold", "tier-99", "a_b"]),
+            ..campaign_snap("creator", Some("42"), vec![])
+        };
+        assert_eq!(
+            campaign_entitlements(&creator, 1_500),
+            vec![
+                format!("{C}42"),
+                format!("{CT}42_free"),
+                format!("{CT}42_tier-10"),
+            ]
+        );
+        // Stale: nothing at all.
+        assert!(campaign_entitlements(&creator, 2_001).is_empty());
+    }
+
+    #[test]
+    fn parse_campaign_tiers_reads_the_ladder() {
+        let body = serde_json::json!({
+            "data": {
+                "id": "42",
+                "type": "campaign",
+                "relationships": {"tiers": {"data": [
+                    {"id": "10", "type": "tier"},
+                    {"id": "11", "type": "tier"},
+                    {"id": "12", "type": "tier"},
+                    {"id": "13", "type": "tier"},
+                    {"id": "14", "type": "tier"}
+                ]}}
+            },
+            "included": [
+                {"type": "tier", "id": "10", "attributes": {"title": "Free"}},
+                {"type": "tier", "id": "11", "attributes": {"title": "Supporter"}},
+                // Collides with "Supporter": one slug, both ids.
+                {"type": "tier", "id": "12", "attributes": {"title": "supporter!"}},
+                // All non-ASCII: the id fallback, as at tag time.
+                {"type": "tier", "id": "13", "attributes": {"title": "サポーター"}},
+                // No title: id form only.
+                {"type": "tier", "id": "14", "attributes": {}},
+                {"type": "tier", "id": "99", "attributes": {"title": "Not listed"}}
+            ]
+        });
+        let tiers = parse_campaign_tiers(&body, "42").expect("tiers");
+        assert_eq!(tiers.ids, vec!["10", "11", "12", "13", "14"]);
+        assert_eq!(tiers.slugs, vec!["free", "supporter", "tier-13"]);
+    }
+
+    #[test]
+    fn parse_campaign_tiers_refuses_another_campaign_or_no_relationship() {
+        let other = serde_json::json!({
+            "data": {"id": "43", "relationships": {"tiers": {"data": []}}}
+        });
+        assert_eq!(parse_campaign_tiers(&other, "42"), None);
+        let missing = serde_json::json!({"data": {"id": "42"}});
+        assert_eq!(parse_campaign_tiers(&missing, "42"), None);
+        let none = serde_json::json!({
+            "data": {"id": "42", "relationships": {"tiers": {"data": []}}}
+        });
+        assert_eq!(
+            parse_campaign_tiers(&none, "42"),
+            Some(OwnedCampaignTiers::default())
+        );
     }
 
     #[test]
@@ -2547,6 +2859,7 @@ mod tests {
                 tier_ids: vec!["tier-1".into()],
                 tier_slugs: vec!["tier-1".into()],
             }],
+            owned_tiers: Default::default(),
             verified_at: now,
             cache_expires_at: now + 300,
         };
@@ -2614,6 +2927,7 @@ mod tests {
             refresh_token_nonce: refresh.nonce,
             wrapped_dek: access.wrapped_dek,
             token_expires_at: now + 3600,
+            owned_tiers: Default::default(),
             linked_at: now,
         }
     }
@@ -2695,6 +3009,7 @@ mod tests {
             cache: MembershipCache::new(redis),
             token_url: PATREON_TOKEN_URL.to_string(),
             identity_url: PATREON_IDENTITY_URL.to_string(),
+            campaigns_url: PATREON_CAMPAIGNS_URL.to_string(),
         };
         let result = materialize_from_link(&state, &link).await;
         assert!(
@@ -2778,6 +3093,7 @@ mod tests {
             cache: MembershipCache::new(redis),
             token_url,
             identity_url,
+            campaigns_url: PATREON_CAMPAIGNS_URL.to_string(),
         };
 
         let (snap, refreshed) = materialize_from_link(&state, &link)
@@ -2832,6 +3148,7 @@ mod tests {
             cache: MembershipCache::new(redis),
             token_url,
             identity_url,
+            campaigns_url: PATREON_CAMPAIGNS_URL.to_string(),
         };
 
         let failure = materialize_from_link(&state, &link)
@@ -2889,19 +3206,22 @@ mod tests {
             sealer: Some(sealer.clone()),
             http,
             cache: MembershipCache::new(redis),
+            campaigns_url: identity_url.replace("/identity", "/campaigns"),
             token_url,
             identity_url,
         }
     }
 
     #[test]
-    fn memberships_scope_check() {
-        assert!(scopes_allow_memberships(""));
-        assert!(scopes_allow_memberships(
-            "identity identity.memberships campaigns"
-        ));
-        assert!(!scopes_allow_memberships("identity campaigns"));
-        assert!(!scopes_allow_memberships("identity.memberships.extra"));
+    fn scope_check() {
+        let m = PATREON_MEMBERSHIPS_SCOPE;
+        assert!(scopes_allow("", m));
+        assert!(scopes_allow("identity identity.memberships campaigns", m));
+        assert!(!scopes_allow("identity campaigns", m));
+        assert!(!scopes_allow("identity.memberships.extra", m));
+        let c = PATREON_CAMPAIGNS_SCOPE;
+        assert!(scopes_allow("identity campaigns", c));
+        assert!(!scopes_allow("identity campaigns.members", c));
     }
 
     #[tokio::test]
@@ -2934,6 +3254,151 @@ mod tests {
         let new_link = refreshed.expect("the 401 must have refreshed");
         assert_eq!(new_link.role, "creator");
         assert_eq!(new_link.campaign_id.as_deref(), Some("creators-own"));
+    }
+
+    /// A Patreon stand-in for a creator that owns campaign 42: `/identity`
+    /// answers one active membership; `/campaigns/42` answers a two-tier
+    /// ladder with `campaign_status`. Returns `(identity_url, campaign hits)`.
+    async fn spawn_creator_mock(
+        campaign_status: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status_line, body) = if req
+                        .starts_with("GET /v2/campaigns/42?include=tiers")
+                    {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            campaign_status,
+                            r#"{"data":{"id":"42","type":"campaign","relationships":{"tiers":{"data":[{"id":"10","type":"tier"},{"id":"11","type":"tier"}]}}},"included":[{"type":"tier","id":"10","attributes":{"title":"Free"}},{"type":"tier","id":"11","attributes":{"title":"Supporter"}}]}"#,
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"data":{"id":"p-1"},"included":[{"type":"member","id":"m1","attributes":{"patron_status":"active_patron"},"relationships":{"campaign":{"data":{"id":"123"}},"currently_entitled_tiers":{"data":[]}}}]}"#,
+                        )
+                    };
+                    let resp = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/v2/identity"), hits)
+    }
+
+    async fn owning_creator_link(sealer: &TokenSealer, scopes: &str) -> PatreonLink {
+        PatreonLink {
+            campaign_id: Some("42".into()),
+            owned_tiers: owned(&["9"], &["old"]),
+            ..creator_link_with_token(sealer, b"access", scopes).await
+        }
+    }
+
+    #[tokio::test]
+    async fn creator_snapshot_carries_the_owned_campaign_tiers() {
+        let sealer = TokenSealer::Plaintext;
+        let link = owning_creator_link(&sealer, "identity identity.memberships campaigns").await;
+        let (identity_url, hits) = spawn_creator_mock("HTTP/1.1 200 OK").await;
+        let state = enabled_state(
+            &sealer,
+            reqwest::Client::new(),
+            PATREON_TOKEN_URL.into(),
+            identity_url,
+        );
+        let (snap, refreshed) = materialize_from_link(&state, &link).await.unwrap();
+        assert!(refreshed.is_none());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            snap.owned_tiers,
+            owned(&["10", "11"], &["free", "supporter"])
+        );
+        assert_eq!(snap.memberships.len(), 1);
+        let ents = campaign_entitlements(&snap, Utc::now().timestamp());
+        for want in ["42_free", "42_supporter", "42_tier-10", "42_tier-11"] {
+            assert!(ents.contains(&format!("{CT}{want}")), "{want}: {ents:?}");
+        }
+        // The cache keeps them.
+        let cached: ArkavoPatreon = SerializableMaterialized::from(&snap).into();
+        assert_eq!(cached, snap);
+    }
+
+    #[tokio::test]
+    async fn failed_tier_fetch_keeps_the_stored_tiers() {
+        let sealer = TokenSealer::Plaintext;
+        let link = owning_creator_link(&sealer, "identity identity.memberships campaigns").await;
+        let (identity_url, hits) = spawn_creator_mock("HTTP/1.1 503 Service Unavailable").await;
+        let state = enabled_state(
+            &sealer,
+            reqwest::Client::new(),
+            PATREON_TOKEN_URL.into(),
+            identity_url,
+        );
+        let (snap, _) = materialize_from_link(&state, &link).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(snap.owned_tiers, link.owned_tiers);
+        // Memberships are unaffected by the tier failure.
+        assert_eq!(snap.memberships.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn creator_without_campaigns_scope_skips_the_tier_fetch() {
+        let sealer = TokenSealer::Plaintext;
+        let link = owning_creator_link(&sealer, "identity identity.memberships").await;
+        let (identity_url, hits) = spawn_creator_mock("HTTP/1.1 200 OK").await;
+        let state = enabled_state(
+            &sealer,
+            reqwest::Client::new(),
+            PATREON_TOKEN_URL.into(),
+            identity_url,
+        );
+        let (snap, _) = materialize_from_link(&state, &link).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(snap.owned_tiers, link.owned_tiers);
+    }
+
+    #[tokio::test]
+    async fn creator_fallback_keeps_the_stored_tiers() {
+        let sealer = TokenSealer::Plaintext;
+        let link = owning_creator_link(&sealer, "").await;
+        let fallback = creator_fallback(&link, 1_000).expect("creator fallback");
+        assert_eq!(fallback.owned_tiers, link.owned_tiers);
+        assert!(fallback.memberships.is_empty());
+        // And a membership failure falls back with whatever the tier read
+        // produced (here: unreachable, so the stored ones).
+        let state = enabled_state(
+            &sealer,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        );
+        let failure = materialize_from_link(&state, &link).await.unwrap_err();
+        assert_eq!(
+            failure.fallback.expect("creator fallback").owned_tiers,
+            link.owned_tiers
+        );
+    }
+
+    #[test]
+    fn cached_snapshot_without_owned_tiers_still_reads() {
+        // Cache rows written before #99 have no owned_tier_* keys.
+        let old = r#"{"role":"creator","patreon_user_id":"p","campaign_id":"42","memberships":[],"verified_at":1,"cache_expires_at":2}"#;
+        let snap: ArkavoPatreon = serde_json::from_str::<SerializableMaterialized>(old)
+            .unwrap()
+            .into();
+        assert_eq!(snap.owned_tiers, OwnedCampaignTiers::default());
     }
 
     #[tokio::test]
@@ -3119,6 +3584,7 @@ mod tests {
             patreon_user_id: "p".into(),
             campaign_id: None,
             memberships: vec![],
+            owned_tiers: Default::default(),
             verified_at: now,
             cache_expires_at: now + 3600, // not expired, so retain can't reclaim
         };
@@ -3143,6 +3609,7 @@ mod tests {
             patreon_user_id: "p-1".into(),
             campaign_id: None,
             memberships: vec![],
+            owned_tiers: Default::default(),
             verified_at: 0,
             cache_expires_at: 1, // already expired
         };
@@ -3163,6 +3630,7 @@ mod tests {
             patreon_user_id: "p-1".into(),
             campaign_id: Some("c-1".into()),
             memberships: vec![],
+            owned_tiers: Default::default(),
             verified_at: now,
             cache_expires_at: now + 3600,
         };
