@@ -171,10 +171,24 @@ pub struct ArkavoPatreon {
     /// creator links alike (a creator's list is empty when its link lacks
     /// the `identity.memberships` scope or the fetch failed).
     pub memberships: Vec<ArkavoPatreonMembership>,
+    /// Creator-only: every tier of the owned `campaign_id`, so the creator's
+    /// token opens content gated on any of them (#99). Empty for consumers.
+    /// Feeds `arkavo_entitlements` only; never encoded in the
+    /// `arkavo_patreon` claim (a decoded snapshot has it empty).
+    pub owned_tiers: OwnedCampaignTiers,
     /// Unix timestamp when this snapshot was materialized.
     pub verified_at: i64,
     /// Unix timestamp after which the snapshot is stale.
     pub cache_expires_at: i64,
+}
+
+/// The tiers of a creator's own campaign, in the same two shapes a
+/// membership carries its entitled tiers: Patreon tier ids and the
+/// deduplicated title slugs (an independent set, not parallel to `ids`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedCampaignTiers {
+    pub ids: Vec<String>,
+    pub slugs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,6 +807,7 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
         patreon_user_id: patreon_user_id.ok_or(CwtError::Malformed)?,
         campaign_id,
         memberships,
+        owned_tiers: OwnedCampaignTiers::default(),
         verified_at: verified_at.ok_or(CwtError::Malformed)?,
         cache_expires_at: cache_expires_at.ok_or(CwtError::Malformed)?,
     })
@@ -1280,6 +1295,7 @@ mod tests {
                     tier_slugs: vec![],
                 },
             ],
+            owned_tiers: Default::default(),
             verified_at: 1_700_000_000,
             cache_expires_at: 1_700_000_300,
         };
@@ -1297,6 +1313,7 @@ mod tests {
             patreon_user_id: "patreon-user-7".into(),
             campaign_id: Some("camp-9".into()),
             memberships: vec![],
+            owned_tiers: Default::default(),
             verified_at: 1_700_000_000,
             cache_expires_at: 1_700_000_300,
         };

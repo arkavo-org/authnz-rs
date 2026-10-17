@@ -369,6 +369,13 @@ impl DynamoDBStore {
         if let Some(cid) = &link.campaign_id {
             item_builder = item_builder.item("campaign_id", AttributeValue::S(cid.clone()));
         }
+        // A token rotation rewrites the whole row, so it must carry the
+        // stored owned tiers forward or the creator fallback loses them.
+        if !link.owned_tiers.ids.is_empty() || !link.owned_tiers.slugs.is_empty() {
+            item_builder = item_builder
+                .item(OWNED_TIER_IDS, string_list(&link.owned_tiers.ids))
+                .item(OWNED_TIER_SLUGS, string_list(&link.owned_tiers.slugs));
+        }
 
         match item_builder.send().await {
             Ok(_) => Ok(()),
@@ -390,6 +397,54 @@ impl DynamoDBStore {
                     error!("Unknown error writing to patreon_tokens table: {:?}", err);
                     Err(DynamoDBError::SdkError(err.to_string()))
                 }
+            },
+        }
+    }
+
+    /// Record what Patreon says a link owns (#99): its campaign and that
+    /// campaign's tiers, and the role that follows (`creator` with a
+    /// campaign, `consumer` without, which removes all three). One
+    /// conditional `UpdateItem` on the row still being the same link (same
+    /// Patreon user, same `linked_at`), so a re-link or unlink in the
+    /// meantime is never overwritten. `Ok(false)` when that condition fails.
+    pub async fn put_patreon_ownership(
+        &self,
+        user_id: Uuid,
+        patreon_user_id: &str,
+        linked_at: i64,
+        campaign_id: Option<&str>,
+        tiers: &crate::cwt::OwnedCampaignTiers,
+    ) -> Result<bool, DynamoDBError> {
+        let mut update = self
+            .client
+            .update_item()
+            .table_name(&self.patreon_tokens_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .condition_expression(
+                "attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at = :la",
+            )
+            .expression_attribute_names("#role", "role")
+            .expression_attribute_names("#cid", "campaign_id")
+            .expression_attribute_names("#ids", OWNED_TIER_IDS)
+            .expression_attribute_names("#slugs", OWNED_TIER_SLUGS)
+            .expression_attribute_values(":pid", AttributeValue::S(patreon_user_id.to_string()))
+            .expression_attribute_values(":la", AttributeValue::N(linked_at.to_string()));
+        update = match campaign_id {
+            Some(cid) => update
+                .update_expression("SET #role = :role, #cid = :cid, #ids = :ids, #slugs = :slugs")
+                .expression_attribute_values(":role", AttributeValue::S("creator".into()))
+                .expression_attribute_values(":cid", AttributeValue::S(cid.to_string()))
+                .expression_attribute_values(":ids", string_list(&tiers.ids))
+                .expression_attribute_values(":slugs", string_list(&tiers.slugs)),
+            None => update
+                .update_expression("SET #role = :role REMOVE #cid, #ids, #slugs")
+                .expression_attribute_values(":role", AttributeValue::S("consumer".into())),
+        };
+        match update.send().await {
+            Ok(_) => Ok(true),
+            Err(e) => match agent_state::classify(e, &self.patreon_tokens_table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
             },
         }
     }
@@ -1967,6 +2022,35 @@ impl DynamoDBStore {
     }
 }
 
+/// `patreon_tokens` attributes holding a creator link's owned campaign tiers.
+const OWNED_TIER_IDS: &str = "campaign_tier_ids";
+const OWNED_TIER_SLUGS: &str = "campaign_tier_slugs";
+
+fn string_list(values: &[String]) -> AttributeValue {
+    AttributeValue::L(values.iter().cloned().map(AttributeValue::S).collect())
+}
+
+/// A stored owned-tier list. Absent (rows written before #99) reads as empty,
+/// and so does a malformed one: failing the read would cost the link its
+/// memberships too, while the next successful tier fetch rewrites it.
+fn read_owned_tier_list(
+    item: &std::collections::HashMap<String, AttributeValue>,
+    key: &str,
+) -> Vec<String> {
+    let Some(v) = item.get(key) else {
+        return Vec::new();
+    };
+    let parsed: Option<Vec<String>> = v.as_l().ok().and_then(|l| {
+        l.iter()
+            .map(|e| e.as_s().ok().map(|s| s.to_string()))
+            .collect()
+    });
+    parsed.unwrap_or_else(|| {
+        warn!("Malformed patreon field {}; reading it as empty", key);
+        Vec::new()
+    })
+}
+
 fn item_to_patreon_link(
     item: &std::collections::HashMap<String, AttributeValue>,
 ) -> Result<crate::patreon::PatreonLink, DynamoDBError> {
@@ -2025,6 +2109,10 @@ fn item_to_patreon_link(
         .get("campaign_id")
         .and_then(|v| v.as_s().ok())
         .map(|s| s.to_string());
+    let owned_tiers = crate::cwt::OwnedCampaignTiers {
+        ids: read_owned_tier_list(item, OWNED_TIER_IDS),
+        slugs: read_owned_tier_list(item, OWNED_TIER_SLUGS),
+    };
 
     Ok(crate::patreon::PatreonLink {
         user_id,
@@ -2040,6 +2128,7 @@ fn item_to_patreon_link(
         wrapped_dek,
         token_expires_at,
         linked_at,
+        owned_tiers,
     })
 }
 
@@ -2355,6 +2444,90 @@ pub(crate) mod tests {
             store.get_identity_link("apple", &subject).await.unwrap(),
             None
         );
+    }
+
+    fn creator_patreon_link(user_id: Uuid, campaign_id: &str) -> crate::patreon::PatreonLink {
+        crate::patreon::PatreonLink {
+            user_id,
+            role: "creator".into(),
+            client_id: "c".into(),
+            patreon_user_id: "p-1".into(),
+            campaign_id: Some(campaign_id.into()),
+            scopes: "identity campaigns".into(),
+            access_token_ct: vec![1],
+            access_token_nonce: vec![2],
+            refresh_token_ct: vec![3],
+            refresh_token_nonce: vec![4],
+            wrapped_dek: vec![5],
+            token_expires_at: 10,
+            linked_at: 1,
+            owned_tiers: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_stores_only_on_the_same_link_and_survives_a_rotation() {
+        let Some(store) = local_store() else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let tiers = crate::cwt::OwnedCampaignTiers {
+            ids: vec!["10".into(), "11".into()],
+            slugs: vec!["free".into()],
+        };
+        // No row: nothing is created.
+        assert!(
+            !store
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers)
+                .await
+                .unwrap()
+        );
+        assert!(store.get_patreon_link(user_id).await.unwrap().is_none());
+
+        // A consumer link whose account turns out to own campaign 42.
+        let link = crate::patreon::PatreonLink {
+            role: "consumer".into(),
+            campaign_id: None,
+            ..creator_patreon_link(user_id, "unused")
+        };
+        store.put_patreon_link(&link).await.unwrap();
+        // Another link generation (a re-link raced this write): refused.
+        for (pid, la) in [("p-2", 1), ("p-1", 2)] {
+            assert!(
+                !store
+                    .put_patreon_ownership(user_id, pid, la, Some("42"), &tiers)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            store
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers)
+                .await
+                .unwrap()
+        );
+        let stored = store.get_patreon_link(user_id).await.unwrap().unwrap();
+        assert_eq!(stored.role, "creator");
+        assert_eq!(stored.campaign_id.as_deref(), Some("42"));
+        assert_eq!(stored.owned_tiers, tiers);
+
+        // A token rotation rewrites the row from the link it read.
+        store.put_patreon_link(&stored).await.unwrap();
+        let rotated = store.get_patreon_link(user_id).await.unwrap().unwrap();
+        assert_eq!(rotated.owned_tiers, tiers);
+        assert_eq!(rotated.campaign_id.as_deref(), Some("42"));
+
+        // Patreon now says it owns none: back to a consumer row.
+        assert!(
+            store
+                .put_patreon_ownership(user_id, "p-1", 1, None, &Default::default())
+                .await
+                .unwrap()
+        );
+        let gone = store.get_patreon_link(user_id).await.unwrap().unwrap();
+        assert_eq!(gone.role, "consumer");
+        assert_eq!(gone.campaign_id, None);
+        assert_eq!(gone.owned_tiers, Default::default());
     }
 
     #[test]

@@ -12,8 +12,10 @@ paths:
 - `POST /oauth/patreon/link`: **Auth-required** link path (the *only* new
   endpoint surface for Patreon — there is deliberately no `/me/patreon`,
   `/entitlements/...`, or status endpoint). Body:
-  `{ "code": "<oauth-code>", "redirect_uri": "<a registered redirect URI>",
-  "role": "creator"|"consumer" }`. Behaviour:
+  `{ "code": "<oauth-code>", "redirect_uri": "<a registered redirect URI>" }`.
+  A `role` field is accepted and **ignored** (#99): whether a link is a
+  creator's is whether Patreon says the account owns a campaign. The
+  response's `role` reports that. Behaviour:
     1. Verifies the inbound `X-Auth-Token` CWT (`sub` is the arkavo user_id).
     2. Resolves the registered Patreon client by `redirect_uri` (Patreon
        issues one client per app) and exchanges `code` at
@@ -21,7 +23,9 @@ paths:
        credentials. The issuing `client_id` is persisted with the token
        bundle so refresh uses the same client's secret.
     3. Fetches `/api/oauth2/v2/identity` to discover the Patreon `user.id`
-       (and, for creators, the owned `campaign.id`).
+       and, when the granted scopes include `campaigns`
+       (`?include=campaign`), the owned `campaign.id`. Stored `role` is
+       `creator` with a campaign, else `consumer`.
     4. Conditional put on `identity_links` for per-Patreon-account
        uniqueness — HTTP 409 if the Patreon account is already linked to a
        *different* arkavo user; idempotent re-link to the same user.
@@ -36,20 +40,28 @@ paths:
   through the one builder `oidc::arkavo_user_claims` (passkey auth CWT,
   DeviceCheck CWT, OIDC access token on code exchange and refresh), which
   calls [`materialize_for_user_bounded`] (3 s deadline) before minting. For
-  **both roles** this queries Patreon's
-  `/identity?include=memberships,memberships.currently_entitled_tiers,memberships.campaign`
-  (refresh once on 401) and builds an `ArkavoPatreon { role,
-  patreon_user_id, campaign_id?, memberships, verified_at,
-  cache_expires_at }` snapshot; a creator's snapshot also keeps its stored
-  owned `campaign_id`. Results are cached in Redis (with in-memory
-  fallback) for `PATREON_CACHE_TTL_SECONDS` (5 min).
-- **Creator links and `identity.memberships`**: a creator whose stored
-  `scopes` are recorded and lack `identity.memberships` is not queried (the
-  snapshot has the campaign and no memberships) and must re-link to qualify
-  for membership-derived entitlements. A creator whose fetch fails or misses
-  the mint deadline gets its campaign claim with no memberships (built before
-  the Patreon work is spawned), cached for `PATREON_FAILURE_CACHE_TTL_SECONDS`
-  (60 s). A refresh whose `scope` is empty or a strict subset of the stored
+  **every link** this makes one `/identity` read (refresh once on 401):
+  `include=memberships,memberships.currently_entitled_tiers,memberships.campaign`
+  with `identity.memberships`, plus `campaign` when the recorded scopes
+  name `campaigns` (only then: asking without it could fail the whole
+  read). It builds an `ArkavoPatreon { role, patreon_user_id, campaign_id?,
+  memberships, owned_tiers, verified_at, cache_expires_at }` snapshot.
+  **Ownership is re-read every time** (#99): `role=creator` and
+  `campaign_id` exactly when Patreon reports an owned campaign, so a patron
+  who launches a campaign is picked up within the cache TTL and one who no
+  longer owns one becomes `consumer`. Without `campaigns` the stored
+  campaign (a link made before #99) is kept as it was. A changed answer is
+  written back to the row (`put_patreon_ownership`). The claim's shape is
+  unchanged. Results are cached in Redis (with in-memory fallback) for
+  `PATREON_CACHE_TTL_SECONDS` (5 min).
+- **Scopes and fallback**: a link whose stored `scopes` are recorded and
+  lack `identity.memberships` gets no memberships, and without `campaigns`
+  either it is not queried at all; it must re-link to qualify for
+  membership-derived entitlements. A link last seen owning a campaign whose
+  read fails or misses the mint deadline gets `owner_fallback`: its stored
+  campaign and tiers, no memberships (built before the Patreon work is
+  spawned), cached for `PATREON_FAILURE_CACHE_TTL_SECONDS` (60 s). Any other
+  link fails closed with no claim. A refresh whose `scope` is empty or a strict subset of the stored
   scopes keeps the stored scopes. A stored copy of the publish FQN in
   `credentials.entitlements` is dropped on every read.
 - **Creator-publishing entitlement** (#91, `src/publishing.rs`):
@@ -70,8 +82,19 @@ paths:
   strand content tagged with the id form). A title slug matching
   `^tier-[0-9]+$` is dropped — "Tier 10234567" would otherwise impersonate
   tier 10234567's id form; the id form already covers the non-ASCII
-  fallback. A creator link adds its owned
-  campaign value. The platform's arkavo-mode ERS only lowercases, so values
+  fallback. An owner (`role=creator`) adds its owned campaign value and
+  **every tier of that campaign** in both forms (#99: Creator gates every
+  archive on a tier, so the campaign value alone opens nothing). The tiers
+  come from `GET /api/oauth2/v2/campaigns/<cid>?include=tiers&fields[tier]=title`
+  (needs `campaigns`; a recorded scope list without it skips the call),
+  read after `/identity` with the token that worked there (so a refreshed
+  one). A changed campaign or tier list is written to the `patreon_tokens`
+  row (`campaign_id`, `campaign_tier_ids` / `campaign_tier_slugs`, `role`;
+  one conditional `UpdateItem` on the same Patreon user and `linked_at`). A
+  failed tier read keeps the stored list (of the same campaign only), as do
+  the owner fallback and a missed mint deadline, so a creator is never
+  locked out of their own content by a Patreon outage. The owned tiers are
+  not in the `arkavo_patreon` claim. The platform's arkavo-mode ERS only lowercases, so values
   must be canonical: non-numeric ids and non-`slugify_tier` slugs are
   dropped. The whole `https://patreon.arkavo.com/` namespace is derived-only
   (`constants::is_derived_only`).

@@ -368,8 +368,16 @@ appraisal, status)
   in **both** the title-slug form and the rename-proof `tier-<tier_id>` form
   (#42). A title slug shaped like the id form (`^tier-[0-9]+$`, e.g. a tier
   titled "Tier 10234567") is never emitted: it would unlock that other
-  tier's id-tagged content. A `role=creator` link adds its own campaign value (not yet its
-  tiers). What the platform's arkavo-mode ERS consumes in place of
+  tier's id-tagged content. **Creator = owns a campaign, per Patreon** (#99):
+  every materialization asks `/identity` for the owned `campaign` (when the
+  link holds the `campaigns` scope) and derives `role` from the answer; the
+  `role` a client sends to `/oauth/patreon/link` is ignored. An owner adds
+  its campaign value and every tier of it, in both forms, so a creator can
+  open their own gated content: the tiers come from
+  `GET /campaigns/<cid>?include=tiers` and are saved on the `patreon_tokens`
+  row (`campaign_tier_ids` / `campaign_tier_slugs`) so a failed fetch or the
+  owner fallback keeps the last ones fetched.
+  What the platform's arkavo-mode ERS consumes in place of
   `arkavo_patreon`, which is still minted until the platform cuts over.
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**
   (`constants::is_derived_only`): refused by `validate_fqns`, stripped from

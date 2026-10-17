@@ -1140,6 +1140,7 @@ mod tests {
                 tier_ids: vec!["tier-gold".into()],
                 tier_slugs: vec!["gold".into()],
             }],
+            owned_tiers: Default::default(),
             verified_at: 1_700_000_000,
             cache_expires_at: 1_700_000_300,
         }

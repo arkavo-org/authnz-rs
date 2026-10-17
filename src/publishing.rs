@@ -430,6 +430,7 @@ mod tests {
             patreon_user_id: "p-1".into(),
             campaign_id: None,
             memberships,
+            owned_tiers: Default::default(),
             verified_at: now,
             cache_expires_at: now + 300,
         }
