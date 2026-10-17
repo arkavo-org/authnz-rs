@@ -26,9 +26,10 @@ The entitlement is **computed when a token is minted, and never stored**.
   Only memberships count. A staff account linked as the *creator* of Arkavo's
   campaign owns that campaign but is not a patron of it, so it does not qualify.
 - **Link role does not matter.** Consumer and creator links qualify in the same
-  way. Creator links now fetch memberships with the same `/identity` call and
-  the same refresh-on-401 path as consumer links. A creator's `arkavo_patreon`
-  claim keeps its owned `campaign_id` and now also lists its memberships.
+  way: every link fetches memberships with the same `/identity` call and the
+  same refresh-on-401 path. A creator's `arkavo_patreon` claim keeps its owned
+  `campaign_id` and also lists its memberships. Since #99 the role is not the
+  client's: it is `creator` when Patreon reports an owned campaign.
 - **Where it appears:** it is appended to `arkavo_entitlements`, after the
   stored list, on:
   - the passkey auth CWT (`POST /authenticate`);
@@ -74,8 +75,8 @@ expire, which is at most 1 hour.
 The Patreon token needs the `identity.memberships` scope to return
 memberships.
 
-- A creator link whose stored `patreon_tokens.scopes` lacks that scope is not
-  queried. Its snapshot carries the owned campaign and no memberships, so it
+- A link whose stored `patreon_tokens.scopes` lacks that scope gets no
+  memberships. An owner's snapshot still carries the owned campaign, so it
   never qualifies. The creator must re-link (`POST /oauth/patreon/link`), and
   the app must request `identity.memberships` in the authorize step.
 - An empty `scopes` value (not recorded) is still queried.

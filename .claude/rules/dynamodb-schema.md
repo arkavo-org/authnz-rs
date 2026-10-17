@@ -151,7 +151,9 @@ paths:
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link
   overwrites in place.
 - **Attributes**:
-  - role (String) - `creator` or `consumer`
+  - role (String) - `creator` or `consumer`: whether Patreon last reported
+    an owned campaign (#99), never the client's word. Rewritten with
+    `campaign_id` by materialization when the answer changes.
   - client_id (String) - The Patreon OAuth client that performed the code
     exchange; refresh must present the same client's secret. Empty on rows
     written before multi-client support (tolerated only while exactly one
@@ -160,7 +162,8 @@ paths:
     duplicated here so the materialization read path doesn't need a second
     lookup against `identity_links`
   - campaign_id (String, optional) - Creator only; the Patreon `campaign.id`
-    discovered at link time
+    the account owns, discovered at link time and re-read on every
+    materialization when the link holds the `campaigns` scope
   - scopes (String) - Space-separated OAuth scopes granted on the token
   - access_token_ct (Binary) - AES-256-GCM ciphertext of the Patreon access
     token under the row's DEK
@@ -177,10 +180,13 @@ paths:
   - campaign_tier_ids / campaign_tier_slugs (List of String, optional;
     creator only, #99) - The owned campaign's tiers as last fetched from
     `GET /campaigns/<cid>?include=tiers` (ids; deduplicated title slugs).
-    Written by one conditional `UpdateItem` on `attribute_exists(user_id) AND
-    campaign_id = :cid` when a fetch differs from the stored list; carried
-    forward by every whole-row put (token rotation). Absent or malformed
-    reads as empty. A re-link writes them empty until the next fetch.
+    Written with `role` and `campaign_id` by one conditional `UpdateItem` on
+    `attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at =
+    :la` (`put_patreon_ownership`) when the campaign or list changed; an
+    account owning none gets all three removed and `role = consumer`.
+    Carried forward by every whole-row put (token rotation). Absent or
+    malformed reads as empty. A re-link writes them empty until the next
+    fetch.
 - **Encryption**: Envelope. A DynamoDB-only compromise yields ciphertext
   blobs but no plaintext tokens — recovery additionally requires
   `kms:Decrypt` on the configured key.
