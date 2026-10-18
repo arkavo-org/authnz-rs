@@ -333,6 +333,34 @@ async fn a_replayed_finish_mints_nothing() {
     assert_eq!(body, "Corrupt Session");
 }
 
+#[tokio::test]
+async fn a_forged_assertion_mints_nothing() {
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id,
+        cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    // The second start replaces the first, so the session holds a challenge
+    // the assertion below did not sign. Only the signature check catches it:
+    // the user handle and the credential are the account's own.
+    let first = start(&c, None).await;
+    let _second = start(&c, None).await;
+
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut auth, first, &cred, Some(user_id)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, r#"{"token":""}"#);
+}
+
 /// `GET /authenticate?account=<id>`.
 fn scoped(account: &Uuid) -> String {
     format!("/authenticate?account={account}")
@@ -445,4 +473,116 @@ async fn an_inbound_token_for_another_account_is_refused_at_an_account_scoped_st
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body, b"User Not Found");
+}
+
+#[tokio::test]
+async fn a_forged_assertion_at_an_account_scoped_start_mints_nothing() {
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id,
+        cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    // As in the name-free case: the session holds the second challenge, and
+    // the assertion signed the first.
+    let first = start_for(&c, &scoped(&user_id), None).await;
+    let _second = start_for(&c, &scoped(&user_id), None).await;
+
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut auth, first, &cred, Some(user_id)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, r#"{"token":""}"#);
+}
+
+#[tokio::test]
+async fn an_account_scoped_finish_refuses_a_mismatching_user_handle() {
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id: a_id,
+        cred: a_cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let Some(Registered { user_id: b_id, .. }) = registered_account(&unique_name()).await else {
+        return;
+    };
+    let options = start_for(&c, &scoped(&a_id), None).await;
+
+    // A's own credential, so its signature verifies; WebAuthn does not sign
+    // the user handle, so only the server's own check refuses B's.
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut auth, options, &a_cred, Some(b_id)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, r#"{"token":""}"#);
+}
+
+#[tokio::test]
+async fn an_account_scoped_finish_accepts_an_absent_user_handle() {
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id,
+        cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let options = start_for(&c, &scoped(&user_id), None).await;
+
+    // A user handle is optional when the start named the account.
+    let (status, body) = finish(&c, &answer_discoverable(&mut auth, options, &cred, None)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["handle"], c.username.as_str());
+    let token = reply["token"].as_str().expect("the reply carries a token");
+    assert_eq!(verified_claims(&c, token).sub, user_id.to_string());
+}
+
+#[tokio::test]
+async fn an_account_scoped_start_refuses_another_accounts_credential_without_a_handle() {
+    let Some(Registered {
+        ceremony: c,
+        user_id: a_id,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let Some(Registered {
+        auth: mut b_auth,
+        cred: b_cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let options = start_for(&c, &scoped(&a_id), None).await;
+
+    // No user handle, so the handle check passes and only the start's list of
+    // A's credentials refuses B's.
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut b_auth, options, &b_cred, None),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, r#"{"token":""}"#);
 }

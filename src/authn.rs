@@ -746,6 +746,11 @@ async fn finish_discoverable_authentication(
 }
 
 /// Finish a ceremony limited to `user_id`'s passkeys.
+///
+/// The user handle is optional here, because the start named the account.
+/// One that is present must be that account's UUID (WebAuthn §7.2).
+/// webauthn-rs checks only the credential id against the start's list, and
+/// the user handle is not signed, so this check is the server's own.
 async fn finish_account_authentication(
     app_state: &AppState,
     patreon: &crate::patreon::PatreonState,
@@ -762,6 +767,17 @@ async fn finish_account_authentication(
         .ok_or(UserNotFound)?;
 
     remove_auth_state(session).await?;
+
+    if auth
+        .get_user_unique_id()
+        .is_some_and(|handle| handle != user_id.as_bytes())
+    {
+        warn!(
+            "Assertion for an account-scoped start of {} carries another user handle",
+            user_id
+        );
+        return Ok(ceremony_failed());
+    }
 
     match app_state
         .webauthn
