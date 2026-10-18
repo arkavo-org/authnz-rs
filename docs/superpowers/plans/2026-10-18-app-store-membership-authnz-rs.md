@@ -219,11 +219,11 @@ Work in a worktree off `origin/main` (6ff7799, version 0.19.0), branch `feat/app
   - `src/app_store_tests.rs`.
 
 **Interfaces:**
-- **New shared helper:** `pub(crate) async fn authenticated_live_account(app_state: &AppState, headers: &HeaderMap) -> Result<Uuid, StatusCode>`. It wraps `verify_inbound_account_token`, parses `sub` as a UUID, and calls `is_account_live`; any failure is 401.
+- **New shared helper:** `pub(crate) struct AuthenticatedAccount { pub user_id: Uuid, pub token_can_publish: bool }` and `pub(crate) async fn authenticated_live_account(app_state: &AppState, headers: &HeaderMap) -> Result<AuthenticatedAccount, StatusCode>`. It wraps `verify_inbound_account_token`, parses `sub` as a UUID, and calls `is_account_live`; any failure is 401. `token_can_publish` is true iff the presented token's `arkavo_entitlements` contains `ENTITLEMENT_CREATOR_PUBLISH`.
   - Leave the two private `extract_authenticated_user_id` copies (`apple_signin.rs`, `patreon.rs`) unchanged. Their consolidation is a follow-up; note it in the PR body.
 - Consumes: `decode_transaction`, `bind_app_store_link`, `put_app_store_state`, `is_account_live`.
 - **Request:** `X-Auth-Token: <CWT>`, with JSON `{"signed_transaction": "<jws>"}`.
-- **Response 200:** `{"active": bool, "expires_at": i64, "environment": "Production"|"Sandbox"}`. The state is read back from the stored record after the write, so grace from earlier notifications counts.
+- **Response 200:** `{"active": bool, "expires_at": i64, "environment": "Production"|"Sandbox", "token_can_publish": bool}`, where `token_can_publish` comes from the presented token (Creator uses it to decide whether to ask for a fresh sign-in). The state is read back from the stored record after the write, so grace from earlier notifications counts.
 - **Errors:** 401; 403, 409, 422 and 503 per the Rules. A missing `appAccountToken` is 422.
 - **Order:** auth → decode → `appAccountToken` rule → bind the link → write the state.
   - `Stale` still answers 200 with the stored state.
@@ -239,7 +239,8 @@ Work in a worktree off `origin/main` (6ff7799, version 0.19.0), branch `feat/app
   - `second_account_same_otid_is_409`;
   - `bad_signature_is_422`;
   - `feature_off_is_503`;
-  - `stale_post_returns_stored_state`.
+  - `stale_post_returns_stored_state`;
+  - `reports_whether_the_presented_token_can_publish` (a token with and one without `ENTITLEMENT_CREATOR_PUBLISH`).
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement.** Log one line: `app_store transaction outcome=<bound|stale|elsewhere|refused> otid=<id> env=<env>`.
 - [ ] **Step 4: Run** → PASS.
