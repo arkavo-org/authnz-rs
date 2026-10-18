@@ -50,7 +50,7 @@
 2. **A passkey from one account is used against an account-scoped start for another.** The ceremony fails with 400 and nothing is minted. Test `an_account_scoped_start_refuses_another_accounts_passkey` (Task 2).
 3. **A replayed POST after a successful sign-in** answers 500 `Corrupt Session`, so a second token is never minted. Test `a_replayed_finish_mints_nothing` (Task 1).
 4. **The start's `X-Auth-Token` names account A, and B's passkey answers.** The answer is 403. Test `an_inbound_token_for_another_account_is_refused_at_finish` (Task 1).
-5. **The old named route** answers 404 after the cutover. Test `the_named_route_is_gone` (Task 2).
+5. **The old named route** answers 404 after the cutover. The production router is built inline in `main`, and the test router never had the named route, so a router test would prove nothing. Task 2 Step 4 checks it with `grep -c 'authenticate/:username' src/main.rs`, which must give `0`.
 
 ---
 
@@ -141,7 +141,6 @@
   - `an_account_scoped_start_refuses_another_accounts_passkey`: start for A, answer with B's passkey. Expect 400 `{"token":""}`.
   - `an_account_scoped_start_for_a_deleted_account_is_user_not_found`: tombstone A (the same `tombstone_account` call as in Task 1), then `GET /authenticate?account=<A>` answers 500 `User Not Found`.
   - `an_inbound_token_for_another_account_is_refused_at_an_account_scoped_start`: start for A with B's `X-Auth-Token`. Expect 500 `User Not Found`, the same behaviour the named start had.
-  - `the_named_route_is_gone`: `GET /authenticate/<A's username>` gives 404.
 - [ ] **Step 2: Run to verify they fail.** Same command as Task 1 Step 2. Expect a FAIL.
 - [ ] **Step 3: Implement.** The `Some(account)` arm is today's named start keyed by `get_user_by_id(&account)`, not by name:
   - The same `X-Auth-Token` check (a mismatch gives `UserNotFound`).
@@ -150,5 +149,8 @@
   - Store `PendingAuthentication::Account`.
 
   Delete the named handler and its route. Update README and CLAUDE.md.
-- [ ] **Step 4: Run.** `AUTHNZ_TEST_DYNAMODB_ENDPOINT=http://localhost:8001 cargo test`. Expect everything to pass, with the 11 authentication tests shown running. Then `cargo build --release`, which must succeed.
+- [ ] **Step 4: Run.**
+  - `AUTHNZ_TEST_DYNAMODB_ENDPOINT=http://localhost:8001 cargo test`. Expect everything to pass, with the 10 authentication tests shown running.
+  - `grep -c 'authenticate/:username' src/main.rs` gives `0`.
+  - `cargo build --release` succeeds.
 - [ ] **Step 5: Commit.** `git commit -m "feat(authn)!: account-scoped re-authentication replaces sign-in by name"`
