@@ -35,7 +35,10 @@ use crate::apple_signin::{
     AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_link_handler,
     apple_nonce_handler,
 };
-use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
+use crate::authn::{
+    finish_authentication, finish_register, start_authentication, start_named_authentication,
+    start_register,
+};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
 use crate::device_check::{
@@ -60,6 +63,8 @@ mod apple_signin;
 mod apple_tokens;
 #[cfg(test)]
 mod apple_tokens_tests;
+#[cfg(test)]
+mod authentication_tests;
 mod authn;
 mod db;
 mod device_check;
@@ -703,8 +708,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
-        .route("/authenticate/:username", get(start_authentication))
-        .route("/authenticate", post(finish_authentication))
+        .route("/authenticate/:username", get(start_named_authentication))
+        .route(
+            "/authenticate",
+            get(start_authentication).post(finish_authentication),
+        )
         // Apple DeviceCheck / App Attest endpoints
         // Unauthenticated registration preflight (Task 5). These issue a
         // ticket; they do NOT gate /register — that is Task 6. A 200 from

@@ -27,7 +27,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 quinn = { version = "0.11", optional = true }
 http-body = { version = "1", optional = true }         # response body size_hint for H3 Content-Length
 http-body-util = { version = "0.1", optional = true }  # frame-by-frame H3 response streaming
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 tower = { version = "0.5", features = ["full"] }
 tower-sessions = "0.12"
 thiserror = "2.0"

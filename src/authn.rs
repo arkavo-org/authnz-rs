@@ -28,6 +28,9 @@ use webauthn_rs::prelude::*;
 
 const SESSION_REG_STATE_KEY: &str = "reg_state";
 
+/// Session key of the open sign-in ceremony, a [`PendingAuthentication`].
+const SESSION_AUTH_STATE_KEY: &str = "auth_state";
+
 /// `idp` claim value for every WebAuthn-minted CWT. Matches
 /// `oidc::idp_from_subject` for an `arkavo:<uuid>` subject.
 const IDP_WEBAUTHN: &str = "webauthn";
@@ -466,7 +469,113 @@ pub async fn finish_register(
     }
 }
 
+/// Query of `GET /authenticate`.
+#[derive(Deserialize)]
+pub struct AuthenticateQuery {
+    /// Limits the ceremony to this account's passkeys. Absent, the ceremony
+    /// is name-free: the passkey the person picks names the account.
+    pub account: Option<Uuid>,
+}
+
+/// The sign-in ceremony a session has open, under [`SESSION_AUTH_STATE_KEY`].
+#[derive(Serialize, Deserialize)]
+pub(crate) enum PendingAuthentication {
+    /// Name-free: the account is unknown until the passkey's user handle
+    /// names it at the finish.
+    Discoverable {
+        state: DiscoverableAuthentication,
+        /// The `sub` of a valid `X-Auth-Token` the start carried. The finish
+        /// refuses a passkey of any other account.
+        inbound_user_id: Option<Uuid>,
+    },
+    /// Limited to one account's passkeys.
+    Account {
+        user_id: Uuid,
+        state: PasskeyAuthentication,
+    },
+}
+
+/// Drop the session's open sign-in ceremony, if any.
+async fn remove_auth_state(session: &Session) -> Result<(), WebauthnError> {
+    if let Err(err) = session.remove_value(SESSION_AUTH_STATE_KEY).await {
+        error!("Failed to remove auth_state from session: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
+    Ok(())
+}
+
+/// The account named by a sign-in start's optional `X-Auth-Token`.
+///
+/// Absent, `None`. Present, it must verify: an invalid token refuses the
+/// start rather than being ignored, and a legacy JWT is rejected with a CWT
+/// error.
+fn inbound_account(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<Uuid>, WebauthnError> {
+    let Some(token_header) = headers.get("X-Auth-Token") else {
+        return Ok(None);
+    };
+    let token_str = token_header
+        .to_str()
+        .map_err(|_| WebauthnError::InvalidToken)?;
+    let claims = verify_inbound_account_token(app_state, token_str)?;
+    Ok(Some(
+        Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::UserNotFound)?,
+    ))
+}
+
+/// `GET /authenticate`: start a sign-in ceremony.
+///
+/// Without `account` the ceremony is name-free. The options list no
+/// credentials, so the system sheet offers every passkey the device holds for
+/// this relying party, and the finish learns the account from the one picked.
 pub async fn start_authentication(
+    Extension(app_state): Extension<AppState>,
+    session: Session,
+    Query(query): Query<AuthenticateQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebauthnError> {
+    info!("Start Authentication");
+
+    remove_auth_state(&session).await?;
+
+    let inbound_user_id = inbound_account(&app_state, &headers)?;
+
+    if let Some(account) = query.account {
+        error!(
+            "Account-scoped authentication for {} is not implemented",
+            account
+        );
+        return Err(Unknown);
+    }
+
+    let (rcr, state) = match app_state.webauthn.start_discoverable_authentication() {
+        Ok(started) => started,
+        Err(e) => {
+            error!("start_discoverable_authentication -> {:?}", e);
+            return Err(Unknown);
+        }
+    };
+    if let Err(err) = session
+        .insert(
+            SESSION_AUTH_STATE_KEY,
+            PendingAuthentication::Discoverable {
+                state,
+                inbound_user_id,
+            },
+        )
+        .await
+    {
+        error!("Failed to insert auth_state into session: {:?}", err);
+        return Err(WebauthnError::InvalidSessionState(err));
+    }
+    Ok(Json(rcr))
+}
+
+/// `GET /authenticate/:username`: start a ceremony limited to the passkeys of
+/// the account with that alias.
+pub async fn start_named_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
@@ -474,22 +583,9 @@ pub async fn start_authentication(
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
 
-    if let Err(err) = session.remove_value("auth_state").await {
-        error!("Failed to remove old auth_state from session: {:?}", err);
-        return Err(WebauthnError::InvalidSessionState(err));
-    }
+    remove_auth_state(&session).await?;
 
-    // Verify inbound CWT account token from X-Auth-Token header (optional).
-    // If present, validate it; legacy JWT tokens will be rejected with a CWT error.
-    let inbound_user_id: Option<Uuid> = if let Some(token_header) = headers.get("X-Auth-Token") {
-        let token_str = token_header
-            .to_str()
-            .map_err(|_| WebauthnError::InvalidToken)?;
-        let claims = verify_inbound_account_token(&app_state, token_str)?;
-        Some(Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::UserNotFound)?)
-    } else {
-        None
-    };
+    let inbound_user_id = inbound_account(&app_state, &headers)?;
 
     // Look up user from DB (authoritative source).
     let user = match app_state
@@ -520,9 +616,15 @@ pub async fn start_authentication(
         .webauthn
         .start_passkey_authentication(&credentials)
     {
-        Ok((rcr, auth_state)) => {
+        Ok((rcr, state)) => {
             if let Err(err) = session
-                .insert("auth_state", (user.user_id, auth_state))
+                .insert(
+                    SESSION_AUTH_STATE_KEY,
+                    PendingAuthentication::Account {
+                        user_id: user.user_id,
+                        state,
+                    },
+                )
                 .await
             {
                 error!("Failed to insert auth_state into session: {:?}", err);
@@ -538,65 +640,196 @@ pub async fn start_authentication(
     Ok(res)
 }
 
+/// `POST /authenticate`: finish the session's sign-in ceremony and mint the
+/// auth token.
+///
+/// The auth token carries the same Arkavo custom claims as the OIDC access
+/// token, derived from the same user record by the same helper
+/// (`oidc::arkavo_user_claims`) — the OpenTDF platform resolves the caller
+/// from `arkavo_account_id` / `arkavo_roles` and refuses a token without them
+/// at KAS rewrap. A row that vanished fails closed rather than minting a
+/// claims-less token.
+///
+/// Both arms read the record BEFORE consuming `auth_state`: a transient
+/// DynamoDB error must not turn a successful WebAuthn ceremony into a failed
+/// login that forces the client through the whole ceremony again. With the
+/// state still in the session the client can simply retry this POST. The
+/// state is still consumed exactly once per completed ceremony.
 pub async fn finish_authentication(
     Extension(app_state): Extension<AppState>,
     Extension(patreon): Extension<crate::patreon::PatreonState>,
     session: Session,
     Json(auth): Json<PublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) =
-        session.get("auth_state").await?.ok_or(CorruptSession)?;
+    let pending: PendingAuthentication = session
+        .get(SESSION_AUTH_STATE_KEY)
+        .await?
+        .ok_or(CorruptSession)?;
 
-    // The auth token carries the same Arkavo custom claims as the OIDC access
-    // token, derived from the same user record by the same helper
-    // (`oidc::arkavo_user_claims`) — the OpenTDF platform resolves the caller
-    // from `arkavo_account_id` / `arkavo_roles` and refuses a token without
-    // them at KAS rewrap. A row that vanished fails closed rather than minting
-    // a claims-less token.
-    //
-    // Read the record BEFORE consuming `auth_state`: a transient DynamoDB
-    // error must not turn a successful WebAuthn ceremony into a failed login
-    // that forces the client through the whole ceremony again. With the state
-    // still in the session the client can simply retry this POST. The state is
-    // still consumed exactly once per completed ceremony, below.
+    match pending {
+        PendingAuthentication::Discoverable {
+            state,
+            inbound_user_id,
+        } => {
+            finish_discoverable_authentication(
+                &app_state,
+                &patreon,
+                &session,
+                &auth,
+                state,
+                inbound_user_id,
+            )
+            .await
+        }
+        PendingAuthentication::Account { user_id, state } => {
+            finish_account_authentication(&app_state, &patreon, &session, &auth, user_id, state)
+                .await
+        }
+    }
+}
+
+/// Finish a name-free ceremony. The passkey's user handle names the account.
+async fn finish_discoverable_authentication(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    session: &Session,
+    auth: &PublicKeyCredential,
+    state: DiscoverableAuthentication,
+    inbound_user_id: Option<Uuid>,
+) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
+    let (user_id, cred_id) = match app_state
+        .webauthn
+        .identify_discoverable_authentication(auth)
+    {
+        Ok(identified) => identified,
+        Err(e) => {
+            error!("identify_discoverable_authentication -> {:?}", e);
+            return Ok(ceremony_failed());
+        }
+    };
+
+    // The named start refused a token for another account. A name-free start
+    // cannot know the account, so the same check happens here.
+    if let Some(tid) = inbound_user_id
+        && tid != user_id
+    {
+        warn!(
+            "Passkey of {} answered a start authenticated as {}",
+            user_id, tid
+        );
+        return Err(WebauthnError::PasskeyAccountMismatch);
+    }
+
     let record = app_state
         .db_store
-        .get_user_by_id(&user_unique_id)
+        .get_user_by_id(&user_id)
+        .await
+        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?;
+
+    // A passkey can outlive its account (deletion leaves it on the device),
+    // and nothing but the record ties a user handle to a credential.
+    let Some(record) = record else {
+        warn!("Passkey user handle {} names no live account", user_id);
+        remove_auth_state(session).await?;
+        return Err(WebauthnError::UnknownPasskey);
+    };
+    if !record
+        .credentials
+        .iter()
+        .any(|c| c.cred_id().as_ref() == cred_id)
+    {
+        warn!("Passkey is not among the credentials of {}", user_id);
+        remove_auth_state(session).await?;
+        return Err(WebauthnError::UnknownPasskey);
+    }
+
+    remove_auth_state(session).await?;
+
+    let keys: Vec<DiscoverableKey> = record
+        .credentials
+        .iter()
+        .map(DiscoverableKey::from)
+        .collect();
+    match app_state
+        .webauthn
+        .finish_discoverable_authentication(auth, state, &keys)
+    {
+        Ok(auth_result) => {
+            log::debug!("Authentication result: {:?}", auth_result);
+            signed_in(app_state, patreon, record).await
+        }
+        Err(e) => {
+            error!("finish_discoverable_authentication -> {:?}", e);
+            Ok(ceremony_failed())
+        }
+    }
+}
+
+/// Finish a ceremony limited to `user_id`'s passkeys.
+async fn finish_account_authentication(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    session: &Session,
+    auth: &PublicKeyCredential,
+    user_id: Uuid,
+    state: PasskeyAuthentication,
+) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
+    let record = app_state
+        .db_store
+        .get_user_by_id(&user_id)
         .await
         .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
         .ok_or(UserNotFound)?;
 
-    if let Err(err) = session.remove_value("auth_state").await {
-        error!("Failed to remove auth_state from session: {:?}", err);
-        return Err(WebauthnError::InvalidSessionState(err));
-    }
+    remove_auth_state(session).await?;
 
     match app_state
         .webauthn
-        .finish_passkey_authentication(&auth, &auth_state)
+        .finish_passkey_authentication(auth, &state)
     {
         Ok(auth_result) => {
             log::debug!("Authentication result: {:?}", auth_result);
-            let user =
-                crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
-            let arkavo_user = crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await;
-            // Generate CWT auth token (1-hour, no cnf binding at this point;
-            // cnf binding is added in Task 15 once the passkey is retrieved from DB).
-            let token = mint_auth_token(&app_state, &user_unique_id, Some(&arkavo_user), None)?;
-            info!("Authentication successful for user: {}", user_unique_id);
-
-            Ok((StatusCode::OK, Json(AuthResponse { token })))
+            signed_in(app_state, patreon, record).await
         }
         Err(e) => {
             error!("finish_authentication -> {:?}", e);
-            Ok((
-                StatusCode::BAD_REQUEST,
-                Json(AuthResponse {
-                    token: String::new(),
-                }),
-            ))
+            Ok(ceremony_failed())
         }
     }
+}
+
+/// Mint the auth token for `record`'s verified ceremony, and reply with it
+/// and the account's alias.
+async fn signed_in(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    record: crate::db::UserCredentials,
+) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
+    let user = crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
+    let arkavo_user = crate::oidc::arkavo_user_claims(app_state, patreon, &user).await;
+    // Generate CWT auth token (1-hour, no cnf binding at this point;
+    // cnf binding is added in Task 15 once the passkey is retrieved from DB).
+    let token = mint_auth_token(app_state, &record.user_id, Some(&arkavo_user), None)?;
+    info!("Authentication successful for user: {}", record.user_id);
+
+    Ok((
+        StatusCode::OK,
+        Json(AuthResponse {
+            token,
+            handle: record.username,
+        }),
+    ))
+}
+
+/// The reply to an assertion that fails verification: 400 `{"token": ""}`.
+fn ceremony_failed() -> (StatusCode, Json<AuthResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(AuthResponse {
+            token: String::new(),
+            handle: String::new(),
+        }),
+    )
 }
 
 #[derive(Serialize)]
@@ -604,6 +837,11 @@ struct AuthResponse {
     /// Arkavo-issued CWT (base64url-encoded COSE_Sign1 wrapped in CBOR tag 61).
     /// Field name is format-agnostic so clients don't conflate it with a JWT.
     token: String,
+    /// The signed-in account's alias. The client cannot learn it from the
+    /// token, which carries only the account UUID. Empty, and so left out,
+    /// on a failed ceremony.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    handle: String,
 }
 
 /// Minimal envelope payload — identifies the user and registered credential
@@ -770,6 +1008,15 @@ pub enum WebauthnError {
     /// preflight again.
     #[error("device attestation required before registration")]
     AttestationRequired,
+    /// A name-free sign-in's passkey names no live account (a deleted
+    /// account's passkey stays on the device), or the account it names does
+    /// not hold that credential.
+    #[error("Unknown Passkey")]
+    UnknownPasskey,
+    /// A name-free sign-in started with a valid `X-Auth-Token` was answered
+    /// by a passkey of another account.
+    #[error("Passkey belongs to another account")]
+    PasskeyAccountMismatch,
 }
 
 impl IntoResponse for WebauthnError {
@@ -858,6 +1105,13 @@ impl IntoResponse for WebauthnError {
                 "Device attestation required: call GET /device-check/register-challenge then \
                  POST /device-check/register-attest before registering"
                     .to_string(),
+            ),
+            // 404, distinct from a failed ceremony's 400, so the client can
+            // tell the system to drop the passkey. It carries no account data.
+            WebauthnError::UnknownPasskey => (StatusCode::NOT_FOUND, "Unknown Passkey".to_string()),
+            WebauthnError::PasskeyAccountMismatch => (
+                StatusCode::FORBIDDEN,
+                "Passkey belongs to another account".to_string(),
             ),
         };
         (status, body).into_response()
