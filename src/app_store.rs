@@ -9,19 +9,28 @@
 //! and the leaf's signature over `header.payload`. There is no online
 //! revocation (OCSP) check.
 //!
+//! [`decode_transaction`], [`decode_renewal_grace`] and [`decode_notification`]
+//! turn verified payloads into typed values and apply the payload rules: the
+//! bundle, the product, a direct purchase and an accepted environment.
+//! Production always verifies against the pinned root; only test builds can
+//! swap the trust anchor ([`AppStoreConfig::for_tests`]).
+//!
 //! Errors are unit variants with fixed messages, so nothing from a signed
 //! payload can reach a log line or a response body through them.
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ecdsa::signature::Verifier;
+use log::{info, warn};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use thiserror::Error;
+use uuid::Uuid;
 use x509_parser::prelude::*;
 
 /// Apple Root CA - G3, from
@@ -72,16 +81,13 @@ pub(crate) enum AppStoreError {
     InvalidChain,
     #[error("signature does not verify")]
     InvalidSignature,
-    // The payload checks produce the rest.
-    #[allow(dead_code)]
     #[error("signed for another app")]
     WrongApp,
-    #[allow(dead_code)]
     #[error("environment not accepted")]
     WrongEnvironment,
-    #[allow(dead_code)]
-    #[error("not a purchase by this account")]
+    #[error("not a direct purchase")]
     NotPurchased,
+    // Produced by the routes when the feature is off.
     #[allow(dead_code)]
     #[error("app store purchases are not configured")]
     NotConfigured,
@@ -207,4 +213,342 @@ fn require_extension(cert: &X509Certificate<'_>, oid: &[u64]) -> Result<(), AppS
         Ok(Some(_)) => Ok(()),
         _ => Err(AppStoreError::InvalidChain),
     }
+}
+
+// --------- Config ---------
+
+/// The App Store environments a payload can be signed for that we accept.
+/// `Xcode` and `LocalTesting` are never accepted: their payloads are unsigned.
+/// Serialized as Apple spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Environment {
+    Production,
+    Sandbox,
+}
+
+impl Environment {
+    fn from_apple(value: &str) -> Option<Self> {
+        match value {
+            "Production" => Some(Self::Production),
+            "Sandbox" => Some(Self::Sandbox),
+            _ => None,
+        }
+    }
+}
+
+/// App Store purchases, enabled by `APP_STORE_BUNDLE_ID`,
+/// `APP_STORE_APP_APPLE_ID` and `APP_STORE_PUBLISH_PRODUCT_IDS`.
+#[derive(Debug, Clone)]
+pub struct AppStoreConfig {
+    pub bundle_id: String,
+    pub app_apple_id: i64,
+    pub product_ids: HashSet<String>,
+    pub environments: HashSet<Environment>,
+    /// The trust anchor tests verify against instead of Apple's. It exists
+    /// only in test builds, so no config can name another root in production.
+    #[cfg(test)]
+    root_der: Option<Vec<u8>>,
+}
+
+impl AppStoreConfig {
+    /// Parse the four env values. `Ok(None)`: the feature is off (one of the
+    /// first three is unset or empty). `Err`: it is set but unusable, which
+    /// also leaves the feature off.
+    pub(crate) fn parse(
+        bundle_id: Option<&str>,
+        app_apple_id: Option<&str>,
+        product_ids: Option<&str>,
+        environments: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        fn present(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|s| !s.is_empty())
+        }
+        let (Some(bundle_id), Some(app_apple_id), Some(product_ids)) = (
+            present(bundle_id),
+            present(app_apple_id),
+            present(product_ids),
+        ) else {
+            return Ok(None);
+        };
+        let app_apple_id: i64 = app_apple_id
+            .parse()
+            .map_err(|_| "APP_STORE_APP_APPLE_ID is not an integer")?;
+        let product_ids: HashSet<String> = product_ids
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if product_ids.is_empty() {
+            return Ok(None);
+        }
+        let environments = match present(environments) {
+            None => HashSet::from([Environment::Production, Environment::Sandbox]),
+            Some(list) => list
+                .split(',')
+                .map(|e| Environment::from_apple(e.trim()))
+                .collect::<Option<HashSet<_>>>()
+                .ok_or("APP_STORE_ENVIRONMENTS accepts only Production and Sandbox")?,
+        };
+        Ok(Some(Self {
+            bundle_id: bundle_id.to_string(),
+            app_apple_id,
+            product_ids,
+            environments,
+            #[cfg(test)]
+            root_der: None,
+        }))
+    }
+
+    /// Read the env vars and log, once, which state the feature is in.
+    pub fn from_env() -> Option<Self> {
+        let var = |name: &str| std::env::var(name).ok();
+        let (bundle, app_id) = (var("APP_STORE_BUNDLE_ID"), var("APP_STORE_APP_APPLE_ID"));
+        let (products, envs) = (
+            var("APP_STORE_PUBLISH_PRODUCT_IDS"),
+            var("APP_STORE_ENVIRONMENTS"),
+        );
+        match Self::parse(
+            bundle.as_deref(),
+            app_id.as_deref(),
+            products.as_deref(),
+            envs.as_deref(),
+        ) {
+            Ok(Some(cfg)) => {
+                info!(
+                    "App Store purchases ENABLED: bundle_id={} app_apple_id={} products={} \
+                     environments={}",
+                    cfg.bundle_id,
+                    cfg.app_apple_id,
+                    cfg.product_ids.len(),
+                    cfg.environments.len()
+                );
+                Some(cfg)
+            }
+            Ok(None) => {
+                info!(
+                    "App Store purchases DISABLED: APP_STORE_BUNDLE_ID / APP_STORE_APP_APPLE_ID / \
+                     APP_STORE_PUBLISH_PRODUCT_IDS not all set"
+                );
+                None
+            }
+            Err(reason) => {
+                warn!("App Store purchases DISABLED: {reason}");
+                None
+            }
+        }
+    }
+
+    /// A config for the production app, verifying against `root_der` instead
+    /// of Apple's root.
+    #[cfg(test)]
+    pub(crate) fn for_tests(root_der: Vec<u8>) -> Self {
+        Self {
+            bundle_id: "com.arkavo.ArkavoCreator".to_string(),
+            app_apple_id: 6_738_845_556,
+            product_ids: HashSet::from(["com.arkavo.ArkavoCreator.membership.monthly".to_string()]),
+            environments: HashSet::from([Environment::Production, Environment::Sandbox]),
+            root_der: Some(root_der),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn root_der(&self) -> &[u8] {
+        apple_root_g3_der()
+    }
+
+    #[cfg(test)]
+    fn root_der(&self) -> &[u8] {
+        match &self.root_der {
+            Some(der) => der,
+            None => apple_root_g3_der(),
+        }
+    }
+}
+
+// --------- Decoding ---------
+
+/// A purchase whose JWS verified and passed the payload rules. Dates are unix
+/// seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTransaction {
+    pub original_transaction_id: String,
+    pub product_id: String,
+    pub environment: Environment,
+    pub app_account_token: Option<Uuid>,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub signed_at: i64,
+}
+
+/// A Server Notification V2 whose JWS, and nested JWS, verified. The type is
+/// for logging; the state comes from the transaction and renewal info.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedNotification {
+    pub notification_type: String,
+    pub transaction: Option<VerifiedTransaction>,
+    pub grace_expires_at: Option<i64>,
+}
+
+/// `Xcode` and `LocalTesting` payloads are unsigned, so they are refused
+/// before any verification is attempted. The environment read here is not yet
+/// trusted; it only ever turns a payload away.
+fn refuse_unsigned_environment(unverified: Option<&str>) -> Result<(), AppStoreError> {
+    match unverified {
+        Some("Xcode" | "LocalTesting") => Err(AppStoreError::WrongEnvironment),
+        _ => Ok(()),
+    }
+}
+
+/// The payload object of a compact JWS, without verifying anything.
+fn peek_payload(jws: &str) -> Result<Map<String, Value>, AppStoreError> {
+    let payload_b64 = jws.split('.').nth(1).ok_or(AppStoreError::Malformed)?;
+    decode_segment(payload_b64)
+}
+
+/// Verify `jws`, turning away unsigned environments first.
+fn verify_signed(cfg: &AppStoreConfig, jws: &str) -> Result<Map<String, Value>, AppStoreError> {
+    let unverified = peek_payload(jws)?;
+    // Transactions and renewal info state it at the top; a notification in
+    // `data`.
+    let environment = |object: &Map<String, Value>| {
+        object
+            .get("environment")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    refuse_unsigned_environment(environment(&unverified).as_deref())?;
+    if let Some(data) = unverified.get("data").and_then(Value::as_object) {
+        refuse_unsigned_environment(environment(data).as_deref())?;
+    }
+    match verify_jws(jws, cfg.root_der())? {
+        Value::Object(payload) => Ok(payload),
+        _ => Err(AppStoreError::Malformed),
+    }
+}
+
+fn accepted_environment(cfg: &AppStoreConfig, value: &str) -> Result<Environment, AppStoreError> {
+    Environment::from_apple(value)
+        .filter(|env| cfg.environments.contains(env))
+        .ok_or(AppStoreError::WrongEnvironment)
+}
+
+fn string_field<'a>(payload: &'a Map<String, Value>, key: &str) -> Result<&'a str, AppStoreError> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(AppStoreError::Malformed)
+}
+
+/// An Apple date (milliseconds) as unix seconds. `None` when absent or null.
+fn seconds_field(payload: &Map<String, Value>, key: &str) -> Result<Option<i64>, AppStoreError> {
+    match payload.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(|ms| Some(ms.div_euclid(1000)))
+            .ok_or(AppStoreError::Malformed),
+    }
+}
+
+fn required_seconds(payload: &Map<String, Value>, key: &str) -> Result<i64, AppStoreError> {
+    seconds_field(payload, key)?.ok_or(AppStoreError::Malformed)
+}
+
+/// Verify a signed transaction and apply the bundle, environment, product and
+/// ownership rules.
+// Reached only from tests until a route verifies a purchase.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_transaction(
+    cfg: &AppStoreConfig,
+    jws: &str,
+) -> Result<VerifiedTransaction, AppStoreError> {
+    let payload = verify_signed(cfg, jws)?;
+
+    if string_field(&payload, "bundleId")? != cfg.bundle_id {
+        return Err(AppStoreError::WrongApp);
+    }
+    let environment = accepted_environment(cfg, string_field(&payload, "environment")?)?;
+    let product_id = string_field(&payload, "productId")?;
+    if !cfg.product_ids.contains(product_id) {
+        return Err(AppStoreError::WrongApp);
+    }
+    if payload.get("inAppOwnershipType").and_then(Value::as_str) != Some("PURCHASED") {
+        return Err(AppStoreError::NotPurchased);
+    }
+    let app_account_token = match payload.get("appAccountToken") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or(AppStoreError::Malformed)?,
+        ),
+    };
+
+    Ok(VerifiedTransaction {
+        original_transaction_id: string_field(&payload, "originalTransactionId")?.to_string(),
+        product_id: product_id.to_string(),
+        environment,
+        app_account_token,
+        expires_at: required_seconds(&payload, "expiresDate")?,
+        revoked_at: seconds_field(&payload, "revocationDate")?,
+        signed_at: required_seconds(&payload, "signedDate")?,
+    })
+}
+
+/// Verify signed renewal info and return its `gracePeriodExpiresDate`.
+// Reached only from tests until a route verifies a purchase.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_renewal_grace(
+    cfg: &AppStoreConfig,
+    jws: &str,
+) -> Result<Option<i64>, AppStoreError> {
+    let payload = verify_signed(cfg, jws)?;
+    // The signature is already trusted; the environment is checked when the
+    // payload states one.
+    if let Some(environment) = payload.get("environment") {
+        accepted_environment(cfg, environment.as_str().ok_or(AppStoreError::Malformed)?)?;
+    }
+    seconds_field(&payload, "gracePeriodExpiresDate")
+}
+
+/// Verify a Server Notification V2 body and, when it carries them, the nested
+/// transaction and renewal info.
+// Reached only from tests until a route verifies a purchase.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_notification(
+    cfg: &AppStoreConfig,
+    signed_payload: &str,
+) -> Result<VerifiedNotification, AppStoreError> {
+    let payload = verify_signed(cfg, signed_payload)?;
+    let notification_type = string_field(&payload, "notificationType")?.to_string();
+    let data = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or(AppStoreError::Malformed)?;
+
+    if string_field(data, "bundleId")? != cfg.bundle_id {
+        return Err(AppStoreError::WrongApp);
+    }
+    let environment = accepted_environment(cfg, string_field(data, "environment")?)?;
+    if environment == Environment::Production
+        && data.get("appAppleId").and_then(Value::as_i64) != Some(cfg.app_apple_id)
+    {
+        return Err(AppStoreError::WrongApp);
+    }
+
+    let transaction = data
+        .get("signedTransactionInfo")
+        .map(|v| decode_transaction(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
+        .transpose()?;
+    let grace_expires_at = data
+        .get("signedRenewalInfo")
+        .map(|v| decode_renewal_grace(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
+        .transpose()?
+        .flatten();
+
+    Ok(VerifiedNotification {
+        notification_type,
+        transaction,
+        grace_expires_at,
+    })
 }

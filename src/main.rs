@@ -338,6 +338,10 @@ pub struct AppState {
     /// creator-publishing entitlement (`PATREON_PUBLISHER_CAMPAIGN_ID`,
     /// `PATREON_PUBLISHER_TIER_IDS`). `None` ⇒ never granted.
     pub publisher: Arc<Option<publishing::PublisherConfig>>,
+    /// App Store purchases (`APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`,
+    /// `APP_STORE_PUBLISH_PRODUCT_IDS`, `APP_STORE_ENVIRONMENTS`). `None` ⇒
+    /// the feature is off.
+    pub app_store: Arc<Option<app_store::AppStoreConfig>>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
     /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
     pub appraisal: agent_state::AppraisalConfig,
@@ -543,6 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let publisher = publishing::PublisherConfig::from_env();
+    let app_store = app_store::AppStoreConfig::from_env();
 
     // Create the app state
     let app_state = AppState {
@@ -565,6 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_status_client_ids: Arc::new(agent_status_client_ids),
         moderation_client_ids: Arc::new(moderation_client_ids),
         publisher: Arc::new(publisher),
+        app_store: Arc::new(app_store),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
@@ -1663,6 +1669,7 @@ pub(crate) mod test_helpers {
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
             publisher: Arc::new(None),
+            app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }

@@ -3,7 +3,10 @@
 //! receipt-signing leaf, ES256 unless a test says otherwise. Pure: no
 //! network, no database.
 
-use crate::app_store::{AppStoreError, apple_root_g3_der, verify_jws};
+use crate::app_store::{
+    AppStoreConfig, AppStoreError, Environment, apple_root_g3_der, decode_notification,
+    decode_renewal_grace, decode_transaction, verify_jws,
+};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -413,4 +416,384 @@ fn apple_root_g3_is_the_published_root() {
         fingerprint.eq_ignore_ascii_case(APPLE_ROOT_G3_SHA256),
         "Apple Root CA - G3 fingerprint is {fingerprint}"
     );
+}
+
+// --------- Semantic decoding ---------
+
+const PRODUCT: &str = "com.arkavo.ArkavoCreator.membership.monthly";
+const TOKEN: &str = "6f1c1d3e-8a54-4b0e-9d0b-2f4f6f0a7c11";
+
+/// A signed-in-the-past subscription transaction expiring a month on, with
+/// `overrides` applied over its fields (a `null` removes one).
+fn purchase(overrides: Value) -> Value {
+    let signed = now_ms();
+    let mut payload = transaction(signed);
+    payload["expiresDate"] = json!(signed + 30 * 86_400_000);
+    for (key, value) in overrides.as_object().unwrap() {
+        if value.is_null() {
+            payload.as_object_mut().unwrap().remove(key);
+        } else {
+            payload[key] = value.clone();
+        }
+    }
+    payload
+}
+
+fn decode(
+    fx: &Fixture,
+    overrides: Value,
+) -> Result<crate::app_store::VerifiedTransaction, AppStoreError> {
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    decode_transaction(&cfg, &sign_jws(&purchase(overrides), fx))
+}
+
+#[test]
+fn decodes_a_production_transaction() {
+    let fx = fixture(Options::default());
+    let signed = 1_700_000_123_456_i64;
+    let tx = decode_transaction(
+        &AppStoreConfig::for_tests(fx.root_der.clone()),
+        &sign_jws(
+            &json!({
+                "originalTransactionId": "2000000123456789",
+                "bundleId": "com.arkavo.ArkavoCreator",
+                "productId": PRODUCT,
+                "inAppOwnershipType": "PURCHASED",
+                "environment": "Production",
+                "appAccountToken": TOKEN,
+                "expiresDate": 1_700_086_400_999_i64,
+                "revocationDate": 1_700_050_000_500_i64,
+                "signedDate": signed,
+            }),
+            &fx,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(tx.original_transaction_id, "2000000123456789");
+    assert_eq!(tx.product_id, PRODUCT);
+    assert_eq!(tx.environment, Environment::Production);
+    assert_eq!(tx.app_account_token, Some(TOKEN.parse().unwrap()));
+    assert_eq!(tx.expires_at, 1_700_086_400);
+    assert_eq!(tx.revoked_at, Some(1_700_050_000));
+    assert_eq!(tx.signed_at, 1_700_000_123);
+}
+
+#[test]
+fn decodes_a_transaction_without_token_or_revocation() {
+    let fx = fixture(Options::default());
+    let tx = decode(&fx, json!({})).unwrap();
+    assert_eq!(tx.app_account_token, None);
+    assert_eq!(tx.revoked_at, None);
+}
+
+#[test]
+fn refuses_wrong_bundle_id() {
+    let fx = fixture(Options::default());
+    assert_eq!(
+        decode(&fx, json!({ "bundleId": "com.example.other" })),
+        Err(AppStoreError::WrongApp)
+    );
+}
+
+#[test]
+fn refuses_product_not_configured() {
+    let fx = fixture(Options::default());
+    assert_eq!(
+        decode(&fx, json!({ "productId": "com.arkavo.ArkavoCreator.tip" })),
+        Err(AppStoreError::WrongApp)
+    );
+}
+
+#[test]
+fn refuses_family_shared() {
+    let fx = fixture(Options::default());
+    assert_eq!(
+        decode(&fx, json!({ "inAppOwnershipType": "FAMILY_SHARED" })),
+        Err(AppStoreError::NotPurchased)
+    );
+    assert_eq!(
+        decode(&fx, json!({ "inAppOwnershipType": null })),
+        Err(AppStoreError::NotPurchased)
+    );
+}
+
+#[test]
+fn accepts_sandbox_by_default() {
+    let fx = fixture(Options::default());
+    assert_eq!(
+        decode(&fx, json!({ "environment": "Sandbox" }))
+            .unwrap()
+            .environment,
+        Environment::Sandbox
+    );
+}
+
+#[test]
+fn refuses_sandbox_when_only_production() {
+    let fx = fixture(Options::default());
+    let mut cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    cfg.environments = [Environment::Production].into();
+    let jws = sign_jws(&purchase(json!({ "environment": "Sandbox" })), &fx);
+    assert_eq!(
+        decode_transaction(&cfg, &jws),
+        Err(AppStoreError::WrongEnvironment)
+    );
+}
+
+/// Their payloads are unsigned, so the refusal comes before verification: a
+/// chain that would not verify still answers `WrongEnvironment`.
+#[test]
+fn refuses_xcode_and_localtesting() {
+    let fx = fixture(Options::default());
+    let other_root = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(other_root.root_der.clone());
+    for environment in ["Xcode", "LocalTesting"] {
+        let jws = sign_jws(&purchase(json!({ "environment": environment })), &fx);
+        assert_eq!(
+            decode_transaction(&cfg, &jws),
+            Err(AppStoreError::WrongEnvironment),
+            "{environment}"
+        );
+    }
+    assert_eq!(
+        decode_transaction(&cfg, &sign_jws(&purchase(json!({})), &fx)),
+        Err(AppStoreError::InvalidChain)
+    );
+}
+
+#[test]
+fn refuses_an_unknown_environment_and_a_bad_token() {
+    let fx = fixture(Options::default());
+    assert_eq!(
+        decode(&fx, json!({ "environment": "Staging" })),
+        Err(AppStoreError::WrongEnvironment)
+    );
+    assert_eq!(
+        decode(&fx, json!({ "appAccountToken": "not-a-uuid" })),
+        Err(AppStoreError::Malformed)
+    );
+    assert_eq!(
+        decode(&fx, json!({ "expiresDate": null })),
+        Err(AppStoreError::Malformed)
+    );
+}
+
+#[test]
+fn refuses_a_transaction_signed_by_another_root() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fixture(Options::default()).root_der);
+    assert_eq!(
+        decode_transaction(&cfg, &sign_jws(&purchase(json!({})), &fx)),
+        Err(AppStoreError::InvalidChain)
+    );
+}
+
+/// With no test override a config verifies against Apple's root, so a fixture
+/// chain does not pass.
+#[test]
+fn production_config_trusts_only_apples_root() {
+    let fx = fixture(Options::default());
+    let mut cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    cfg.bundle_id = "com.arkavo.ArkavoCreator".into();
+    let parsed = AppStoreConfig::parse(
+        Some("com.arkavo.ArkavoCreator"),
+        Some("6738845556"),
+        Some(PRODUCT),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        decode_transaction(&parsed, &sign_jws(&purchase(json!({})), &fx)),
+        Err(AppStoreError::InvalidChain)
+    );
+}
+
+fn notification(fx: &Fixture, notification_type: &str, data: Value) -> String {
+    sign_jws(
+        &json!({
+            "notificationType": notification_type,
+            "notificationUUID": "9f7b6c46-2c1d-4a45-8a34-3c1a2b5d7e90",
+            "data": data,
+            "signedDate": now_ms(),
+        }),
+        fx,
+    )
+}
+
+fn notification_data(fx: &Fixture, environment: &str) -> Value {
+    json!({
+        "bundleId": "com.arkavo.ArkavoCreator",
+        "appAppleId": 6_738_845_556_i64,
+        "environment": environment,
+        "signedTransactionInfo": sign_jws(&purchase(json!({ "environment": environment })), fx),
+    })
+}
+
+#[test]
+fn production_notification_requires_app_apple_id() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    for app_apple_id in [json!(1), json!(null)] {
+        let mut data = notification_data(&fx, "Production");
+        data["appAppleId"] = app_apple_id;
+        assert_eq!(
+            decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
+            Err(AppStoreError::WrongApp)
+        );
+    }
+    let ok = decode_notification(
+        &cfg,
+        &notification(&fx, "DID_RENEW", notification_data(&fx, "Production")),
+    )
+    .unwrap();
+    assert_eq!(ok.notification_type, "DID_RENEW");
+}
+
+#[test]
+fn sandbox_notification_skips_app_apple_id() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let mut data = notification_data(&fx, "Sandbox");
+    data.as_object_mut().unwrap().remove("appAppleId");
+    let decoded = decode_notification(&cfg, &notification(&fx, "SUBSCRIBED", data)).unwrap();
+    assert_eq!(
+        decoded.transaction.unwrap().environment,
+        Environment::Sandbox
+    );
+}
+
+#[test]
+fn notification_decodes_nested_transaction_and_grace() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let mut data = notification_data(&fx, "Production");
+    data["signedRenewalInfo"] = json!(sign_jws(
+        &json!({
+            "environment": "Production",
+            "gracePeriodExpiresDate": 1_700_172_800_321_i64,
+        }),
+        &fx
+    ));
+    let decoded = decode_notification(&cfg, &notification(&fx, "DID_FAIL_TO_RENEW", data)).unwrap();
+
+    assert_eq!(decoded.notification_type, "DID_FAIL_TO_RENEW");
+    assert_eq!(decoded.grace_expires_at, Some(1_700_172_800));
+    let tx = decoded.transaction.unwrap();
+    assert_eq!(tx.original_transaction_id, "2000000123456789");
+    assert_eq!(tx.environment, Environment::Production);
+}
+
+#[test]
+fn notification_refuses_a_bad_nested_transaction() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let mut data = notification_data(&fx, "Production");
+    data["signedTransactionInfo"] = json!(sign_jws(
+        &purchase(json!({ "productId": "com.arkavo.ArkavoCreator.tip" })),
+        &fx
+    ));
+    assert_eq!(
+        decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
+        Err(AppStoreError::WrongApp)
+    );
+
+    let mut data = notification_data(&fx, "Production");
+    data["signedTransactionInfo"] = json!("not.a.jws");
+    assert_eq!(
+        decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
+        Err(AppStoreError::Malformed)
+    );
+}
+
+#[test]
+fn notification_refuses_wrong_bundle_and_unsigned_environments() {
+    let fx = fixture(Options::default());
+    let unrelated = AppStoreConfig::for_tests(fixture(Options::default()).root_der);
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+
+    let mut data = notification_data(&fx, "Sandbox");
+    data["bundleId"] = json!("com.example.other");
+    assert_eq!(
+        decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
+        Err(AppStoreError::WrongApp)
+    );
+
+    for environment in ["Xcode", "LocalTesting"] {
+        let data = json!({ "bundleId": "com.arkavo.ArkavoCreator", "environment": environment });
+        assert_eq!(
+            decode_notification(&unrelated, &notification(&fx, "TEST", data)),
+            Err(AppStoreError::WrongEnvironment),
+            "{environment}"
+        );
+    }
+}
+
+#[test]
+fn test_notification_has_no_transaction() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let data = json!({ "bundleId": "com.arkavo.ArkavoCreator", "environment": "Sandbox" });
+    let decoded = decode_notification(&cfg, &notification(&fx, "TEST", data)).unwrap();
+
+    assert_eq!(decoded.notification_type, "TEST");
+    assert_eq!(decoded.transaction, None);
+    assert_eq!(decoded.grace_expires_at, None);
+}
+
+#[test]
+fn renewal_info_without_grace_has_none() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let jws = sign_jws(&json!({ "environment": "Sandbox" }), &fx);
+    assert_eq!(decode_renewal_grace(&cfg, &jws), Ok(None));
+    let xcode = sign_jws(&json!({ "environment": "Xcode" }), &fx);
+    assert_eq!(
+        decode_renewal_grace(&cfg, &xcode),
+        Err(AppStoreError::WrongEnvironment)
+    );
+}
+
+#[test]
+fn from_env_disabled_without_bundle_id() {
+    let parse = AppStoreConfig::parse;
+    assert!(
+        parse(None, Some("6738845556"), Some(PRODUCT), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse(Some(" "), Some("6738845556"), Some(PRODUCT), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse(Some("b"), None, Some(PRODUCT), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse(Some("b"), Some("1"), Some(" , "), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(parse(Some("b"), Some("six"), Some(PRODUCT), None).is_err());
+}
+
+#[test]
+fn config_environments_default_and_validate() {
+    let parse = |envs| AppStoreConfig::parse(Some("b"), Some("1"), Some("p1, p2"), envs);
+    let both = [Environment::Production, Environment::Sandbox].into();
+
+    let default = parse(None).unwrap().unwrap();
+    assert_eq!(default.environments, both);
+    assert_eq!(default.product_ids.len(), 2);
+    assert_eq!(parse(Some("")).unwrap().unwrap().environments, both);
+    assert_eq!(
+        parse(Some("Production")).unwrap().unwrap().environments,
+        [Environment::Production].into()
+    );
+    assert!(parse(Some("Production,Xcode")).is_err());
+    assert!(parse(Some("production")).is_err());
 }
