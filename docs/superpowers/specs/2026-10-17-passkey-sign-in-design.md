@@ -150,8 +150,14 @@ device's accounts by name makes the choice visible.
 
   The app never asks a person for this identifier. ArkavoKit reads it from
   the stored token's `sub`, which needs no signature check, because the
-  passkey proves control. It exists only so deletion and the broker
-  re-authenticate the account they named. It is not a sign-in path.
+  passkey proves control. It exists only so that an account the app
+  already knows is re-authenticated, not whichever passkey the person picks:
+  - deletion;
+  - the broker;
+  - the sign-in that follows "Create account" in the iOS app, which passes
+    the UUID from the token registration just returned.
+
+  It is not a way to sign in to an unknown account.
 - `GET /authenticate/:username` is deleted. A request to it is no longer
   routed (404).
 - Update README and CLAUDE.md, which document the routes.
