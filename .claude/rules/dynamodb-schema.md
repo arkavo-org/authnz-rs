@@ -20,6 +20,21 @@ paths:
   record); lifted by a `REMOVE` conditional on `LIVE_ROW` (returns the old
   map for the audit log). Read
   with `consistent_read(true)` on every mint whose membership qualifies.
+- **app_store** (Map, optional): the account's App Store subscriptions, keyed
+  by `original_transaction_id` (a numeric string, so addressed through an
+  expression attribute name). Each value: `product_id` (String),
+  `environment` (`Production`|`Sandbox`), `expires_at` (Number),
+  `grace_expires_at` (Number, optional), `revoked_at` (Number, optional),
+  `last_signed_at` (Number); all times unix seconds. Written by
+  `put_app_store_state` in two conditional `UpdateItem`s (DynamoDB rejects
+  overlapping paths in one expression): `SET app_store = :empty` on `LIVE_ROW
+  AND attribute_not_exists(app_store)`, then `SET app_store.#otid = :rec` on
+  `LIVE_ROW AND (attribute_not_exists(app_store.#otid) OR
+  app_store.#otid.last_signed_at <= :signed)`. Order is by `last_signed_at`
+  (Apple's `signedDate`) per otid, never by JWS bytes (an ECDSA signature is
+  malleable); the JWS is not stored. Read with the suspension in one
+  `consistent_read(true)` `GetItem` (`get_publishing_state`). The entitlement
+  derived from it is never stored.
 - **Tombstone** (#88): a deleted account's row is replaced, in one put on
   `attribute_exists(user_id) AND attribute_not_exists(deleted_at)`, by
   `user_id`, `deleted_at` (Number; its presence makes the row a tombstone),
@@ -82,6 +97,14 @@ paths:
     tombstone, and it 409s a new account linking the same Apple ID until
     revoked. A row with some but not all `token_*` attributes is unreadable
     and keeps the deletion `failed` (permanent).
+- **App Store subscription link** (`appstore#<original_transaction_id>`; no
+  Apple token): attributes `user_id` and `created_at` (Number, unix seconds;
+  kept on a re-bind). Written by `bind_app_store_link` as one `UpdateItem` on
+  `attribute_not_exists(link_pk) OR user_id = :uid`, followed by an
+  `is_account_live` re-check that deletes the link if the account died
+  meanwhile. It holds no `token_*` attribute, so the sweep's
+  `delete_identity_links_of` removes it. Read with `app_store_link_owner`
+  (consistent). The state lives on the `credentials` row, not here.
 - **PII**: Deliberately minimal. No email, display name, relay address, or
   `real_user_status` is stored here, even if the IdP returns them. A sealed
   Apple refresh token is not PII.

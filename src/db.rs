@@ -9,6 +9,7 @@ use webauthn_rs::prelude::*;
 
 mod account;
 mod agent_state;
+mod app_store;
 mod apple_tokens;
 mod guardians;
 mod publishing;
@@ -19,6 +20,9 @@ pub use agent_state::{
     AgentState, AgentTrust, AuthorizeOver, AuthorizeWrite, EffectiveState, QuarantineOutcome,
     SwarmWrite,
 };
+// Used by the App Store routes of a later change.
+#[allow(unused_imports)]
+pub use app_store::{AppStoreRecord, LinkOutcome, PublishingState, StateOutcome};
 pub use guardians::Guardian;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 
@@ -176,6 +180,11 @@ pub enum DynamoDBError {
     LinkConflict,
     #[error("Device is already bound to a different user")]
     DeviceBindingConflict,
+
+    /// The account has no live `credentials` row (unknown or deleted). The
+    /// caller answers 401: the token outlived the account.
+    #[error("account is not live")]
+    AccountGone,
 
     /// A DynamoDB condition expression rejected the write (lost a race, or
     /// the row is in a state the caller may not overwrite).
