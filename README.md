@@ -89,15 +89,29 @@ curl -X POST http://localhost:8080/register/testuser \
 
 2. Authenticate:
 
+Without `account`, the ceremony is name-free: the options list no
+credentials, and the passkey the person picks names the account. The reply
+carries `"mediation":"conditional"`, a browser-autofill hint (webauthn-rs
+forces it) that native clients ignore.
+
 ```shell
-curl  http://localhost:8080/authenticate/testuser
+curl http://localhost:8080/authenticate
+```
+
+To re-authenticate a known account, limit the ceremony to its passkeys with
+`account=<uuid>`. A missing or deleted account answers 500 `User Not Found`.
+
+```shell
+curl "http://localhost:8080/authenticate?account=<uuid>"
 ```
 
 ```shell
-curl -X POST http://localhost:8080/authenticate/testuser \
+curl -X POST http://localhost:8080/authenticate \
   -H "Content-Type: application/json" \
   -d '{"challenge": "..."}'
 ```
+
+The success reply is `{"token": "<CWT>", "handle": "<username>"}`.
 
 ## Development
 

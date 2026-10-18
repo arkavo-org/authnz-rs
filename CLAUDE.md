@@ -67,8 +67,8 @@ when unset.
 **authn.rs** - WebAuthn authentication flow
 - `start_register`: Initiates passkey registration with DID validation
 - `finish_register`: Completes registration, stores credential, issues CWT
-- `start_authentication`: Initiates passkey authentication
-- `finish_authentication`: Verifies authentication, issues CWT
+- `start_authentication`: Initiates passkey authentication (`GET /authenticate[?account=<uuid>]`); name-free without `account`, limited to that account's passkeys with it
+- `finish_authentication`: Verifies authentication, issues CWT; replies `{token, handle}`
 - Account token generation with 99-year registration tokens (~5148 weeks)
 - Authentication tokens expire in 1 hour
 - Uses attestation envelope with ECDSA signature for registration response
@@ -467,13 +467,14 @@ appraisal, status)
    - Returns attestation envelope (signed with ECDSA) + CWT in X-Auth-Token header (COSE_Sign1, ES256)
 
 2. **Authentication Flow**:
-   - Client sends CWT in X-Auth-Token header to `/authenticate/:username`
-   - Server decodes inbound CWT (exp/iat enforced with ±60s skew)
+   - `GET /authenticate` starts a name-free ceremony: no credentials are listed, and the passkey's user handle names the account at the finish. The reply includes `"mediation":"conditional"` (webauthn-rs forces it), a browser-autofill hint native clients ignore
+   - `GET /authenticate?account=<uuid>` limits the ceremony to that account's passkeys (re-authentication); a missing or tombstoned account answers 500 `User Not Found`. There is no `/authenticate/:username` route
+   - Client may send a CWT in X-Auth-Token; the server decodes it (exp/iat enforced with ±60s skew). A token for another account is refused (`User Not Found` at an account-scoped start, 403 `Passkey belongs to another account` at a name-free finish)
    - Retrieves credentials from DB (authoritative — no token-embedded fallback)
    - Generates WebAuthn challenge, stores auth state in session
    - Client completes WebAuthn ceremony
    - Server verifies authentication via `/authenticate` POST
-   - Issues new CWT with 1-hour expiration
+   - Issues new CWT with 1-hour expiration, replying `{"token", "handle"}`; a failed assertion answers 400 `{"token":""}`
 
 3. **OAuth Integration**:
    - Callback endpoint: `/oauth/:client/:provider`

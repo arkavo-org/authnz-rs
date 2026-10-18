@@ -525,11 +525,15 @@ fn inbound_account(
     ))
 }
 
-/// `GET /authenticate`: start a sign-in ceremony.
+/// `GET /authenticate[?account=<uuid>]`: start a sign-in ceremony.
 ///
 /// Without `account` the ceremony is name-free. The options list no
 /// credentials, so the system sheet offers every passkey the device holds for
 /// this relying party, and the finish learns the account from the one picked.
+///
+/// With `account` the ceremony is limited to that account's passkeys, for a
+/// client that already knows the account and re-authenticates it. A missing or
+/// deleted account answers `UserNotFound`.
 pub async fn start_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
@@ -542,102 +546,78 @@ pub async fn start_authentication(
 
     let inbound_user_id = inbound_account(&app_state, &headers)?;
 
-    if let Some(account) = query.account {
-        error!(
-            "Account-scoped authentication for {} is not implemented",
-            account
-        );
-        return Err(Unknown);
-    }
-
-    let (rcr, state) = match app_state.webauthn.start_discoverable_authentication() {
-        Ok(started) => started,
-        Err(e) => {
-            error!("start_discoverable_authentication -> {:?}", e);
-            return Err(Unknown);
-        }
+    let (rcr, pending) = match query.account {
+        None => start_discoverable(&app_state, inbound_user_id)?,
+        Some(account) => start_account(&app_state, account, inbound_user_id).await?,
     };
-    if let Err(err) = session
-        .insert(
-            SESSION_AUTH_STATE_KEY,
-            PendingAuthentication::Discoverable {
-                state,
-                inbound_user_id,
-            },
-        )
-        .await
-    {
+    if let Err(err) = session.insert(SESSION_AUTH_STATE_KEY, pending).await {
         error!("Failed to insert auth_state into session: {:?}", err);
         return Err(WebauthnError::InvalidSessionState(err));
     }
     Ok(Json(rcr))
 }
 
-/// `GET /authenticate/:username`: start a ceremony limited to the passkeys of
-/// the account with that alias.
-pub async fn start_named_authentication(
-    Extension(app_state): Extension<AppState>,
-    session: Session,
-    Path(username): Path<String>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, WebauthnError> {
-    info!("Start Authentication");
+/// Start a name-free ceremony.
+fn start_discoverable(
+    app_state: &AppState,
+    inbound_user_id: Option<Uuid>,
+) -> Result<(RequestChallengeResponse, PendingAuthentication), WebauthnError> {
+    match app_state.webauthn.start_discoverable_authentication() {
+        Ok((rcr, state)) => Ok((
+            rcr,
+            PendingAuthentication::Discoverable {
+                state,
+                inbound_user_id,
+            },
+        )),
+        Err(e) => {
+            error!("start_discoverable_authentication -> {:?}", e);
+            Err(Unknown)
+        }
+    }
+}
 
-    remove_auth_state(&session).await?;
-
-    let inbound_user_id = inbound_account(&app_state, &headers)?;
-
-    // Look up user from DB (authoritative source).
-    let user = match app_state
+/// Start a ceremony limited to the passkeys of `account`.
+async fn start_account(
+    app_state: &AppState,
+    account: Uuid,
+    inbound_user_id: Option<Uuid>,
+) -> Result<(RequestChallengeResponse, PendingAuthentication), WebauthnError> {
+    // The database is the authority for both the account and its credentials.
+    let record = app_state
         .db_store
-        .get_user_by_name(&username)
+        .get_user_by_id(&account)
         .await
         .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
-    {
-        Some(user) => user,
-        None => return Err(UserNotFound),
-    };
+        .ok_or(UserNotFound)?;
 
-    // If a token was provided, ensure it belongs to this user.
+    // If a token was provided, ensure it belongs to this account.
     if let Some(tid) = inbound_user_id
-        && tid != user.user_id
+        && tid != record.user_id
     {
         return Err(UserNotFound);
     }
 
-    // Credentials come exclusively from DB (authoritative).
-    let credentials = if user.credentials.is_empty() {
+    if record.credentials.is_empty() {
         return Err(UserHasNoCredentials);
-    } else {
-        user.credentials.clone()
-    };
+    }
 
-    let res = match app_state
+    match app_state
         .webauthn
-        .start_passkey_authentication(&credentials)
+        .start_passkey_authentication(&record.credentials)
     {
-        Ok((rcr, state)) => {
-            if let Err(err) = session
-                .insert(
-                    SESSION_AUTH_STATE_KEY,
-                    PendingAuthentication::Account {
-                        user_id: user.user_id,
-                        state,
-                    },
-                )
-                .await
-            {
-                error!("Failed to insert auth_state into session: {:?}", err);
-                return Err(WebauthnError::InvalidSessionState(err));
-            }
-            Json(rcr)
-        }
+        Ok((rcr, state)) => Ok((
+            rcr,
+            PendingAuthentication::Account {
+                user_id: record.user_id,
+                state,
+            },
+        )),
         Err(e) => {
-            error!("start_authentication -> {:?}", e);
-            return Err(Unknown);
+            error!("start_passkey_authentication -> {:?}", e);
+            Err(Unknown)
         }
-    };
-    Ok(res)
+    }
 }
 
 /// `POST /authenticate`: finish the session's sign-in ceremony and mint the

@@ -97,21 +97,34 @@ fn answer_discoverable(
     assertion
 }
 
-/// `GET /authenticate` on `c`'s session, with `token` as `X-Auth-Token`.
-async fn start(c: &Ceremony, token: Option<&str>) -> RequestChallengeResponse {
-    let mut request = Request::builder().uri("/authenticate");
+/// `GET {uri}` on `c`'s session, with `token` as `X-Auth-Token`: the status
+/// and the body.
+async fn start_raw(c: &Ceremony, uri: &str, token: Option<&str>) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder().uri(uri);
     if let Some(token) = token {
         request = request.header("X-Auth-Token", token);
     }
     let response = c.send(request, Body::empty()).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "GET /authenticate must start a ceremony"
-    );
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
+    (status, body.to_vec())
+}
+
+/// `GET /authenticate` on `c`'s session, with `token` as `X-Auth-Token`.
+async fn start(c: &Ceremony, token: Option<&str>) -> RequestChallengeResponse {
+    start_for(c, "/authenticate", token).await
+}
+
+/// `GET {uri}` on `c`'s session, which must start a ceremony.
+async fn start_for(c: &Ceremony, uri: &str, token: Option<&str>) -> RequestChallengeResponse {
+    let (status, body) = start_raw(c, uri, token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /authenticate must start a ceremony"
+    );
     serde_json::from_slice(&body).expect("GET /authenticate returns WebAuthn request options")
 }
 
@@ -318,4 +331,118 @@ async fn a_replayed_finish_mints_nothing() {
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body, "Corrupt Session");
+}
+
+/// `GET /authenticate?account=<id>`.
+fn scoped(account: &Uuid) -> String {
+    format!("/authenticate?account={account}")
+}
+
+#[tokio::test]
+async fn an_account_scoped_start_lists_only_that_accounts_passkeys() {
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id,
+        cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    // A second account, so a bug that lists every credential shows.
+    let Some(_other) = registered_account(&unique_name()).await else {
+        return;
+    };
+
+    let options = start_for(&c, &scoped(&user_id), None).await;
+
+    let listed: Vec<_> = options
+        .public_key
+        .allow_credentials
+        .iter()
+        .map(|allowed| allowed.id.clone())
+        .collect();
+    assert_eq!(listed, vec![cred.clone()], "only the account's own passkey");
+
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut auth, options, &cred, Some(user_id)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["handle"], c.username.as_str());
+    let token = reply["token"].as_str().expect("the reply carries a token");
+    assert_eq!(verified_claims(&c, token).sub, user_id.to_string());
+}
+
+#[tokio::test]
+async fn an_account_scoped_start_refuses_another_accounts_passkey() {
+    let Some(Registered {
+        ceremony: c,
+        user_id: a_id,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let Some(Registered {
+        auth: mut b_auth,
+        user_id: b_id,
+        cred: b_cred,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let options = start_for(&c, &scoped(&a_id), None).await;
+
+    let (status, body) = finish(
+        &c,
+        &answer_discoverable(&mut b_auth, options, &b_cred, Some(b_id)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, r#"{"token":""}"#);
+}
+
+#[tokio::test]
+async fn an_account_scoped_start_for_a_deleted_account_is_user_not_found() {
+    let Some(Registered {
+        ceremony: c,
+        user_id,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    tombstone(&c, &user_id).await;
+
+    let (status, body) = start_raw(&c, &scoped(&user_id), None).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, b"User Not Found");
+}
+
+#[tokio::test]
+async fn an_inbound_token_for_another_account_is_refused_at_an_account_scoped_start() {
+    let Some(Registered {
+        ceremony: c,
+        user_id: a_id,
+        ..
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    let Some(Registered { token: b_token, .. }) = registered_account(&unique_name()).await else {
+        return;
+    };
+
+    let (status, body) = start_raw(&c, &scoped(&a_id), Some(&b_token)).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, b"User Not Found");
 }

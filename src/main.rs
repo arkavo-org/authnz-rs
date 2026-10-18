@@ -35,10 +35,7 @@ use crate::apple_signin::{
     AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_link_handler,
     apple_nonce_handler,
 };
-use crate::authn::{
-    finish_authentication, finish_register, start_authentication, start_named_authentication,
-    start_register,
-};
+use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
 use crate::db::DynamoDBStore;
 use crate::device_check::{
@@ -708,7 +705,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
         .route("/register/:username", get(start_register))
         .route("/register", post(finish_register))
-        .route("/authenticate/:username", get(start_named_authentication))
         .route(
             "/authenticate",
             get(start_authentication).post(finish_authentication),
