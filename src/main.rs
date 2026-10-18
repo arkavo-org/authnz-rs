@@ -56,6 +56,9 @@ mod agent;
 #[cfg(test)]
 mod agent_plane_tests;
 mod agent_state;
+mod app_store;
+#[cfg(test)]
+mod app_store_tests;
 mod apple_signin;
 mod apple_tokens;
 #[cfg(test)]
