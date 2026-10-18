@@ -89,15 +89,75 @@ curl -X POST http://localhost:8080/register/testuser \
 
 2. Authenticate:
 
-```shell
-curl  http://localhost:8080/authenticate/testuser
-```
+A `GET /authenticate` starts a ceremony, keeps it in the session and sets the
+session cookie. The `POST /authenticate` that finishes it must carry that
+cookie.
+
+Without `account`, the ceremony is name-free: the options list no
+credentials, and the passkey the person picks names the account. The reply
+carries `"mediation":"conditional"`, a browser-autofill hint (webauthn-rs
+forces it) that native clients ignore.
 
 ```shell
-curl -X POST http://localhost:8080/authenticate/testuser \
-  -H "Content-Type: application/json" \
-  -d '{"challenge": "..."}'
+curl -c cookies.txt http://localhost:8080/authenticate
 ```
+
+To re-authenticate a known account, limit the ceremony to its passkeys with
+`account=<uuid>`. A missing or deleted account answers 500 `User Not Found`,
+and an account with no passkey 500 `User Has No Credentials`. A malformed
+`account` gets axum's query rejection: 400
+`Failed to deserialize query string: …`.
+
+```shell
+curl -c cookies.txt "http://localhost:8080/authenticate?account=<uuid>"
+```
+
+Either start may carry an Arkavo CWT in `X-Auth-Token`:
+
+- An expired or invalid token refuses the start with 401 `CWT error: …`.
+- A valid token for another account is refused: 500 `User Not Found` at an
+  account-scoped start, 403 `Passkey belongs to another account` at a
+  name-free finish.
+- Clients should not forward a cached token to the name-free start. A stale
+  one refuses the start that should replace it, and a valid one for account
+  A turns a pick of B's passkey into the 403.
+- Clients must not forward a token to `?account=`. A token for another
+  account there answers 500 `User Not Found`, which ArkavoKit reads as "the
+  account is already deleted".
+
+The POST body is the WebAuthn `PublicKeyCredential` the authenticator returned
+for those options (`id`, `rawId`, `type`, and a `response` with
+`authenticatorData`, `clientDataJSON`, `signature` and `userHandle`):
+
+```shell
+curl -b cookies.txt -X POST http://localhost:8080/authenticate \
+  -H "Content-Type: application/json" \
+  -d @assertion.json
+```
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"token":"<CWT>","handle":"<username>"}` | The assertion verified. The CWT expires in 1 hour. |
+| 400 | `{"token":""}` | Ceremony failure. The assertion did not verify (challenge, signature, origin, user verification, or a credential the account-scoped start did not list). Or a name-free assertion's user handle is missing or not a 16-byte UUID. Or an account-scoped assertion carries a user handle that is not that account's UUID. |
+| 404 | `Unknown Passkey` | Name-free only. The user handle names no live account, or the account does not hold that credential id. This is decided before the signature check, and the body carries no account data. Clients remove the passkey from the device on it, so the body must not change. |
+| 403 | `Passkey belongs to another account` | Name-free only. The start carried a valid `X-Auth-Token`, and the passkey's user handle names another account. Also decided before the signature check. |
+| 500 | `Corrupt Session` | The session holds no open ceremony: no start, a lost cookie, or a ceremony already finished (a replayed POST). |
+| 500 | `User Not Found` | Account-scoped only. The account was deleted between the start and the finish. ArkavoKit maps this text to "already deleted", so it must not change. |
+
+A DynamoDB error at the finish answers 500 `Database operation failed: …` and
+leaves the ceremony open, so the client can retry the POST. A body that is not
+a `PublicKeyCredential` gets axum's JSON rejection.
+
+Two webauthn-rs details:
+
+- The name-free start uses `allow_backup_eligible_upgrade = false`, and the
+  account-scoped start uses `true`. A passkey stored as not backup-eligible
+  that now reports backup eligibility fails the name-free finish with 400,
+  and the account-scoped finish accepts it.
+- Neither finish saves the credential update in webauthn-rs's
+  `AuthenticationResult` (signature counter, backup state). So that
+  difference never heals, and clone detection compares the counter with the
+  value stored at registration.
 
 ## Development
 

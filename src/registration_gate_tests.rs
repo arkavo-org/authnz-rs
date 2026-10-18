@@ -265,8 +265,8 @@ use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential};
 
 /// The whole registration surface, including `POST /register`, over a real
-/// store.
-fn ceremony_router(store: Arc<DynamoDBStore>) -> Router {
+/// store, plus the sign-in routes so a registered session can sign in.
+pub(super) fn ceremony_router(store: Arc<DynamoDBStore>) -> Router {
     let app_state = crate::test_helpers::build_test_app_state_with_store(store);
     // Patreon disabled: `materialize_for_user` returns before touching Redis,
     // so the unreachable client below is never dialled.
@@ -276,6 +276,10 @@ fn ceremony_router(store: Arc<DynamoDBStore>) -> Router {
     Router::new()
         .route("/register/:username", get(crate::authn::start_register))
         .route("/register", post(crate::authn::finish_register))
+        .route(
+            "/authenticate",
+            get(crate::authn::start_authentication).post(crate::authn::finish_authentication),
+        )
         .route("/test-only/seed-ticket", get(seed_ticket))
         .layer(Extension(app_state))
         .layer(Extension(patreon))
@@ -284,17 +288,17 @@ fn ceremony_router(store: Arc<DynamoDBStore>) -> Router {
 
 /// One client session: a fresh username and a fresh attested `key_id`, so
 /// runs never collide in a DynamoDB Local that outlives them.
-struct Ceremony {
+pub(super) struct Ceremony {
     app: Router,
-    store: Arc<DynamoDBStore>,
+    pub(super) store: Arc<DynamoDBStore>,
     cookie: String,
-    username: String,
+    pub(super) username: String,
     key_id: String,
 }
 
 impl Ceremony {
     /// A session holding a live ticket, or `None` without DynamoDB Local.
-    async fn begin() -> Option<Self> {
+    pub(super) async fn begin() -> Option<Self> {
         let store = Arc::new(crate::db::tests::local_store()?);
         let id = uuid::Uuid::new_v4().simple().to_string();
         let mut c = Ceremony {
@@ -309,7 +313,7 @@ impl Ceremony {
         Some(c)
     }
 
-    async fn send(
+    pub(super) async fn send(
         &self,
         request: axum::http::request::Builder,
         body: Body,
@@ -326,12 +330,12 @@ impl Ceremony {
             .unwrap()
     }
 
-    async fn get(&self, uri: &str) -> axum::response::Response {
+    pub(super) async fn get(&self, uri: &str) -> axum::response::Response {
         self.send(Request::builder().uri(uri), Body::empty()).await
     }
 
     /// (Re)write this session's ticket, `expires_in` seconds from now.
-    async fn seed(&self, expires_in: i64) -> axum::response::Response {
+    pub(super) async fn seed(&self, expires_in: i64) -> axum::response::Response {
         let response = self
             .get(&format!(
                 "/test-only/seed-ticket?key_id={}&expires_in={expires_in}",
@@ -343,7 +347,7 @@ impl Ceremony {
     }
 
     /// `GET /register/:username`, which must admit this ticketed session.
-    async fn options(&self) -> CreationChallengeResponse {
+    pub(super) async fn options(&self) -> CreationChallengeResponse {
         let response = self.get(&register_uri(&self.username)).await;
         assert_eq!(
             response.status(),
@@ -356,7 +360,10 @@ impl Ceremony {
         serde_json::from_slice(&body).expect("start_register returns WebAuthn creation options")
     }
 
-    async fn finish(&self, credential: &RegisterPublicKeyCredential) -> axum::response::Response {
+    pub(super) async fn finish(
+        &self,
+        credential: &RegisterPublicKeyCredential,
+    ) -> axum::response::Response {
         self.send(
             Request::builder()
                 .method("POST")
@@ -367,7 +374,7 @@ impl Ceremony {
         .await
     }
 
-    async fn credential_count(&self) -> usize {
+    pub(super) async fn credential_count(&self) -> usize {
         self.store
             .get_user_by_name(&self.username)
             .await
@@ -376,7 +383,7 @@ impl Ceremony {
     }
 
     /// Slots this key has spent; `None` if it was never charged.
-    async fn registrations(&self) -> Option<u32> {
+    pub(super) async fn registrations(&self) -> Option<u32> {
         self.store
             .get_attest_key_record(&self.key_id)
             .await
