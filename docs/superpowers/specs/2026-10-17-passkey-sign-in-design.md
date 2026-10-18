@@ -128,6 +128,14 @@ device's accounts by name makes the choice visible.
   4. The token is minted exactly as today: `oidc::arkavo_user_claims`, then
      `mint_auth_token`.
 - The reply becomes `{"token": …, "handle": <the account's alias>}`.
+- **The optional `X-Auth-Token` check stays.** The named start refused a
+  token that belonged to another account. If the start carried a valid
+  `X-Auth-Token`, the name-free finish refuses when the account it
+  identified is not that token's `sub`.
+- **An unknown passkey gets its own refusal.** This covers a user handle
+  with no live account and a credential not in the account's record. The
+  answer is distinct and carries no account data, so the client can tell it
+  apart from a failed ceremony.
 - The ordering rule in today's `finish_authentication` stays: read the record
   before consuming the session state, so a transient DynamoDB error lets the
   client retry the POST.
@@ -164,6 +172,25 @@ device's accounts by name makes the choice visible.
   - "User Not Found" still maps to `.alreadyDeleted`.
   - With no stored token there is no UUID. Deletion then needs a sign-in
     first, which is the same as being signed out today.
+- **Stale passkeys** *(the reason sign-in was scoped by name: owner,
+  2026-10-17)*:
+  - A passkey whose account is gone stays in the device's passkey list.
+    That happens when an account is deleted, or when an alias is deleted
+    and re-created under a new account UUID. The name-scoped sheet hid such
+    passkeys, but the name-free sheet would list them.
+  - AuthenticationServices' `ASCredentialDataManager` (iOS and macOS 26.2+)
+    lets the app tell the system which passkeys to drop.
+    - **On the server's unknown-passkey refusal:**
+      `reportUnknownPublicKeyCredential(relyingPartyIdentifier:credentialID:)`
+      runs for the picked credential, and then the app shows its
+      "no longer exists" message.
+    - **After a successful account deletion:**
+      `reportAllAcceptedPublicKeyCredentials(relyingPartyIdentifier:userHandle:acceptedCredentialIDs: [])`
+      runs for the deleted account's user handle, so its passkeys leave the
+      list straight away.
+  - ArkavoKit supports iOS 26, so these calls sit behind
+    `#available(iOS 26.2, *)`. The apps target iOS 27 and macOS 27.
+  - Reporting failures are logged and never block sign-in or deletion.
 - `registerUser(handle:did:)` is unchanged.
 - Ship as a new ArkavoKit minor release.
 
@@ -205,9 +232,14 @@ deploy need not wait on an App Review approval.
 ## Edge cases the builder must handle
 
 - **The picked passkey's account no longer exists** (the account was deleted
-  and the passkey stayed in iCloud Keychain). The server refuses, and the app
-  says the account for that passkey no longer exists. It must not hang and
-  must not show raw server text.
+  and the passkey stayed in iCloud Keychain).
+  - The server answers with its unknown-passkey refusal.
+  - The app reports that credential as unknown, so it leaves the list, and
+    says the account for that passkey no longer exists.
+  - The app must not hang and must not show raw server text.
+- **A re-created alias.** The list may show the alias twice: the old,
+  deleted account's passkey and the new one. Picking the old one behaves as
+  above, and the stale entry is gone afterwards.
 - **The person cancels the sheet.** They stay signed out with no error
   banner. Today's cancellation handling applies.
 - **The device has no Arkavo passkey.** The system sheet offers a passkey from
