@@ -87,6 +87,12 @@ pub(crate) enum AppStoreError {
     InvalidSignature,
     #[error("signed for another app")]
     WrongApp,
+    /// A product of this app that is not configured to grant membership.
+    /// The client route answers it as it does `WrongApp`; the notification
+    /// route acknowledges it (the notification never changes, so a 4xx would
+    /// only make Apple retry it).
+    #[error("product not configured")]
+    UnknownProduct,
     #[error("environment not accepted")]
     WrongEnvironment,
     #[error("not a direct purchase")]
@@ -480,7 +486,7 @@ pub(crate) fn decode_transaction(
     let environment = accepted_environment(cfg, string_field(&payload, "environment")?)?;
     let product_id = string_field(&payload, "productId")?;
     if !cfg.product_ids.contains(product_id) {
-        return Err(AppStoreError::WrongApp);
+        return Err(AppStoreError::UnknownProduct);
     }
     if payload.get("inAppOwnershipType").and_then(Value::as_str) != Some("PURCHASED") {
         return Err(AppStoreError::NotPurchased);
@@ -544,8 +550,9 @@ pub(crate) fn decode_renewal_info(
 /// Verify a Server Notification V2 body and, when it carries them, the nested
 /// transaction and renewal info.
 ///
-/// A verified payload with no `data` but a `summary` (a bulk renewal-date
-/// extension) decodes without a transaction, like `TEST`. The nested
+/// A verified payload with no `data` (a bulk renewal-date extension's
+/// `summary`, an `externalPurchaseToken`) decodes without a transaction, like
+/// `TEST`. The nested
 /// transaction must state the environment `data` does, and the renewal info
 /// must belong to the same subscription (and environment, when it states
 /// one): the outer label is what decides whether `appAppleId` is checked, so
@@ -557,16 +564,25 @@ pub(crate) fn decode_notification(
     let payload = verify_signed(cfg, signed_payload)?;
     let notification_type = string_field(&payload, "notificationType")?.to_string();
     let Some(data) = payload.get("data").and_then(Value::as_object) else {
-        return if payload.get("summary").is_some_and(Value::is_object) {
-            Ok(VerifiedNotification {
-                notification_type,
-                environment: None,
-                transaction: None,
-                grace_expires_at: None,
-            })
-        } else {
-            Err(AppStoreError::Malformed)
-        };
+        // A verified payload without `data` (a `summary`, an
+        // `externalPurchaseToken`, whatever Apple adds) has no transaction to
+        // apply and is acknowledged. Where it names a bundle, it must be ours.
+        for key in ["summary", "externalPurchaseToken"] {
+            if let Some(bundle) = payload
+                .get(key)
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("bundleId"))
+                && bundle.as_str() != Some(cfg.bundle_id.as_str())
+            {
+                return Err(AppStoreError::WrongApp);
+            }
+        }
+        return Ok(VerifiedNotification {
+            notification_type,
+            environment: None,
+            transaction: None,
+            grace_expires_at: None,
+        });
     };
 
     if string_field(data, "bundleId")? != cfg.bundle_id {
@@ -878,8 +894,15 @@ async fn post_notification(
     let Ok(NotificationRequest { signed_payload }) = serde_json::from_slice(body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(notification) = decode_notification(cfg, &signed_payload) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let notification = match decode_notification(cfg, &signed_payload) {
+        Ok(notification) => notification,
+        // Ours, but not a product that grants membership: nothing to apply,
+        // and a 4xx would only make Apple retry it.
+        Err(AppStoreError::UnknownProduct) => {
+            trace.outcome = "ignored=product";
+            return StatusCode::OK.into_response();
+        }
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     trace.notification_type = Some(loggable_type(&notification.notification_type));
     trace.environment = notification.environment;

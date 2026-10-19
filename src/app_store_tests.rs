@@ -504,7 +504,7 @@ fn refuses_product_not_configured() {
     let fx = fixture(Options::default());
     assert_eq!(
         decode(&fx, json!({ "productId": "com.arkavo.ArkavoCreator.tip" })),
-        Err(AppStoreError::WrongApp)
+        Err(AppStoreError::UnknownProduct)
     );
 }
 
@@ -700,7 +700,7 @@ fn notification_refuses_a_bad_nested_transaction() {
     ));
     assert_eq!(
         decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
-        Err(AppStoreError::WrongApp)
+        Err(AppStoreError::UnknownProduct)
     );
 
     let mut data = notification_data(&fx, "Production");
@@ -849,15 +849,34 @@ fn summary_notification_decodes_without_a_transaction() {
     assert_eq!(decoded.notification_type, "RENEWAL_EXTENSION");
     assert_eq!(decoded.transaction, None);
 
-    // Neither `data` nor `summary` is still malformed.
+    // Any other verified payload without `data` has no transaction either.
     let bare = sign_jws(
         &json!({ "notificationType": "DID_RENEW", "signedDate": now_ms() }),
         &fx,
     );
-    assert_eq!(
-        decode_notification(&cfg, &bare),
-        Err(AppStoreError::Malformed)
-    );
+    let decoded = decode_notification(&cfg, &bare).unwrap();
+    assert_eq!(decoded.notification_type, "DID_RENEW");
+    assert_eq!(decoded.transaction, None);
+
+    // Where such a payload names a bundle, it must be this app's.
+    for key in ["summary", "externalPurchaseToken"] {
+        let named = |bundle: &str| {
+            sign_jws(
+                &json!({
+                    "notificationType": "EXTERNAL_PURCHASE_TOKEN",
+                    key: { "bundleId": bundle },
+                    "signedDate": now_ms(),
+                }),
+                &fx,
+            )
+        };
+        assert!(decode_notification(&cfg, &named("com.arkavo.ArkavoCreator")).is_ok());
+        assert_eq!(
+            decode_notification(&cfg, &named("com.example.other")),
+            Err(AppStoreError::WrongApp),
+            "{key}"
+        );
+    }
 }
 
 #[test]
@@ -2110,6 +2129,83 @@ mod notifications_route {
         );
         let (status, _) = h.notify_payload(&payload).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Apple's third V2 shape carries an `externalPurchaseToken`, not `data`.
+    #[tokio::test]
+    async fn payload_without_data_is_200_and_writes_nothing() {
+        let Some(h) = Harness::new() else { return };
+        let payload = sign_jws(
+            &json!({
+                "notificationType": "EXTERNAL_PURCHASE_TOKEN",
+                "externalPurchaseToken": {
+                    "externalPurchaseId": "SANDBOX_abc",
+                    "bundleId": "com.arkavo.ArkavoCreator",
+                },
+                "signedDate": now_ms(),
+            }),
+            &h.fx,
+        );
+        let (status, body) = h.notify_payload(&payload).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty(), "{body}");
+
+        let bare = sign_jws(
+            &json!({ "notificationType": "SOMETHING_NEW", "signedDate": now_ms() }),
+            &h.fx,
+        );
+        let (status, _) = h.notify_payload(&bare).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Another app's token is not ours.
+        let other = sign_jws(
+            &json!({
+                "notificationType": "EXTERNAL_PURCHASE_TOKEN",
+                "externalPurchaseToken": { "bundleId": "com.example.other" },
+                "signedDate": now_ms(),
+            }),
+            &h.fx,
+        );
+        let (status, _) = h.notify_payload(&other).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A product of this app that does not grant membership is acknowledged
+    /// and writes nothing; a wrong bundle or an unconfigured environment is
+    /// still turned away.
+    #[tokio::test]
+    async fn another_product_is_200_and_writes_nothing() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        let mut tx = snapshot(&t, Some(&id), base_ms(), expiry);
+        tx["productId"] = json!("com.arkavo.ArkavoCreator.tip");
+
+        let status = h.deliver("DID_RENEW", tx.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+
+        // An existing membership is not touched by the other product.
+        let member = otid();
+        h.deliver(
+            "SUBSCRIBED",
+            snapshot(&member, Some(&id), base_ms(), expiry),
+            None,
+        )
+        .await;
+        let mut tip = snapshot(&member, Some(&id), base_ms() + 5_000, expiry + 86_400_000);
+        tip["productId"] = json!("com.arkavo.ArkavoCreator.tip");
+        assert_eq!(h.deliver("DID_RENEW", tip, None).await, StatusCode::OK);
+        assert_eq!(only_record(&h, &id).await.expires_at, secs(expiry));
+
+        let mut wrong_bundle = tx;
+        wrong_bundle["bundleId"] = json!("com.example.other");
+        let (status, _) = h
+            .notify_payload(&h.notice("DID_RENEW", wrong_bundle, None))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
