@@ -88,12 +88,37 @@ transaction (`expiresDate`, `revocationDate`) and, for the grace period, the
 renewal info of App Store Server Notifications V2 (`gracePeriodExpiresDate`);
 an older notification never overwrites a newer one.
 
+- **Order.** Snapshots apply in `signedDate` order. Two signed in the same
+  second apply in arrival order, except that one without a `revocationDate`
+  never replaces one that has it.
+- **Past periods.** Each record keeps the `transactionId` of the billing
+  period it describes. A snapshot of *another* transaction that ends before
+  the stored one is a past period and never changes the record: it can't
+  shorten `expires_at` and can't set `revoked_at`. Apple signs a
+  notification when it sends it, so a `REFUND`, `CONSUMPTION_REQUEST`,
+  `REFUND_DECLINED` or `REFUND_REVERSED` of last month's transaction is
+  signed after this month's renewal; without this rule it would end the
+  current period, and Creator's re-post of the current transaction would be
+  stale. The notification is acknowledged (`200`, logged
+  `outcome=ignored=past_period`); a client post of it answers with the
+  stored record, as a stale post does. A renewal (a new transaction ending no
+  earlier) and every snapshot of the stored transaction, a refund of it
+  included, follow the order above. A record stored before transaction ids
+  were kept follows the order alone. The rule is part of the write's
+  DynamoDB condition, so it holds under concurrent deliveries.
+- **Environment.** A snapshot never changes a record of the other
+  environment, so a Sandbox snapshot can't flip a Production record. The
+  notification is acknowledged (`outcome=ignored=environment`); a client post
+  answers `422 invalid transaction`.
+
 - **Lapse.** When a subscription is not renewed, the entitlement ends at the
   first mint after `expires_at`. No notification is needed, the stored date
   decides.
 - **Grace (billing retry).** While Apple retries a failed renewal and reports
   a grace period, the entitlement continues until the grace period ends.
-  Without a recorded grace period there is none.
+  Without a recorded grace period there is none. Only a notification's
+  renewal info sets or clears it: a notification without renewal info, and a
+  client post, leave it as it is.
 - **Refund or revocation.** A `revocationDate` removes the entitlement at the
   very next mint, even if `expires_at` is still in the future. The read is
   strongly consistent, so no stale index is involved. Already-issued tokens
@@ -106,15 +131,29 @@ an older notification never overwrites a newer one.
   visible. Set `APP_STORE_ENVIRONMENTS=Production` to refuse Sandbox. `Xcode`
   and `LocalTesting` payloads are unsigned and always refused.
 - **One subscription, one account.** The subscription
-  (`original_transaction_id`) is bound to an account by an `appstore#<id>`
-  identity link; a second live account posting it gets `409`. Deleting the
-  first account removes the link (the account-deletion sweep), which frees the
-  subscription for another account.
+  (`original_transaction_id`) is bound to one account by an `appstore#<id>`
+  identity link. Deleting the account removes the link (the account-deletion
+  sweep), which frees the subscription for another account.
+- **Resubscribing for another account.** A lapsed subscription resubscribed
+  with the same Apple ID while signed in to another account keeps its
+  `original_transaction_id`. The link moves to the new account (the caller
+  of `POST /app-store/transactions`, or the live account a notification's
+  `appAccountToken` names) only when either holds:
+  - the linked account is not live (deleted but not yet swept); or
+  - the transaction is Sandbox and its `appAccountToken` names the new
+    account. App Review reuses Sandbox Apple IDs with fresh accounts.
+
+  Otherwise the link stays: a second live account posting a Production
+  subscription of another live account gets `409`, and notifications keep
+  feeding the linked account. A purchase whose `appAccountToken` names a
+  third account never moves it (`403` while that account is live). The move
+  is conditional on the previous owner, and the new owner is checked again
+  after it, as a bind is. The previous owner's record is not touched; a
+  Sandbox one expires on its own (Sandbox renewals take minutes). In Sandbox,
+  whichever account posts a transaction bought for it holds the link.
 - **Setup.** Env vars are in the table below; the client posts the
-  transaction after a purchase, and App Store Connect → App Information → App
-  Store Server Notifications (Version 2, Production and Sandbox URLs both
-  `https://identity.arkavo.net/app-store/notifications`) keeps the state
-  current.
+  transaction after a purchase, and App Store Server Notifications keep the
+  state current. See [Deploy](#deploy).
 
 ### Lapse timing
 
@@ -235,9 +274,10 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
 
 ## Deploy
 
-1. **No table changes.** The suspension is an attribute on the existing
-   `credentials` table (DynamoDB is schemaless for non-key attributes), and no
-   new table or GSI is needed.
+1. **No table changes.** The suspension and the App Store records are
+   attributes on the existing `credentials` table (DynamoDB is schemaless for
+   non-key attributes), the App Store links are `appstore#<id>` rows of
+   `identity_links`, and no new table, GSI or IAM grant is needed.
 2. Register a moderation service client, if you don't have one:
    - `OIDC_CLIENT_<TAG>_ID`, `_SECRET` and a dummy `_REDIRECT_URIS`, as
      described in `docs/pep-service-clients.md`;
@@ -246,16 +286,47 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
    - `PATREON_PUBLISHER_CAMPAIGN_ID=<Arkavo campaign id>`;
    - `PATREON_PUBLISHER_TIER_IDS=<tier id>[,<tier id>…]`, taken from Patreon
      (the tier's `id`, not its title);
-   - `MODERATION_CLIENT_IDS=<moderation client id>`.
+   - `MODERATION_CLIENT_IDS=<moderation client id>`;
+   - `APP_STORE_BUNDLE_ID=com.arkavo.ArkavoCreator`,
+     `APP_STORE_APP_APPLE_ID=6738845556` and
+     `APP_STORE_PUBLISH_PRODUCT_IDS=com.arkavo.ArkavoCreator.membership.monthly`
+     (`APP_STORE_ENVIRONMENTS` is optional; the default is
+     `Production,Sandbox`).
 4. Check that the Patreon apps' authorize URLs request `identity.memberships`
    for **creator** links as well as consumer links. Creators linked before that
    change must re-link.
 5. Restart. Confirm that the startup log reports `Creator publishing
-   entitlement ENABLED`.
-6. Check end to end:
-   - a qualifying account's passkey auth CWT lists the FQN in
-     `arkavo_entitlements`;
-   - after `PUT …/publishing-suspension`, the next auth CWT does not list it.
+   entitlement ENABLED` and `App Store purchases ENABLED`.
+6. Check that the notification route is live:
+
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+     https://identity.arkavo.net/app-store/notifications \
+     -H 'Content-Type: application/json' -d '{}'
+   ```
+
+   It must answer `400`. A `404` means the running binary has no such route;
+   a `503` means the `APP_STORE_*` variables are not all set.
+7. In App Store Connect → App Information → App Store Server Notifications,
+   select Version 2 and set both the **Production** and the **Sandbox**
+   Server URL to `https://identity.arkavo.net/app-store/notifications`.
+8. Turn **Streamlined Purchasing** off in App Store Connect before any real
+   sale. Only a purchase that starts in Creator carries `appAccountToken`, and
+   identity refuses a transaction without one (`422 invalid transaction`; a
+   notification for it binds to no account). There is no fallback for a
+   purchase that starts on the App Store.
+9. First rollout only: run "Request a Test Notification" for Production
+   (App Store Server API, `POST /inApps/v1/notifications/test`). The log must
+   show `app_store notification type=TEST otid=- env=Production
+   outcome=ignored=no_transaction`. A `400` means the TEST payload was
+   refused, for example because it lacks `appAppleId`.
+10. Check end to end:
+    - a qualifying account's passkey auth CWT lists the FQN in
+      `arkavo_entitlements`;
+    - after `PUT …/publishing-suspension`, the next auth CWT does not list it;
+    - a Sandbox purchase in Creator answers `POST /app-store/transactions`
+      with `"active":true`, logs `app_store transaction outcome=bound …
+      env=Sandbox`, and the next auth CWT lists the FQN.
 
 **Rollback:** unset the two `PATREON_PUBLISHER_*` variables (Patreon) and one
 of the first three `APP_STORE_*` variables (App Store). No more tokens get the
