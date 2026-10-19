@@ -250,8 +250,61 @@ impl DynamoDBStore {
                 other => return Err(other),
             },
         };
+        self.recheck_app_store_link(otid, user_id, outcome == LinkOutcome::Bound)
+            .await?;
+        Ok(outcome)
+    }
+
+    /// Move `appstore#<otid>` from `from` to `to`: one conditional update on
+    /// the link still naming `from` (a move is a new binding, so `created_at`
+    /// restarts). `Ok(false)`: it no longer does (another bind or move, or the
+    /// deletion sweep, changed it) and nothing was written. Whether a move is
+    /// allowed is the caller's decision. Afterwards `to` is checked again as a
+    /// bind checks it, and the link this call wrote is taken back (deleted)
+    /// when `to` is dead or the check fails. `from`'s `credentials` row is
+    /// never touched.
+    pub async fn move_app_store_link(
+        &self,
+        otid: &str,
+        from: &Uuid,
+        to: &Uuid,
+    ) -> Result<bool, DynamoDBError> {
+        let table = &self.identity_links_table;
+        let result = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key("link_pk", s(&link_pk(otid)))
+            .update_expression("SET user_id = :to, created_at = :now")
+            .condition_expression("user_id = :from")
+            .expression_attribute_values(":from", s(&from.to_string()))
+            .expression_attribute_values(":to", s(&to.to_string()))
+            .expression_attribute_values(":now", n(chrono::Utc::now().timestamp()))
+            .send()
+            .await;
+        if let Err(e) = result {
+            return match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            };
+        }
+        self.recheck_app_store_link(otid, to, true).await?;
+        Ok(true)
+    }
+
+    /// The check after a link write: a deletion may have swept the links
+    /// before this one landed. On a dead account the link is deleted and
+    /// [`DynamoDBError::AccountGone`] returned (even when the delete fails;
+    /// the sweep removes the link then). If the check itself fails, a link
+    /// this call `wrote` is taken back and the check's error returned.
+    async fn recheck_app_store_link(
+        &self,
+        otid: &str,
+        user_id: &Uuid,
+        wrote: bool,
+    ) -> Result<(), DynamoDBError> {
         match self.is_account_live(user_id).await {
-            Ok(true) => Ok(outcome),
+            Ok(true) => Ok(()),
             Ok(false) => {
                 // Dead either way: a link that could not be taken back stays
                 // for the deletion sweep (it removes every link of the
@@ -263,12 +316,10 @@ impl DynamoDBStore {
             }
             Err(e) => {
                 // Unknown whether the account died. A link this call just
-                // wrote is taken back so the failed bind leaves nothing; one
+                // wrote is taken back so the failed write leaves nothing; one
                 // that was already this account's was bound by an earlier,
                 // checked call and stays.
-                if outcome == LinkOutcome::Bound
-                    && let Err(del) = self.delete_app_store_link(otid, user_id).await
-                {
+                if wrote && let Err(del) = self.delete_app_store_link(otid, user_id).await {
                     warn!(
                         "could not take back app store link original_transaction_id={otid}: {del}"
                     );
@@ -874,6 +925,56 @@ mod tests {
         let err = blind.bind_app_store_link(&t, &id).await.unwrap_err();
         assert!(!matches!(err, DynamoDBError::AccountGone), "{err:?}");
         assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn move_link_only_from_its_current_owner() {
+        let Some(store) = local_store() else { return };
+        let (a, b, c) = (
+            user(&store, "asm-a").await,
+            user(&store, "asm-b").await,
+            user(&store, "asm-c").await,
+        );
+        let t = otid();
+        store.bind_app_store_link(&t, &a).await.unwrap();
+
+        assert!(store.move_app_store_link(&t, &a, &b).await.unwrap());
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(b));
+        // Conditional on the old owner: a move from A no longer applies.
+        assert!(!store.move_app_store_link(&t, &a, &c).await.unwrap());
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(b));
+        // Nor does a move of a link that does not exist, which creates none.
+        let absent = otid();
+        assert!(!store.move_app_store_link(&absent, &a, &c).await.unwrap());
+        assert_eq!(store.app_store_link_owner(&absent).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_move_to_a_dead_account_is_taken_back() {
+        let Some(store) = local_store() else { return };
+        let a = user(&store, "asm-from").await;
+        let gone = user(&store, "asm-gone").await;
+        tombstone(&store, &gone).await;
+        let t = otid();
+        store.bind_app_store_link(&t, &a).await.unwrap();
+
+        let err = store.move_app_store_link(&t, &a, &gone).await.unwrap_err();
+        assert!(matches!(err, DynamoDBError::AccountGone), "{err:?}");
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_move_whose_recheck_fails_is_taken_back() {
+        let Some(store) = local_store() else { return };
+        let blind = store_with_unreadable_accounts(&store);
+        let (a, b) = (user(&store, "asm-ra").await, user(&store, "asm-rb").await);
+        let t = otid();
+        store.bind_app_store_link(&t, &a).await.unwrap();
+
+        let err = blind.move_app_store_link(&t, &a, &b).await.unwrap_err();
+        assert!(!matches!(err, DynamoDBError::AccountGone), "{err:?}");
+        // The link this call wrote is taken back.
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
     }
 
     async fn link_item(store: &DynamoDBStore, t: &str) -> HashMap<String, AttributeValue> {

@@ -1426,16 +1426,22 @@ mod transactions_route {
         let (first, second) = (h.user().await, h.user().await);
         let t = otid();
 
-        let by_first =
-            h.jws(json!({ "originalTransactionId": t, "appAccountToken": first.to_string() }));
+        let by_first = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": first.to_string(),
+            "environment": "Production",
+        }));
         let (status, body) = h.post(&h.token(&first), &by_first).await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        // The same Apple ID's subscription, now claimed for another account
-        // (here by a transaction naming a dead account).
+        // The same Apple ID's Production subscription, resubscribed while
+        // signed in to another account: the first account is live, so it
+        // keeps it.
         let by_second = h.jws(json!({
             "originalTransactionId": t,
+            "transactionId": "2000000123456790",
             "appAccountToken": second.to_string(),
+            "environment": "Production",
         }));
         let (status, body) = h.post(&h.token(&second), &by_second).await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -1443,6 +1449,111 @@ mod transactions_route {
         assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(first));
         assert!(h.records(&second).await.is_empty());
         assert_eq!(h.records(&first).await.len(), 1);
+    }
+
+    /// App Review reuses Sandbox Apple IDs with fresh accounts: a Sandbox
+    /// resubscription bought for the caller moves the link to it. The old
+    /// owner's entry is left to expire.
+    #[tokio::test]
+    async fn a_sandbox_resubscription_moves_to_the_caller() {
+        let Some(h) = Harness::new() else { return };
+        let (first, second) = (h.user().await, h.user().await);
+        let t = otid();
+        let by_first =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": first.to_string() }));
+        assert_eq!(h.post(&h.token(&first), &by_first).await.0, StatusCode::OK);
+        let first_records = h.records(&first).await;
+
+        let by_second = h.jws(json!({
+            "originalTransactionId": t,
+            "transactionId": "2000000123456790",
+            "appAccountToken": second.to_string(),
+        }));
+        let (status, body) = h.post(&h.token(&second), &by_second).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["active"], true);
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(second)
+        );
+        let moved = h.records(&second).await;
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].transaction_id.as_deref(), Some("2000000123456790"));
+        assert_eq!(h.records(&first).await, first_records);
+
+        // The resubscription was bought for the second account, so the first
+        // cannot take it back with it.
+        let (status, body) = h.post(&h.token(&first), &by_second).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, OTHER_ACCOUNT_BODY);
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(second)
+        );
+    }
+
+    /// A subscription whose account was deleted (not yet swept) moves to the
+    /// caller, Production included.
+    #[tokio::test]
+    async fn a_dead_owners_subscription_moves_to_the_caller() {
+        let Some(h) = Harness::new() else { return };
+        let (first, second) = (h.user().await, h.user().await);
+        let t = otid();
+        let by_first = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": first.to_string(),
+            "environment": "Production",
+        }));
+        assert_eq!(h.post(&h.token(&first), &by_first).await.0, StatusCode::OK);
+        h.store
+            .tombstone_account(&first, &format!("{first}.test"), None, 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(first));
+
+        let by_second = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": second.to_string(),
+            "environment": "Production",
+        }));
+        let (status, body) = h.post(&h.token(&second), &by_second).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(second)
+        );
+        assert_eq!(h.records(&second).await.len(), 1);
+    }
+
+    /// A Sandbox purchase whose `appAccountToken` names a third account is
+    /// not the caller's to move: 409 while that account is deleted (and the
+    /// owner is live), 403 while it is live.
+    #[tokio::test]
+    async fn a_move_never_happens_for_a_third_accounts_purchase() {
+        let Some(h) = Harness::new() else { return };
+        let (owner, caller, third) = (h.user().await, h.user().await, h.user().await);
+        let t = otid();
+        let by_owner =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": owner.to_string() }));
+        assert_eq!(h.post(&h.token(&owner), &by_owner).await.0, StatusCode::OK);
+
+        let for_third =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": third.to_string() }));
+        let (status, body) = h.post(&h.token(&caller), &for_third).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, OTHER_ACCOUNT_BODY);
+
+        h.store
+            .tombstone_account(&third, &format!("{third}.test"), None, 1_700_000_000)
+            .await
+            .unwrap();
+        let (status, body) = h.post(&h.token(&caller), &for_third).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, OTHER_SUBSCRIPTION_BODY);
+
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(owner));
+        assert!(h.records(&caller).await.is_empty());
+        assert_eq!(h.records(&owner).await.len(), 1);
     }
 
     #[tokio::test]
@@ -2221,7 +2332,8 @@ mod notifications_route {
         assert_eq!(only_record(&h, &id).await.original_transaction_id, t);
     }
 
-    /// A linked subscription goes to its owner, whatever the token names.
+    /// A linked Production subscription goes to its live owner, whatever the
+    /// token names.
     #[tokio::test]
     async fn a_linked_subscription_follows_its_link() {
         let Some(h) = Harness::new() else { return };
@@ -2229,7 +2341,8 @@ mod notifications_route {
         let other = h.user().await;
         let t = otid();
         let expiry = now_ms() + 30 * 86_400_000;
-        h.deliver(
+        h.deliver_in(
+            "Production",
             "SUBSCRIBED",
             snapshot(&t, Some(&owner), base_ms(), expiry),
             None,
@@ -2237,7 +2350,8 @@ mod notifications_route {
         .await;
 
         let status = h
-            .deliver(
+            .deliver_in(
+                "Production",
                 "DID_RENEW",
                 snapshot(&t, Some(&other), base_ms() + 5_000, expiry + 86_400_000),
                 None,
@@ -2251,6 +2365,101 @@ mod notifications_route {
             secs(expiry + 86_400_000)
         );
         assert!(h.records(&other).await.is_empty());
+    }
+
+    /// A Sandbox notification for a live account other than the owner moves
+    /// the link to it (App Review's reused Sandbox Apple IDs). The old
+    /// owner's entry is left to expire.
+    #[tokio::test]
+    async fn a_sandbox_notification_moves_the_link_to_the_account_it_names() {
+        let Some(h) = Harness::new() else { return };
+        let (owner, other) = (h.user().await, h.user().await);
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver(
+            "SUBSCRIBED",
+            snapshot(&t, Some(&owner), base_ms(), expiry),
+            None,
+        )
+        .await;
+        let owners_record = only_record(&h, &owner).await;
+
+        let status = h
+            .deliver(
+                "SUBSCRIBED",
+                snapshot(&t, Some(&other), base_ms() + 5_000, expiry + 86_400_000),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(other));
+        assert_eq!(
+            only_record(&h, &other).await.expires_at,
+            secs(expiry + 86_400_000)
+        );
+        assert_eq!(only_record(&h, &owner).await, owners_record);
+    }
+
+    /// A deleted owner's subscription (not yet swept) moves to the live
+    /// account a notification names, Production included.
+    #[tokio::test]
+    async fn a_notification_moves_a_dead_owners_link() {
+        let Some(h) = Harness::new() else { return };
+        let (owner, other) = (h.user().await, h.user().await);
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver_in(
+            "Production",
+            "SUBSCRIBED",
+            snapshot(&t, Some(&owner), base_ms(), expiry),
+            None,
+        )
+        .await;
+        h.store
+            .tombstone_account(&owner, &format!("{owner}.test"), None, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let status = h
+            .deliver_in(
+                "Production",
+                "SUBSCRIBED",
+                snapshot(&t, Some(&other), base_ms() + 5_000, expiry),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(other));
+        assert_eq!(only_record(&h, &other).await.expires_at, secs(expiry));
+    }
+
+    /// A notification never moves a link to an account that is not live, or
+    /// when it names none: it follows the link.
+    #[tokio::test]
+    async fn a_notification_never_moves_to_an_account_that_is_not_live() {
+        let Some(h) = Harness::new() else { return };
+        let owner = h.user().await;
+        let gone = h.deleted_user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver("SUBSCRIBED", snapshot(&t, Some(&owner), t0, expiry), None)
+            .await;
+
+        for (i, token) in [Some(gone), Some(Uuid::new_v4()), None].iter().enumerate() {
+            let signed = t0 + 5_000 * (i as i64 + 1);
+            let status = h
+                .deliver(
+                    "DID_RENEW",
+                    snapshot(&t, token.as_ref(), signed, expiry),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{token:?}");
+            assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(owner));
+            assert_eq!(only_record(&h, &owner).await.last_signed_at, secs(signed));
+        }
+        assert!(h.records(&gone).await.is_empty());
     }
 
     #[tokio::test]

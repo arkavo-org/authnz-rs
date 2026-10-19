@@ -19,7 +19,9 @@
 //! payload can reach a log line or a response body through them.
 
 use crate::AppState;
-use crate::db::{AppStoreRecord, DynamoDBError, GraceUpdate, LinkOutcome, StateOutcome};
+use crate::db::{
+    AppStoreRecord, DynamoDBError, DynamoDBStore, GraceUpdate, LinkOutcome, StateOutcome,
+};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -651,6 +653,66 @@ pub(crate) fn app_store_active(cfg: &AppStoreConfig, records: &[AppStoreRecord],
     })
 }
 
+// --------- The link ---------
+
+/// How a subscription stands after [`bind_or_move`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// Newly bound to the account.
+    Bound,
+    /// Already the account's.
+    AlreadyYours,
+    /// Moved to the account from another one.
+    Moved,
+    /// Bound to this other account, which keeps it.
+    Elsewhere(Uuid),
+}
+
+/// Bind `tx`'s subscription to `to`, moving its link from the current owner
+/// when the move rule allows it, which is when either holds:
+///
+/// - (a) the owner is not live (deleted, not yet swept, or unknown);
+/// - (b) the transaction is Sandbox and its `appAccountToken` names `to`.
+///   App Review reuses Sandbox Apple IDs with fresh accounts, and a
+///   resubscription keeps its `originalTransactionId`.
+///
+/// A Production subscription of another live account stays where it is. The
+/// move is conditional on the owner read, so a race with another bind, move
+/// or the deletion sweep is re-evaluated (a few times at most); the old
+/// owner's row is never touched (its Sandbox entry is left to expire).
+async fn bind_or_move(
+    store: &DynamoDBStore,
+    tx: &VerifiedTransaction,
+    to: &Uuid,
+) -> Result<Binding, DynamoDBError> {
+    let otid = &tx.original_transaction_id;
+    let sandbox_for_to =
+        tx.environment == Environment::Sandbox && tx.app_account_token == Some(*to);
+    for _ in 0..3 {
+        match store.bind_app_store_link(otid, to).await? {
+            LinkOutcome::Bound => return Ok(Binding::Bound),
+            LinkOutcome::AlreadyYours => return Ok(Binding::AlreadyYours),
+            LinkOutcome::BoundElsewhere => {}
+        }
+        // Gone again (swept), or now `to`'s: the next bind settles it.
+        let Some(owner) = store.app_store_link_owner(otid).await? else {
+            continue;
+        };
+        if owner == *to {
+            continue;
+        }
+        if !sandbox_for_to && store.is_account_live(&owner).await? {
+            return Ok(Binding::Elsewhere(owner));
+        }
+        if store.move_app_store_link(otid, &owner, to).await? {
+            return Ok(Binding::Moved);
+        }
+    }
+    Err(DynamoDBError::Internal(
+        "app store link changed on every attempt".into(),
+    ))
+}
+
 // --------- POST /app-store/transactions ---------
 
 const BODY_ANOTHER_ACCOUNT: &str = "transaction belongs to another account";
@@ -695,9 +757,10 @@ fn internal(what: &str, e: &DynamoDBError) -> Response {
 ///
 /// Order: the feature is configured, the caller authenticates (and still
 /// exists), the JWS verifies, the transaction names an account (`appAccountToken`),
-/// the link is bound, the state is written, and the answer is read back from
-/// the stored record, so a grace period a notification recorded counts and a
-/// stale post answers with what is stored.
+/// the link is bound (or moved to the caller, see [`bind_or_move`]), the
+/// state is written, and the answer is read back from the stored record, so a
+/// grace period a notification recorded counts and a stale or past-period
+/// post answers with what is stored.
 pub(crate) async fn transactions_handler(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -759,19 +822,15 @@ async fn post_transaction(
 
     // Always the link first: the state lands on the caller's row only once the
     // subscription is the caller's.
-    match app_state
-        .db_store
-        .bind_app_store_link(&tx.original_transaction_id, &caller.user_id)
-        .await
-    {
-        Ok(LinkOutcome::Bound | LinkOutcome::AlreadyYours) => {}
-        Ok(LinkOutcome::BoundElsewhere) => {
+    let binding = match bind_or_move(&app_state.db_store, &tx, &caller.user_id).await {
+        Ok(Binding::Elsewhere(_)) => {
             trace.outcome = "elsewhere";
             return refuse(StatusCode::CONFLICT, BODY_ANOTHER_SUBSCRIPTION);
         }
+        Ok(binding) => binding,
         Err(DynamoDBError::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => return internal("link", &e),
-    }
+    };
 
     let record = AppStoreRecord {
         original_transaction_id: tx.original_transaction_id.clone(),
@@ -788,7 +847,13 @@ async fn post_transaction(
         .put_app_store_state(&caller.user_id, &record, GraceUpdate::Keep)
         .await
     {
-        Ok(StateOutcome::Applied) => trace.outcome = "bound",
+        Ok(StateOutcome::Applied) => {
+            trace.outcome = if binding == Binding::Moved {
+                "moved"
+            } else {
+                "bound"
+            };
+        }
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
         // Answered with the stored period, as a stale post is.
         Ok(StateOutcome::PastPeriod) => trace.outcome = "past_period",
@@ -926,63 +991,53 @@ async fn post_notification(
     trace.environment = Some(tx.environment);
 
     // The account the subscription belongs to, always settled before the
-    // state is written: its link, or a new link to the account the purchase
-    // was made for.
+    // state is written: its link, or a link (new, or moved when the move rule
+    // allows it) to the live account the purchase was made for.
     let store = &app_state.db_store;
-    let mut newly_bound = false;
-    let owner = match store
+    let linked = match store
         .app_store_link_owner(&tx.original_transaction_id)
         .await
     {
-        Ok(Some(owner)) => owner,
-        Ok(None) => {
-            // An unknown subscription is bound only to a live account the
-            // purchase names; anything else is not ours to track.
-            let Some(named) = tx.app_account_token else {
-                trace.outcome = "ignored=unbound";
-                return StatusCode::OK.into_response();
-            };
-            match store.is_account_live(&named).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    trace.outcome = "ignored=unbound";
-                    return StatusCode::OK.into_response();
-                }
-                Err(e) => return internal_notification("account lookup", &e),
-            }
-            match store
-                .bind_app_store_link(&tx.original_transaction_id, &named)
-                .await
-            {
-                Ok(LinkOutcome::Bound | LinkOutcome::AlreadyYours) => {
-                    newly_bound = true;
-                    named
-                }
-                // Another delivery bound it between the read and the bind:
-                // follow whoever won.
-                Ok(LinkOutcome::BoundElsewhere) => {
-                    match store
-                        .app_store_link_owner(&tx.original_transaction_id)
-                        .await
-                    {
-                        Ok(Some(owner)) => owner,
-                        Ok(None) => {
-                            return internal_notification(
-                                "link",
-                                &DynamoDBError::Internal("link vanished after conflict".into()),
-                            );
-                        }
-                        Err(e) => return internal_notification("link", &e),
-                    }
-                }
-                Err(DynamoDBError::AccountGone) => {
-                    trace.outcome = "ignored=account_gone";
-                    return StatusCode::OK.into_response();
-                }
-                Err(e) => return internal_notification("link", &e),
-            }
-        }
+        Ok(linked) => linked,
         Err(e) => return internal_notification("link lookup", &e),
+    };
+    // The account the purchase names, when it is live and not already the
+    // owner. Nothing is ever bound or moved to an account that is not live.
+    let claimant = match tx.app_account_token {
+        Some(named) if linked != Some(named) => match store.is_account_live(&named).await {
+            Ok(true) => Some(named),
+            Ok(false) => None,
+            Err(e) => return internal_notification("account lookup", &e),
+        },
+        _ => None,
+    };
+    let mut link_outcome = None;
+    let owner = match (claimant, linked) {
+        (Some(named), _) => match bind_or_move(store, &tx, &named).await {
+            Ok(Binding::Bound) => {
+                link_outcome = Some("bound");
+                named
+            }
+            Ok(Binding::Moved) => {
+                link_outcome = Some("moved");
+                named
+            }
+            Ok(Binding::AlreadyYours) => named,
+            // A live owner keeps a Production subscription: follow its link.
+            Ok(Binding::Elsewhere(owner)) => owner,
+            Err(DynamoDBError::AccountGone) => {
+                trace.outcome = "ignored=account_gone";
+                return StatusCode::OK.into_response();
+            }
+            Err(e) => return internal_notification("link", &e),
+        },
+        (None, Some(owner)) => owner,
+        // An unknown subscription is bound only to a live account the
+        // purchase names; anything else is not ours to track.
+        (None, None) => {
+            trace.outcome = "ignored=unbound";
+            return StatusCode::OK.into_response();
+        }
     };
 
     let record = AppStoreRecord {
@@ -1002,9 +1057,7 @@ async fn post_notification(
         .put_app_store_state(&owner, &record, notification.grace)
         .await
     {
-        Ok(StateOutcome::Applied) => {
-            trace.outcome = if newly_bound { "bound" } else { "applied" };
-        }
+        Ok(StateOutcome::Applied) => trace.outcome = link_outcome.unwrap_or("applied"),
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
         Ok(StateOutcome::PastPeriod) => trace.outcome = "ignored=past_period",
         Ok(StateOutcome::OtherEnvironment) => trace.outcome = "ignored=environment",
