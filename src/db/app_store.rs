@@ -14,10 +14,6 @@
 //! signature is malleable, so two different byte strings verify for one
 //! payload. The JWS itself is not stored.
 
-// The routes that call this arrive in a later change; until then only the
-// tests use it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::agent_state::{classify, n, s};
 use super::publishing::{self, PublishingSuspension};
 use super::{DynamoDBError, DynamoDBStore, account};
@@ -72,6 +68,8 @@ pub enum StateOutcome {
 /// What one consistent read of the `credentials` row yields for a mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishingState {
+    // Read by the mint, which arrives in a later change.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub suspension: Option<PublishingSuspension>,
     pub app_store: Vec<AppStoreRecord>,
 }
@@ -141,9 +139,10 @@ impl DynamoDBStore {
     /// account's (a re-bind keeps `created_at`). Afterwards the account is
     /// checked again: a deletion may have swept the links before this one
     /// landed, so on a dead account the link is deleted and
-    /// [`DynamoDBError::AccountGone`] returned. A failed re-check is returned
-    /// as its error and the link stays; the caller retries, which is
-    /// idempotent.
+    /// [`DynamoDBError::AccountGone`] returned (even when the delete fails;
+    /// the sweep removes the link then). If the re-check itself fails, its
+    /// error is returned and a link this call created is taken back; the
+    /// caller retries, which is idempotent.
     pub async fn bind_app_store_link(
         &self,
         otid: &str,
@@ -176,11 +175,32 @@ impl DynamoDBStore {
                 other => return Err(other),
             },
         };
-        if !self.is_account_live(user_id).await? {
-            self.delete_app_store_link(otid, user_id).await?;
-            return Err(DynamoDBError::AccountGone);
+        match self.is_account_live(user_id).await {
+            Ok(true) => Ok(outcome),
+            Ok(false) => {
+                // Dead either way: a link that could not be taken back stays
+                // for the deletion sweep (it removes every link of the
+                // account), and the caller still hears the account is gone.
+                if let Err(e) = self.delete_app_store_link(otid, user_id).await {
+                    warn!("could not take back app store link original_transaction_id={otid}: {e}");
+                }
+                Err(DynamoDBError::AccountGone)
+            }
+            Err(e) => {
+                // Unknown whether the account died. A link this call just
+                // wrote is taken back so the failed bind leaves nothing; one
+                // that was already this account's was bound by an earlier,
+                // checked call and stays.
+                if outcome == LinkOutcome::Bound
+                    && let Err(del) = self.delete_app_store_link(otid, user_id).await
+                {
+                    warn!(
+                        "could not take back app store link original_transaction_id={otid}: {del}"
+                    );
+                }
+                Err(e)
+            }
         }
-        Ok(outcome)
     }
 
     /// Delete `appstore#<otid>` while it still names `user_id`.
@@ -205,6 +225,8 @@ impl DynamoDBStore {
     }
 
     /// The account a subscription is bound to. A consistent read.
+    // Used by the notification route, which arrives in a later change.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn app_store_link_owner(&self, otid: &str) -> Result<Option<Uuid>, DynamoDBError> {
         let out = self
             .client
@@ -446,6 +468,106 @@ mod tests {
         );
         // The refused bind wrote nothing.
         assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(a));
+    }
+
+    /// A store whose `credentials` table does not exist, so the liveness
+    /// re-check after a link write errors while the link write itself works.
+    fn store_with_unreadable_accounts(store: &DynamoDBStore) -> DynamoDBStore {
+        DynamoDBStore::with_client(
+            store.client.clone(),
+            format!("missing-credentials-{}", Uuid::new_v4().simple()),
+            store.handles_table.clone(),
+            store.device_bindings_table.clone(),
+            store.identity_links_table.clone(),
+            store.patreon_tokens_table.clone(),
+            store.agent_delegations_table.clone(),
+            store.device_attest_keys_table.clone(),
+            store.guardians_table.clone(),
+            vec![],
+        )
+    }
+
+    /// Fails every `DeleteItem` before it is sent.
+    #[derive(Debug)]
+    struct RefuseDeletes;
+
+    impl aws_sdk_dynamodb::config::Intercept for RefuseDeletes {
+        fn name(&self) -> &'static str {
+            "RefuseDeletes"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<
+                '_,
+            >,
+            _: &aws_sdk_dynamodb::config::RuntimeComponents,
+            _: &mut aws_sdk_dynamodb::config::ConfigBag,
+        ) -> Result<(), aws_sdk_dynamodb::error::BoxError> {
+            let target = context.request().headers().get("x-amz-target");
+            if target.is_some_and(|t| t.ends_with(".DeleteItem")) {
+                return Err("delete refused by the test".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_account_is_gone_even_when_the_take_back_fails() {
+        let Some(store) = local_store() else { return };
+        let config = store
+            .client
+            .config()
+            .to_builder()
+            .interceptor(RefuseDeletes)
+            .build();
+        let no_deletes = DynamoDBStore::with_client(
+            aws_sdk_dynamodb::Client::from_conf(config),
+            store.credentials_table.clone(),
+            store.handles_table.clone(),
+            store.device_bindings_table.clone(),
+            store.identity_links_table.clone(),
+            store.patreon_tokens_table.clone(),
+            store.agent_delegations_table.clone(),
+            store.device_attest_keys_table.clone(),
+            store.guardians_table.clone(),
+            vec![],
+        );
+        let gone = user(&store, "asb-nodelete").await;
+        tombstone(&store, &gone).await;
+        let t = otid();
+
+        // The take-back itself fails (proved below by the link surviving),
+        // yet the caller is told the account is gone, not given a 5xx.
+        let err = no_deletes.bind_app_store_link(&t, &gone).await.unwrap_err();
+        assert!(matches!(err, DynamoDBError::AccountGone), "{err:?}");
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(gone));
+
+        // The deletion sweep removes what the take-back could not.
+        store.delete_identity_links_of(&gone).await.unwrap();
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_liveness_recheck_takes_back_the_link_it_wrote() {
+        let Some(store) = local_store() else { return };
+        let blind = store_with_unreadable_accounts(&store);
+        let id = user(&store, "asb-recheck").await;
+        let t = otid();
+
+        let err = blind.bind_app_store_link(&t, &id).await.unwrap_err();
+        assert!(!matches!(err, DynamoDBError::AccountGone), "{err:?}");
+        // The failed bind left nothing behind.
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
+
+        // A link an earlier, checked bind made is not this call's to remove.
+        assert_eq!(
+            store.bind_app_store_link(&t, &id).await.unwrap(),
+            LinkOutcome::Bound
+        );
+        let err = blind.bind_app_store_link(&t, &id).await.unwrap_err();
+        assert!(!matches!(err, DynamoDBError::AccountGone), "{err:?}");
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(id));
     }
 
     async fn link_item(store: &DynamoDBStore, t: &str) -> HashMap<String, AttributeValue> {

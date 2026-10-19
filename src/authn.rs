@@ -940,6 +940,57 @@ pub fn mint_registration_token(
     Ok(crate::cwt::encode_for_header(&bytes))
 }
 
+/// The caller of an `X-Auth-Token` request, once its account is known to
+/// exist.
+pub(crate) struct AuthenticatedAccount {
+    pub user_id: Uuid,
+    /// Whether the presented token itself carries
+    /// [`crate::constants::ENTITLEMENT_CREATOR_PUBLISH`]. A token minted
+    /// before a purchase does not, which tells a client to sign in again.
+    pub token_can_publish: bool,
+}
+
+/// Authenticate a request by its `X-Auth-Token` CWT and check the account
+/// behind it still exists: the CWT outlives a deleted account (#88). Any
+/// failure, whether a missing, unreadable, expired or forged token, a `sub`
+/// that is not a UUID, a deleted account or a failed account lookup, is a 401
+/// (the lookup failure is logged), so a caller never gets in on an unchecked
+/// account.
+pub(crate) async fn authenticated_live_account(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedAccount, StatusCode> {
+    let token = headers
+        .get("X-Auth-Token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = verify_inbound_account_token(app_state, token).map_err(|e| {
+        warn!("X-Auth-Token rejected: {e}");
+        StatusCode::UNAUTHORIZED
+    })?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return Err(StatusCode::UNAUTHORIZED),
+        Err(e) => {
+            error!("Account lookup for an authenticated request failed: {e}");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let token_can_publish = claims
+        .custom
+        .arkavo_entitlements
+        .as_ref()
+        .is_some_and(|ents| {
+            ents.iter()
+                .any(|e| e == crate::constants::ENTITLEMENT_CREATOR_PUBLISH)
+        });
+    Ok(AuthenticatedAccount {
+        user_id,
+        token_can_publish,
+    })
+}
+
 pub fn verify_inbound_account_token(
     app_state: &AppState,
     token: &str,

@@ -1,11 +1,14 @@
 //! StoreKit JWS verification (`app_store::verify_jws`) against fixture chains
 //! shaped like Apple's: a root, a WWDR-marked intermediate and a
 //! receipt-signing leaf, ES256 unless a test says otherwise. Pure: no
-//! network, no database.
+//! network, no database, except `POST /app-store/transactions`, which runs
+//! against DynamoDB Local (each of those tests returns early unless
+//! `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it).
 
 use crate::app_store::{
-    AppStoreConfig, AppStoreError, Environment, apple_root_g3_der, decode_notification,
-    decode_renewal_grace, decode_transaction, verify_jws,
+    AppStoreConfig, AppStoreError, Environment, app_store_active, apple_root_g3_der,
+    decode_notification, decode_renewal_grace, decode_transaction, transactions_handler,
+    verify_jws,
 };
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -796,4 +799,655 @@ fn config_environments_default_and_validate() {
     );
     assert!(parse(Some("Production,Xcode")).is_err());
     assert!(parse(Some("production")).is_err());
+}
+
+// --------- The Active rule ---------
+
+mod active_rule {
+    use super::*;
+    use crate::db::AppStoreRecord;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn cfg() -> AppStoreConfig {
+        AppStoreConfig::for_tests(Vec::new())
+    }
+
+    fn record() -> AppStoreRecord {
+        AppStoreRecord {
+            original_transaction_id: "1".into(),
+            product_id: PRODUCT.into(),
+            environment: Environment::Production,
+            expires_at: NOW + 100,
+            grace_expires_at: None,
+            revoked_at: None,
+            last_signed_at: NOW - 100,
+        }
+    }
+
+    #[test]
+    fn a_current_unrevoked_configured_record_is_active() {
+        assert!(app_store_active(&cfg(), &[record()], NOW));
+        // Not before any record exists.
+        assert!(!app_store_active(&cfg(), &[], NOW));
+    }
+
+    #[test]
+    fn expiry_is_exclusive() {
+        let r = record();
+        assert!(app_store_active(
+            &cfg(),
+            std::slice::from_ref(&r),
+            r.expires_at - 1
+        ));
+        assert!(!app_store_active(
+            &cfg(),
+            std::slice::from_ref(&r),
+            r.expires_at
+        ));
+        assert!(!app_store_active(
+            &cfg(),
+            std::slice::from_ref(&r),
+            r.expires_at + 1
+        ));
+    }
+
+    #[test]
+    fn grace_extends_past_expiry_and_never_shortens_it() {
+        let in_grace = AppStoreRecord {
+            expires_at: NOW - 10,
+            grace_expires_at: Some(NOW + 10),
+            ..record()
+        };
+        assert!(app_store_active(
+            &cfg(),
+            std::slice::from_ref(&in_grace),
+            NOW
+        ));
+        assert!(!app_store_active(&cfg(), &[in_grace], NOW + 10));
+
+        // A grace date earlier than the expiry does not cut the term short.
+        let early_grace = AppStoreRecord {
+            grace_expires_at: Some(NOW - 50),
+            ..record()
+        };
+        assert!(app_store_active(&cfg(), &[early_grace], NOW));
+    }
+
+    #[test]
+    fn a_revocation_ends_it_whatever_the_dates() {
+        let refunded = AppStoreRecord {
+            revoked_at: Some(NOW - 1),
+            grace_expires_at: Some(NOW + 1_000),
+            ..record()
+        };
+        assert!(!app_store_active(&cfg(), &[refunded], NOW));
+    }
+
+    #[test]
+    fn an_unconfigured_product_or_environment_grants_nothing() {
+        let other_product = AppStoreRecord {
+            product_id: "com.example.other".into(),
+            ..record()
+        };
+        assert!(!app_store_active(&cfg(), &[other_product], NOW));
+
+        let mut production_only = cfg();
+        production_only.environments = [Environment::Production].into();
+        let sandbox = AppStoreRecord {
+            environment: Environment::Sandbox,
+            ..record()
+        };
+        assert!(!app_store_active(
+            &production_only,
+            std::slice::from_ref(&sandbox),
+            NOW
+        ));
+        assert!(app_store_active(&cfg(), &[sandbox], NOW));
+    }
+
+    #[test]
+    fn any_one_active_record_is_enough() {
+        let lapsed = AppStoreRecord {
+            expires_at: NOW - 1,
+            ..record()
+        };
+        assert!(app_store_active(&cfg(), &[lapsed.clone(), record()], NOW));
+        assert!(!app_store_active(&cfg(), &[lapsed], NOW));
+    }
+}
+
+// --------- POST /app-store/transactions ---------
+
+mod transactions_route {
+    use super::*;
+    use crate::AppState;
+    use crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
+    use crate::cwt::ArkavoUserClaims;
+    use crate::db::{AppStoreRecord, DynamoDBStore, StateOutcome};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Extension, Router};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const OTHER_ACCOUNT_BODY: &str = "transaction belongs to another account";
+    const OTHER_SUBSCRIPTION_BODY: &str = "subscription belongs to another account";
+    const INVALID_BODY: &str = "invalid transaction";
+    const UNAVAILABLE_BODY: &str = "app store purchases unavailable";
+
+    struct Harness {
+        state: AppState,
+        store: Arc<DynamoDBStore>,
+        fx: Fixture,
+        app: Router,
+    }
+
+    impl Harness {
+        /// `None` unless DynamoDB Local is configured.
+        fn new() -> Option<Self> {
+            Self::with_config(true)
+        }
+
+        fn with_config(enabled: bool) -> Option<Self> {
+            let store = Arc::new(crate::db::tests::local_store()?);
+            let fx = fixture(Options::default());
+            let mut state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+            state.app_store =
+                Arc::new(enabled.then(|| AppStoreConfig::for_tests(fx.root_der.clone())));
+            let app = Router::new()
+                .route("/app-store/transactions", post(transactions_handler))
+                .layer(Extension(state.clone()));
+            Some(Self {
+                state,
+                store,
+                fx,
+                app,
+            })
+        }
+
+        async fn user(&self) -> Uuid {
+            self.store
+                .create_user(
+                    &format!("as-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                    "did:key:z6MkAppStoreRoute",
+                )
+                .await
+                .unwrap()
+                .user_id
+        }
+
+        async fn deleted_user(&self) -> Uuid {
+            let id = self.user().await;
+            self.store
+                .tombstone_account(&id, &format!("{id}.test"), None, 1_700_000_000)
+                .await
+                .unwrap();
+            id
+        }
+
+        fn token(&self, id: &Uuid) -> String {
+            crate::authn::mint_auth_token(&self.state, id, None, None).unwrap()
+        }
+
+        /// A token that carries the derived creator-publishing entitlement.
+        fn publishing_token(&self, id: &Uuid) -> String {
+            let user = ArkavoUserClaims {
+                account_id: id.to_string(),
+                roles: vec!["user".into()],
+                entitlements: vec![],
+                derived_entitlements: vec![ENTITLEMENT_CREATOR_PUBLISH.into()],
+                patreon: None,
+            };
+            crate::authn::mint_auth_token(&self.state, id, Some(&user), None).unwrap()
+        }
+
+        fn expired_token(&self, id: &Uuid) -> String {
+            let mut claims =
+                crate::cwt::ArkavoClaims::auth(&self.state.issuer, &id.to_string(), 1, None);
+            claims.iat -= 7_200;
+            claims.exp -= 7_200;
+            let bytes = crate::cwt::mint(&claims, &self.state.cwt_signing_key, &self.state.cwt_kid)
+                .unwrap();
+            crate::cwt::encode_for_header(&bytes)
+        }
+
+        fn jws(&self, overrides: Value) -> String {
+            sign_jws(&purchase(overrides), &self.fx)
+        }
+
+        async fn post_raw(&self, token: Option<&str>, body: Vec<u8>) -> (StatusCode, String) {
+            let mut req =
+                Request::post("/app-store/transactions").header("content-type", "application/json");
+            if let Some(t) = token {
+                req = req.header("X-Auth-Token", t);
+            }
+            let resp = self
+                .app
+                .clone()
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn post(&self, token: &str, jws: &str) -> (StatusCode, String) {
+            self.post_raw(
+                Some(token),
+                json!({ "signed_transaction": jws })
+                    .to_string()
+                    .into_bytes(),
+            )
+            .await
+        }
+
+        async fn records(&self, id: &Uuid) -> Vec<AppStoreRecord> {
+            self.store
+                .get_publishing_state(id)
+                .await
+                .unwrap()
+                .map(|s| s.app_store)
+                .unwrap_or_default()
+        }
+    }
+
+    /// Numeric, as Apple's are; unique per test run (the database is shared).
+    fn otid() -> String {
+        Uuid::new_v4().as_u128().to_string()
+    }
+
+    fn secs(ms: i64) -> i64 {
+        ms.div_euclid(1000)
+    }
+
+    fn json_body(body: &str) -> Value {
+        serde_json::from_str(body).unwrap_or_else(|_| panic!("not json: {body}"))
+    }
+
+    /// Covers: a purchase by its own account binds and reports active.
+    #[tokio::test]
+    async fn binds_and_reports_active() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let payload = purchase(json!({
+            "originalTransactionId": t,
+            "appAccountToken": id.to_string(),
+        }));
+        let (status, body) = h.post(&h.token(&id), &sign_jws(&payload, &h.fx)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json_body(&body),
+            json!({
+                "active": true,
+                "expires_at": secs(payload["expiresDate"].as_i64().unwrap()),
+                "environment": "Sandbox",
+                "token_can_publish": false,
+            })
+        );
+        // The read-backs prove the database was reached and written.
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+        let records = h.records(&id).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].original_transaction_id, t);
+        assert_eq!(records[0].product_id, PRODUCT);
+        assert_eq!(records[0].environment, Environment::Sandbox);
+        assert_eq!(
+            records[0].last_signed_at,
+            secs(payload["signedDate"].as_i64().unwrap())
+        );
+        assert_eq!(records[0].revoked_at, None);
+    }
+
+    #[tokio::test]
+    async fn posting_again_is_idempotent() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": id.to_string() }));
+        for _ in 0..2 {
+            let (status, body) = h.post(&h.token(&id), &jws).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(json_body(&body)["active"], true);
+        }
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+        assert_eq!(h.records(&id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refunded_transaction_binds_but_reports_inactive() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let revoked_ms = now_ms() - 1_000;
+        let jws = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": id.to_string(),
+            "revocationDate": revoked_ms,
+        }));
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["active"], false);
+        assert_eq!(h.records(&id).await[0].revoked_at, Some(secs(revoked_ms)));
+    }
+
+    /// Review Focus 1: the client re-authenticates and re-posts.
+    #[tokio::test]
+    async fn expired_token_is_401() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": id.to_string() }));
+
+        let (status, _) = h.post(&h.expired_token(&id), &jws).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+
+        // The same purchase posted with a fresh token goes through.
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn missing_or_garbage_token_is_401() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let jws =
+            h.jws(json!({ "originalTransactionId": otid(), "appAccountToken": id.to_string() }));
+        let body = json!({ "signed_transaction": jws })
+            .to_string()
+            .into_bytes();
+
+        let (status, _) = h.post_raw(None, body.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = h.post_raw(Some("not-a-cwt"), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn deleted_caller_is_401() {
+        let Some(h) = Harness::new() else { return };
+        let gone = h.deleted_user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": gone.to_string() }));
+
+        // Its token still verifies; the account behind it does not exist.
+        let (status, _) = h.post(&h.token(&gone), &jws).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&gone).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_app_account_token_is_422() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": null }));
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+    }
+
+    /// Review Focus 5: a leaked JWS replayed by another live account.
+    #[tokio::test]
+    async fn token_for_other_live_account_is_403() {
+        let Some(h) = Harness::new() else { return };
+        let (owner, thief) = (h.user().await, h.user().await);
+        let t = otid();
+        let jws =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": owner.to_string() }));
+        let (status, body) = h.post(&h.token(&thief), &jws).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, OTHER_ACCOUNT_BODY);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&thief).await.is_empty());
+        assert!(h.records(&owner).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_for_deleted_account_binds_to_caller() {
+        let Some(h) = Harness::new() else { return };
+        let (gone, caller) = (h.deleted_user().await, h.user().await);
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": gone.to_string() }));
+        let (status, body) = h.post(&h.token(&caller), &jws).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["active"], true);
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(caller)
+        );
+        assert_eq!(h.records(&caller).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_for_unknown_account_binds_to_caller() {
+        let Some(h) = Harness::new() else { return };
+        let caller = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": Uuid::new_v4().to_string(),
+        }));
+        let (status, body) = h.post(&h.token(&caller), &jws).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(caller)
+        );
+    }
+
+    /// Review Focus 3.
+    #[tokio::test]
+    async fn second_account_same_otid_is_409() {
+        let Some(h) = Harness::new() else { return };
+        let (first, second) = (h.user().await, h.user().await);
+        let t = otid();
+
+        let by_first =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": first.to_string() }));
+        let (status, body) = h.post(&h.token(&first), &by_first).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The same Apple ID's subscription, now claimed for another account
+        // (here by a transaction naming a dead account).
+        let by_second = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": second.to_string(),
+        }));
+        let (status, body) = h.post(&h.token(&second), &by_second).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, OTHER_SUBSCRIPTION_BODY);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(first));
+        assert!(h.records(&second).await.is_empty());
+        assert_eq!(h.records(&first).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_first_account_frees_the_subscription() {
+        let Some(h) = Harness::new() else { return };
+        let (first, second) = (h.user().await, h.user().await);
+        let t = otid();
+        let by_first =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": first.to_string() }));
+        assert_eq!(h.post(&h.token(&first), &by_first).await.0, StatusCode::OK);
+
+        h.store
+            .tombstone_account(&first, &format!("{first}.test"), None, 1_700_000_000)
+            .await
+            .unwrap();
+        h.store.delete_identity_links_of(&first).await.unwrap();
+
+        let by_second =
+            h.jws(json!({ "originalTransactionId": t, "appAccountToken": second.to_string() }));
+        let (status, body) = h.post(&h.token(&second), &by_second).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            h.store.app_store_link_owner(&t).await.unwrap(),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_signature_is_422() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let payload =
+            purchase(json!({ "originalTransactionId": t, "appAccountToken": id.to_string() }));
+        let genuine = sign_jws(&payload, &h.fx);
+
+        // Signed under another root.
+        let other = fixture(Options::default());
+        let (status, body) = h.post(&h.token(&id), &sign_jws(&payload, &other)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+
+        // Payload swapped under the genuine signature.
+        let mut parts: Vec<&str> = genuine.split('.').collect();
+        let forged_payload = segment(&purchase(json!({
+            "originalTransactionId": t,
+            "appAccountToken": id.to_string(),
+            "expiresDate": now_ms() + 3_650 * 86_400_000,
+        })));
+        parts[1] = &forged_payload;
+        let (status, body) = h.post(&h.token(&id), &parts.join(".")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+
+        // Not a JWS at all.
+        let (status, body) = h.post(&h.token(&id), "garbage").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transaction_for_another_product_is_422() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let jws = h.jws(json!({
+            "originalTransactionId": otid(),
+            "appAccountToken": id.to_string(),
+            "productId": "com.example.other",
+        }));
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+    }
+
+    #[tokio::test]
+    async fn a_body_without_signed_transaction_is_422_after_auth() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        for body in [&b"{}"[..], b"not json", b""] {
+            let (status, text) = h.post_raw(Some(&h.token(&id)), body.to_vec()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(text, INVALID_BODY);
+        }
+        // Unauthenticated callers learn nothing about the body.
+        let (status, _) = h.post_raw(None, b"{}".to_vec()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn feature_off_is_503() {
+        let Some(h) = Harness::with_config(false) else {
+            return;
+        };
+        let id = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": id.to_string() }));
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, UNAVAILABLE_BODY);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+    }
+
+    /// An older snapshot changes nothing; the answer is the stored state, so a
+    /// grace period a notification recorded counts.
+    #[tokio::test]
+    async fn stale_post_returns_stored_state() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let now = secs(now_ms());
+        let stored = AppStoreRecord {
+            original_transaction_id: t.clone(),
+            product_id: PRODUCT.into(),
+            environment: Environment::Production,
+            expires_at: now - 600,
+            grace_expires_at: Some(now + 3_600),
+            revoked_at: None,
+            last_signed_at: now + 60,
+        };
+        assert_eq!(
+            h.store.put_app_store_state(&id, &stored).await.unwrap(),
+            StateOutcome::Applied
+        );
+
+        // Signed an hour before the stored snapshot, and expired.
+        let older_ms = now_ms() - 3_600_000;
+        let jws = sign_jws(
+            &{
+                let mut p = transaction(older_ms);
+                p["originalTransactionId"] = json!(t);
+                p["appAccountToken"] = json!(id.to_string());
+                p["expiresDate"] = json!(older_ms + 1_000);
+                p
+            },
+            &h.fx,
+        );
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json_body(&body),
+            json!({
+                "active": true,
+                "expires_at": stored.expires_at,
+                "environment": "Production",
+                "token_can_publish": false,
+            })
+        );
+        assert_eq!(h.records(&id).await, vec![stored]);
+        // The subscription is still bound to the caller.
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn reports_whether_the_presented_token_can_publish() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let jws =
+            h.jws(json!({ "originalTransactionId": otid(), "appAccountToken": id.to_string() }));
+
+        let (status, body) = h.post(&h.publishing_token(&id), &jws).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["token_can_publish"], true);
+
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["token_can_publish"], false);
+    }
 }

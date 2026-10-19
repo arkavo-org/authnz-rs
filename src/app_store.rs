@@ -18,10 +18,16 @@
 //! Errors are unit variants with fixed messages, so nothing from a signed
 //! payload can reach a log line or a response body through them.
 
+use crate::AppState;
+use crate::db::{AppStoreRecord, DynamoDBError, LinkOutcome, StateOutcome};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ecdsa::signature::Verifier;
-use log::{info, warn};
+use log::{error, info, warn};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
 use serde::de::DeserializeOwned;
@@ -62,8 +68,6 @@ const WWDR_INTERMEDIATE_OID: [u64; 8] = [1, 2, 840, 113635, 100, 6, 2, 1];
 const RECEIPT_SIGNING_OID: [u64; 8] = [1, 2, 840, 113635, 100, 6, 11, 1];
 
 /// The DER of [`APPLE_ROOT_CA_G3`], decoded once.
-// Reached only from tests until a route verifies a purchase.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apple_root_g3_der() -> &'static [u8] {
     APPLE_ROOT_G3_DER.get_or_init(|| {
         ::pem::parse(APPLE_ROOT_CA_G3.as_bytes())
@@ -103,8 +107,6 @@ struct JwsHeader {
 ///
 /// `root_der` is the trust anchor `x5c[2]` must equal byte for byte:
 /// [`apple_root_g3_der`] in production, a fixture root in tests.
-// Reached only from tests until a route verifies a purchase.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn verify_jws(jws: &str, root_der: &[u8]) -> Result<Value, AppStoreError> {
     // A fourth segment would leave a '.' in the payload segment, which
     // base64url refuses.
@@ -227,6 +229,13 @@ pub enum Environment {
 }
 
 impl Environment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "Production",
+            Self::Sandbox => "Sandbox",
+        }
+    }
+
     fn from_apple(value: &str) -> Option<Self> {
         match value {
             "Production" => Some(Self::Production),
@@ -456,8 +465,6 @@ fn required_seconds(payload: &Map<String, Value>, key: &str) -> Result<i64, AppS
 
 /// Verify a signed transaction and apply the bundle, environment, product and
 /// ownership rules.
-// Reached only from tests until a route verifies a purchase.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn decode_transaction(
     cfg: &AppStoreConfig,
     jws: &str,
@@ -551,4 +558,195 @@ pub(crate) fn decode_notification(
         transaction,
         grace_expires_at,
     })
+}
+
+// --------- The Active rule ---------
+
+/// Whether an account holds an active membership, given its stored records.
+///
+/// A record is active iff its product and environment are both in `cfg`, it
+/// has no `revoked_at`, and `now` is before the later of its `expires_at` and
+/// its `grace_expires_at` (a billing-retry grace the notifications recorded).
+/// One active record is enough. Times are unix seconds.
+pub(crate) fn app_store_active(cfg: &AppStoreConfig, records: &[AppStoreRecord], now: i64) -> bool {
+    records.iter().any(|r| {
+        cfg.product_ids.contains(&r.product_id)
+            && cfg.environments.contains(&r.environment)
+            && r.revoked_at.is_none()
+            && now < r.expires_at.max(r.grace_expires_at.unwrap_or(i64::MIN))
+    })
+}
+
+// --------- POST /app-store/transactions ---------
+
+const BODY_ANOTHER_ACCOUNT: &str = "transaction belongs to another account";
+const BODY_ANOTHER_SUBSCRIPTION: &str = "subscription belongs to another account";
+const BODY_INVALID: &str = "invalid transaction";
+const BODY_UNAVAILABLE: &str = "app store purchases unavailable";
+
+#[derive(Deserialize)]
+struct TransactionRequest {
+    signed_transaction: String,
+}
+
+#[derive(Serialize)]
+struct TransactionResponse {
+    active: bool,
+    expires_at: i64,
+    environment: Environment,
+    token_can_publish: bool,
+}
+
+/// What the request's one log line says. Only the subscription's
+/// `original_transaction_id`, its environment and the outcome: never a JWS, a
+/// token or an `appAccountToken`.
+struct Trace {
+    outcome: &'static str,
+    original_transaction_id: Option<String>,
+    environment: Option<Environment>,
+}
+
+fn refuse(status: StatusCode, body: &'static str) -> Response {
+    (status, body).into_response()
+}
+
+/// A storage failure: logged here, a bare 500 on the wire.
+fn internal(what: &str, e: &DynamoDBError) -> Response {
+    error!("app store transaction: {what} failed: {e}");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// `POST /app-store/transactions`: bind the purchased subscription in
+/// `signed_transaction` to the caller and report its state.
+///
+/// Order: the feature is configured, the caller authenticates (and still
+/// exists), the JWS verifies, the transaction names an account (`appAccountToken`),
+/// the link is bound, the state is written, and the answer is read back from
+/// the stored record, so a grace period a notification recorded counts and a
+/// stale post answers with what is stored.
+pub(crate) async fn transactions_handler(
+    Extension(app_state): Extension<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut trace = Trace {
+        outcome: "refused",
+        original_transaction_id: None,
+        environment: None,
+    };
+    let response = post_transaction(&app_state, &headers, &body, &mut trace).await;
+    info!(
+        "app_store transaction outcome={} otid={} env={}",
+        trace.outcome,
+        trace.original_transaction_id.as_deref().unwrap_or("-"),
+        trace.environment.map_or("-", Environment::as_str),
+    );
+    response
+}
+
+async fn post_transaction(
+    app_state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+    trace: &mut Trace,
+) -> Response {
+    let Some(cfg) = app_state.app_store.as_ref() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, BODY_UNAVAILABLE);
+    };
+    let caller = match crate::authn::authenticated_live_account(app_state, headers).await {
+        Ok(account) => account,
+        Err(status) => return status.into_response(),
+    };
+
+    // Parsed here, after authentication, so a caller without a token learns
+    // nothing about what the body should look like.
+    let Ok(TransactionRequest { signed_transaction }) = serde_json::from_slice(body) else {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, BODY_INVALID);
+    };
+    let Ok(tx) = decode_transaction(cfg, &signed_transaction) else {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, BODY_INVALID);
+    };
+    trace.original_transaction_id = Some(tx.original_transaction_id.clone());
+    trace.environment = Some(tx.environment);
+
+    // The transaction must name the account it was bought for.
+    let Some(named) = tx.app_account_token else {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, BODY_INVALID);
+    };
+    if named != caller.user_id {
+        // Another live account's purchase is not the caller's to claim. A
+        // deleted or unknown account's still-billing subscription is.
+        match app_state.db_store.is_account_live(&named).await {
+            Ok(true) => return refuse(StatusCode::FORBIDDEN, BODY_ANOTHER_ACCOUNT),
+            Ok(false) => {}
+            Err(e) => return internal("account lookup", &e),
+        }
+    }
+
+    // Always the link first: the state lands on the caller's row only once the
+    // subscription is the caller's.
+    match app_state
+        .db_store
+        .bind_app_store_link(&tx.original_transaction_id, &caller.user_id)
+        .await
+    {
+        Ok(LinkOutcome::Bound | LinkOutcome::AlreadyYours) => {}
+        Ok(LinkOutcome::BoundElsewhere) => {
+            trace.outcome = "elsewhere";
+            return refuse(StatusCode::CONFLICT, BODY_ANOTHER_SUBSCRIPTION);
+        }
+        Err(DynamoDBError::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return internal("link", &e),
+    }
+
+    let record = AppStoreRecord {
+        original_transaction_id: tx.original_transaction_id.clone(),
+        product_id: tx.product_id,
+        environment: tx.environment,
+        expires_at: tx.expires_at,
+        grace_expires_at: None,
+        revoked_at: tx.revoked_at,
+        last_signed_at: tx.signed_at,
+    };
+    match app_state
+        .db_store
+        .put_app_store_state(&caller.user_id, &record)
+        .await
+    {
+        Ok(StateOutcome::Applied) => trace.outcome = "bound",
+        Ok(StateOutcome::Stale) => trace.outcome = "stale",
+        Ok(StateOutcome::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(DynamoDBError::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return internal("state write", &e),
+    }
+
+    // The stored record, not the posted one: it may be newer, and it holds
+    // any grace a notification recorded.
+    let stored = match app_state
+        .db_store
+        .get_publishing_state(&caller.user_id)
+        .await
+    {
+        Ok(Some(state)) => state
+            .app_store
+            .into_iter()
+            .find(|r| r.original_transaction_id == tx.original_transaction_id),
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return internal("state read", &e),
+    };
+    let Some(stored) = stored else {
+        error!("app store transaction: stored record unreadable after write");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    Json(TransactionResponse {
+        active: app_store_active(
+            cfg,
+            std::slice::from_ref(&stored),
+            chrono::Utc::now().timestamp(),
+        ),
+        expires_at: stored.expires_at,
+        environment: stored.environment,
+        token_can_publish: caller.token_can_publish,
+    })
+    .into_response()
 }

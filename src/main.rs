@@ -704,6 +704,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .put(publishing::put_publishing_suspension)
                 .delete(publishing::delete_publishing_suspension),
         )
+        // App Store Creator Membership: bind a purchased subscription to the
+        // caller and report its state. Auth CWT required.
+        .route(
+            "/app-store/transactions",
+            post(app_store::transactions_handler),
+        )
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
         .route("/account", axum::routing::delete(account::delete_account))
