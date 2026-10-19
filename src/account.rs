@@ -13,7 +13,8 @@
 //! 2. **After [`ACCOUNT_DELETION_GRACE_SECONDS`]:** [`sweep`] removes what is
 //!    bound to the account in other tables: the handle, App Attest device
 //!    bindings, every Apple/Google/Patreon identity link except an Apple link
-//!    holding a token, the Patreon token row (sealed tokens and wrapped key;
+//!    holding a token (passkey index rows are kept and marked revoked, #104),
+//!    the Patreon token row (sealed tokens and wrapped key;
 //!    Patreon has no revocation endpoint) and its cache, and it revokes the
 //!    account's agent delegations and Guardians, stripping their labels.
 //!    Last, it revokes the account's Sign in with Apple refresh tokens with
@@ -278,6 +279,9 @@ pub(crate) async fn sweep(
     db.delete_patreon_link(uid).await?;
     patreon.cache.invalidate(*uid).await;
     let links = db.delete_identity_links_of(uid).await?;
+    // Kept, revoked as of the deletion: the status route already reports
+    // them revoked from the tombstone on, with this same time (#104).
+    let passkeys = db.revoke_passkey_links_of(uid, deletion.deleted_at).await?;
     let devices = db.delete_device_bindings_of(uid).await?;
     let agents = db.revoke_and_scrub_delegations_of(uid, now).await?;
     let guardians = db.revoke_and_scrub_guardians_of(uid, now).await?;
@@ -286,7 +290,7 @@ pub(crate) async fn sweep(
     let apple_tokens = revoke_apple_tokens(db, apple, uid).await?;
     info!(
         "audit account_deletion outcome=swept user_id={uid} identity_links={links} \
-         device_bindings={devices} agents={agents} guardians={guardians} \
+         passkeys={passkeys} device_bindings={devices} agents={agents} guardians={guardians} \
          apple_tokens={apple_tokens}"
     );
     Ok(())

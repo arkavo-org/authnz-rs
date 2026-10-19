@@ -82,6 +82,16 @@ paths:
     tombstone, and it 409s a new account linking the same Apple ID until
     revoked. A row with some but not all `token_*` attributes is unreadable
     and keeps the deletion `failed` (permanent).
+- **Passkey index** (#104; `db/passkeys.rs`): `link_pk = passkey#<base64url
+  credential id>`, `provider = passkey`, `subject` = the id, `user_id`,
+  `linked_at` (first attestation), `revoked_at` (Number, optional). Written by
+  `POST /passkeys/credential-attestation` on `attribute_not_exists(link_pk) OR
+  (user_id = :uid AND attribute_not_exists(revoked_at))`. Never deleted: the
+  deletion sweep's link step skips `provider = passkey`
+  (`(attribute_not_exists(provider) OR provider <> :passkey)`, in the scan
+  filter and the delete condition) and `revoke_passkey_links_of` sets
+  `revoked_at = if_not_exists(revoked_at, deleted_at)`. Read by
+  `GET /passkeys/credentials/:id/status` (consistent), never by sign-in.
 - **PII**: Deliberately minimal. No email, display name, relay address, or
   `real_user_status` is stored here, even if the IdP returns them. A sealed
   Apple refresh token is not PII.

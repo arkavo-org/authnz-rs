@@ -9,5 +9,6 @@
 //! ...) and pulling them into this crate would drag that coupling along.
 
 pub mod constants;
+pub mod credential_attestation;
 pub mod cwt;
 pub mod keys;
