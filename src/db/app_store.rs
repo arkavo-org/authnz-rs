@@ -15,7 +15,9 @@
 //! signature is malleable, so two different byte strings verify for one
 //! payload. The JWS itself is not stored. A snapshot of an earlier billing
 //! period (another `transaction_id`, ending before the stored one) never
-//! changes an entry, however late it was signed.
+//! changes an entry, however late it was signed; a snapshot of a later period
+//! (another `transaction_id`, ending after it) applies, however early it was
+//! signed.
 
 use super::agent_state::{classify, n, s};
 use super::publishing::{self, PublishingSuspension};
@@ -376,7 +378,7 @@ impl DynamoDBStore {
     /// Store a subscription's state on the account's `credentials` row.
     ///
     /// Every write is conditional on `LIVE_ROW`, and an update of an existing
-    /// entry on three rules besides:
+    /// entry on these rules besides:
     ///
     /// - **Environment.** A snapshot of another environment never changes an
     ///   entry, so a Sandbox snapshot cannot flip a Production record.
@@ -388,8 +390,8 @@ impl DynamoDBStore {
     ///   later than the stored one applies whatever its `last_signed_at`.
     ///   Any later snapshot of that period carries its id, so it falls under
     ///   the signed order and its own refund still revokes.
-    /// - **Signed order.** Otherwise the incoming `last_signed_at` must be later than
-    ///   the stored one, or equal to it unless that would replace a stored
+    /// - **Signed order.** Except for a newer period, the incoming
+    ///   `last_signed_at` must be later than the stored one, or equal to it unless that would replace a stored
     ///   `revoked_at` with a snapshot that has none (two snapshots signed in
     ///   the same second apply in arrival order, but a refund is never undone
     ///   by a tie).
@@ -1487,8 +1489,9 @@ mod tests {
         assert_eq!(state_of(&store, &id).await, vec![refund]);
     }
 
-    /// A new transaction that ends no earlier (a renewal, or a same-length
-    /// upgrade) applies under the signed order, and becomes the stored one.
+    /// A new transaction that ends at the same time (a same-length upgrade)
+    /// applies under the signed order; one that ends later (a renewal) applies
+    /// whatever its signing time. Either becomes the stored one.
     #[tokio::test]
     async fn a_renewal_by_another_transaction_applies() {
         let Some(store) = local_store() else { return };
@@ -1634,6 +1637,69 @@ mod tests {
             StateOutcome::Applied
         );
         assert_eq!(state_of(&store, &id).await, vec![earlier_period]);
+    }
+
+    /// A stored entry without a transaction id is unknown, so a later-ending
+    /// snapshot signed earlier is no provable newer period: the signed order
+    /// decides and it is stale.
+    #[tokio::test]
+    async fn a_legacy_entry_does_not_yield_to_an_earlier_signed_later_period() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-legacy-newer").await;
+        let t = otid();
+        let legacy = AppStoreRecord {
+            transaction_id: None,
+            ..period(&t, "-", 1_700_000_100, 1_702_600_000)
+        };
+        store
+            .put_app_store_state(&id, &legacy, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        let later_end_signed_earlier = period(&t, "t1", 1_700_000_050, 1_705_200_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &later_end_signed_earlier, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Stale
+        );
+        assert_eq!(state_of(&store, &id).await, vec![legacy]);
+    }
+
+    /// A refund of last month, signed after this month's renewal and stored
+    /// first, leaves the entry revoked; the renewal signed before it still
+    /// replaces it and clears the revocation.
+    #[tokio::test]
+    async fn a_renewal_replaces_a_stored_refund_of_the_previous_period() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-refund-first").await;
+        let t = otid();
+        let (e1, e2) = (1_702_600_000, 1_705_200_000);
+        let refund = AppStoreRecord {
+            revoked_at: Some(1_700_000_090),
+            ..period(&t, "t1", 1_700_000_100, e1)
+        };
+        store
+            .put_app_store_state(&id, &refund, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        assert_eq!(
+            state_of(&store, &id).await[0].revoked_at,
+            Some(1_700_000_090)
+        );
+
+        let renewal = period(&t, "t2", 1_700_000_050, e2);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &renewal, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        let stored = state_of(&store, &id).await;
+        assert_eq!(stored, vec![renewal]);
+        assert_eq!(stored[0].expires_at, e2);
+        assert_eq!(stored[0].revoked_at, None);
     }
 
     /// A snapshot of another environment never changes an entry, so a

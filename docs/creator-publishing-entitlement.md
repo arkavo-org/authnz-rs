@@ -86,12 +86,11 @@ A stored subscription record is **active** when all of these hold:
 One active record is enough. The record's state comes from the signed
 transaction (`expiresDate`, `revocationDate`) and, for the grace period, the
 renewal info of App Store Server Notifications V2 (`gracePeriodExpiresDate`);
-an older notification never overwrites a newer one.
+an older notification never overwrites a newer one of the same period.
 
 - **Order.** Snapshots apply in `signedDate` order, except a newer period
-  (below). Two signed in the same
-  second apply in arrival order, except that one without a `revocationDate`
-  never replaces one that has it.
+  (below). Two signed in the same second apply in arrival order, except that
+  one without a `revocationDate` never replaces one that has it.
 - **Past periods.** Each record keeps the `transactionId` of the billing
   period it describes. A snapshot of *another* transaction that ends before
   the stored one is a past period and never changes the record: it can't
