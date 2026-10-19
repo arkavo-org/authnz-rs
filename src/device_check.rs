@@ -1292,11 +1292,7 @@ pub fn verify_inbound_token(
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    Ok(crate::cwt::verify(
-        &bytes,
-        &app_state.cwt_verifying_key,
-        &opts,
-    )?)
+    Ok(crate::cwt::verify(&bytes, &app_state.cwt_keys, &opts)?)
 }
 
 #[derive(Error, Debug)]

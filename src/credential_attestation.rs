@@ -112,11 +112,12 @@ pub fn mint(a: &CredentialAttestation, key: &SigningKey, kid: &[u8]) -> Result<V
         .map_err(|_| CwtError::Malformed)
 }
 
-/// Verify an attestation's signature and shape against `key`, as a consumer
-/// would (tdf-iroh-s3, Creator, arkavo-ios implement the same rules; this
-/// one pins them in tests). Accepts tag 18 or untagged; refuses the CWT tag.
-/// Checking `iss`, `rpId` and `sub` against expectations is the caller's.
-pub fn verify(bytes: &[u8], key: &VerifyingKey) -> Result<CredentialAttestation, CwtError> {
+/// Verify an attestation's signature and shape against the key its `kid`
+/// names in `keys`, as a consumer would (tdf-iroh-s3, Creator, arkavo-ios
+/// implement the same rules and select the key from `cose-keys` by `kid`;
+/// this one pins them in tests). Accepts tag 18 or untagged; refuses the CWT
+/// tag. Checking `iss`, `rpId` and `sub` against expectations is the caller's.
+pub fn verify(bytes: &[u8], keys: &crate::keys::KeySet) -> Result<CredentialAttestation, CwtError> {
     if bytes.starts_with(&crate::cwt::CWT_TAG_PREFIX) {
         return Err(CwtError::Malformed);
     }
@@ -133,6 +134,7 @@ pub fn verify(bytes: &[u8], key: &VerifyingKey) -> Result<CredentialAttestation,
     {
         return Err(CwtError::Malformed);
     }
+    let key = keys.get(&header.key_id).ok_or(CwtError::UnknownKey)?;
     sign1
         .verify_signature(b"", |sig_bytes, to_verify| {
             let sig = Signature::from_slice(sig_bytes).map_err(|_| ())?;
@@ -262,6 +264,11 @@ mod tests {
 
     const GOLDEN_KID: &[u8] = b"arkavo-fixture-kid-1";
 
+    /// A one-key set: `vk` under `kid`.
+    fn set(vk: &VerifyingKey, kid: &[u8]) -> crate::keys::KeySet {
+        crate::keys::KeySet::new(*vk, kid.to_vec())
+    }
+
     /// The exact bytes the encoder produces for [`golden`]: ES256 here is
     /// deterministic (RFC 6979), so any change to the encoding shows up as a
     /// diff. tdf-iroh-s3 verifies this same vector; changing it breaks them.
@@ -280,7 +287,7 @@ mod tests {
         );
         let parsed = verify(
             &hex::decode(GOLDEN_ATTESTATION).unwrap(),
-            sk.verifying_key(),
+            &set(sk.verifying_key(), GOLDEN_KID),
         )
         .unwrap();
         assert_eq!(parsed, a);
@@ -298,7 +305,7 @@ mod tests {
     fn roundtrip() {
         let (sk, vk, a) = keys();
         let bytes = mint(&a, &sk, b"kid").unwrap();
-        assert_eq!(verify(&bytes, &vk).unwrap(), a);
+        assert_eq!(verify(&bytes, &set(&vk, b"kid")).unwrap(), a);
     }
 
     /// The layout tdf-iroh-s3 verifies, byte by byte where it matters.
@@ -365,7 +372,7 @@ mod tests {
             .unwrap()
             .to_vec()
             .unwrap();
-        assert_eq!(verify(&untagged, &vk).unwrap(), a);
+        assert_eq!(verify(&untagged, &set(&vk, b"kid")).unwrap(), a);
     }
 
     #[test]
@@ -374,8 +381,34 @@ mod tests {
         let bytes = mint(&a, &sk, b"kid").unwrap();
         let other = *SigningKey::random(&mut OsRng).verifying_key();
         assert!(matches!(
-            verify(&bytes, &other),
+            verify(&bytes, &set(&other, b"kid")),
             Err(CwtError::InvalidSignature)
+        ));
+    }
+
+    /// #107 acceptance: an attestation minted under key A still verifies after
+    /// the signer switches to key B while A stays listed as verify-only, and
+    /// stops verifying once A is dropped from the set.
+    #[test]
+    fn verifies_under_a_retired_key_while_it_is_listed() {
+        let (sk_a, vk_a, a) = keys();
+        let kid_a = crate::keys::thumbprint_kid(&vk_a).unwrap();
+        let before = mint(&a, &sk_a, &kid_a).unwrap();
+
+        let sk_b = SigningKey::random(&mut OsRng);
+        let vk_b = *sk_b.verifying_key();
+        let kid_b = crate::keys::thumbprint_kid(&vk_b).unwrap();
+        let mut rotated = crate::keys::KeySet::new(vk_b, kid_b.clone());
+        rotated.add_verify_only(vk_a, kid_a).unwrap();
+
+        assert_eq!(verify(&before, &rotated).unwrap(), a);
+        let after = mint(&a, &sk_b, &kid_b).unwrap();
+        assert_eq!(verify(&after, &rotated).unwrap(), a);
+
+        let a_dropped = crate::keys::KeySet::new(vk_b, kid_b);
+        assert!(matches!(
+            verify(&before, &a_dropped),
+            Err(CwtError::UnknownKey)
         ));
     }
 
@@ -392,7 +425,7 @@ mod tests {
             now: a.iat,
             skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
         };
-        assert!(crate::cwt::verify(&bytes, &vk, &opts).is_err());
+        assert!(crate::cwt::verify(&bytes, &set(&vk, b"kid"), &opts).is_err());
 
         let untagged = coset::CoseSign1::from_tagged_slice(&bytes)
             .unwrap()
@@ -400,9 +433,9 @@ mod tests {
             .unwrap();
         let mut as_cwt = crate::cwt::CWT_TAG_PREFIX.to_vec();
         as_cwt.extend_from_slice(&untagged);
-        assert!(crate::cwt::verify(&as_cwt, &vk, &opts).is_err());
+        assert!(crate::cwt::verify(&as_cwt, &set(&vk, b"kid"), &opts).is_err());
         // And the verifier here refuses the CWT tag.
-        assert!(verify(&as_cwt, &vk).is_err());
+        assert!(verify(&as_cwt, &set(&vk, b"kid")).is_err());
     }
 
     #[test]
@@ -412,6 +445,6 @@ mod tests {
         let claims = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None);
         let token = crate::cwt::mint(&claims, &sk, b"kid").unwrap();
         let inner = crate::cwt::strip_cwt_tag(&token).unwrap();
-        assert!(verify(inner, &vk).is_err());
+        assert!(verify(inner, &set(&vk, b"kid")).is_err());
     }
 }

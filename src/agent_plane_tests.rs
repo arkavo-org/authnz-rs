@@ -372,7 +372,7 @@ pub(crate) fn verify_token(p: &Plane, token: &str) -> crate::cwt::ArkavoClaims {
     let bytes = crate::cwt::decode_from_header(token).unwrap();
     crate::cwt::verify(
         &bytes,
-        &p.state.cwt_verifying_key,
+        &p.state.cwt_keys,
         &crate::cwt::VerifyOptions {
             expected_iss: Some(&p.state.issuer),
             expected_aud: Some("https://platform.arkavo.net"),

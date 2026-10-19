@@ -48,7 +48,7 @@ or untagged. It is **never** tagged 61 (CWT). External AAD: empty.
 | Label | Value |
 |---|---|
 | 1 (`alg`) | -7 (ES256) |
-| 4 (`kid`) | the kid of a key in `/.well-known/cose-keys` (today the CWT signing key) |
+| 4 (`kid`) | the kid of a key in `/.well-known/cose-keys` (the CWT signing key current when it was minted) |
 | 3 (`content type`) | text `"application/arkavo-passkey-credential+cbor"` |
 
 No `crit`. Nothing unprotected.
@@ -97,14 +97,17 @@ The WebAuthn relying party accepts exactly one origin,
 passkeys report `signCount` 0: ignore it.
 
 `credential_attestation::verify` in this repo implements steps 1–3 against
-one key and is what the tests pin.
+a key set, selecting the key by `kid`, and is what the tests pin.
 
 ### Key rotation
 
 Because an attestation has no expiry, the key that signed it must stay
 listed in `/.well-known/cose-keys` for as long as pointers signed under it
-should verify. `cose-keys` serves one key today; a rotation must keep
-serving the retired key (verification only) alongside the new one.
+should verify. `cose-keys` lists the current signing key and every
+verify-only key (`VERIFY_ONLY_KEY_PATHS`, #107), so a verifier must select
+the key by `kid`, never assume the set has one key. A retired key stays
+listed until no stored catalog bundle cites its `kid`; a leaked key is
+removed at once. Runbook: [key-rotation.md](key-rotation.md).
 
 ## Status: `GET /passkeys/credentials/{credentialId}/status`
 

@@ -265,7 +265,7 @@ other relying parties.
 | Endpoint                              | Purpose                                       |
 | ------------------------------------- | --------------------------------------------- |
 | `GET /.well-known/openid-configuration` | OIDC discovery document                     |
-| `GET /.well-known/jwks.json`            | Public ES256 signing key as a JWK           |
+| `GET /.well-known/jwks.json`            | Public ES256 keys as JWKs (signing key first) |
 | `GET /oauth/authorize`                  | Authorization endpoint (code flow)          |
 | `POST /oauth/token`                     | Token endpoint                              |
 | `GET /oauth/userinfo`                   | UserInfo endpoint                           |

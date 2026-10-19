@@ -348,10 +348,11 @@ async fn quarantine_stops_issuance_and_only_a_guardian_re_appraises() {
     let r = mint(&client, &base, &a1).await;
     assert_eq!(r.status(), 200);
     let tok: Value = r.json().await.unwrap();
-    let (_, vk, _) = server_keys();
+    let (_, vk, kid) = server_keys();
+    let keys = authnz_rs::keys::KeySet::new(vk, kid);
     let claims = authnz_rs::cwt::verify(
         &authnz_rs::cwt::decode_from_header(tok["token"].as_str().unwrap()).unwrap(),
-        &vk,
+        &keys,
         &authnz_rs::cwt::VerifyOptions {
             expected_iss: Some(&std::env::var("OIDC_ISSUER").unwrap()),
             expected_aud: Some("https://platform.test"),
@@ -475,7 +476,7 @@ async fn quarantine_stops_issuance_and_only_a_guardian_re_appraises() {
     let tok: Value = r.json().await.unwrap();
     let claims = authnz_rs::cwt::verify(
         &authnz_rs::cwt::decode_from_header(tok["token"].as_str().unwrap()).unwrap(),
-        &vk,
+        &keys,
         &authnz_rs::cwt::VerifyOptions {
             expected_iss: Some(&std::env::var("OIDC_ISSUER").unwrap()),
             expected_aud: Some("https://platform.test"),
