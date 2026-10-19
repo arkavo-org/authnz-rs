@@ -19,7 +19,7 @@
 //! payload can reach a log line or a response body through them.
 
 use crate::AppState;
-use crate::db::{AppStoreRecord, DynamoDBError, LinkOutcome, StateOutcome};
+use crate::db::{AppStoreRecord, DynamoDBError, GraceUpdate, LinkOutcome, StateOutcome};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -710,7 +710,7 @@ async fn post_transaction(
     };
     match app_state
         .db_store
-        .put_app_store_state(&caller.user_id, &record)
+        .put_app_store_state(&caller.user_id, &record, GraceUpdate::Keep)
         .await
     {
         Ok(StateOutcome::Applied) => trace.outcome = "bound",

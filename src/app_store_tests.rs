@@ -924,7 +924,7 @@ mod transactions_route {
     use crate::AppState;
     use crate::constants::ENTITLEMENT_CREATOR_PUBLISH;
     use crate::cwt::ArkavoUserClaims;
-    use crate::db::{AppStoreRecord, DynamoDBStore, StateOutcome};
+    use crate::db::{AppStoreRecord, DynamoDBStore, GraceUpdate, StateOutcome};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
@@ -1402,7 +1402,10 @@ mod transactions_route {
             last_signed_at: now + 60,
         };
         assert_eq!(
-            h.store.put_app_store_state(&id, &stored).await.unwrap(),
+            h.store
+                .put_app_store_state(&id, &stored, GraceUpdate::Set(stored.grace_expires_at))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
 
@@ -1449,5 +1452,82 @@ mod transactions_route {
         let (status, body) = h.post(&h.token(&id), &jws).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(json_body(&body)["token_can_publish"], false);
+    }
+
+    /// A client post never touches the grace a notification recorded: a
+    /// member in billing-retry stays active after opening the app.
+    #[tokio::test]
+    async fn a_client_post_keeps_the_grace_a_notification_recorded() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let now = secs(now_ms());
+        let stored = AppStoreRecord {
+            original_transaction_id: t.clone(),
+            product_id: PRODUCT.into(),
+            environment: Environment::Sandbox,
+            expires_at: now - 600,
+            grace_expires_at: Some(now + 3_600),
+            revoked_at: None,
+            last_signed_at: now - 100,
+        };
+        h.store
+            .put_app_store_state(&id, &stored, GraceUpdate::Set(stored.grace_expires_at))
+            .await
+            .unwrap();
+
+        // Signed now (newer than the stored snapshot), same expiry.
+        let signed_ms = now_ms();
+        let jws = sign_jws(
+            &{
+                let mut p = transaction(signed_ms);
+                p["originalTransactionId"] = json!(t);
+                p["appAccountToken"] = json!(id.to_string());
+                p["expiresDate"] = json!(stored.expires_at * 1000);
+                p
+            },
+            &h.fx,
+        );
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let answer = json_body(&body);
+        assert_eq!(answer["active"], true);
+        assert_eq!(answer["expires_at"], stored.expires_at);
+        // Applied, not stale: the snapshot moved on while the grace stayed.
+        assert_eq!(
+            h.records(&id).await,
+            vec![AppStoreRecord {
+                last_signed_at: secs(signed_ms),
+                ..stored
+            }]
+        );
+    }
+
+    /// A storage failure in the account lookup is the server's, not a reason
+    /// for the client to sign in again.
+    #[tokio::test]
+    async fn a_failed_account_lookup_is_500_not_401() {
+        let Some(mut h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let jws = h.jws(json!({ "originalTransactionId": t, "appAccountToken": id.to_string() }));
+        let token = h.token(&id);
+
+        let blind = Arc::new(
+            h.store
+                .with_credentials_table(format!("missing-credentials-{}", Uuid::new_v4().simple())),
+        );
+        h.state.db_store = blind;
+        h.app = Router::new()
+            .route("/app-store/transactions", post(transactions_handler))
+            .layer(Extension(h.state.clone()));
+
+        let (status, _) = h.post(&token, &jws).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // A bad token is still the client's to fix.
+        let (status, _) = h.post("not-a-cwt", &jws).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
     }
 }

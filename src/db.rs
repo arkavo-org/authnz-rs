@@ -20,7 +20,7 @@ pub use agent_state::{
     AgentState, AgentTrust, AuthorizeOver, AuthorizeWrite, EffectiveState, QuarantineOutcome,
     SwarmWrite,
 };
-pub use app_store::{AppStoreRecord, LinkOutcome, StateOutcome};
+pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, StateOutcome};
 // Named by the token mint, which arrives in a later change.
 #[allow(unused_imports)]
 pub use app_store::PublishingState;

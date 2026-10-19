@@ -952,10 +952,10 @@ pub(crate) struct AuthenticatedAccount {
 
 /// Authenticate a request by its `X-Auth-Token` CWT and check the account
 /// behind it still exists: the CWT outlives a deleted account (#88). Any
-/// failure, whether a missing, unreadable, expired or forged token, a `sub`
-/// that is not a UUID, a deleted account or a failed account lookup, is a 401
-/// (the lookup failure is logged), so a caller never gets in on an unchecked
-/// account.
+/// token failure (missing, unreadable, expired or forged, or a `sub` that is
+/// not a UUID) and a deleted account are a 401, which tells a client to sign
+/// in again. A failed account lookup is a 500 (logged): the caller's sign-in
+/// is not at fault, and it never gets in on an unchecked account.
 pub(crate) async fn authenticated_live_account(
     app_state: &AppState,
     headers: &HeaderMap,
@@ -974,7 +974,7 @@ pub(crate) async fn authenticated_live_account(
         Ok(false) => return Err(StatusCode::UNAUTHORIZED),
         Err(e) => {
             error!("Account lookup for an authenticated request failed: {e}");
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
     let token_can_publish = claims

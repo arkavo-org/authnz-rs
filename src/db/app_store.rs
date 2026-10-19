@@ -65,6 +65,18 @@ pub enum StateOutcome {
     AccountGone,
 }
 
+/// What a state write does to the stored `grace_expires_at`. Only the
+/// notifications know the grace period (it comes from their renewal info), so
+/// a client's post is `Keep` and never changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraceUpdate {
+    /// Leave a stored grace as it is; a new entry gets none. The record's own
+    /// `grace_expires_at` is ignored.
+    Keep,
+    /// Store this grace (or clear it with `None`), whatever the record says.
+    Set(Option<i64>),
+}
+
 /// What one consistent read of the `credentials` row yields for a mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishingState {
@@ -249,16 +261,137 @@ impl DynamoDBStore {
 
     /// Store a subscription's state on the account's `credentials` row.
     ///
-    /// Two conditional updates, since DynamoDB rejects overlapping document
-    /// paths in one expression: first the `app_store` map is ensured, then
-    /// `app_store.<otid>` is set, only if it is absent or its `last_signed_at`
-    /// is not later than the incoming one. Both carry `LIVE_ROW`, so nothing
-    /// lands on a tombstone or recreates a deleted row.
+    /// Every write is conditional on `LIVE_ROW` and on the ordering rule: the
+    /// incoming `last_signed_at` must be later than the stored one, or equal
+    /// to it unless that would replace a stored `revoked_at` with a snapshot
+    /// that has none (two snapshots signed in the same second apply in
+    /// arrival order, but a refund is never undone by a tie).
+    ///
+    /// An existing entry is updated field by field, so a field the write does
+    /// not own (`grace_expires_at` under [`GraceUpdate::Keep`]) is left
+    /// alone; the whole entry is written only when it is new. DynamoDB
+    /// rejects overlapping document paths in one expression and cannot create
+    /// a map and a key in it at once, so the attempts are conditional
+    /// updates, each atomic: update the existing entry; else ensure the map
+    /// and insert the entry if absent; else (a concurrent insert won) update
+    /// once more. If none applies the record is `Stale` (a later or tied
+    /// revoked snapshot is stored) or the account is gone.
     pub async fn put_app_store_state(
         &self,
         user_id: &Uuid,
         rec: &AppStoreRecord,
+        grace: GraceUpdate,
     ) -> Result<StateOutcome, DynamoDBError> {
+        if self.update_app_store_entry(user_id, rec, grace).await? {
+            return Ok(StateOutcome::Applied);
+        }
+        if self.insert_app_store_entry(user_id, rec, grace).await? {
+            return Ok(StateOutcome::Applied);
+        }
+        if self.update_app_store_entry(user_id, rec, grace).await? {
+            return Ok(StateOutcome::Applied);
+        }
+        if self.is_account_live(user_id).await? {
+            Ok(StateOutcome::Stale)
+        } else {
+            Ok(StateOutcome::AccountGone)
+        }
+    }
+
+    /// Update the fields of an existing entry. `false`: the entry is absent,
+    /// the row is not live, or the ordering rule refuses the write.
+    async fn update_app_store_entry(
+        &self,
+        user_id: &Uuid,
+        rec: &AppStoreRecord,
+        grace: GraceUpdate,
+    ) -> Result<bool, DynamoDBError> {
+        let table = &self.credentials_table;
+        let entry = "#as.#otid";
+        let mut sets = vec![
+            format!("{entry}.#pid = :pid"),
+            format!("{entry}.#env = :env"),
+            format!("{entry}.#exp = :exp"),
+            format!("{entry}.#signed = :signed"),
+        ];
+        let mut removes = Vec::new();
+        match rec.revoked_at {
+            Some(_) => sets.push(format!("{entry}.#rev = :rev")),
+            None => removes.push(format!("{entry}.#rev")),
+        }
+        match grace {
+            GraceUpdate::Keep => {}
+            GraceUpdate::Set(Some(_)) => sets.push(format!("{entry}.#grace = :grace")),
+            GraceUpdate::Set(None) => removes.push(format!("{entry}.#grace")),
+        }
+        let mut expression = format!("SET {}", sets.join(", "));
+        if !removes.is_empty() {
+            expression.push_str(&format!(" REMOVE {}", removes.join(", ")));
+        }
+        // A tie replaces a stored snapshot unless that drops its revocation.
+        let ordering = if rec.revoked_at.is_some() {
+            format!("{entry}.#signed <= :signed")
+        } else {
+            format!(
+                "({entry}.#signed < :signed OR \
+                 ({entry}.#signed = :signed AND attribute_not_exists({entry}.#rev)))"
+            )
+        };
+        let mut update = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression(expression)
+            .condition_expression(format!(
+                "{} AND attribute_exists({entry}) AND {ordering}",
+                account::LIVE_ROW
+            ))
+            .expression_attribute_names("#as", ATTR)
+            .expression_attribute_names("#otid", &rec.original_transaction_id)
+            .expression_attribute_names("#pid", "product_id")
+            .expression_attribute_names("#env", "environment")
+            .expression_attribute_names("#exp", "expires_at")
+            .expression_attribute_names("#signed", "last_signed_at")
+            .expression_attribute_values(":pid", s(&rec.product_id))
+            .expression_attribute_values(":env", s(environment_str(rec.environment)))
+            .expression_attribute_values(":exp", n(rec.expires_at))
+            .expression_attribute_values(":signed", n(rec.last_signed_at));
+        if let Some(revoked) = rec.revoked_at {
+            update = update
+                .expression_attribute_names("#rev", "revoked_at")
+                .expression_attribute_values(":rev", n(revoked));
+        } else {
+            update = update.expression_attribute_names("#rev", "revoked_at");
+        }
+        match grace {
+            GraceUpdate::Set(Some(g)) => {
+                update = update
+                    .expression_attribute_names("#grace", "grace_expires_at")
+                    .expression_attribute_values(":grace", n(g));
+            }
+            GraceUpdate::Set(None) => {
+                update = update.expression_attribute_names("#grace", "grace_expires_at");
+            }
+            GraceUpdate::Keep => {}
+        }
+        match update.send().await {
+            Ok(_) => Ok(true),
+            Err(e) => match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Ensure the `app_store` map exists, then write the whole entry if it is
+    /// absent. `false`: the entry exists already or the row is not live.
+    async fn insert_app_store_entry(
+        &self,
+        user_id: &Uuid,
+        rec: &AppStoreRecord,
+        grace: GraceUpdate,
+    ) -> Result<bool, DynamoDBError> {
         let table = &self.credentials_table;
         let key = s(&user_id.to_string());
 
@@ -277,13 +410,20 @@ impl DynamoDBStore {
             .send()
             .await;
         if let Err(e) = ensure {
-            // Already there (or no live row, which the next update reports).
+            // Already there (or no live row, which the insert reports).
             match classify(e, table) {
                 DynamoDBError::ConditionalConflict => {}
                 other => return Err(other),
             }
         }
 
+        let entry = AppStoreRecord {
+            grace_expires_at: match grace {
+                GraceUpdate::Keep => None,
+                GraceUpdate::Set(g) => g,
+            },
+            ..rec.clone()
+        };
         let set = self
             .client
             .update_item()
@@ -291,26 +431,18 @@ impl DynamoDBStore {
             .key("user_id", key)
             .update_expression("SET #as.#otid = :rec")
             .condition_expression(format!(
-                "{} AND (attribute_not_exists(#as.#otid) \
-                 OR #as.#otid.last_signed_at <= :signed)",
+                "{} AND attribute_exists(#as) AND attribute_not_exists(#as.#otid)",
                 account::LIVE_ROW
             ))
             .expression_attribute_names("#as", ATTR)
             .expression_attribute_names("#otid", &rec.original_transaction_id)
-            .expression_attribute_values(":rec", to_attr(rec))
-            .expression_attribute_values(":signed", n(rec.last_signed_at))
+            .expression_attribute_values(":rec", to_attr(&entry))
             .send()
             .await;
         match set {
-            Ok(_) => Ok(StateOutcome::Applied),
+            Ok(_) => Ok(true),
             Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => {
-                    if self.is_account_live(user_id).await? {
-                        Ok(StateOutcome::Stale)
-                    } else {
-                        Ok(StateOutcome::AccountGone)
-                    }
-                }
+                DynamoDBError::ConditionalConflict => Ok(false),
                 other => Err(other),
             },
         }
@@ -366,6 +498,26 @@ impl DynamoDBStore {
     }
 }
 
+impl DynamoDBStore {
+    /// This store with another `credentials` table name. Tests point it at a
+    /// table that does not exist to make account lookups fail.
+    #[cfg(test)]
+    pub(crate) fn with_credentials_table(&self, table: String) -> DynamoDBStore {
+        DynamoDBStore::with_client(
+            self.client.clone(),
+            table,
+            self.handles_table.clone(),
+            self.device_bindings_table.clone(),
+            self.identity_links_table.clone(),
+            self.patreon_tokens_table.clone(),
+            self.agent_delegations_table.clone(),
+            self.device_attest_keys_table.clone(),
+            self.guardians_table.clone(),
+            self.default_entitlements.clone(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +538,11 @@ mod tests {
             revoked_at: None,
             last_signed_at: signed,
         }
+    }
+
+    /// Store `rec` as a notification would: its own grace, set or cleared.
+    fn set(rec: &AppStoreRecord) -> GraceUpdate {
+        GraceUpdate::Set(rec.grace_expires_at)
     }
 
     async fn user(store: &DynamoDBStore, tag: &str) -> Uuid {
@@ -473,18 +630,7 @@ mod tests {
     /// A store whose `credentials` table does not exist, so the liveness
     /// re-check after a link write errors while the link write itself works.
     fn store_with_unreadable_accounts(store: &DynamoDBStore) -> DynamoDBStore {
-        DynamoDBStore::with_client(
-            store.client.clone(),
-            format!("missing-credentials-{}", Uuid::new_v4().simple()),
-            store.handles_table.clone(),
-            store.device_bindings_table.clone(),
-            store.identity_links_table.clone(),
-            store.patreon_tokens_table.clone(),
-            store.agent_delegations_table.clone(),
-            store.device_attest_keys_table.clone(),
-            store.guardians_table.clone(),
-            vec![],
-        )
+        store.with_credentials_table(format!("missing-credentials-{}", Uuid::new_v4().simple()))
     }
 
     /// Fails every `DeleteItem` before it is sent.
@@ -613,7 +759,10 @@ mod tests {
         let (t1, t2) = (otid(), otid());
         let first = rec(&t1, 1_700_000_000);
         assert_eq!(
-            store.put_app_store_state(&id, &first).await.unwrap(),
+            store
+                .put_app_store_state(&id, &first, set(&first))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
         assert_eq!(state_of(&store, &id).await, vec![first.clone()]);
@@ -626,7 +775,10 @@ mod tests {
             ..rec(&t2, 1_700_000_100)
         };
         assert_eq!(
-            store.put_app_store_state(&id, &second).await.unwrap(),
+            store
+                .put_app_store_state(&id, &second, set(&second))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
         let mut want = vec![first.clone(), second];
@@ -636,7 +788,10 @@ mod tests {
         // A newer snapshot of the first replaces it; an equal one applies too.
         let renewed = rec(&t1, 1_700_001_000);
         assert_eq!(
-            store.put_app_store_state(&id, &renewed).await.unwrap(),
+            store
+                .put_app_store_state(&id, &renewed, set(&renewed))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
         let same_time = AppStoreRecord {
@@ -644,7 +799,10 @@ mod tests {
             ..renewed
         };
         assert_eq!(
-            store.put_app_store_state(&id, &same_time).await.unwrap(),
+            store
+                .put_app_store_state(&id, &same_time, set(&same_time))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
         let got = state_of(&store, &id).await;
@@ -661,7 +819,10 @@ mod tests {
         let t = otid();
         let newer = rec(&t, 1_700_002_000);
         assert_eq!(
-            store.put_app_store_state(&id, &newer).await.unwrap(),
+            store
+                .put_app_store_state(&id, &newer, set(&newer))
+                .await
+                .unwrap(),
             StateOutcome::Applied
         );
         // An older EXPIRED arriving late must not replace the newer renewal.
@@ -670,7 +831,10 @@ mod tests {
             ..rec(&t, 1_700_001_000)
         };
         assert_eq!(
-            store.put_app_store_state(&id, &older).await.unwrap(),
+            store
+                .put_app_store_state(&id, &older, set(&older))
+                .await
+                .unwrap(),
             StateOutcome::Stale
         );
         assert_eq!(state_of(&store, &id).await, vec![newer]);
@@ -683,7 +847,7 @@ mod tests {
         tombstone(&store, &gone).await;
         assert_eq!(
             store
-                .put_app_store_state(&gone, &rec(&otid(), 1_700_000_000))
+                .put_app_store_state(&gone, &rec(&otid(), 1_700_000_000), GraceUpdate::Keep)
                 .await
                 .unwrap(),
             StateOutcome::AccountGone
@@ -697,7 +861,7 @@ mod tests {
         let unknown = Uuid::new_v4();
         assert_eq!(
             store
-                .put_app_store_state(&unknown, &rec(&otid(), 1_700_000_000))
+                .put_app_store_state(&unknown, &rec(&otid(), 1_700_000_000), GraceUpdate::Keep)
                 .await
                 .unwrap(),
             StateOutcome::AccountGone
@@ -718,7 +882,7 @@ mod tests {
         );
 
         let r = rec(&otid(), 1_700_000_000);
-        store.put_app_store_state(&id, &r).await.unwrap();
+        store.put_app_store_state(&id, &r, set(&r)).await.unwrap();
         let sus = PublishingSuspension {
             reason: "report upheld".into(),
             report_id: Some("rpt-9".into()),
@@ -746,7 +910,7 @@ mod tests {
         let id = user(&store, "aps-bad").await;
         let (good, bad) = (otid(), otid());
         let r = rec(&good, 1_700_000_000);
-        store.put_app_store_state(&id, &r).await.unwrap();
+        store.put_app_store_state(&id, &r, set(&r)).await.unwrap();
         store
             .client
             .update_item()
@@ -778,5 +942,197 @@ mod tests {
         assert_eq!(store.app_store_link_owner(&t2).await.unwrap(), None);
         // Another account's link stays.
         assert_eq!(store.app_store_link_owner(&t3).await.unwrap(), Some(other));
+    }
+
+    #[tokio::test]
+    async fn keep_leaves_a_stored_grace_and_set_replaces_or_clears_it() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-grace").await;
+        let t = otid();
+        let with_grace = AppStoreRecord {
+            grace_expires_at: Some(1_800_000_000),
+            ..rec(&t, 1_700_000_000)
+        };
+        store
+            .put_app_store_state(&id, &with_grace, set(&with_grace))
+            .await
+            .unwrap();
+
+        // A client post: newer, a new term, no say over the grace.
+        let renewed = AppStoreRecord {
+            expires_at: 1_900_000_000,
+            grace_expires_at: Some(42),
+            ..rec(&t, 1_700_000_100)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &renewed, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        let got = state_of(&store, &id).await;
+        assert_eq!(
+            got,
+            vec![AppStoreRecord {
+                grace_expires_at: Some(1_800_000_000),
+                ..renewed.clone()
+            }]
+        );
+
+        // A notification sets another grace, then clears it.
+        let later = AppStoreRecord {
+            grace_expires_at: Some(1_850_000_000),
+            ..rec(&t, 1_700_000_200)
+        };
+        store
+            .put_app_store_state(&id, &later, set(&later))
+            .await
+            .unwrap();
+        assert_eq!(state_of(&store, &id).await, vec![later.clone()]);
+
+        let cleared = AppStoreRecord {
+            grace_expires_at: Some(7),
+            ..rec(&t, 1_700_000_300)
+        };
+        store
+            .put_app_store_state(&id, &cleared, GraceUpdate::Set(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            state_of(&store, &id).await,
+            vec![AppStoreRecord {
+                grace_expires_at: None,
+                ..cleared
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_on_a_new_entry_stores_no_grace() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-keepnew").await;
+        let r = AppStoreRecord {
+            grace_expires_at: Some(1_800_000_000),
+            ..rec(&otid(), 1_700_000_000)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &r, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(
+            state_of(&store, &id).await,
+            vec![AppStoreRecord {
+                grace_expires_at: None,
+                ..r
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_write_leaves_the_grace_alone_too() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-stalegrace").await;
+        let t = otid();
+        let newer = AppStoreRecord {
+            grace_expires_at: Some(1_800_000_000),
+            ..rec(&t, 1_700_002_000)
+        };
+        store
+            .put_app_store_state(&id, &newer, set(&newer))
+            .await
+            .unwrap();
+        let older = rec(&t, 1_700_001_000);
+        for grace in [GraceUpdate::Keep, GraceUpdate::Set(None)] {
+            assert_eq!(
+                store.put_app_store_state(&id, &older, grace).await.unwrap(),
+                StateOutcome::Stale
+            );
+        }
+        assert_eq!(state_of(&store, &id).await, vec![newer]);
+    }
+
+    /// Same-second snapshots apply in arrival order, except that a snapshot
+    /// without `revoked_at` never replaces one that has it.
+    #[tokio::test]
+    async fn a_tie_never_undoes_a_revocation() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-tie").await;
+        let t = otid();
+        let signed = 1_700_000_000;
+        let refunded = AppStoreRecord {
+            revoked_at: Some(signed - 5),
+            ..rec(&t, signed)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &refunded, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+
+        // The same second, no revocation: refused, on either grace mode.
+        let live_again = rec(&t, signed);
+        for grace in [GraceUpdate::Keep, set(&live_again)] {
+            assert_eq!(
+                store
+                    .put_app_store_state(&id, &live_again, grace)
+                    .await
+                    .unwrap(),
+                StateOutcome::Stale
+            );
+        }
+        assert_eq!(state_of(&store, &id).await, vec![refunded.clone()]);
+
+        // A strictly later snapshot is allowed to lift it.
+        let later = rec(&t, signed + 1);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &later, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(state_of(&store, &id).await, vec![later.clone()]);
+
+        // A tie that adds a revocation applies, and ties between plain
+        // snapshots apply in arrival order.
+        let revoked_now = AppStoreRecord {
+            revoked_at: Some(signed + 1),
+            ..rec(&t, signed + 1)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &revoked_now, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        let t2 = otid();
+        let (first, second) = (
+            rec(&t2, signed),
+            AppStoreRecord {
+                expires_at: signed + 99,
+                ..rec(&t2, signed)
+            },
+        );
+        for r in [&first, &second] {
+            assert_eq!(
+                store
+                    .put_app_store_state(&id, r, GraceUpdate::Keep)
+                    .await
+                    .unwrap(),
+                StateOutcome::Applied
+            );
+        }
+        let got = state_of(&store, &id).await;
+        assert!(
+            got.contains(&revoked_now) && got.contains(&second),
+            "{got:?}"
+        );
     }
 }
