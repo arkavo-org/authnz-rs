@@ -80,8 +80,6 @@ pub enum GraceUpdate {
 /// What one consistent read of the `credentials` row yields for a mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishingState {
-    // Read by the mint, which arrives in a later change.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub suspension: Option<PublishingSuspension>,
     pub app_store: Vec<AppStoreRecord>,
 }
@@ -504,6 +502,59 @@ impl DynamoDBStore {
         DynamoDBStore::with_client(
             self.client.clone(),
             table,
+            self.handles_table.clone(),
+            self.device_bindings_table.clone(),
+            self.identity_links_table.clone(),
+            self.patreon_tokens_table.clone(),
+            self.agent_delegations_table.clone(),
+            self.device_attest_keys_table.clone(),
+            self.guardians_table.clone(),
+            self.default_entitlements.clone(),
+        )
+    }
+}
+
+/// Counts the `GetItem` requests a client sends.
+#[cfg(test)]
+#[derive(Debug)]
+struct CountGetItems(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl aws_sdk_dynamodb::config::Intercept for CountGetItems {
+    fn name(&self) -> &'static str {
+        "CountGetItems"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _: &aws_sdk_dynamodb::config::RuntimeComponents,
+        _: &mut aws_sdk_dynamodb::config::ConfigBag,
+    ) -> Result<(), aws_sdk_dynamodb::error::BoxError> {
+        let target = context.request().headers().get("x-amz-target");
+        if target.is_some_and(|t| t.ends_with(".GetItem")) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl DynamoDBStore {
+    /// This store, with every `GetItem` it sends counted in `counter`.
+    pub(crate) fn counting_get_items(
+        &self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> DynamoDBStore {
+        let conf = self
+            .client
+            .config()
+            .to_builder()
+            .interceptor(CountGetItems(counter))
+            .build();
+        DynamoDBStore::with_client(
+            aws_sdk_dynamodb::Client::from_conf(conf),
+            self.credentials_table.clone(),
             self.handles_table.clone(),
             self.device_bindings_table.clone(),
             self.identity_links_table.clone(),

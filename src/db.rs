@@ -21,9 +21,6 @@ pub use agent_state::{
     SwarmWrite,
 };
 pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, StateOutcome};
-// Named by the token mint, which arrives in a later change.
-#[allow(unused_imports)]
-pub use app_store::PublishingState;
 pub use guardians::Guardian;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 

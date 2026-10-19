@@ -1,30 +1,43 @@
 # Creator-publishing entitlement
 
 Issue [#91](https://github.com/arkavo-org/authnz-rs/issues/91). Code: `src/publishing.rs`,
-`src/db/publishing.rs`, `oidc::arkavo_user_claims`, `patreon::materialize_from_link`.
+`src/app_store.rs`, `src/db/app_store.rs`, `src/db/publishing.rs`, `oidc::arkavo_user_claims`, `patreon::materialize_from_link`.
 
 ## Behaviour
 
-An account may publish while its linked Patreon identity is a paying patron of
-Arkavo's own campaign at a qualifying tier. authnz-rs proves this with the
-entitlement
+An account may publish while it holds either of two memberships:
+
+- its linked Patreon identity is a paying patron of Arkavo's own campaign at a
+  qualifying tier; or
+- it has an active App Store Creator Membership (the auto-renewable
+  subscription, bought in Arkavo Creator and bound to the account through
+  `POST /app-store/transactions`).
+
+authnz-rs proves this with the entitlement
 
 ```
 https://patreon.arkavo.com/attr/arkavo-creator/value/publish
 ```
 
+It is the same FQN whichever source grants it, and one FQN even when both do.
 The entitlement is **computed when a token is minted, and never stored**.
 
 - **Granted when all of these hold:**
-  - the feature is configured;
-  - the account's Patreon snapshot lists a membership whose `campaign_id` is
-    `PATREON_PUBLISHER_CAMPAIGN_ID`, whose `patron_status` is `active_patron`,
-    and whose currently entitled tier IDs include at least one ID from
-    `PATREON_PUBLISHER_TIER_IDS`;
+  - at least one source qualifies:
+    - **Patreon**: the feature is configured, and the account's Patreon
+      snapshot lists a membership whose `campaign_id` is
+      `PATREON_PUBLISHER_CAMPAIGN_ID`, whose `patron_status` is
+      `active_patron`, and whose currently entitled tier IDs include at least
+      one ID from `PATREON_PUBLISHER_TIER_IDS`; or
+    - **App Store**: the feature is configured (`APP_STORE_*`) and a
+      subscription record bound to the account is active (below);
   - the account has no publishing suspension.
 
   Only memberships count. A staff account linked as the *creator* of Arkavo's
   campaign owns that campaign but is not a patron of it, so it does not qualify.
+  The two sources are independent: an account with no Patreon link, or with
+  Patreon not configured at all, still gets the entitlement from an active App
+  Store membership.
 - **Link role does not matter.** Consumer and creator links qualify in the same
   way: every link fetches memberships with the same `/identity` call and the
   same refresh-on-401 path. A creator's `arkavo_patreon` claim keeps its owned
@@ -53,8 +66,51 @@ The entitlement is **computed when a token is minted, and never stored**.
   - Patreon is unreachable;
   - the 3 s materialization deadline passes;
   - the snapshot is stale;
-  - the suspension read fails;
+  - the read of the account's publishing state (suspension and App Store
+    records) fails, whichever source would have granted;
   - the suspension record is malformed.
+
+### App Store membership
+
+A stored subscription record is **active** when all of these hold:
+
+- its `product_id` is in `APP_STORE_PUBLISH_PRODUCT_IDS`;
+- its `environment` is in `APP_STORE_ENVIRONMENTS`;
+- it has no `revoked_at`;
+- now is before the later of its `expires_at` and its `grace_expires_at`.
+
+One active record is enough. The record's state comes from the signed
+transaction (`expiresDate`, `revocationDate`) and, for the grace period, the
+renewal info of App Store Server Notifications V2 (`gracePeriodExpiresDate`);
+an older notification never overwrites a newer one.
+
+- **Lapse.** When a subscription is not renewed, the entitlement ends at the
+  first mint after `expires_at`. No notification is needed, the stored date
+  decides.
+- **Grace (billing retry).** While Apple retries a failed renewal and reports
+  a grace period, the entitlement continues until the grace period ends.
+  Without a recorded grace period there is none.
+- **Refund or revocation.** A `revocationDate` removes the entitlement at the
+  very next mint, even if `expires_at` is still in the future. The read is
+  strongly consistent, so no stale index is involved. Already-issued tokens
+  keep it until they expire, at most 1 hour.
+- **Suspension** withholds it exactly as for Patreon.
+- **Sandbox.** Owner decision: Production and Sandbox are both accepted on
+  production, because App Review buys in Sandbox. TestFlight testers can
+  therefore get publishing for free; suspension and the content filter still
+  apply. Every Sandbox grant is logged with `env=Sandbox`, so abuse is
+  visible. Set `APP_STORE_ENVIRONMENTS=Production` to refuse Sandbox. `Xcode`
+  and `LocalTesting` payloads are unsigned and always refused.
+- **One subscription, one account.** The subscription
+  (`original_transaction_id`) is bound to an account by an `appstore#<id>`
+  identity link; a second live account posting it gets `409`. Deleting the
+  first account removes the link (the account-deletion sweep), which frees the
+  subscription for another account.
+- **Setup.** Env vars are in the table below; the client posts the
+  transaction after a purchase, and App Store Connect → App Information → App
+  Store Server Notifications (Version 2, Production and Sandbox URLs both
+  `https://identity.arkavo.net/app-store/notifications`) keeps the state
+  current.
 
 ### Lapse timing
 
@@ -101,15 +157,23 @@ Every setting is an environment variable. In production they go in
 | `PATREON_PUBLISHER_CAMPAIGN_ID` | Arkavo's Patreon campaign id. |
 | `PATREON_PUBLISHER_TIER_IDS` | Comma-separated Patreon **tier IDs** (not titles; titles are editable, see #42) that qualify. |
 | `MODERATION_CLIENT_IDS` | Comma-separated OIDC client_ids whose service CWTs may use the suspension endpoints. Empty ⇒ 403. |
+| `APP_STORE_BUNDLE_ID` | Bundle id the purchase must be signed for (`com.arkavo.ArkavoCreator`). |
+| `APP_STORE_APP_APPLE_ID` | The app's numeric Apple ID (`6738845556`); Production notifications must carry it. |
+| `APP_STORE_PUBLISH_PRODUCT_IDS` | Comma-separated product ids that grant publishing (`com.arkavo.ArkavoCreator.membership.monthly`). |
+| `APP_STORE_ENVIRONMENTS` | Optional; default `Production,Sandbox`. |
 
-- If either `PATREON_PUBLISHER_*` variable is unset or empty, the entitlement is
-  never granted.
+- If either `PATREON_PUBLISHER_*` variable is unset or empty, Patreon never
+  grants the entitlement. If any of the first three `APP_STORE_*` variables is
+  unset, the App Store never grants it and the two `/app-store/*` routes answer
+  503. The sources are configured separately; with neither configured a mint
+  makes no extra DynamoDB read.
 - Startup logs the feature state once: `Creator publishing entitlement
   ENABLED: …` or `… DISABLED: …`. It warns when only one of the two variables
   is set.
-- Patreon itself must also be configured (`PATREON_CLIENT_*` and
-  `PATREON_KMS_KEY_ID`). Otherwise there is no snapshot and the entitlement is
-  never granted.
+- For the Patreon source, Patreon itself must also be configured
+  (`PATREON_CLIENT_*` and `PATREON_KMS_KEY_ID`). Otherwise there is no
+  snapshot and Patreon never grants it. The App Store source does not need
+  Patreon.
 
 ## Suspension API
 
@@ -189,5 +253,6 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
      `arkavo_entitlements`;
    - after `PUT …/publishing-suspension`, the next auth CWT does not list it.
 
-**Rollback:** unset the two `PATREON_PUBLISHER_*` variables. No more tokens get
-the entitlement. Stored suspensions are harmless and can stay.
+**Rollback:** unset the two `PATREON_PUBLISHER_*` variables (Patreon) and one
+of the first three `APP_STORE_*` variables (App Store). No more tokens get the
+entitlement from that source. Stored suspensions are harmless and can stay.

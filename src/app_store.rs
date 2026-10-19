@@ -97,10 +97,6 @@ pub(crate) enum AppStoreError {
     WrongEnvironment,
     #[error("not a direct purchase")]
     NotPurchased,
-    // Produced by the routes when the feature is off.
-    #[allow(dead_code)]
-    #[error("app store purchases are not configured")]
-    NotConfigured,
 }
 
 #[derive(Deserialize)]

@@ -274,6 +274,17 @@ other relying parties.
 | `POST /oauth/apple/link`                | Link Sign in with Apple to the signed-in account (`X-Auth-Token`); with revocation configured, also exchanges `authorization_code` and keeps the refresh token so account deletion can revoke it |
 | `POST /oauth/apple/callback`            | Web-flow Apple callback — **disabled (501)** until full code-exchange + state-bound nonce land |
 
+### App Store Creator Membership
+
+An active App Store Creator Membership grants the same derived publishing
+entitlement as a qualifying Patreon membership (see
+[docs/creator-publishing-entitlement.md](docs/creator-publishing-entitlement.md)).
+
+| Endpoint | Auth | Purpose and status codes |
+| --- | --- | --- |
+| `POST /app-store/transactions` | `X-Auth-Token` (passkey auth CWT of a live account) | Body `{"signed_transaction":"<StoreKit JWS>"}`. Binds the subscription to the caller and answers `{active, expires_at, environment, token_can_publish}`. `200` on success; `401` for a missing, expired or deleted-account token (re-authenticate and post again); `403` `transaction belongs to another account` (its `appAccountToken` names another live account); `409` `subscription belongs to another account` (already bound elsewhere); `422` `invalid transaction` (does not verify, wrong app, product or ownership, or no `appAccountToken`); `503` `app store purchases unavailable` (feature not configured); `500` for a storage failure. |
+| `POST /app-store/notifications` | None: the signature of the App Store Server Notification V2 `signedPayload` is the only trust | Body `{"signedPayload":"<JWS>"}`. `200` for every verified payload, applied or ignored; `400` for a body or payload that does not verify or is not for this app (Apple retries); `503` when the feature is not configured; `500` for a storage failure (Apple retries). |
+
 ### Apple Sign In security gates
 
 Every accepted Apple id_token must clear all of:
