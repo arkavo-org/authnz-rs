@@ -10,6 +10,7 @@ use crate::app_store::{
     decode_notification, decode_renewal_info, decode_transaction, notifications_handler,
     transactions_handler, verify_jws,
 };
+use crate::db::GraceUpdate;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -699,7 +700,7 @@ fn notification_decodes_nested_transaction_and_grace() {
     let decoded = decode_notification(&cfg, &notification(&fx, "DID_FAIL_TO_RENEW", data)).unwrap();
 
     assert_eq!(decoded.notification_type, "DID_FAIL_TO_RENEW");
-    assert_eq!(decoded.grace_expires_at, Some(1_700_172_800));
+    assert_eq!(decoded.grace, GraceUpdate::Set(Some(1_700_172_800)));
     let tx = decoded.transaction.unwrap();
     assert_eq!(tx.original_transaction_id, "2000000123456789");
     assert_eq!(tx.environment, Environment::Production);
@@ -759,7 +760,7 @@ fn test_notification_has_no_transaction() {
 
     assert_eq!(decoded.notification_type, "TEST");
     assert_eq!(decoded.transaction, None);
-    assert_eq!(decoded.grace_expires_at, None);
+    assert_eq!(decoded.grace, GraceUpdate::Keep);
 }
 
 #[test]
@@ -845,7 +846,30 @@ fn notification_refuses_renewal_info_of_another_subscription_or_environment() {
         json!({ "environment": null, "gracePeriodExpiresDate": 1_700_172_800_000_i64 })
     ));
     let decoded = decode_notification(&cfg, &notification(&fx, "DID_FAIL_TO_RENEW", data)).unwrap();
-    assert_eq!(decoded.grace_expires_at, Some(1_700_172_800));
+    assert_eq!(decoded.grace, GraceUpdate::Set(Some(1_700_172_800)));
+}
+
+/// Only renewal info speaks about the grace period: without it a
+/// notification leaves the stored grace alone; with it, an absent
+/// `gracePeriodExpiresDate` clears it.
+#[test]
+fn only_renewal_info_sets_or_clears_the_grace() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+
+    let without = notification(&fx, "REFUND", notification_data(&fx, "Sandbox"));
+    assert_eq!(
+        decode_notification(&cfg, &without).unwrap().grace,
+        GraceUpdate::Keep
+    );
+
+    let mut data = notification_data(&fx, "Sandbox");
+    data["signedRenewalInfo"] = json!(renewal(&fx, json!({})));
+    let no_grace = notification(&fx, "DID_RENEW", data);
+    assert_eq!(
+        decode_notification(&cfg, &no_grace).unwrap().grace,
+        GraceUpdate::Set(None)
+    );
 }
 
 #[test]
@@ -1559,6 +1583,7 @@ mod transactions_route {
                 let mut p = transaction(older_ms);
                 p["originalTransactionId"] = json!(t);
                 p["appAccountToken"] = json!(id.to_string());
+                p["environment"] = json!("Production");
                 p["expiresDate"] = json!(older_ms + 1_000);
                 p
             },
@@ -1622,6 +1647,39 @@ mod transactions_route {
                 "token_can_publish": false,
             })
         );
+        assert_eq!(h.records(&id).await, before);
+    }
+
+    /// A Sandbox snapshot of a subscription stored as Production is refused
+    /// and changes nothing.
+    #[tokio::test]
+    async fn a_post_of_another_environment_is_422() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let signed = now_ms() - 60_000;
+        let production = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": id.to_string(),
+            "environment": "Production",
+            "signedDate": signed,
+        }));
+        let (status, body) = h.post(&h.token(&id), &production).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let before = h.records(&id).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].environment, Environment::Production);
+
+        let sandbox = h.jws(json!({
+            "originalTransactionId": t,
+            "appAccountToken": id.to_string(),
+            "environment": "Sandbox",
+            "signedDate": signed + 30_000,
+            "revocationDate": signed + 10_000,
+        }));
+        let (status, body) = h.post(&h.token(&id), &sandbox).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
         assert_eq!(h.records(&id).await, before);
     }
 
@@ -1773,15 +1831,45 @@ mod notifications_route {
         /// A signed Sandbox notification of `notification_type` carrying the
         /// transaction `tx` (and renewal info `renewal`, if any).
         fn notice(&self, notification_type: &str, tx: Value, renewal: Option<Value>) -> String {
+            self.notice_in("Sandbox", notification_type, tx, renewal)
+        }
+
+        /// [`Self::notice`] for `environment`, which the transaction and any
+        /// renewal info state too (a Production one carries the app's Apple
+        /// ID).
+        fn notice_in(
+            &self,
+            environment: &str,
+            notification_type: &str,
+            mut tx: Value,
+            renewal: Option<Value>,
+        ) -> String {
+            tx["environment"] = json!(environment);
             let mut data = json!({
                 "bundleId": "com.arkavo.ArkavoCreator",
-                "environment": "Sandbox",
+                "appAppleId": 6_738_845_556_i64,
+                "environment": environment,
                 "signedTransactionInfo": self.jws(tx),
             });
-            if let Some(renewal) = renewal {
+            if let Some(mut renewal) = renewal {
+                renewal["environment"] = json!(environment);
                 data["signedRenewalInfo"] = json!(sign_jws(&renewal, &self.fx));
             }
             notification(&self.fx, notification_type, data)
+        }
+
+        async fn deliver_in(
+            &self,
+            environment: &str,
+            notification_type: &str,
+            tx: Value,
+            renewal: Option<Value>,
+        ) -> StatusCode {
+            let (status, body) = self
+                .notify_payload(&self.notice_in(environment, notification_type, tx, renewal))
+                .await;
+            assert!(body.is_empty(), "{body}");
+            status
         }
 
         async fn deliver(
@@ -1790,11 +1878,8 @@ mod notifications_route {
             tx: Value,
             renewal: Option<Value>,
         ) -> StatusCode {
-            let (status, body) = self
-                .notify_payload(&self.notice(notification_type, tx, renewal))
-                .await;
-            assert!(body.is_empty(), "{body}");
-            status
+            self.deliver_in("Sandbox", notification_type, tx, renewal)
+                .await
         }
     }
 
@@ -2046,6 +2131,73 @@ mod notifications_route {
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(only_record(&h, &id).await.grace_expires_at, None);
+    }
+
+    /// A notification without renewal info (a REFUND_REVERSED, a
+    /// CONSUMPTION_REQUEST) leaves a recorded grace period alone: only renewal
+    /// info sets or clears it.
+    #[tokio::test]
+    async fn a_notification_without_renewal_info_keeps_the_grace() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = t0 + 1_000;
+        let grace = now_ms() + 16 * 86_400_000;
+        h.deliver(
+            "DID_FAIL_TO_RENEW",
+            snapshot(&t, Some(&id), t0, expiry),
+            Some(renewal_info(&t, Some(grace))),
+        )
+        .await;
+        assert_eq!(
+            only_record(&h, &id).await.grace_expires_at,
+            Some(secs(grace))
+        );
+
+        let status = h
+            .deliver(
+                "CONSUMPTION_REQUEST",
+                snapshot(&t, Some(&id), t0 + 5_000, expiry),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let record = only_record(&h, &id).await;
+        // Applied (the snapshot moved on), the grace kept.
+        assert_eq!(record.last_signed_at, secs(t0 + 5_000));
+        assert_eq!(record.grace_expires_at, Some(secs(grace)));
+    }
+
+    /// A Sandbox notification of a subscription stored as Production is
+    /// acknowledged and changes nothing, so it cannot flip the record.
+    #[tokio::test]
+    async fn a_notification_of_another_environment_changes_nothing() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = now_ms() + 30 * 86_400_000;
+        let status = h
+            .deliver_in(
+                "Production",
+                "SUBSCRIBED",
+                snapshot(&t, Some(&id), t0, expiry),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let before = only_record(&h, &id).await;
+        assert_eq!(before.environment, Environment::Production);
+
+        let mut refund = snapshot(&t, Some(&id), t0 + 10_000, expiry);
+        refund["revocationDate"] = json!(t0 + 9_000);
+        assert_eq!(
+            h.deliver_in("Sandbox", "REFUND", refund, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(only_record(&h, &id).await, before);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
     }
 
     #[tokio::test]

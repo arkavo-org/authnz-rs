@@ -402,7 +402,10 @@ pub struct VerifiedNotification {
     /// (a summary).
     pub environment: Option<Environment>,
     pub transaction: Option<VerifiedTransaction>,
-    pub grace_expires_at: Option<i64>,
+    /// What the renewal info says about the billing-retry grace: `Set` (to a
+    /// date, or cleared) when the notification carries renewal info, `Keep`
+    /// when it does not.
+    pub grace: GraceUpdate,
 }
 
 /// `Xcode` and `LocalTesting` payloads are unsigned, so they are refused
@@ -580,7 +583,7 @@ pub(crate) fn decode_notification(
             notification_type,
             environment: None,
             transaction: None,
-            grace_expires_at: None,
+            grace: GraceUpdate::Keep,
         });
     };
 
@@ -604,8 +607,9 @@ pub(crate) fn decode_notification(
         return Err(AppStoreError::WrongEnvironment);
     }
     // Renewal info only qualifies a transaction; without one there is
-    // nothing to apply it to.
-    let grace_expires_at = match (&transaction, data.get("signedRenewalInfo")) {
+    // nothing to apply it to. Only renewal info speaks about the grace
+    // period, so a notification without it leaves a stored grace alone.
+    let grace = match (&transaction, data.get("signedRenewalInfo")) {
         (Some(tx), Some(renewal)) => {
             let renewal =
                 decode_renewal_info(cfg, renewal.as_str().ok_or(AppStoreError::Malformed)?)?;
@@ -617,16 +621,16 @@ pub(crate) fn decode_notification(
             if renewal.environment.is_some_and(|e| e != tx.environment) {
                 return Err(AppStoreError::WrongEnvironment);
             }
-            renewal.grace_expires_at
+            GraceUpdate::Set(renewal.grace_expires_at)
         }
-        _ => None,
+        _ => GraceUpdate::Keep,
     };
 
     Ok(VerifiedNotification {
         notification_type,
         environment: Some(environment),
         transaction,
-        grace_expires_at,
+        grace,
     })
 }
 
@@ -788,6 +792,11 @@ async fn post_transaction(
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
         // Answered with the stored period, as a stale post is.
         Ok(StateOutcome::PastPeriod) => trace.outcome = "past_period",
+        // A snapshot of another environment than the stored one.
+        Ok(StateOutcome::OtherEnvironment) => {
+            trace.outcome = "environment";
+            return refuse(StatusCode::UNPROCESSABLE_ENTITY, BODY_INVALID);
+        }
         Ok(StateOutcome::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(DynamoDBError::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => return internal("state write", &e),
@@ -982,16 +991,15 @@ async fn post_notification(
         product_id: tx.product_id,
         environment: tx.environment,
         expires_at: tx.expires_at,
-        grace_expires_at: notification.grace_expires_at,
+        grace_expires_at: match notification.grace {
+            GraceUpdate::Set(grace) => grace,
+            GraceUpdate::Keep => None,
+        },
         revoked_at: tx.revoked_at,
         last_signed_at: tx.signed_at,
     };
     match store
-        .put_app_store_state(
-            &owner,
-            &record,
-            GraceUpdate::Set(notification.grace_expires_at),
-        )
+        .put_app_store_state(&owner, &record, notification.grace)
         .await
     {
         Ok(StateOutcome::Applied) => {
@@ -999,6 +1007,7 @@ async fn post_notification(
         }
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
         Ok(StateOutcome::PastPeriod) => trace.outcome = "ignored=past_period",
+        Ok(StateOutcome::OtherEnvironment) => trace.outcome = "ignored=environment",
         Ok(StateOutcome::AccountGone) | Err(DynamoDBError::AccountGone) => {
             trace.outcome = "ignored=account_gone";
         }

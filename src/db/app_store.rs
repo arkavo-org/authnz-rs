@@ -71,13 +71,17 @@ pub enum StateOutcome {
     /// The snapshot is of an earlier billing period: another transaction
     /// that ends before the stored one. Nothing changed.
     PastPeriod,
+    /// The snapshot is of another environment than the stored entry (a
+    /// Sandbox snapshot of a Production record). Nothing changed.
+    OtherEnvironment,
     /// The account has no live row (unknown or deleted); nothing was written.
     AccountGone,
 }
 
-/// What a state write does to the stored `grace_expires_at`. Only the
-/// notifications know the grace period (it comes from their renewal info), so
-/// a client's post is `Keep` and never changes it.
+/// What a state write does to the stored `grace_expires_at`. Only renewal
+/// info knows the grace period, and only notifications carry it, so a
+/// client's post, and a notification without renewal info, is `Keep` and
+/// never changes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraceUpdate {
     /// Leave a stored grace as it is; a new entry gets none. The record's own
@@ -190,6 +194,9 @@ fn refusal(row: Option<&HashMap<String, AttributeValue>>, rec: &AppStoreRecord) 
     let Some(stored) = from_attr(otid, entry) else {
         return EntryUpdate::Done(StateOutcome::Stale);
     };
+    if stored.environment != rec.environment {
+        return EntryUpdate::Done(StateOutcome::OtherEnvironment);
+    }
     let past_period = matches!(
         (&stored.transaction_id, &rec.transaction_id),
         (Some(stored_tid), Some(tid)) if stored_tid != tid
@@ -316,8 +323,10 @@ impl DynamoDBStore {
     /// Store a subscription's state on the account's `credentials` row.
     ///
     /// Every write is conditional on `LIVE_ROW`, and an update of an existing
-    /// entry on two rules besides:
+    /// entry on three rules besides:
     ///
+    /// - **Environment.** A snapshot of another environment never changes an
+    ///   entry, so a Sandbox snapshot cannot flip a Production record.
     /// - **Past period.** A snapshot of another transaction that ends before
     ///   the stored one describes an earlier billing period (a REFUND of last
     ///   month, signed when it is sent) and never changes the entry. A stored
@@ -337,7 +346,8 @@ impl DynamoDBStore {
     /// and insert the entry if absent; else (a concurrent insert won) update
     /// once more. A refused update reports why from the row its condition was
     /// checked against (returned with the refusal, so no second read): the
-    /// account is gone, the snapshot is of a past period, or it is stale.
+    /// account is gone, the snapshot is of another environment or of a past
+    /// period, or it is stale.
     pub async fn put_app_store_state(
         &self,
         user_id: &Uuid,
@@ -371,9 +381,9 @@ impl DynamoDBStore {
     ) -> Result<EntryUpdate, DynamoDBError> {
         let table = &self.credentials_table;
         let entry = "#as.#otid";
+        // The environment is never changed: the condition requires it equal.
         let mut sets = vec![
             format!("{entry}.#pid = :pid"),
-            format!("{entry}.#env = :env"),
             format!("{entry}.#exp = :exp"),
             format!("{entry}.#signed = :signed"),
         ];
@@ -421,7 +431,7 @@ impl DynamoDBStore {
             .key("user_id", s(&user_id.to_string()))
             .update_expression(expression)
             .condition_expression(format!(
-                "{} AND attribute_exists({entry}){period} AND {ordering}",
+                "{} AND attribute_exists({entry}) AND {entry}.#env = :env{period} AND {ordering}",
                 account::LIVE_ROW
             ))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
@@ -1427,5 +1437,34 @@ mod tests {
             StateOutcome::Applied
         );
         assert_eq!(state_of(&store, &id).await, vec![earlier_period]);
+    }
+
+    /// A snapshot of another environment never changes an entry, so a
+    /// Sandbox snapshot cannot flip a Production record.
+    #[tokio::test]
+    async fn another_environment_never_changes_the_entry() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-env").await;
+        let t = otid();
+        let production = rec(&t, 1_700_000_000);
+        store
+            .put_app_store_state(&id, &production, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        let sandbox = AppStoreRecord {
+            environment: Environment::Sandbox,
+            revoked_at: Some(1_700_000_050),
+            ..rec(&t, 1_700_000_100)
+        };
+        for grace in [GraceUpdate::Keep, GraceUpdate::Set(Some(1_800_000_000))] {
+            assert_eq!(
+                store
+                    .put_app_store_state(&id, &sandbox, grace)
+                    .await
+                    .unwrap(),
+                StateOutcome::OtherEnvironment
+            );
+        }
+        assert_eq!(state_of(&store, &id).await, vec![production]);
     }
 }
