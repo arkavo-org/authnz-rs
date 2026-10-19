@@ -7,8 +7,8 @@
 
 use crate::app_store::{
     AppStoreConfig, AppStoreError, Environment, app_store_active, apple_root_g3_der,
-    decode_notification, decode_renewal_grace, decode_transaction, transactions_handler,
-    verify_jws,
+    decode_notification, decode_renewal_info, decode_transaction, notifications_handler,
+    transactions_handler, verify_jws,
 };
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -674,6 +674,7 @@ fn notification_decodes_nested_transaction_and_grace() {
     let mut data = notification_data(&fx, "Production");
     data["signedRenewalInfo"] = json!(sign_jws(
         &json!({
+            "originalTransactionId": "2000000123456789",
             "environment": "Production",
             "gracePeriodExpiresDate": 1_700_172_800_321_i64,
         }),
@@ -750,11 +751,112 @@ fn renewal_info_without_grace_has_none() {
     let fx = fixture(Options::default());
     let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
     let jws = sign_jws(&json!({ "environment": "Sandbox" }), &fx);
-    assert_eq!(decode_renewal_grace(&cfg, &jws), Ok(None));
+    let info = decode_renewal_info(&cfg, &jws).unwrap();
+    assert_eq!(info.grace_expires_at, None);
+    assert_eq!(info.original_transaction_id, None);
+    assert_eq!(info.environment, Some(Environment::Sandbox));
     let xcode = sign_jws(&json!({ "environment": "Xcode" }), &fx);
     assert_eq!(
-        decode_renewal_grace(&cfg, &xcode),
+        decode_renewal_info(&cfg, &xcode),
         Err(AppStoreError::WrongEnvironment)
+    );
+}
+
+fn renewal(fx: &Fixture, overrides: Value) -> String {
+    let mut payload = json!({
+        "originalTransactionId": "2000000123456789",
+        "environment": "Sandbox",
+    });
+    for (key, value) in overrides.as_object().unwrap() {
+        if value.is_null() {
+            payload.as_object_mut().unwrap().remove(key);
+        } else {
+            payload[key] = value.clone();
+        }
+    }
+    sign_jws(&payload, fx)
+}
+
+/// The outer environment label decides whether `appAppleId` is checked, so it
+/// must not be able to wrap a transaction of the other environment.
+#[test]
+fn notification_refuses_a_nested_transaction_of_another_environment() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    for (outer, inner) in [("Sandbox", "Production"), ("Production", "Sandbox")] {
+        let mut data = notification_data(&fx, outer);
+        data["signedTransactionInfo"] =
+            json!(sign_jws(&purchase(json!({ "environment": inner })), &fx));
+        assert_eq!(
+            decode_notification(&cfg, &notification(&fx, "DID_RENEW", data)),
+            Err(AppStoreError::WrongEnvironment),
+            "{outer} wrapping {inner}"
+        );
+    }
+}
+
+#[test]
+fn notification_refuses_renewal_info_of_another_subscription_or_environment() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let cases = [
+        (
+            renewal(&fx, json!({ "originalTransactionId": "2000000999999999" })),
+            AppStoreError::Malformed,
+        ),
+        (
+            renewal(&fx, json!({ "originalTransactionId": null })),
+            AppStoreError::Malformed,
+        ),
+        (
+            renewal(&fx, json!({ "environment": "Production" })),
+            AppStoreError::WrongEnvironment,
+        ),
+    ];
+    for (jws, expected) in cases {
+        let mut data = notification_data(&fx, "Sandbox");
+        data["signedRenewalInfo"] = json!(jws);
+        assert_eq!(
+            decode_notification(&cfg, &notification(&fx, "DID_FAIL_TO_RENEW", data)),
+            Err(expected)
+        );
+    }
+
+    // A matching renewal info that states no environment is accepted.
+    let mut data = notification_data(&fx, "Sandbox");
+    data["signedRenewalInfo"] = json!(renewal(
+        &fx,
+        json!({ "environment": null, "gracePeriodExpiresDate": 1_700_172_800_000_i64 })
+    ));
+    let decoded = decode_notification(&cfg, &notification(&fx, "DID_FAIL_TO_RENEW", data)).unwrap();
+    assert_eq!(decoded.grace_expires_at, Some(1_700_172_800));
+}
+
+#[test]
+fn summary_notification_decodes_without_a_transaction() {
+    let fx = fixture(Options::default());
+    let cfg = AppStoreConfig::for_tests(fx.root_der.clone());
+    let jws = sign_jws(
+        &json!({
+            "notificationType": "RENEWAL_EXTENSION",
+            "subtype": "SUMMARY",
+            "summary": { "environment": "Sandbox", "succeededCount": 3 },
+            "signedDate": now_ms(),
+        }),
+        &fx,
+    );
+    let decoded = decode_notification(&cfg, &jws).unwrap();
+    assert_eq!(decoded.notification_type, "RENEWAL_EXTENSION");
+    assert_eq!(decoded.transaction, None);
+
+    // Neither `data` nor `summary` is still malformed.
+    let bare = sign_jws(
+        &json!({ "notificationType": "DID_RENEW", "signedDate": now_ms() }),
+        &fx,
+    );
+    assert_eq!(
+        decode_notification(&cfg, &bare),
+        Err(AppStoreError::Malformed)
     );
 }
 
@@ -933,25 +1035,25 @@ mod transactions_route {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    const OTHER_ACCOUNT_BODY: &str = "transaction belongs to another account";
-    const OTHER_SUBSCRIPTION_BODY: &str = "subscription belongs to another account";
-    const INVALID_BODY: &str = "invalid transaction";
-    const UNAVAILABLE_BODY: &str = "app store purchases unavailable";
+    pub(super) const OTHER_ACCOUNT_BODY: &str = "transaction belongs to another account";
+    pub(super) const OTHER_SUBSCRIPTION_BODY: &str = "subscription belongs to another account";
+    pub(super) const INVALID_BODY: &str = "invalid transaction";
+    pub(super) const UNAVAILABLE_BODY: &str = "app store purchases unavailable";
 
-    struct Harness {
-        state: AppState,
-        store: Arc<DynamoDBStore>,
-        fx: Fixture,
-        app: Router,
+    pub(super) struct Harness {
+        pub(super) state: AppState,
+        pub(super) store: Arc<DynamoDBStore>,
+        pub(super) fx: Fixture,
+        pub(super) app: Router,
     }
 
     impl Harness {
         /// `None` unless DynamoDB Local is configured.
-        fn new() -> Option<Self> {
+        pub(super) fn new() -> Option<Self> {
             Self::with_config(true)
         }
 
-        fn with_config(enabled: bool) -> Option<Self> {
+        pub(super) fn with_config(enabled: bool) -> Option<Self> {
             let store = Arc::new(crate::db::tests::local_store()?);
             let fx = fixture(Options::default());
             let mut state = crate::test_helpers::build_test_app_state_with_store(store.clone());
@@ -968,7 +1070,7 @@ mod transactions_route {
             })
         }
 
-        async fn user(&self) -> Uuid {
+        pub(super) async fn user(&self) -> Uuid {
             self.store
                 .create_user(
                     &format!("as-{}", &Uuid::new_v4().simple().to_string()[..12]),
@@ -979,7 +1081,7 @@ mod transactions_route {
                 .user_id
         }
 
-        async fn deleted_user(&self) -> Uuid {
+        pub(super) async fn deleted_user(&self) -> Uuid {
             let id = self.user().await;
             self.store
                 .tombstone_account(&id, &format!("{id}.test"), None, 1_700_000_000)
@@ -988,12 +1090,12 @@ mod transactions_route {
             id
         }
 
-        fn token(&self, id: &Uuid) -> String {
+        pub(super) fn token(&self, id: &Uuid) -> String {
             crate::authn::mint_auth_token(&self.state, id, None, None).unwrap()
         }
 
         /// A token that carries the derived creator-publishing entitlement.
-        fn publishing_token(&self, id: &Uuid) -> String {
+        pub(super) fn publishing_token(&self, id: &Uuid) -> String {
             let user = ArkavoUserClaims {
                 account_id: id.to_string(),
                 roles: vec!["user".into()],
@@ -1004,7 +1106,7 @@ mod transactions_route {
             crate::authn::mint_auth_token(&self.state, id, Some(&user), None).unwrap()
         }
 
-        fn expired_token(&self, id: &Uuid) -> String {
+        pub(super) fn expired_token(&self, id: &Uuid) -> String {
             let mut claims =
                 crate::cwt::ArkavoClaims::auth(&self.state.issuer, &id.to_string(), 1, None);
             claims.iat -= 7_200;
@@ -1014,11 +1116,15 @@ mod transactions_route {
             crate::cwt::encode_for_header(&bytes)
         }
 
-        fn jws(&self, overrides: Value) -> String {
+        pub(super) fn jws(&self, overrides: Value) -> String {
             sign_jws(&purchase(overrides), &self.fx)
         }
 
-        async fn post_raw(&self, token: Option<&str>, body: Vec<u8>) -> (StatusCode, String) {
+        pub(super) async fn post_raw(
+            &self,
+            token: Option<&str>,
+            body: Vec<u8>,
+        ) -> (StatusCode, String) {
             let mut req =
                 Request::post("/app-store/transactions").header("content-type", "application/json");
             if let Some(t) = token {
@@ -1037,7 +1143,7 @@ mod transactions_route {
             (status, String::from_utf8_lossy(&bytes).into_owned())
         }
 
-        async fn post(&self, token: &str, jws: &str) -> (StatusCode, String) {
+        pub(super) async fn post(&self, token: &str, jws: &str) -> (StatusCode, String) {
             self.post_raw(
                 Some(token),
                 json!({ "signed_transaction": jws })
@@ -1047,7 +1153,7 @@ mod transactions_route {
             .await
         }
 
-        async fn records(&self, id: &Uuid) -> Vec<AppStoreRecord> {
+        pub(super) async fn records(&self, id: &Uuid) -> Vec<AppStoreRecord> {
             self.store
                 .get_publishing_state(id)
                 .await
@@ -1058,15 +1164,15 @@ mod transactions_route {
     }
 
     /// Numeric, as Apple's are; unique per test run (the database is shared).
-    fn otid() -> String {
+    pub(super) fn otid() -> String {
         Uuid::new_v4().as_u128().to_string()
     }
 
-    fn secs(ms: i64) -> i64 {
+    pub(super) fn secs(ms: i64) -> i64 {
         ms.div_euclid(1000)
     }
 
-    fn json_body(body: &str) -> Value {
+    pub(super) fn json_body(body: &str) -> Value {
         serde_json::from_str(body).unwrap_or_else(|_| panic!("not json: {body}"))
     }
 
@@ -1529,5 +1635,566 @@ mod transactions_route {
         let (status, _) = h.post("not-a-cwt", &jws).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+    }
+}
+
+// --------- POST /app-store/notifications ---------
+
+mod notifications_route {
+    use super::transactions_route::{Harness, otid, secs};
+    use super::*;
+    use crate::db::AppStoreRecord;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Extension, Router};
+    use uuid::Uuid;
+
+    /// A moment well in the past, so the seconds that order snapshots can be
+    /// told apart without waiting.
+    fn base_ms() -> i64 {
+        now_ms() - 3_600_000
+    }
+
+    /// A snapshot of one subscription: signed `signed_ms`, valid until
+    /// `expires_ms`, bought for `token`.
+    fn snapshot(t: &str, token: Option<&Uuid>, signed_ms: i64, expires_ms: i64) -> Value {
+        json!({
+            "originalTransactionId": t,
+            "appAccountToken": token.map(|id| id.to_string()),
+            "signedDate": signed_ms,
+            "expiresDate": expires_ms,
+        })
+    }
+
+    impl Harness {
+        fn notification_app(&self) -> Router {
+            Router::new()
+                .route("/app-store/notifications", post(notifications_handler))
+                .layer(Extension(self.state.clone()))
+        }
+
+        async fn notify_raw(&self, body: Vec<u8>) -> (StatusCode, String) {
+            self.notification_app().oneshot_post(body).await
+        }
+
+        async fn notify_payload(&self, signed_payload: &str) -> (StatusCode, String) {
+            self.notify_raw(
+                json!({ "signedPayload": signed_payload })
+                    .to_string()
+                    .into_bytes(),
+            )
+            .await
+        }
+
+        /// A signed Sandbox notification of `notification_type` carrying the
+        /// transaction `tx` (and renewal info `renewal`, if any).
+        fn notice(&self, notification_type: &str, tx: Value, renewal: Option<Value>) -> String {
+            let mut data = json!({
+                "bundleId": "com.arkavo.ArkavoCreator",
+                "environment": "Sandbox",
+                "signedTransactionInfo": self.jws(tx),
+            });
+            if let Some(renewal) = renewal {
+                data["signedRenewalInfo"] = json!(sign_jws(&renewal, &self.fx));
+            }
+            notification(&self.fx, notification_type, data)
+        }
+
+        async fn deliver(
+            &self,
+            notification_type: &str,
+            tx: Value,
+            renewal: Option<Value>,
+        ) -> StatusCode {
+            let (status, body) = self
+                .notify_payload(&self.notice(notification_type, tx, renewal))
+                .await;
+            assert!(body.is_empty(), "{body}");
+            status
+        }
+    }
+
+    trait PostOnce {
+        async fn oneshot_post(self, body: Vec<u8>) -> (StatusCode, String);
+    }
+
+    impl PostOnce for Router {
+        async fn oneshot_post(self, body: Vec<u8>) -> (StatusCode, String) {
+            let resp = self
+                .oneshot(
+                    Request::post("/app-store/notifications")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+
+    use tower::ServiceExt;
+
+    fn renewal_info(t: &str, grace_ms: Option<i64>) -> Value {
+        let mut info = json!({ "originalTransactionId": t, "environment": "Sandbox" });
+        if let Some(grace) = grace_ms {
+            info["gracePeriodExpiresDate"] = json!(grace);
+        }
+        info
+    }
+
+    async fn only_record(h: &Harness, id: &Uuid) -> AppStoreRecord {
+        let mut records = h.records(id).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        records.remove(0)
+    }
+
+    /// Covers: a renewal moves the stored expiry forward.
+    #[tokio::test]
+    async fn renewal_extends_expiry() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let first_expiry = t0 + 30 * 86_400_000;
+        let renewed_expiry = first_expiry + 30 * 86_400_000;
+
+        let status = h
+            .deliver(
+                "SUBSCRIBED",
+                snapshot(&t, Some(&id), t0, first_expiry),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(only_record(&h, &id).await.expires_at, secs(first_expiry));
+
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                snapshot(&t, Some(&id), t0 + 5_000, renewed_expiry),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let record = only_record(&h, &id).await;
+        assert_eq!(record.expires_at, secs(renewed_expiry));
+        assert_eq!(record.last_signed_at, secs(t0 + 5_000));
+        assert_eq!(record.product_id, PRODUCT);
+        assert_eq!(record.environment, Environment::Sandbox);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+    }
+
+    /// Covers: a refund's `revocationDate` is stored even though the expiry is
+    /// in the future.
+    #[tokio::test]
+    async fn refund_sets_revoked_at() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver("SUBSCRIBED", snapshot(&t, Some(&id), t0, expiry), None)
+            .await;
+        assert_eq!(only_record(&h, &id).await.revoked_at, None);
+
+        let mut refund = snapshot(&t, Some(&id), t0 + 10_000, expiry);
+        refund["revocationDate"] = json!(t0 + 9_000);
+        assert_eq!(h.deliver("REFUND", refund, None).await, StatusCode::OK);
+
+        let record = only_record(&h, &id).await;
+        assert_eq!(record.revoked_at, Some(secs(t0 + 9_000)));
+        assert_eq!(record.expires_at, secs(expiry));
+    }
+
+    /// Review Focus 2: an older EXPIRED delivered after a newer DID_RENEW
+    /// must not end an active membership.
+    #[tokio::test]
+    async fn older_expired_after_newer_renew_is_ignored() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let lapsed = t0 + 1_000;
+        let renewed = now_ms() + 30 * 86_400_000;
+
+        h.deliver(
+            "DID_RENEW",
+            snapshot(&t, Some(&id), t0 + 60_000, renewed),
+            None,
+        )
+        .await;
+        // The EXPIRED was signed before the renewal and arrives after it.
+        let status = h
+            .deliver(
+                "EXPIRED",
+                snapshot(&t, Some(&id), t0 + 30_000, lapsed),
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let record = only_record(&h, &id).await;
+        assert_eq!(record.expires_at, secs(renewed));
+        assert_eq!(record.last_signed_at, secs(t0 + 60_000));
+    }
+
+    /// Covers: grace comes from the renewal info and is cleared by the next
+    /// snapshot that has none.
+    #[tokio::test]
+    async fn grace_period_is_stored() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = t0 + 1_000;
+        let grace = now_ms() + 16 * 86_400_000;
+
+        let status = h
+            .deliver(
+                "DID_FAIL_TO_RENEW",
+                snapshot(&t, Some(&id), t0, expiry),
+                Some(renewal_info(&t, Some(grace))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let record = only_record(&h, &id).await;
+        assert_eq!(record.grace_expires_at, Some(secs(grace)));
+        assert_eq!(record.expires_at, secs(expiry));
+
+        // Billing recovers: the later snapshot carries no grace.
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                snapshot(&t, Some(&id), t0 + 5_000, expiry + 30 * 86_400_000),
+                Some(renewal_info(&t, None)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(only_record(&h, &id).await.grace_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn unlinked_with_live_token_binds() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+
+        let expiry = now_ms() + 30 * 86_400_000;
+        let status = h
+            .deliver(
+                "SUBSCRIBED",
+                snapshot(&t, Some(&id), base_ms(), expiry),
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+        assert_eq!(only_record(&h, &id).await.original_transaction_id, t);
+    }
+
+    /// A linked subscription goes to its owner, whatever the token names.
+    #[tokio::test]
+    async fn a_linked_subscription_follows_its_link() {
+        let Some(h) = Harness::new() else { return };
+        let owner = h.user().await;
+        let other = h.user().await;
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver(
+            "SUBSCRIBED",
+            snapshot(&t, Some(&owner), base_ms(), expiry),
+            None,
+        )
+        .await;
+
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                snapshot(&t, Some(&other), base_ms() + 5_000, expiry + 86_400_000),
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(owner));
+        assert_eq!(
+            only_record(&h, &owner).await.expires_at,
+            secs(expiry + 86_400_000)
+        );
+        assert!(h.records(&other).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unlinked_without_live_token_is_dropped() {
+        let Some(h) = Harness::new() else { return };
+        let gone = h.deleted_user().await;
+        let unknown = Uuid::new_v4();
+        let expiry = now_ms() + 30 * 86_400_000;
+
+        for (name, token) in [
+            ("none", None),
+            ("unknown", Some(unknown)),
+            ("deleted", Some(gone)),
+        ] {
+            let t = otid();
+            let status = h
+                .deliver(
+                    "DID_RENEW",
+                    snapshot(&t, token.as_ref(), base_ms(), expiry),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(
+                h.store.app_store_link_owner(&t).await.unwrap(),
+                None,
+                "{name}"
+            );
+        }
+        assert!(h.records(&gone).await.is_empty());
+        assert!(h.records(&unknown).await.is_empty());
+    }
+
+    /// Review Focus 3: a notification racing the deletion sweep cannot write
+    /// onto the tombstone.
+    #[tokio::test]
+    async fn notification_after_sweep_writes_nothing() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        h.deliver(
+            "SUBSCRIBED",
+            snapshot(&t, Some(&id), base_ms(), expiry),
+            None,
+        )
+        .await;
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+
+        // Tombstoned, links not swept yet: the link still names the account.
+        h.store
+            .tombstone_account(&id, &format!("{id}.test"), None, 1_700_000_000)
+            .await
+            .unwrap();
+        let before = h.store.get_publishing_state(&id).await.unwrap();
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                snapshot(&t, Some(&id), now_ms(), expiry + 30 * 86_400_000),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.get_publishing_state(&id).await.unwrap(), before);
+        assert!(
+            h.records(&id)
+                .await
+                .iter()
+                .all(|r| r.expires_at == secs(expiry))
+        );
+
+        // Swept: the link is gone, and the token names a dead account.
+        assert_eq!(h.store.delete_identity_links_of(&id).await.unwrap(), 1);
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                snapshot(&t, Some(&id), now_ms() + 1_000, expiry + 60 * 86_400_000),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(
+            h.records(&id)
+                .await
+                .iter()
+                .all(|r| r.expires_at == secs(expiry))
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_payload_is_400() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+
+        // Signed by a chain to another root.
+        let rogue = fixture(Options::default());
+        let mut data = json!({
+            "bundleId": "com.arkavo.ArkavoCreator",
+            "environment": "Sandbox",
+        });
+        data["signedTransactionInfo"] = json!(sign_jws(
+            &purchase(snapshot(&t, Some(&id), base_ms(), expiry)),
+            &rogue
+        ));
+        let forged = notification(&rogue, "SUBSCRIBED", data);
+        let (status, _) = h.notify_payload(&forged).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Genuine outer signature, forged nested transaction.
+        let mut data = json!({
+            "bundleId": "com.arkavo.ArkavoCreator",
+            "environment": "Sandbox",
+        });
+        data["signedTransactionInfo"] = json!(sign_jws(
+            &purchase(snapshot(&t, Some(&id), base_ms(), expiry)),
+            &rogue
+        ));
+        let (status, _) = h
+            .notify_payload(&notification(&h.fx, "SUBSCRIBED", data))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = h.notify_payload("not.a.jws").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_400() {
+        let Some(h) = Harness::new() else { return };
+        for body in [&b""[..], b"{}", b"not json", br#"{"signedPayload":7}"#] {
+            let (status, _) = h.notify_raw(body.to_vec()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notification_is_200() {
+        let Some(h) = Harness::new() else { return };
+        // Apple's Production TEST carries the app's Apple ID.
+        let production = notification(
+            &h.fx,
+            "TEST",
+            json!({
+                "bundleId": "com.arkavo.ArkavoCreator",
+                "appAppleId": 6_738_845_556_i64,
+                "environment": "Production",
+            }),
+        );
+        let sandbox = notification(
+            &h.fx,
+            "TEST",
+            json!({ "bundleId": "com.arkavo.ArkavoCreator", "environment": "Sandbox" }),
+        );
+        for payload in [production, sandbox] {
+            let (status, body) = h.notify_payload(&payload).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.is_empty(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_notification_is_200() {
+        let Some(h) = Harness::new() else { return };
+        let payload = sign_jws(
+            &json!({
+                "notificationType": "RENEWAL_EXTENSION",
+                "subtype": "SUMMARY",
+                "summary": { "environment": "Sandbox", "succeededCount": 2 },
+                "signedDate": now_ms(),
+            }),
+            &h.fx,
+        );
+        let (status, _) = h.notify_payload(&payload).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn production_wrong_app_apple_id_is_400() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let expiry = now_ms() + 30 * 86_400_000;
+        let mut payload = snapshot(&t, Some(&id), base_ms(), expiry);
+        payload["environment"] = json!("Production");
+        for app_apple_id in [json!(1), json!(null)] {
+            let data = json!({
+                "bundleId": "com.arkavo.ArkavoCreator",
+                "appAppleId": app_apple_id,
+                "environment": "Production",
+                "signedTransactionInfo": h.jws(payload.clone()),
+            });
+            let (status, _) = h
+                .notify_payload(&notification(&h.fx, "SUBSCRIBED", data))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        // A Sandbox label wrapped around a Production transaction is no way
+        // round the rule.
+        let data = json!({
+            "bundleId": "com.arkavo.ArkavoCreator",
+            "environment": "Sandbox",
+            "signedTransactionInfo": h.jws(payload),
+        });
+        let (status, _) = h
+            .notify_payload(&notification(&h.fx, "SUBSCRIBED", data))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), None);
+        assert!(h.records(&id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn feature_off_is_503() {
+        let Some(h) = Harness::with_config(false) else {
+            return;
+        };
+        let (status, body) = h.notify_payload("anything").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "app store purchases unavailable");
+    }
+
+    /// A storage failure is the server's: Apple retries a 500.
+    #[tokio::test]
+    async fn a_storage_failure_is_500() {
+        let Some(mut h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let payload = h.notice(
+            "SUBSCRIBED",
+            snapshot(&t, Some(&id), base_ms(), now_ms() + 86_400_000),
+            None,
+        );
+        h.state.db_store = std::sync::Arc::new(
+            h.store
+                .with_credentials_table(format!("missing-credentials-{}", Uuid::new_v4().simple())),
+        );
+        let (status, _) = h.notify_payload(&payload).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Ordering keys on `original_transaction_id` and `signedDate`, never on
+    /// the JWS bytes: the same snapshot re-signed (new signature bytes) is
+    /// absorbed.
+    #[tokio::test]
+    async fn a_redelivered_snapshot_changes_nothing() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let expiry = now_ms() + 30 * 86_400_000;
+        for _ in 0..2 {
+            let status = h
+                .deliver("DID_RENEW", snapshot(&t, Some(&id), t0, expiry), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let record = only_record(&h, &id).await;
+        assert_eq!(record.expires_at, secs(expiry));
+        assert_eq!(record.last_signed_at, secs(t0));
     }
 }

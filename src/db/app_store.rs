@@ -237,8 +237,6 @@ impl DynamoDBStore {
     }
 
     /// The account a subscription is bound to. A consistent read.
-    // Used by the notification route, which arrives in a later change.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn app_store_link_owner(&self, otid: &str) -> Result<Option<Uuid>, DynamoDBError> {
         let out = self
             .client

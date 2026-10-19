@@ -710,6 +710,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/app-store/transactions",
             post(app_store::transactions_handler),
         )
+        // App Store Server Notifications V2: renewals, lapses, refunds and
+        // grace. No auth header; the Apple-signed payload is the only trust.
+        .route(
+            "/app-store/notifications",
+            post(app_store::notifications_handler),
+        )
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
         .route("/account", axum::routing::delete(account::delete_account))

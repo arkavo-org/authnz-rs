@@ -394,6 +394,9 @@ pub struct VerifiedTransaction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedNotification {
     pub notification_type: String,
+    /// The environment `data` states; `None` for a payload without `data`
+    /// (a summary).
+    pub environment: Option<Environment>,
     pub transaction: Option<VerifiedTransaction>,
     pub grace_expires_at: Option<i64>,
 }
@@ -502,36 +505,69 @@ pub(crate) fn decode_transaction(
     })
 }
 
-/// Verify signed renewal info and return its `gracePeriodExpiresDate`.
-// Reached only from tests until a route verifies a purchase.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn decode_renewal_grace(
+/// Signed renewal info, verified: what a notification needs from it (the
+/// subscription it belongs to, its environment when it states one, and the
+/// billing-retry grace).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenewalInfo {
+    pub original_transaction_id: Option<String>,
+    pub environment: Option<Environment>,
+    pub grace_expires_at: Option<i64>,
+}
+
+pub(crate) fn decode_renewal_info(
     cfg: &AppStoreConfig,
     jws: &str,
-) -> Result<Option<i64>, AppStoreError> {
+) -> Result<RenewalInfo, AppStoreError> {
     let payload = verify_signed(cfg, jws)?;
     // The signature is already trusted; the environment is checked when the
     // payload states one.
-    if let Some(environment) = payload.get("environment") {
-        accepted_environment(cfg, environment.as_str().ok_or(AppStoreError::Malformed)?)?;
-    }
-    seconds_field(&payload, "gracePeriodExpiresDate")
+    let environment = payload
+        .get("environment")
+        .map(|v| accepted_environment(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
+        .transpose()?;
+    let original_transaction_id = payload
+        .get("originalTransactionId")
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or(AppStoreError::Malformed)
+        })
+        .transpose()?;
+    Ok(RenewalInfo {
+        original_transaction_id,
+        environment,
+        grace_expires_at: seconds_field(&payload, "gracePeriodExpiresDate")?,
+    })
 }
 
 /// Verify a Server Notification V2 body and, when it carries them, the nested
 /// transaction and renewal info.
-// Reached only from tests until a route verifies a purchase.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// A verified payload with no `data` but a `summary` (a bulk renewal-date
+/// extension) decodes without a transaction, like `TEST`. The nested
+/// transaction must state the environment `data` does, and the renewal info
+/// must belong to the same subscription (and environment, when it states
+/// one): the outer label is what decides whether `appAppleId` is checked, so
+/// it must not be able to wrap a transaction of another environment.
 pub(crate) fn decode_notification(
     cfg: &AppStoreConfig,
     signed_payload: &str,
 ) -> Result<VerifiedNotification, AppStoreError> {
     let payload = verify_signed(cfg, signed_payload)?;
     let notification_type = string_field(&payload, "notificationType")?.to_string();
-    let data = payload
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or(AppStoreError::Malformed)?;
+    let Some(data) = payload.get("data").and_then(Value::as_object) else {
+        return if payload.get("summary").is_some_and(Value::is_object) {
+            Ok(VerifiedNotification {
+                notification_type,
+                environment: None,
+                transaction: None,
+                grace_expires_at: None,
+            })
+        } else {
+            Err(AppStoreError::Malformed)
+        };
+    };
 
     if string_field(data, "bundleId")? != cfg.bundle_id {
         return Err(AppStoreError::WrongApp);
@@ -547,14 +583,33 @@ pub(crate) fn decode_notification(
         .get("signedTransactionInfo")
         .map(|v| decode_transaction(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
         .transpose()?;
-    let grace_expires_at = data
-        .get("signedRenewalInfo")
-        .map(|v| decode_renewal_grace(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
-        .transpose()?
-        .flatten();
+    if let Some(tx) = &transaction
+        && tx.environment != environment
+    {
+        return Err(AppStoreError::WrongEnvironment);
+    }
+    // Renewal info only qualifies a transaction; without one there is
+    // nothing to apply it to.
+    let grace_expires_at = match (&transaction, data.get("signedRenewalInfo")) {
+        (Some(tx), Some(renewal)) => {
+            let renewal =
+                decode_renewal_info(cfg, renewal.as_str().ok_or(AppStoreError::Malformed)?)?;
+            if renewal.original_transaction_id.as_deref()
+                != Some(tx.original_transaction_id.as_str())
+            {
+                return Err(AppStoreError::Malformed);
+            }
+            if renewal.environment.is_some_and(|e| e != tx.environment) {
+                return Err(AppStoreError::WrongEnvironment);
+            }
+            renewal.grace_expires_at
+        }
+        _ => None,
+    };
 
     Ok(VerifiedNotification {
         notification_type,
+        environment: Some(environment),
         transaction,
         grace_expires_at,
     })
@@ -749,4 +804,178 @@ async fn post_transaction(
         token_can_publish: caller.token_can_publish,
     })
     .into_response()
+}
+
+// --------- POST /app-store/notifications ---------
+
+#[derive(Deserialize)]
+struct NotificationRequest {
+    #[serde(rename = "signedPayload")]
+    signed_payload: String,
+}
+
+/// What a notification's one log line says: the type Apple signed, the
+/// subscription's `original_transaction_id`, its environment and the outcome.
+/// Never a JWS, a token or an `appAccountToken`.
+struct NotificationTrace {
+    outcome: &'static str,
+    notification_type: Option<String>,
+    original_transaction_id: Option<String>,
+    environment: Option<Environment>,
+}
+
+/// A notification type reduced to what Apple's names use, so nothing a payload
+/// carries can shape a log line.
+fn loggable_type(notification_type: &str) -> String {
+    notification_type
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(48)
+        .collect()
+}
+
+fn internal_notification(what: &str, e: &DynamoDBError) -> Response {
+    error!("app store notification: {what} failed: {e}");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// `POST /app-store/notifications`: App Store Server Notifications V2. No
+/// auth header; the signature is the only trust.
+///
+/// Answers 503 when the feature is off, 400 for a body without
+/// `signedPayload` or a payload that does not verify or is not for this app
+/// (Apple retries a non-2xx), 500 for a storage failure (so Apple retries
+/// it), and 200 for every verified payload, applied or ignored.
+pub(crate) async fn notifications_handler(
+    Extension(app_state): Extension<AppState>,
+    body: Bytes,
+) -> Response {
+    let mut trace = NotificationTrace {
+        outcome: "refused",
+        notification_type: None,
+        original_transaction_id: None,
+        environment: None,
+    };
+    let response = post_notification(&app_state, &body, &mut trace).await;
+    info!(
+        "app_store notification type={} otid={} env={} outcome={}",
+        trace.notification_type.as_deref().unwrap_or("-"),
+        trace.original_transaction_id.as_deref().unwrap_or("-"),
+        trace.environment.map_or("-", Environment::as_str),
+        trace.outcome,
+    );
+    response
+}
+
+async fn post_notification(
+    app_state: &AppState,
+    body: &[u8],
+    trace: &mut NotificationTrace,
+) -> Response {
+    let Some(cfg) = app_state.app_store.as_ref() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, BODY_UNAVAILABLE);
+    };
+    let Ok(NotificationRequest { signed_payload }) = serde_json::from_slice(body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(notification) = decode_notification(cfg, &signed_payload) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    trace.notification_type = Some(loggable_type(&notification.notification_type));
+    trace.environment = notification.environment;
+
+    let Some(tx) = notification.transaction else {
+        trace.outcome = "ignored=no_transaction";
+        return StatusCode::OK.into_response();
+    };
+    trace.original_transaction_id = Some(tx.original_transaction_id.clone());
+    trace.environment = Some(tx.environment);
+
+    // The account the subscription belongs to, always settled before the
+    // state is written: its link, or a new link to the account the purchase
+    // was made for.
+    let store = &app_state.db_store;
+    let mut newly_bound = false;
+    let owner = match store
+        .app_store_link_owner(&tx.original_transaction_id)
+        .await
+    {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            // An unknown subscription is bound only to a live account the
+            // purchase names; anything else is not ours to track.
+            let Some(named) = tx.app_account_token else {
+                trace.outcome = "ignored=unbound";
+                return StatusCode::OK.into_response();
+            };
+            match store.is_account_live(&named).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    trace.outcome = "ignored=unbound";
+                    return StatusCode::OK.into_response();
+                }
+                Err(e) => return internal_notification("account lookup", &e),
+            }
+            match store
+                .bind_app_store_link(&tx.original_transaction_id, &named)
+                .await
+            {
+                Ok(LinkOutcome::Bound | LinkOutcome::AlreadyYours) => {
+                    newly_bound = true;
+                    named
+                }
+                // Another delivery bound it between the read and the bind:
+                // follow whoever won.
+                Ok(LinkOutcome::BoundElsewhere) => {
+                    match store
+                        .app_store_link_owner(&tx.original_transaction_id)
+                        .await
+                    {
+                        Ok(Some(owner)) => owner,
+                        Ok(None) => {
+                            return internal_notification(
+                                "link",
+                                &DynamoDBError::Internal("link vanished after conflict".into()),
+                            );
+                        }
+                        Err(e) => return internal_notification("link", &e),
+                    }
+                }
+                Err(DynamoDBError::AccountGone) => {
+                    trace.outcome = "ignored=account_gone";
+                    return StatusCode::OK.into_response();
+                }
+                Err(e) => return internal_notification("link", &e),
+            }
+        }
+        Err(e) => return internal_notification("link lookup", &e),
+    };
+
+    let record = AppStoreRecord {
+        original_transaction_id: tx.original_transaction_id,
+        product_id: tx.product_id,
+        environment: tx.environment,
+        expires_at: tx.expires_at,
+        grace_expires_at: notification.grace_expires_at,
+        revoked_at: tx.revoked_at,
+        last_signed_at: tx.signed_at,
+    };
+    match store
+        .put_app_store_state(
+            &owner,
+            &record,
+            GraceUpdate::Set(notification.grace_expires_at),
+        )
+        .await
+    {
+        Ok(StateOutcome::Applied) => {
+            trace.outcome = if newly_bound { "bound" } else { "applied" };
+        }
+        Ok(StateOutcome::Stale) => trace.outcome = "stale",
+        Ok(StateOutcome::AccountGone) | Err(DynamoDBError::AccountGone) => {
+            trace.outcome = "ignored=account_gone";
+        }
+        Err(e) => return internal_notification("state write", &e),
+    }
+    StatusCode::OK.into_response()
 }
