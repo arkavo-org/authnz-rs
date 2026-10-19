@@ -458,6 +458,7 @@ fn decodes_a_production_transaction() {
         &AppStoreConfig::for_tests(fx.root_der.clone()),
         &sign_jws(
             &json!({
+                "transactionId": "2000000987654321",
                 "originalTransactionId": "2000000123456789",
                 "bundleId": "com.arkavo.ArkavoCreator",
                 "productId": PRODUCT,
@@ -474,6 +475,7 @@ fn decodes_a_production_transaction() {
     .unwrap();
 
     assert_eq!(tx.original_transaction_id, "2000000123456789");
+    assert_eq!(tx.transaction_id, "2000000987654321");
     assert_eq!(tx.product_id, PRODUCT);
     assert_eq!(tx.environment, Environment::Production);
     assert_eq!(tx.app_account_token, Some(TOKEN.parse().unwrap()));
@@ -488,6 +490,20 @@ fn decodes_a_transaction_without_token_or_revocation() {
     let tx = decode(&fx, json!({})).unwrap();
     assert_eq!(tx.app_account_token, None);
     assert_eq!(tx.revoked_at, None);
+}
+
+/// The transaction id says which billing period a snapshot describes, so a
+/// transaction without one is refused.
+#[test]
+fn refuses_a_transaction_without_a_transaction_id() {
+    let fx = fixture(Options::default());
+    for transaction_id in [json!(null), json!(2_000_000_987_654_321_i64)] {
+        assert_eq!(
+            decode(&fx, json!({ "transactionId": transaction_id })),
+            Err(AppStoreError::Malformed),
+            "{transaction_id}"
+        );
+    }
 }
 
 #[test]
@@ -937,6 +953,7 @@ mod active_rule {
     fn record() -> AppStoreRecord {
         AppStoreRecord {
             original_transaction_id: "1".into(),
+            transaction_id: Some("1".into()),
             product_id: PRODUCT.into(),
             environment: Environment::Production,
             expires_at: NOW + 100,
@@ -1519,6 +1536,7 @@ mod transactions_route {
         let now = secs(now_ms());
         let stored = AppStoreRecord {
             original_transaction_id: t.clone(),
+            transaction_id: Some("2000000123456789".into()),
             product_id: PRODUCT.into(),
             environment: Environment::Production,
             expires_at: now - 600,
@@ -1563,6 +1581,50 @@ mod transactions_route {
         assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
     }
 
+    /// Creator posting last month's refunded transaction (signed after this
+    /// month's) changes nothing and is answered with the stored period.
+    #[tokio::test]
+    async fn a_past_period_post_returns_the_stored_state() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = now_ms() - 3_600_000;
+        let this_month_end = now_ms() + 30 * 86_400_000;
+        let current = h.jws(json!({
+            "originalTransactionId": t,
+            "transactionId": "t2",
+            "appAccountToken": id.to_string(),
+            "signedDate": t0,
+            "expiresDate": this_month_end,
+        }));
+        let (status, body) = h.post(&h.token(&id), &current).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let before = h.records(&id).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].transaction_id.as_deref(), Some("t2"));
+
+        let last_month = h.jws(json!({
+            "originalTransactionId": t,
+            "transactionId": "t1",
+            "appAccountToken": id.to_string(),
+            "signedDate": t0 + 60_000,
+            "expiresDate": t0 - 1_000,
+            "revocationDate": t0 + 30_000,
+        }));
+        let (status, body) = h.post(&h.token(&id), &last_month).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json_body(&body),
+            json!({
+                "active": true,
+                "expires_at": secs(this_month_end),
+                "environment": "Sandbox",
+                "token_can_publish": false,
+            })
+        );
+        assert_eq!(h.records(&id).await, before);
+    }
+
     #[tokio::test]
     async fn reports_whether_the_presented_token_can_publish() {
         let Some(h) = Harness::new() else { return };
@@ -1589,6 +1651,7 @@ mod transactions_route {
         let now = secs(now_ms());
         let stored = AppStoreRecord {
             original_transaction_id: t.clone(),
+            transaction_id: None,
             product_id: PRODUCT.into(),
             environment: Environment::Sandbox,
             expires_at: now - 600,
@@ -1623,6 +1686,7 @@ mod transactions_route {
         assert_eq!(
             h.records(&id).await,
             vec![AppStoreRecord {
+                transaction_id: Some("2000000123456789".into()),
                 last_signed_at: secs(signed_ms),
                 ..stored
             }]
@@ -1660,7 +1724,7 @@ mod transactions_route {
 // --------- POST /app-store/notifications ---------
 
 mod notifications_route {
-    use super::transactions_route::{Harness, otid, secs};
+    use super::transactions_route::{Harness, json_body, otid, secs};
     use super::*;
     use crate::db::AppStoreRecord;
     use axum::body::Body;
@@ -1767,6 +1831,13 @@ mod notifications_route {
         info
     }
 
+    /// A billing period of `t`: the snapshot of transaction `tid`.
+    fn period(t: &str, tid: &str, token: &Uuid, signed_ms: i64, expires_ms: i64) -> Value {
+        let mut tx = snapshot(t, Some(token), signed_ms, expires_ms);
+        tx["transactionId"] = json!(tid);
+        tx
+    }
+
     async fn only_record(h: &Harness, id: &Uuid) -> AppStoreRecord {
         let mut records = h.records(id).await;
         assert_eq!(records.len(), 1, "{records:?}");
@@ -1829,6 +1900,85 @@ mod notifications_route {
         let record = only_record(&h, &id).await;
         assert_eq!(record.revoked_at, Some(secs(t0 + 9_000)));
         assert_eq!(record.expires_at, secs(expiry));
+    }
+
+    /// A REFUND of last month's transaction is signed when Apple sends it,
+    /// after this month's renewal. It neither shortens nor revokes the current
+    /// period, so the member's own re-post of the current transaction still
+    /// applies (before, it was stale and locked the member out).
+    #[tokio::test]
+    async fn a_later_refund_of_an_earlier_period_keeps_the_current_one() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let this_month_end = now_ms() + 30 * 86_400_000;
+
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                period(&t, "t2", &id, t0 + 10_000, this_month_end),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let current = only_record(&h, &id).await;
+
+        for notification_type in ["CONSUMPTION_REQUEST", "REFUND", "REFUND_REVERSED"] {
+            let mut last_month = period(&t, "t1", &id, t0 + 30_000, t0);
+            last_month["revocationDate"] = json!(t0 + 20_000);
+            assert_eq!(
+                h.deliver(notification_type, last_month, None).await,
+                StatusCode::OK,
+                "{notification_type}"
+            );
+            assert_eq!(only_record(&h, &id).await, current, "{notification_type}");
+        }
+        assert_eq!(current.transaction_id.as_deref(), Some("t2"));
+        assert_eq!(current.expires_at, secs(this_month_end));
+        assert_eq!(current.revoked_at, None);
+
+        // Creator re-posts the current transaction, signed before the refund
+        // was sent.
+        let repost = h.jws(period(&t, "t2", &id, t0 + 20_000, this_month_end));
+        let (status, body) = h.post(&h.token(&id), &repost).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["active"], true);
+        assert_eq!(only_record(&h, &id).await.last_signed_at, secs(t0 + 20_000));
+    }
+
+    /// A renewal is a new transaction that ends later: it applies, and a
+    /// refund of it (the current period) still revokes.
+    #[tokio::test]
+    async fn a_renewal_by_a_new_transaction_applies_and_its_refund_revokes() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let first_end = t0 + 1_000;
+        let second_end = now_ms() + 30 * 86_400_000;
+
+        h.deliver("SUBSCRIBED", period(&t, "t1", &id, t0, first_end), None)
+            .await;
+        let status = h
+            .deliver(
+                "DID_RENEW",
+                period(&t, "t2", &id, t0 + 5_000, second_end),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let renewed = only_record(&h, &id).await;
+        assert_eq!(renewed.transaction_id.as_deref(), Some("t2"));
+        assert_eq!(renewed.expires_at, secs(second_end));
+
+        let mut refund = period(&t, "t2", &id, t0 + 10_000, second_end);
+        refund["revocationDate"] = json!(t0 + 9_000);
+        assert_eq!(h.deliver("REFUND", refund, None).await, StatusCode::OK);
+        let refunded = only_record(&h, &id).await;
+        assert_eq!(refunded.transaction_id.as_deref(), Some("t2"));
+        assert_eq!(refunded.revoked_at, Some(secs(t0 + 9_000)));
+        assert_eq!(refunded.expires_at, secs(second_end));
     }
 
     /// Review Focus 2: an older EXPIRED delivered after a newer DID_RENEW

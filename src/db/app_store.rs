@@ -6,19 +6,23 @@
 //!   and holds no token, so the deletion sweep's link step removes it.
 //! - **The state**: a map attribute `app_store` on the account's `credentials`
 //!   row, keyed by original transaction id. Each value is
-//!   `{product_id, environment, expires_at, grace_expires_at?, revoked_at?,
-//!   last_signed_at}`, all times unix seconds.
+//!   `{transaction_id?, product_id, environment, expires_at,
+//!   grace_expires_at?, revoked_at?, last_signed_at}`, all times unix
+//!   seconds. `transaction_id` names the billing period the entry describes.
 //!
 //! Ordering is by the transaction's `last_signed_at` (Apple's `signedDate`)
 //! and the `original_transaction_id`, never by the bytes of a JWS: an ECDSA
 //! signature is malleable, so two different byte strings verify for one
-//! payload. The JWS itself is not stored.
+//! payload. The JWS itself is not stored. A snapshot of an earlier billing
+//! period (another `transaction_id`, ending before the stored one) never
+//! changes an entry, however late it was signed.
 
 use super::agent_state::{classify, n, s};
 use super::publishing::{self, PublishingSuspension};
 use super::{DynamoDBError, DynamoDBStore, account};
 use crate::app_store::Environment;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue, ReturnValuesOnConditionCheckFailure};
 use log::warn;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -35,6 +39,9 @@ fn link_pk(otid: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStoreRecord {
     pub original_transaction_id: String,
+    /// The `transactionId` of the snapshot: which billing period it
+    /// describes. `None` on an entry stored before it was kept (unknown).
+    pub transaction_id: Option<String>,
     pub product_id: String,
     pub environment: Environment,
     pub expires_at: i64,
@@ -61,6 +68,9 @@ pub enum StateOutcome {
     Applied,
     /// A record with a later `last_signed_at` is stored; nothing changed.
     Stale,
+    /// The snapshot is of an earlier billing period: another transaction
+    /// that ends before the stored one. Nothing changed.
+    PastPeriod,
     /// The account has no live row (unknown or deleted); nothing was written.
     AccountGone,
 }
@@ -101,6 +111,9 @@ fn parse_environment(v: &str) -> Option<Environment> {
 
 fn to_attr(rec: &AppStoreRecord) -> AttributeValue {
     let mut m = HashMap::new();
+    if let Some(tid) = &rec.transaction_id {
+        m.insert("transaction_id".to_string(), s(tid));
+    }
     m.insert("product_id".to_string(), s(&rec.product_id));
     m.insert(
         "environment".to_string(),
@@ -132,14 +145,59 @@ fn from_attr(otid: &str, v: &AttributeValue) -> Option<AppStoreRecord> {
         None => Some(None),
         Some(_) => num(k).map(Some),
     };
+    let transaction_id = match m.get("transaction_id") {
+        None => None,
+        Some(v) => Some(v.as_s().ok()?.clone()),
+    };
     Some(AppStoreRecord {
         original_transaction_id: otid.to_string(),
+        transaction_id,
         product_id: text("product_id")?,
         environment: parse_environment(&text("environment")?)?,
         expires_at: num("expires_at")?,
         grace_expires_at: optional("grace_expires_at")?,
         revoked_at: optional("revoked_at")?,
         last_signed_at: num("last_signed_at")?,
+    })
+}
+
+/// What a field-level update of an entry came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryUpdate {
+    /// Applied, or refused for the reason given.
+    Done(StateOutcome),
+    /// The row is live but holds no entry for the subscription yet.
+    Absent,
+}
+
+/// Why the update's condition refused `rec`, given the row it was checked
+/// against. The checks mirror the condition's clauses in order. Only the
+/// tombstone marker and the subscription's own entry are read from the row
+/// (which is the whole `credentials` item, so it is never logged).
+fn refusal(row: Option<&HashMap<String, AttributeValue>>, rec: &AppStoreRecord) -> EntryUpdate {
+    let Some(row) = row.filter(|r| !account::is_tombstone(r)) else {
+        return EntryUpdate::Done(StateOutcome::AccountGone);
+    };
+    let otid = &rec.original_transaction_id;
+    let Some(entry) = row
+        .get(ATTR)
+        .and_then(|m| m.as_m().ok())
+        .and_then(|m| m.get(otid))
+    else {
+        return EntryUpdate::Absent;
+    };
+    // An unreadable entry refuses every update (it grants nothing).
+    let Some(stored) = from_attr(otid, entry) else {
+        return EntryUpdate::Done(StateOutcome::Stale);
+    };
+    let past_period = matches!(
+        (&stored.transaction_id, &rec.transaction_id),
+        (Some(stored_tid), Some(tid)) if stored_tid != tid
+    ) && stored.expires_at > rec.expires_at;
+    EntryUpdate::Done(if past_period {
+        StateOutcome::PastPeriod
+    } else {
+        StateOutcome::Stale
     })
 }
 
@@ -257,11 +315,18 @@ impl DynamoDBStore {
 
     /// Store a subscription's state on the account's `credentials` row.
     ///
-    /// Every write is conditional on `LIVE_ROW` and on the ordering rule: the
-    /// incoming `last_signed_at` must be later than the stored one, or equal
-    /// to it unless that would replace a stored `revoked_at` with a snapshot
-    /// that has none (two snapshots signed in the same second apply in
-    /// arrival order, but a refund is never undone by a tie).
+    /// Every write is conditional on `LIVE_ROW`, and an update of an existing
+    /// entry on two rules besides:
+    ///
+    /// - **Past period.** A snapshot of another transaction that ends before
+    ///   the stored one describes an earlier billing period (a REFUND of last
+    ///   month, signed when it is sent) and never changes the entry. A stored
+    ///   entry without a `transaction_id` is unknown and skips this rule.
+    /// - **Signed order.** The incoming `last_signed_at` must be later than
+    ///   the stored one, or equal to it unless that would replace a stored
+    ///   `revoked_at` with a snapshot that has none (two snapshots signed in
+    ///   the same second apply in arrival order, but a refund is never undone
+    ///   by a tie).
     ///
     /// An existing entry is updated field by field, so a field the write does
     /// not own (`grace_expires_at` under [`GraceUpdate::Keep`]) is left
@@ -270,38 +335,40 @@ impl DynamoDBStore {
     /// a map and a key in it at once, so the attempts are conditional
     /// updates, each atomic: update the existing entry; else ensure the map
     /// and insert the entry if absent; else (a concurrent insert won) update
-    /// once more. If none applies the record is `Stale` (a later or tied
-    /// revoked snapshot is stored) or the account is gone.
+    /// once more. A refused update reports why from the row its condition was
+    /// checked against (returned with the refusal, so no second read): the
+    /// account is gone, the snapshot is of a past period, or it is stale.
     pub async fn put_app_store_state(
         &self,
         user_id: &Uuid,
         rec: &AppStoreRecord,
         grace: GraceUpdate,
     ) -> Result<StateOutcome, DynamoDBError> {
-        if self.update_app_store_entry(user_id, rec, grace).await? {
-            return Ok(StateOutcome::Applied);
+        if let EntryUpdate::Done(outcome) = self.update_app_store_entry(user_id, rec, grace).await?
+        {
+            return Ok(outcome);
         }
         if self.insert_app_store_entry(user_id, rec, grace).await? {
             return Ok(StateOutcome::Applied);
         }
-        if self.update_app_store_entry(user_id, rec, grace).await? {
-            return Ok(StateOutcome::Applied);
-        }
-        if self.is_account_live(user_id).await? {
-            Ok(StateOutcome::Stale)
-        } else {
-            Ok(StateOutcome::AccountGone)
+        // A concurrent insert won, or the row is no longer live.
+        match self.update_app_store_entry(user_id, rec, grace).await? {
+            EntryUpdate::Done(outcome) => Ok(outcome),
+            // Nothing removes an entry from a live row.
+            EntryUpdate::Absent => Err(DynamoDBError::Internal(
+                "app store entry neither insertable nor present".into(),
+            )),
         }
     }
 
-    /// Update the fields of an existing entry. `false`: the entry is absent,
-    /// the row is not live, or the ordering rule refuses the write.
+    /// Update the fields of an existing entry. When the condition refuses
+    /// it, the reason is read from the row as the condition saw it.
     async fn update_app_store_entry(
         &self,
         user_id: &Uuid,
         rec: &AppStoreRecord,
         grace: GraceUpdate,
-    ) -> Result<bool, DynamoDBError> {
+    ) -> Result<EntryUpdate, DynamoDBError> {
         let table = &self.credentials_table;
         let entry = "#as.#otid";
         let mut sets = vec![
@@ -311,6 +378,10 @@ impl DynamoDBStore {
             format!("{entry}.#signed = :signed"),
         ];
         let mut removes = Vec::new();
+        match rec.transaction_id {
+            Some(_) => sets.push(format!("{entry}.#tid = :tid")),
+            None => removes.push(format!("{entry}.#tid")),
+        }
         match rec.revoked_at {
             Some(_) => sets.push(format!("{entry}.#rev = :rev")),
             None => removes.push(format!("{entry}.#rev")),
@@ -324,6 +395,16 @@ impl DynamoDBStore {
         if !removes.is_empty() {
             expression.push_str(&format!(" REMOVE {}", removes.join(", ")));
         }
+        // Another transaction ending earlier is a past period. Without an
+        // incoming id (a record built in a test) the rule cannot apply.
+        let period = if rec.transaction_id.is_some() {
+            format!(
+                " AND (attribute_not_exists({entry}.#tid) OR {entry}.#tid = :tid OR \
+                 {entry}.#exp <= :exp)"
+            )
+        } else {
+            String::new()
+        };
         // A tie replaces a stored snapshot unless that drops its revocation.
         let ordering = if rec.revoked_at.is_some() {
             format!("{entry}.#signed <= :signed")
@@ -340,19 +421,24 @@ impl DynamoDBStore {
             .key("user_id", s(&user_id.to_string()))
             .update_expression(expression)
             .condition_expression(format!(
-                "{} AND attribute_exists({entry}) AND {ordering}",
+                "{} AND attribute_exists({entry}){period} AND {ordering}",
                 account::LIVE_ROW
             ))
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
             .expression_attribute_names("#as", ATTR)
             .expression_attribute_names("#otid", &rec.original_transaction_id)
             .expression_attribute_names("#pid", "product_id")
             .expression_attribute_names("#env", "environment")
             .expression_attribute_names("#exp", "expires_at")
             .expression_attribute_names("#signed", "last_signed_at")
+            .expression_attribute_names("#tid", "transaction_id")
             .expression_attribute_values(":pid", s(&rec.product_id))
             .expression_attribute_values(":env", s(environment_str(rec.environment)))
             .expression_attribute_values(":exp", n(rec.expires_at))
             .expression_attribute_values(":signed", n(rec.last_signed_at));
+        if let Some(tid) = &rec.transaction_id {
+            update = update.expression_attribute_values(":tid", s(tid));
+        }
         if let Some(revoked) = rec.revoked_at {
             update = update
                 .expression_attribute_names("#rev", "revoked_at")
@@ -372,11 +458,15 @@ impl DynamoDBStore {
             GraceUpdate::Keep => {}
         }
         match update.send().await {
-            Ok(_) => Ok(true),
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(false),
-                other => Err(other),
-            },
+            Ok(_) => Ok(EntryUpdate::Done(StateOutcome::Applied)),
+            Err(e) => {
+                if let Some(UpdateItemError::ConditionalCheckFailedException(refused)) =
+                    e.as_service_error()
+                {
+                    return Ok(refusal(refused.item(), rec));
+                }
+                Err(classify(e, table))
+            }
         }
     }
 
@@ -580,6 +670,8 @@ mod tests {
     fn rec(otid: &str, signed: i64) -> AppStoreRecord {
         AppStoreRecord {
             original_transaction_id: otid.to_string(),
+            // The first transaction's id is the original transaction id.
+            transaction_id: Some(otid.to_string()),
             product_id: "com.arkavo.ArkavoCreator.membership.monthly".into(),
             environment: Environment::Production,
             expires_at: signed + 2_592_000,
@@ -632,6 +724,15 @@ mod tests {
             ..rec("222", 1_700_000_000)
         };
         assert_eq!(from_attr("222", &to_attr(&full)), Some(full));
+    }
+
+    #[test]
+    fn a_record_without_a_transaction_id_roundtrips() {
+        let unknown = AppStoreRecord {
+            transaction_id: None,
+            ..rec("333", 1_700_000_000)
+        };
+        assert_eq!(from_attr("333", &to_attr(&unknown)), Some(unknown));
     }
 
     #[test]
@@ -1183,5 +1284,148 @@ mod tests {
             got.contains(&revoked_now) && got.contains(&second),
             "{got:?}"
         );
+    }
+
+    /// A billing period of `t`: transaction `tid`, signed `signed`, ending
+    /// `expires`.
+    fn period(t: &str, tid: &str, signed: i64, expires: i64) -> AppStoreRecord {
+        AppStoreRecord {
+            transaction_id: Some(tid.to_string()),
+            expires_at: expires,
+            ..rec(t, signed)
+        }
+    }
+
+    /// A later-signed snapshot of an earlier transaction (a REFUND of last
+    /// month) neither shortens nor revokes the current period.
+    #[tokio::test]
+    async fn a_past_period_never_changes_the_entry() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-past").await;
+        let t = otid();
+        let current = AppStoreRecord {
+            grace_expires_at: Some(1_705_000_000),
+            ..period(&t, "t2", 1_700_000_000, 1_702_600_000)
+        };
+        store
+            .put_app_store_state(&id, &current, set(&current))
+            .await
+            .unwrap();
+
+        let refund_of_last_month = AppStoreRecord {
+            revoked_at: Some(1_700_000_400),
+            ..period(&t, "t1", 1_700_000_500, 1_700_000_000)
+        };
+        for grace in [
+            GraceUpdate::Keep,
+            GraceUpdate::Set(None),
+            set(&refund_of_last_month),
+        ] {
+            assert_eq!(
+                store
+                    .put_app_store_state(&id, &refund_of_last_month, grace)
+                    .await
+                    .unwrap(),
+                StateOutcome::PastPeriod
+            );
+        }
+        assert_eq!(state_of(&store, &id).await, vec![current]);
+    }
+
+    /// The same transaction keeps the signed order and the revocation rule: a
+    /// refund of the current period revokes it.
+    #[tokio::test]
+    async fn a_refund_of_the_current_transaction_revokes() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-refund").await;
+        let t = otid();
+        let current = period(&t, "t2", 1_700_000_000, 1_702_600_000);
+        store
+            .put_app_store_state(&id, &current, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        let refund = AppStoreRecord {
+            revoked_at: Some(1_700_000_400),
+            ..period(&t, "t2", 1_700_000_500, 1_702_600_000)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &refund, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(state_of(&store, &id).await, vec![refund]);
+    }
+
+    /// A new transaction that ends no earlier (a renewal, or a same-length
+    /// upgrade) applies under the signed order, and becomes the stored one.
+    #[tokio::test]
+    async fn a_renewal_by_another_transaction_applies() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-renew").await;
+        let t = otid();
+        let first = period(&t, "t1", 1_700_000_000, 1_702_600_000);
+        store
+            .put_app_store_state(&id, &first, GraceUpdate::Keep)
+            .await
+            .unwrap();
+
+        let same_end = period(&t, "t2", 1_700_000_100, 1_702_600_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &same_end, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        let renewed = period(&t, "t3", 1_702_600_000, 1_705_200_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &renewed, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(state_of(&store, &id).await, vec![renewed.clone()]);
+
+        // A renewal signed before the stored snapshot is still stale.
+        let late = period(&t, "t4", 1_702_599_000, 1_707_800_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &late, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Stale
+        );
+        assert_eq!(state_of(&store, &id).await, vec![renewed]);
+    }
+
+    /// An entry stored before transaction ids were kept has an unknown one,
+    /// so the signed order alone decides, and the write records the id.
+    #[tokio::test]
+    async fn an_entry_without_a_transaction_id_follows_the_signed_order() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-noid").await;
+        let t = otid();
+        let legacy = AppStoreRecord {
+            transaction_id: None,
+            ..period(&t, "-", 1_700_000_000, 1_702_600_000)
+        };
+        store
+            .put_app_store_state(&id, &legacy, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        assert_eq!(state_of(&store, &id).await, vec![legacy]);
+
+        let earlier_period = period(&t, "t1", 1_700_000_500, 1_700_000_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &earlier_period, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(state_of(&store, &id).await, vec![earlier_period]);
     }
 }

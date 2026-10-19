@@ -383,6 +383,8 @@ impl AppStoreConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTransaction {
     pub original_transaction_id: String,
+    /// This transaction (one billing period) of the subscription.
+    pub transaction_id: String,
     pub product_id: String,
     pub environment: Environment,
     pub app_account_token: Option<Uuid>,
@@ -498,6 +500,7 @@ pub(crate) fn decode_transaction(
 
     Ok(VerifiedTransaction {
         original_transaction_id: string_field(&payload, "originalTransactionId")?.to_string(),
+        transaction_id: string_field(&payload, "transactionId")?.to_string(),
         product_id: product_id.to_string(),
         environment,
         app_account_token,
@@ -768,6 +771,7 @@ async fn post_transaction(
 
     let record = AppStoreRecord {
         original_transaction_id: tx.original_transaction_id.clone(),
+        transaction_id: Some(tx.transaction_id),
         product_id: tx.product_id,
         environment: tx.environment,
         expires_at: tx.expires_at,
@@ -782,6 +786,8 @@ async fn post_transaction(
     {
         Ok(StateOutcome::Applied) => trace.outcome = "bound",
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
+        // Answered with the stored period, as a stale post is.
+        Ok(StateOutcome::PastPeriod) => trace.outcome = "past_period",
         Ok(StateOutcome::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(DynamoDBError::AccountGone) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => return internal("state write", &e),
@@ -972,6 +978,7 @@ async fn post_notification(
 
     let record = AppStoreRecord {
         original_transaction_id: tx.original_transaction_id,
+        transaction_id: Some(tx.transaction_id),
         product_id: tx.product_id,
         environment: tx.environment,
         expires_at: tx.expires_at,
@@ -991,6 +998,7 @@ async fn post_notification(
             trace.outcome = if newly_bound { "bound" } else { "applied" };
         }
         Ok(StateOutcome::Stale) => trace.outcome = "stale",
+        Ok(StateOutcome::PastPeriod) => trace.outcome = "ignored=past_period",
         Ok(StateOutcome::AccountGone) | Err(DynamoDBError::AccountGone) => {
             trace.outcome = "ignored=account_gone";
         }

@@ -307,6 +307,7 @@ mod app_store_source {
     fn record(otid: &str, env: Environment, expires_at: i64, signed: i64) -> AppStoreRecord {
         AppStoreRecord {
             original_transaction_id: otid.into(),
+            transaction_id: Some(otid.into()),
             product_id: PRODUCT.into(),
             environment: env,
             expires_at,
