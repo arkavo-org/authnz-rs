@@ -62,12 +62,16 @@ The entitlement is **computed when a token is minted, and never stored**.
     on a row from before this change is dropped whenever the list is read
     (tokens, agent delegation and re-mint, `/entities`), with a warning in
     the log; only the mint-time derivation can emit the FQN.
-- **Fails closed.** Any of the following withholds the entitlement:
+- **Fails closed.** Each source fails closed on its own. These withhold the
+  **Patreon source** only; the App Store source is unaffected, so an account
+  with an active App Store membership still gets the entitlement:
   - Patreon is unreachable;
   - the 3 s materialization deadline passes;
-  - the snapshot is stale;
+  - the snapshot is stale.
+
+  These withhold the entitlement whichever source would have granted it:
   - the read of the account's publishing state (suspension and App Store
-    records) fails, whichever source would have granted;
+    records) fails;
   - the suspension record is malformed.
 
 ### App Store membership
