@@ -197,6 +197,8 @@ fn refusal(row: Option<&HashMap<String, AttributeValue>>, rec: &AppStoreRecord) 
     if stored.environment != rec.environment {
         return EntryUpdate::Done(StateOutcome::OtherEnvironment);
     }
+    // A newer period (another transaction ending later) is never refused by
+    // the signed order, so what remains here is a past period or a stale one.
     let past_period = matches!(
         (&stored.transaction_id, &rec.transaction_id),
         (Some(stored_tid), Some(tid)) if stored_tid != tid
@@ -382,7 +384,11 @@ impl DynamoDBStore {
     ///   the stored one describes an earlier billing period (a REFUND of last
     ///   month, signed when it is sent) and never changes the entry. A stored
     ///   entry without a `transaction_id` is unknown and skips this rule.
-    /// - **Signed order.** The incoming `last_signed_at` must be later than
+    /// - **Newer period.** A snapshot of another transaction that ends
+    ///   later than the stored one applies whatever its `last_signed_at`.
+    ///   Any later snapshot of that period carries its id, so it falls under
+    ///   the signed order and its own refund still revokes.
+    /// - **Signed order.** Otherwise the incoming `last_signed_at` must be later than
     ///   the stored one, or equal to it unless that would replace a stored
     ///   `revoked_at` with a snapshot that has none (two snapshots signed in
     ///   the same second apply in arrival order, but a refund is never undone
@@ -467,13 +473,25 @@ impl DynamoDBStore {
             String::new()
         };
         // A tie replaces a stored snapshot unless that drops its revocation.
-        let ordering = if rec.revoked_at.is_some() {
+        let signed_order = if rec.revoked_at.is_some() {
             format!("{entry}.#signed <= :signed")
         } else {
             format!(
                 "({entry}.#signed < :signed OR \
                  ({entry}.#signed = :signed AND attribute_not_exists({entry}.#rev)))"
             )
+        };
+        // Another transaction that ends later is a newer period and applies
+        // whatever its signing time: a snapshot of the previous period may
+        // have been signed after it (a REFUND_DECLINED sent after the
+        // renewal). Without an incoming id the rule cannot apply.
+        let ordering = if rec.transaction_id.is_some() {
+            format!(
+                "((attribute_exists({entry}.#tid) AND {entry}.#tid <> :tid AND \
+                 {entry}.#exp < :exp) OR {signed_order})"
+            )
+        } else {
+            signed_order
         };
         let mut update = self
             .client
@@ -1500,16 +1518,94 @@ mod tests {
         );
         assert_eq!(state_of(&store, &id).await, vec![renewed.clone()]);
 
-        // A renewal signed before the stored snapshot is still stale.
+        // A different transaction that ends at the same time as the stored
+        // one is no newer period, so the signed order still decides.
+        let same_end_early = period(&t, "t5", 1_702_599_000, 1_705_200_000);
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &same_end_early, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Stale
+        );
+        assert_eq!(state_of(&store, &id).await, vec![renewed]);
+
+        // A renewal that ends later is a newer period: it applies although
+        // it was signed before the stored snapshot.
         let late = period(&t, "t4", 1_702_599_000, 1_707_800_000);
         assert_eq!(
             store
                 .put_app_store_state(&id, &late, GraceUpdate::Keep)
                 .await
                 .unwrap(),
+            StateOutcome::Applied
+        );
+        assert_eq!(state_of(&store, &id).await, vec![late]);
+    }
+
+    /// A snapshot of last month (a REFUND_DECLINED) stored first, signed
+    /// after this month's renewal: the renewal still applies, whatever its
+    /// signing time, and a later refund of it revokes.
+    #[tokio::test]
+    async fn a_newer_period_applies_whatever_its_signing_time() {
+        let Some(store) = local_store() else { return };
+        let id = user(&store, "ass-newer").await;
+        let t = otid();
+        let (e1, e2) = (1_702_600_000, 1_705_200_000);
+        let declined = period(&t, "t1", 1_700_000_100, e1);
+        store
+            .put_app_store_state(&id, &declined, GraceUpdate::Keep)
+            .await
+            .unwrap();
+
+        let renewal = AppStoreRecord {
+            grace_expires_at: Some(1_705_300_000),
+            ..period(&t, "t2", 1_700_000_050, e2)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &renewal, set(&renewal))
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        let stored = state_of(&store, &id).await;
+        assert_eq!(stored, vec![renewal.clone()]);
+        assert_eq!(stored[0].transaction_id.as_deref(), Some("t2"));
+        assert_eq!(stored[0].expires_at, e2);
+
+        // The same snapshot of last month, delivered again, is a past period.
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &declined, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::PastPeriod
+        );
+        // A refund of the new period follows the signed order and revokes.
+        let refund = AppStoreRecord {
+            revoked_at: Some(1_700_000_060),
+            ..period(&t, "t2", 1_700_000_070, e2)
+        };
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &refund, GraceUpdate::Keep)
+                .await
+                .unwrap(),
+            StateOutcome::Applied
+        );
+        // An earlier-signed snapshot of the same transaction stays stale.
+        assert_eq!(
+            store
+                .put_app_store_state(&id, &renewal, GraceUpdate::Keep)
+                .await
+                .unwrap(),
             StateOutcome::Stale
         );
-        assert_eq!(state_of(&store, &id).await, vec![renewed]);
+        assert_eq!(
+            state_of(&store, &id).await[0].revoked_at,
+            Some(1_700_000_060)
+        );
     }
 
     /// An entry stored before transaction ids were kept has an unknown one,

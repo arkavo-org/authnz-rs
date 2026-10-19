@@ -1761,6 +1761,52 @@ mod transactions_route {
         assert_eq!(h.records(&id).await, before);
     }
 
+    /// Last month's transaction is stored first, signed after this month's
+    /// renewal; Creator's post of the renewal, signed earlier, is the newer
+    /// period and applies.
+    #[tokio::test]
+    async fn a_post_of_a_newer_period_applies_whatever_its_signing_time() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = now_ms() - 3_600_000;
+        let last_month_end = now_ms() + 86_400_000;
+        let this_month_end = now_ms() + 30 * 86_400_000;
+        let last_month = h.jws(json!({
+            "originalTransactionId": t,
+            "transactionId": "t1",
+            "appAccountToken": id.to_string(),
+            "signedDate": t0 + 60_000,
+            "expiresDate": last_month_end,
+        }));
+        let (status, body) = h.post(&h.token(&id), &last_month).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(json_body(&body)["expires_at"], secs(last_month_end));
+
+        let renewal = h.jws(json!({
+            "originalTransactionId": t,
+            "transactionId": "t2",
+            "appAccountToken": id.to_string(),
+            "signedDate": t0,
+            "expiresDate": this_month_end,
+        }));
+        let (status, body) = h.post(&h.token(&id), &renewal).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json_body(&body),
+            json!({
+                "active": true,
+                "expires_at": secs(this_month_end),
+                "environment": "Sandbox",
+                "token_can_publish": false,
+            })
+        );
+        let records = h.records(&id).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].transaction_id.as_deref(), Some("t2"));
+        assert_eq!(records[0].expires_at, secs(this_month_end));
+    }
+
     /// A Sandbox snapshot of a subscription stored as Production is refused
     /// and changes nothing.
     #[tokio::test]
@@ -2141,6 +2187,46 @@ mod notifications_route {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(json_body(&body)["active"], true);
         assert_eq!(only_record(&h, &id).await.last_signed_at, secs(t0 + 20_000));
+    }
+
+    /// A REFUND_DECLINED of last month is signed after this month's renewal
+    /// and stored first; the DID_RENEW signed before it is the newer period
+    /// and applies whatever its signing time: 200, and the stored period is the
+    /// renewal's (the outcome is only logged).
+    #[tokio::test]
+    async fn a_renewal_signed_before_a_stored_earlier_period_applies() {
+        let Some(h) = Harness::new() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let t0 = base_ms();
+        let last_month_end = now_ms() + 86_400_000;
+        let this_month_end = now_ms() + 30 * 86_400_000;
+
+        let status = h
+            .deliver(
+                "REFUND_DECLINED",
+                period(&t, "t1", &id, t0 + 30_000, last_month_end),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            only_record(&h, &id).await.transaction_id.as_deref(),
+            Some("t1")
+        );
+
+        let (status, body) = h
+            .notify_payload(&h.notice(
+                "DID_RENEW",
+                period(&t, "t2", &id, t0 + 10_000, this_month_end),
+                None,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let renewed = only_record(&h, &id).await;
+        assert_eq!(renewed.transaction_id.as_deref(), Some("t2"));
+        assert_eq!(renewed.expires_at, secs(this_month_end));
+        assert_eq!(renewed.last_signed_at, secs(t0 + 10_000));
     }
 
     /// A renewal is a new transaction that ends later: it applies, and a

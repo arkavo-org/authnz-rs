@@ -88,7 +88,8 @@ transaction (`expiresDate`, `revocationDate`) and, for the grace period, the
 renewal info of App Store Server Notifications V2 (`gracePeriodExpiresDate`);
 an older notification never overwrites a newer one.
 
-- **Order.** Snapshots apply in `signedDate` order. Two signed in the same
+- **Order.** Snapshots apply in `signedDate` order, except a newer period
+  (below). Two signed in the same
   second apply in arrival order, except that one without a `revocationDate`
   never replaces one that has it.
 - **Past periods.** Each record keeps the `transactionId` of the billing
@@ -101,9 +102,16 @@ an older notification never overwrites a newer one.
   current period, and Creator's re-post of the current transaction would be
   stale. The notification is acknowledged (`200`, logged
   `outcome=ignored=past_period`); a client post of it answers with the
-  stored record, as a stale post does. A renewal (a new transaction ending no
-  earlier) and every snapshot of the stored transaction, a refund of it
-  included, follow the order above. A record stored before transaction ids
+  stored record, as a stale post does.
+- **Newer periods.** A snapshot of *another* transaction that ends later than
+  the stored one is a newer period and applies whatever its `signedDate`:
+  the stored snapshot may be a later-signed one of the previous period (a
+  `REFUND_DECLINED` sent after the renewal), and the renewal must not wait
+  for a later signature. Every later snapshot of that period carries its
+  transaction, so it follows the order above and its own refund still
+  revokes. A different transaction ending at the same time as the stored one
+  and every snapshot of the stored transaction, a refund of it included,
+  follow the order above. A record stored before transaction ids
   were kept follows the order alone. The rule is part of the write's
   DynamoDB condition, so it holds under concurrent deliveries.
 - **Environment.** A snapshot never changes a record of the other
