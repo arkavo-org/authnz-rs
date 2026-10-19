@@ -328,6 +328,17 @@ are never revoked by the server (the person can still remove Arkavo under
 Apple Account → Sign in with Apple). Nothing needs repairing after rolling
 forward.
 
+#### App Store membership (0.20.0)
+
+No new table or IAM grant. A subscription is bound to an account by an
+`identity_links` row `appstore#<original_transaction_id>` (`user_id`,
+`created_at`; no token, so the account-deletion sweep's link step removes it),
+and its state is the `app_store` map attribute on the account's `credentials`
+row (see `.claude/rules/dynamodb-schema.md`). The calls it makes are the ones
+the identity links table already needs (`dynamodb:UpdateItem`, `GetItem`,
+`DeleteItem`, `Scan`) and the credentials table already has (`UpdateItem`,
+`GetItem`).
+
 #### `guardians` Table and Agent Trust State
 
 Required before deploying 0.13.0: `POST /guardians` writes the table named

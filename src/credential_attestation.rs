@@ -236,8 +236,8 @@ mod tests {
             iss: "https://identity.arkavo.net".into(),
             sub: "0a1b2c3d-0000-4000-8000-000000000001".into(),
             credential_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            x: point.x().unwrap().as_slice().try_into().unwrap(),
-            y: point.y().unwrap().as_slice().try_into().unwrap(),
+            x: (*point.x().unwrap()).into(),
+            y: (*point.y().unwrap()).into(),
             rp_id: "identity.arkavo.net".into(),
             iat: 1_760_000_000,
         }

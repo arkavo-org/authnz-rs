@@ -43,6 +43,8 @@ when unset.
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
 | `MODERATION_CLIENT_IDS` | client_ids whose service CWTs may set, lift and read publishing suspensions (`PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`). Empty ⇒ 403. See `docs/creator-publishing-entitlement.md`. |
 | `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
+| `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. All three required; any unset ⇒ the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
+| `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
@@ -351,8 +353,13 @@ appraisal, status)
   the passkey auth CWT, the DeviceCheck CWT and OIDC access tokens on code
   exchange *and* refresh) appends it to `arkavo_entitlements` while the
   account's Patreon snapshot shows an `active_patron` membership of
-  `PATREON_PUBLISHER_CAMPAIGN_ID` at a tier in `PATREON_PUBLISHER_TIER_IDS`,
-  and the account has no publishing suspension. Fails closed.
+  `PATREON_PUBLISHER_CAMPAIGN_ID` at a tier in `PATREON_PUBLISHER_TIER_IDS`
+  **or** a bound App Store Creator Membership is active (`app_store.rs`: a
+  non-revoked record of a configured product and environment, unexpired
+  counting any billing-retry grace), and the account has no publishing
+  suspension. One `get_publishing_state` read (the `credentials` row,
+  strongly consistent) yields the suspension and the App Store records, and
+  happens only when a source can grant. Fails closed.
 - Carried in `ArkavoUserClaims::derived_entitlements`, so
   `mint_registration_token` drops it (~99-year token), and
   `entitlements::validate_fqns` refuses to store it (never delegable to

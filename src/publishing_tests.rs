@@ -273,6 +273,308 @@ async fn feature_unset_or_non_qualifying_membership_grants_nothing() {
     assert!(f.claims().await.derived_entitlements.is_empty());
 }
 
+// ---- App Store Creator Membership ----
+
+mod app_store_source {
+    use super::*;
+    use crate::app_store::{AppStoreConfig, Environment};
+    use crate::db::{AppStoreRecord, GraceUpdate, StateOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PRODUCT: &str = "com.arkavo.ArkavoCreator.membership.monthly";
+
+    fn publish_count(derived: &[String]) -> usize {
+        derived
+            .iter()
+            .filter(|e| *e == ENTITLEMENT_CREATOR_PUBLISH)
+            .count()
+    }
+
+    /// A fresh user with the App Store feature configured and Patreon off
+    /// (no publisher config, no snapshot).
+    async fn app_store_only() -> Option<Fixture> {
+        let mut f = Fixture::new().await?;
+        f.state.publisher = Arc::new(None);
+        f.state.app_store = Arc::new(Some(AppStoreConfig::for_tests(Vec::new())));
+        f.patreon = PatreonState::new(
+            None,
+            None,
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None),
+        );
+        Some(f)
+    }
+
+    fn record(otid: &str, env: Environment, expires_at: i64, signed: i64) -> AppStoreRecord {
+        AppStoreRecord {
+            original_transaction_id: otid.into(),
+            transaction_id: Some(otid.into()),
+            product_id: PRODUCT.into(),
+            environment: env,
+            expires_at,
+            grace_expires_at: None,
+            revoked_at: None,
+            last_signed_at: signed,
+        }
+    }
+
+    async fn put(f: &Fixture, rec: &AppStoreRecord, grace: GraceUpdate) {
+        let out = f
+            .store
+            .put_app_store_state(&f.user_id, rec, grace)
+            .await
+            .unwrap();
+        assert_eq!(out, StateOutcome::Applied);
+    }
+
+    fn unique_otid() -> String {
+        Uuid::new_v4().as_u128().to_string()
+    }
+
+    #[tokio::test]
+    async fn app_store_only_member_gets_publish_without_patreon_config_or_snapshot() {
+        let Some(f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        // Nothing bound yet.
+        assert!(f.claims().await.derived_entitlements.is_empty());
+
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Production, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        let user = f.claims().await;
+        assert!(user.patreon.is_none());
+        assert_eq!(
+            user.derived_entitlements,
+            vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        );
+        // Derived, never stored.
+        assert_eq!(user.entitlements, f.stored);
+        assert!(
+            !f.store
+                .get_user_entitlements(&f.user_id)
+                .await
+                .unwrap()
+                .contains(&ENTITLEMENT_CREATOR_PUBLISH.to_string())
+        );
+        let auth = decode(
+            &crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap(),
+        );
+        assert!(has_publish(&auth));
+    }
+
+    #[tokio::test]
+    async fn expired_membership_grants_nothing() {
+        let Some(f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(
+                &unique_otid(),
+                Environment::Production,
+                now - 10,
+                now - 2_592_000,
+            ),
+            GraceUpdate::Keep,
+        )
+        .await;
+        assert!(f.claims().await.derived_entitlements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grace_period_still_grants() {
+        let Some(f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(
+                &unique_otid(),
+                Environment::Production,
+                now - 10,
+                now - 2_592_000,
+            ),
+            GraceUpdate::Set(Some(now + 3600)),
+        )
+        .await;
+        assert_eq!(
+            f.claims().await.derived_entitlements,
+            vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        );
+    }
+
+    /// Review Focus 4: a refund ends the entitlement at the very next mint,
+    /// although `expires_at` is still in the future.
+    #[tokio::test]
+    async fn refunded_membership_grants_nothing_at_next_mint() {
+        let Some(f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        let otid = unique_otid();
+        let mut rec = record(&otid, Environment::Production, now + 3600, now - 100);
+        put(&f, &rec, GraceUpdate::Keep).await;
+        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+
+        rec.revoked_at = Some(now);
+        rec.last_signed_at = now;
+        put(&f, &rec, GraceUpdate::Keep).await;
+        assert!(f.claims().await.derived_entitlements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn suspended_app_store_member_grants_nothing() {
+        let Some(f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Production, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        f.suspend().await;
+        assert!(f.claims().await.derived_entitlements.is_empty());
+        f.store
+            .lift_publishing_suspension(&f.user_id)
+            .await
+            .unwrap();
+        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn patreon_and_app_store_member_gets_one_fqn() {
+        let Some(mut f) = Fixture::new().await else {
+            return;
+        };
+        f.state.app_store = Arc::new(Some(AppStoreConfig::for_tests(Vec::new())));
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Production, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        assert_eq!(publish_count(&f.claims().await.derived_entitlements), 1);
+
+        // Patreon alone still grants once, with the App Store feature on and
+        // nothing bound to the account.
+        let g = Fixture::new().await.unwrap();
+        let mut state = g.state.clone();
+        state.app_store = f.state.app_store.clone();
+        let derived = crate::publishing::derived_entitlements(
+            &state,
+            Some(g.user_id),
+            Some(&qualifying_snapshot("consumer")),
+        )
+        .await;
+        assert_eq!(derived, vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sandbox_record_ignored_when_only_production_configured() {
+        let Some(mut f) = app_store_only().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Sandbox, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        // Sandbox is accepted by default (owner decision).
+        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+
+        let mut cfg = AppStoreConfig::for_tests(Vec::new());
+        cfg.environments = [Environment::Production].into_iter().collect();
+        f.state.app_store = Arc::new(Some(cfg));
+        assert!(f.claims().await.derived_entitlements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_read_error_fails_closed() {
+        let Some(mut f) = Fixture::new().await else {
+            return;
+        };
+        f.state.app_store = Arc::new(Some(AppStoreConfig::for_tests(Vec::new())));
+        let now = Utc::now().timestamp();
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Production, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        // Both sources would grant, and the read of the row fails.
+        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+        f.state.db_store = Arc::new(
+            f.store
+                .with_credentials_table(format!("missing-credentials-{}", Uuid::new_v4().simple())),
+        );
+        assert!(f.claims().await.derived_entitlements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn neither_source_configured_does_no_read() {
+        let Some(mut f) = Fixture::new().await else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        // A record that would be active if the feature were on.
+        put(
+            &f,
+            &record(&unique_otid(), Environment::Production, now + 3600, now),
+            GraceUpdate::Keep,
+        )
+        .await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        f.state.db_store = Arc::new(f.store.counting_get_items(reads.clone()));
+        let snap = qualifying_snapshot("consumer");
+
+        // Neither Patreon publishing nor the App Store configured.
+        f.state.publisher = Arc::new(None);
+        f.state.app_store = Arc::new(None);
+        let derived =
+            crate::publishing::derived_entitlements(&f.state, Some(f.user_id), Some(&snap)).await;
+        assert!(derived.is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        // Patreon configured but the membership does not qualify, App Store off.
+        f.state.publisher = Arc::new(Some(publisher_cfg()));
+        let mut lapsed = snap.clone();
+        lapsed.memberships[0].patron_status = Some("declined_patron".into());
+        let derived =
+            crate::publishing::derived_entitlements(&f.state, Some(f.user_id), Some(&lapsed)).await;
+        assert!(derived.is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        // A service account has no user id: no read even with the feature on.
+        f.state.app_store = Arc::new(Some(AppStoreConfig::for_tests(Vec::new())));
+        let derived = crate::publishing::derived_entitlements(&f.state, None, None).await;
+        assert!(derived.is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        // With a source that can grant, exactly one read replaces the old
+        // suspension read.
+        let derived =
+            crate::publishing::derived_entitlements(&f.state, Some(f.user_id), Some(&snap)).await;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        f.state.publisher = Arc::new(None);
+        let derived =
+            crate::publishing::derived_entitlements(&f.state, Some(f.user_id), None).await;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+}
+
 // ---- Admin endpoint ----
 
 fn router(state: AppState) -> Router {

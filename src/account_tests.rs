@@ -494,3 +494,42 @@ async fn a_deleted_accounts_agents_stop_at_once() {
     let (st, body) = p.mint(&agent).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
 }
+
+/// Review Focus 3: the sweep deletes the `appstore#` link, so the same
+/// subscription can be bound by another account afterwards.
+#[tokio::test]
+async fn sweep_frees_the_subscription_for_another_account() {
+    use crate::db::LinkOutcome;
+    let Some(p) = Plane::new().await else { return };
+    let app = router(&p);
+    let (a, cwt_a) = p.user(&[]).await;
+    let (b, _) = p.user(&[]).await;
+    let otid = Uuid::new_v4().as_u128().to_string();
+
+    assert_eq!(
+        p.store.bind_app_store_link(&otid, &a).await.unwrap(),
+        LinkOutcome::Bound
+    );
+    assert_eq!(
+        p.store.bind_app_store_link(&otid, &b).await.unwrap(),
+        LinkOutcome::BoundElsewhere
+    );
+
+    let (st, body) = delete_account(&app, &cwt_a).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+    crate::account::run_once(
+        &p.store,
+        &patreon_off(),
+        &crate::apple_tokens::AppleTokens::disabled(),
+        &a,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(p.store.app_store_link_owner(&otid).await.unwrap(), None);
+    assert_eq!(
+        p.store.bind_app_store_link(&otid, &b).await.unwrap(),
+        LinkOutcome::Bound
+    );
+    assert_eq!(p.store.app_store_link_owner(&otid).await.unwrap(), Some(b));
+}

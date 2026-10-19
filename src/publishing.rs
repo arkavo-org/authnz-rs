@@ -5,14 +5,17 @@
 //! assertion CWT, OIDC access token incl. refresh) gets it appended to
 //! `arkavo_entitlements` while all of these hold:
 //!
-//! 1. the feature is configured (`PATREON_PUBLISHER_CAMPAIGN_ID` and
-//!    `PATREON_PUBLISHER_TIER_IDS` both set);
-//! 2. the account's materialized Patreon snapshot (cached ≤ 5 min) lists a
-//!    membership of that campaign with `patron_status = active_patron` and
-//!    at least one currently entitled tier ID in the configured set — the
-//!    snapshot's own `campaign_id` (the campaign a creator *owns*) is never
-//!    consulted;
-//! 3. the account carries no publishing suspension.
+//! 1. a source qualifies, either one:
+//!    - Patreon: the feature is configured (`PATREON_PUBLISHER_CAMPAIGN_ID`
+//!      and `PATREON_PUBLISHER_TIER_IDS` both set) and the account's
+//!      materialized Patreon snapshot (cached ≤ 5 min) lists a membership of
+//!      that campaign with `patron_status = active_patron` and at least one
+//!      currently entitled tier ID in the configured set — the snapshot's own
+//!      `campaign_id` (the campaign a creator *owns*) is never consulted;
+//!    - App Store: the feature is configured (`APP_STORE_*`) and a
+//!      subscription record bound to the account is active
+//!      ([`app_store_active`]);
+//! 2. the account carries no publishing suspension.
 //!
 //! Every failure (Patreon down, deadline passed, DB error, malformed record)
 //! withholds the entitlement. It is never written to
@@ -24,6 +27,7 @@
 //! service CWT whose client is on `MODERATION_CLIENT_IDS`.
 
 use crate::AppState;
+use crate::app_store::{Environment, app_store_active};
 use crate::constants::{
     ENTITLEMENT_CREATOR_PUBLISH, SUSPENSION_REASON_MAX_LEN, SUSPENSION_REPORT_ID_MAX_LEN,
 };
@@ -120,43 +124,75 @@ pub(crate) fn qualifies(cfg: &PublisherConfig, snap: &ArkavoPatreon, now: i64) -
 }
 
 /// The entitlements derived for `user_id` at this mint (today: the
-/// creator-publishing entitlement or nothing). Checks run cheapest first —
-/// config, then the already-materialized snapshot, then one strongly
-/// consistent read of the suspension — so feature-off, unlinked and
-/// non-qualifying users cost no extra DynamoDB call. Fails closed.
+/// creator-publishing entitlement or nothing).
+///
+/// Two sources grant it, either one enough: a qualifying Patreon membership
+/// (`patreon_ok`: the feature is configured and the already-materialized
+/// snapshot qualifies) or an active App Store Creator Membership (the feature
+/// is configured and a record bound to the account is active, see
+/// [`app_store_active`]). Neither applies ⇒ no DynamoDB read at all.
+/// Otherwise one strongly consistent read of the `credentials` row yields the
+/// suspension and the App Store records together; a suspension withholds the
+/// entitlement whichever source granted it. The read happens only when a
+/// source can grant, so feature-off and non-qualifying users cost nothing
+/// extra. Any read error withholds the entitlement (fails closed). A Sandbox
+/// grant is logged with `env=Sandbox`.
 pub(crate) async fn derived_entitlements(
     app_state: &AppState,
     user_id: Option<Uuid>,
     snap: Option<&ArkavoPatreon>,
 ) -> Vec<String> {
-    let Some(cfg) = app_state.publisher.as_ref().as_ref() else {
+    let Some(user_id) = user_id else {
         return Vec::new();
     };
-    let (Some(user_id), Some(snap)) = (user_id, snap) else {
-        return Vec::new();
+    let now = Utc::now().timestamp();
+    let patreon_ok = match (app_state.publisher.as_ref().as_ref(), snap) {
+        (Some(cfg), Some(snap)) => qualifies(cfg, snap, now),
+        _ => false,
     };
-    if !qualifies(cfg, snap, Utc::now().timestamp()) {
+    let app_store_cfg = app_state.app_store.as_ref().as_ref();
+    if !patreon_ok && app_store_cfg.is_none() {
         return Vec::new();
     }
-    match app_state.db_store.get_publishing_suspension(&user_id).await {
-        Ok(Some(None)) => vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()],
-        Ok(Some(Some(_))) => {
-            info!(
-                "Publishing entitlement withheld for user {}: publishing is suspended",
-                user_id
-            );
-            Vec::new()
-        }
-        Ok(None) => Vec::new(),
+    let state = match app_state.db_store.get_publishing_state(&user_id).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return Vec::new(),
         Err(e) => {
             warn!(
-                "Publishing suspension lookup failed for user {}: {} — failing closed (no \
+                "Publishing state lookup failed for user {}: {} — failing closed (no \
                  publishing entitlement)",
                 user_id, e
             );
-            Vec::new()
+            return Vec::new();
+        }
+    };
+    let app_store_ok =
+        app_store_cfg.is_some_and(|cfg| app_store_active(cfg, &state.app_store, now));
+    if !patreon_ok && !app_store_ok {
+        return Vec::new();
+    }
+    if state.suspension.is_some() {
+        info!(
+            "Publishing entitlement withheld for user {}: publishing is suspended",
+            user_id
+        );
+        return Vec::new();
+    }
+    // Every Sandbox grant is visible (TestFlight and App Review buy there).
+    if let Some(cfg) = app_store_cfg.filter(|_| app_store_ok) {
+        let sandbox = state.app_store.iter().any(|r| {
+            r.environment == Environment::Sandbox
+                && app_store_active(cfg, std::slice::from_ref(r), now)
+        });
+        if sandbox {
+            info!(
+                "Publishing entitlement granted for user {} from an App Store membership \
+                 env=Sandbox",
+                user_id
+            );
         }
     }
+    vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
 }
 
 // --------- Admin: publishing suspension ---------

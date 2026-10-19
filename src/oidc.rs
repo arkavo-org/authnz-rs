@@ -2975,6 +2975,7 @@ pub(crate) mod tests {
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
             publisher: Arc::new(None),
+            app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -3099,6 +3100,7 @@ pub(crate) mod tests {
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
             publisher: Arc::new(None),
+            app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };

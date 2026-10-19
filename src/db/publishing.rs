@@ -10,7 +10,7 @@ use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const ATTR: &str = "publishing_suspension";
+pub(super) const ATTR: &str = "publishing_suspension";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PublishingSuspension {
@@ -64,7 +64,7 @@ fn to_attr(sus: &PublishingSuspension) -> AttributeValue {
 
 /// Parse the stored map. A malformed record is an error, not "not
 /// suspended": the caller fails closed on it.
-fn from_attr(v: &AttributeValue) -> Result<PublishingSuspension, DynamoDBError> {
+pub(super) fn from_attr(v: &AttributeValue) -> Result<PublishingSuspension, DynamoDBError> {
     let m = v
         .as_m()
         .map_err(|_| DynamoDBError::Internal(format!("{ATTR} is not a map")))?;
