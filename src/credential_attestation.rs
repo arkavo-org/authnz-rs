@@ -250,6 +250,50 @@ mod tests {
         (sk, vk, sample(cred.verifying_key()))
     }
 
+    /// The fixed inputs of the golden vector (shared with tdf-iroh-s3's
+    /// fixture): IdP key scalar 0x42 * 32, credential key scalar 0x07 * 32.
+    fn golden() -> (SigningKey, CredentialAttestation) {
+        let sk = SigningKey::from_slice(&[0x42; 32]).unwrap();
+        let cred = SigningKey::from_slice(&[0x07; 32]).unwrap();
+        let mut a = sample(cred.verifying_key());
+        a.credential_id = (0u8..16).collect();
+        (sk, a)
+    }
+
+    const GOLDEN_KID: &[u8] = b"arkavo-fixture-kid-1";
+
+    /// The exact bytes the encoder produces for [`golden`]: ES256 here is
+    /// deterministic (RFC 6979), so any change to the encoding shows up as a
+    /// diff. tdf-iroh-s3 verifies this same vector; changing it breaks them.
+    const GOLDEN_ATTESTATION: &str = "d2845846a3012603782a6170706c69636174696f6e2f61726b61766f2d706173736b65792d63726564656e7469616c2b63626f72045461726b61766f2d666978747572652d6b69642d31a0590100a763747970781961726b61766f2d706173736b65792d63726564656e7469616c63697373781b68747470733a2f2f6964656e746974792e61726b61766f2e6e657463737562782430613162326333642d303030302d343030302d383030302d3030303030303030303030316c63726564656e7469616c496450000102030405060708090a0b0c0d0e0f697075626c69634b6579a4010220012158201e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e225820a46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a36472704964736964656e746974792e61726b61766f2e6e6574636961741a68e778005840f568be35ab831986618bee8fc0b863cbb02169a3b8e870cc4a02a96982387707e21a8551a68a3f9c7349042b24bde95cba23692298a8df9760407c49d5821557";
+
+    #[test]
+    fn golden_vector() {
+        let (sk, a) = golden();
+        let bytes = mint(&a, &sk, GOLDEN_KID).unwrap();
+        assert_eq!(hex::encode(&bytes), GOLDEN_ATTESTATION);
+        let issuer = sk.verifying_key().to_encoded_point(false);
+        assert_eq!(
+            hex::encode(issuer.as_bytes()),
+            "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90af\
+             d0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d"
+        );
+        let parsed = verify(
+            &hex::decode(GOLDEN_ATTESTATION).unwrap(),
+            sk.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(parsed, a);
+        assert_eq!(
+            hex::encode(parsed.x),
+            "1e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e"
+        );
+        assert_eq!(
+            hex::encode(parsed.y),
+            "a46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a3"
+        );
+    }
+
     #[test]
     fn roundtrip() {
         let (sk, vk, a) = keys();
