@@ -11,6 +11,7 @@ mod account;
 mod agent_state;
 mod apple_tokens;
 mod guardians;
+mod passkeys;
 mod publishing;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
 #[cfg(test)]
@@ -20,6 +21,7 @@ pub use agent_state::{
     SwarmWrite,
 };
 pub use guardians::Guardian;
+pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 
 #[derive(Debug, Serialize, Deserialize)]

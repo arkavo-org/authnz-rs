@@ -18,23 +18,23 @@ const ORIGIN: &str = "https://identity.arkavo.net";
 
 /// A registered account, with the session that registered it and the
 /// software passkey that holds its credential.
-struct Registered {
-    ceremony: Ceremony,
+pub(crate) struct Registered {
+    pub(crate) ceremony: Ceremony,
     auth: WebauthnAuthenticator<SoftPasskey>,
-    user_id: Uuid,
-    cred: Base64UrlSafeData,
+    pub(crate) user_id: Uuid,
+    pub(crate) cred: Base64UrlSafeData,
     /// The `X-Auth-Token` its `POST /register` answered with.
-    token: String,
+    pub(crate) token: String,
 }
 
 /// A username no other run has used.
-fn unique_name() -> String {
+pub(crate) fn unique_name() -> String {
     format!("signin-{}", &Uuid::new_v4().simple().to_string()[..12])
 }
 
 /// Register `username` through the ticketed ceremony, or `None` without
 /// DynamoDB Local.
-async fn registered_account(username: &str) -> Option<Registered> {
+pub(crate) async fn registered_account(username: &str) -> Option<Registered> {
     let mut ceremony = Ceremony::begin().await?;
     ceremony.username = username.to_string();
     let mut auth = WebauthnAuthenticator::new(SoftPasskey::new(true));

@@ -28,6 +28,13 @@ pub const SESSION_TIMEOUT_SECONDS: i64 = 600;
 /// OIDC issuer URL (default; can be overridden via OIDC_ISSUER env var)
 pub const DEFAULT_OIDC_ISSUER: &str = "https://identity.arkavo.net";
 
+/// WebAuthn relying party id. Every passkey is scoped to it, and a passkey
+/// credential attestation (#104) names it as `rpId`.
+pub const WEBAUTHN_RP_ID: &str = "identity.arkavo.net";
+
+/// The one origin WebAuthn ceremonies are accepted from.
+pub const WEBAUTHN_RP_ORIGIN: &str = "https://identity.arkavo.net";
+
 /// OIDC ID token lifetime in seconds (1 hour)
 pub const ID_TOKEN_LIFETIME_SECONDS: i64 = 3600;
 
