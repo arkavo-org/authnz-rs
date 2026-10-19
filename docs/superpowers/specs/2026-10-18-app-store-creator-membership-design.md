@@ -136,8 +136,9 @@ Creator meets App Store guideline 3.1.3(b) (Creator#68). The owner skipped the d
   same pattern as `IrohPublisher`'s own HTTP), not ArkavoKit. That keeps an ArkavoKit tag off the
   1.1 critical path.
 - **Streamlined Purchasing.** Turn it off in App Store Connect, so every purchase starts in
-  Creator and carries `appAccountToken`. It's reversible, and the client-post binding still covers
-  the no-token case.
+  Creator and carries `appAccountToken`. This is a hard precondition: identity refuses a
+  transaction without `appAccountToken` (422), so there is no safety net for purchases that start
+  outside Creator.
 
 ### Non-goals
 
@@ -165,7 +166,8 @@ Creator meets App Store guideline 3.1.3(b) (Creator#68). The owner skipped the d
   - Verify: `POST /app-store/notifications` with `{}` answers 400, not 404.
 - **R3.** In App Store Connect → App Information → App Store Server Notifications, set Version 2
   with both the Production and Sandbox URL `https://identity.arkavo.net/app-store/notifications`.
-  Then turn Streamlined Purchasing off.
+  Then turn Streamlined Purchasing off. This must happen before any real sale. Last, run "Request a
+  Test Notification" for Production: a 400 means Apple's TEST payload lacks `appAppleId`.
 - **R4.** Creator beta (1.1-beta.14), then on TestFlight:
   - buy in Sandbox;
   - check Settings shows Active;
