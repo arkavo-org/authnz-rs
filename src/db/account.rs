@@ -340,19 +340,30 @@ impl DynamoDBStore {
     /// and that meets `also` (a condition expression), if given.
     /// `identity_links` and `device_bindings` have no index on `user_id`, so
     /// this is a paginated scan; each delete is conditional on the row still
-    /// naming the account. Returns how many rows were removed.
+    /// naming the account. `skip` (a filter expression and its one value)
+    /// leaves rows out of both the scan and the deletes. Returns how many
+    /// rows were removed.
     async fn delete_rows_owned_by(
         &self,
         table: &str,
         key: &str,
         user_id: &Uuid,
         also: Option<&str>,
+        skip: Option<(&str, (&str, AttributeValue))>,
     ) -> Result<u32, DynamoDBError> {
+        let mut filter = "user_id = :uid".to_string();
+        if let Some((f, _)) = skip {
+            filter = format!("{filter} AND {f}");
+        }
         let condition = match also {
-            Some(c) => format!("user_id = :uid AND {c}"),
-            None => "user_id = :uid".to_string(),
+            Some(c) => format!("{filter} AND {c}"),
+            None => filter.clone(),
         };
         let uid = s(&user_id.to_string());
+        let mut values = HashMap::from([(":uid".to_string(), uid.clone())]);
+        if let Some((_, (name, v))) = skip {
+            values.insert(name.to_string(), v);
+        }
         let mut removed = 0;
         let mut start = None;
         loop {
@@ -360,10 +371,10 @@ impl DynamoDBStore {
                 .client
                 .scan()
                 .table_name(table)
-                .filter_expression("user_id = :uid")
+                .filter_expression(&filter)
                 .projection_expression("#k")
                 .expression_attribute_names("#k", key)
-                .expression_attribute_values(":uid", uid.clone())
+                .set_expression_attribute_values(Some(values.clone()))
                 .set_exclusive_start_key(start)
                 .send()
                 .await
@@ -376,7 +387,7 @@ impl DynamoDBStore {
                     .table_name(table)
                     .key(key, k.clone())
                     .condition_expression(&condition)
-                    .expression_attribute_values(":uid", uid.clone())
+                    .set_expression_attribute_values(Some(values.clone()))
                     .send()
                     .await;
                 match result {
@@ -398,7 +409,8 @@ impl DynamoDBStore {
     /// Remove every Apple, Google and Patreon identity link of the account,
     /// except an Apple link that holds a token (`db::apple_tokens`): that one
     /// stays until Apple has revoked the token, and the sweep's last step
-    /// deletes it.
+    /// deletes it. Passkey index rows (`db::passkeys`) are never deleted:
+    /// [`Self::revoke_passkey_links_of`] marks them revoked.
     pub async fn delete_identity_links_of(&self, user_id: &Uuid) -> Result<u32, DynamoDBError> {
         let table = self.identity_links_table.clone();
         self.delete_rows_owned_by(
@@ -406,6 +418,10 @@ impl DynamoDBStore {
             "link_pk",
             user_id,
             Some(super::apple_tokens::HOLDS_NO_TOKEN),
+            Some((
+                super::passkeys::NOT_PASSKEY,
+                super::passkeys::not_passkey_value(),
+            )),
         )
         .await
     }
@@ -413,7 +429,7 @@ impl DynamoDBStore {
     /// Remove every App Attest device binding of the account.
     pub async fn delete_device_bindings_of(&self, user_id: &Uuid) -> Result<u32, DynamoDBError> {
         let table = self.device_bindings_table.clone();
-        self.delete_rows_owned_by(&table, "device_id", user_id, None)
+        self.delete_rows_owned_by(&table, "device_id", user_id, None, None)
             .await
     }
 

@@ -418,7 +418,8 @@ appraisal, status)
 - **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` deletes
   the handle, device bindings, identity links (scan: no `user_id` GSI; an
   Apple link holding a token is left for the last step) and the
-  Patreon token row (Patreon has no revocation endpoint), invalidates the
+  Patreon token row (Patreon has no revocation endpoint), revokes (never
+  deletes) the passkey index rows (#104), invalidates the
   Patreon cache, revokes agent delegations (+ chain cascade; also done in the
   request itself) and Guardians and blanks their `name` / `delegator_username`
   (rows stay: a revoked or
@@ -438,6 +439,31 @@ appraisal, status)
 - `GET /account/deletions/:id`: no token; the id is `<user_id>.<128-bit hex>`,
   compared constant-time. `pending | failed | completed`. Contract:
   [docs/account-deletion.md](docs/account-deletion.md).
+
+**passkeys.rs** - Passkey credential attestations (#104, catalog v2)
+- `POST /passkeys/credential-attestation` (passkey auth CWT, body
+  `{"credentialId": b64url}`): `{attestation}` = COSE_Sign1 (tag 18, never
+  61), ES256 under the CWT kid, protected `content type`
+  `application/arkavo-passkey-credential+cbor`, payload a text-keyed map of
+  exactly `typ` (`arkavo-passkey-credential`), `iss`, `sub` (bare UUID, as in
+  the passkey CWT), `credentialId` (bytes), `publicKey` (COSE_Key kty/crv/x/y
+  only), `rpId`, `iat`. **No `exp`.** 404 for a credential the account does
+  not hold or that was revoked. Format and verifier in the lib module
+  `credential_attestation.rs`; contract
+  [docs/passkey-credential-attestation.md](docs/passkey-credential-attestation.md),
+  which tdf-iroh-s3, Creator and arkavo-ios verify against: change it only
+  with them.
+- `cwt::verify` refuses any protected `content type` and any `typ` claim, so
+  an attestation never passes as a token. Keep both.
+- `GET /passkeys/credentials/:id/status` (public, `no-store`):
+  `{sub, revoked, revokedAt?}`; 404 if never attested. Revoked = the index
+  row's `revoked_at`, or the account is a tombstone (`revokedAt` =
+  `deleted_at`), or the account no longer holds the credential.
+- Index: `identity_links` row `passkey#<b64url id>` (`db/passkeys.rs`),
+  written on first attestation, never deleted; the deletion sweep skips it in
+  the link deletion and sets `revoked_at` = `deleted_at`. A future passkey
+  removal route must revoke the row, not delete it. The signing key must stay
+  in `/.well-known/cose-keys` while its attestations should verify.
 
 **entities.rs** - Service-gated entity lookup (spec §2.4)
 - `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace

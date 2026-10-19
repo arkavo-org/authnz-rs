@@ -1057,6 +1057,9 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     Some(i64::try_from(i128::from(n)).map_err(|_| CwtError::Malformed)?)
             }
             (Value::Text(s), _) if s == "auth_time" => return Err(CwtError::Malformed),
+            // A `typ` marks a signed record that is not a token (a passkey
+            // credential attestation, #104). No CWT carries one.
+            (Value::Text(s), _) if s == "typ" => return Err(CwtError::Malformed),
             _ => {} // Ignore unknown claims (forward-compat).
         }
     }
@@ -1097,6 +1100,12 @@ pub fn verify(
     match sign1.protected.header.alg {
         Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
         _ => return Err(CwtError::UnsupportedAlg),
+    }
+    // No CWT minted here carries a content type; a passkey credential
+    // attestation (`credential_attestation`) always does. Refusing it keeps
+    // an attestation from ever passing as a token (#104).
+    if sign1.protected.header.content_type.is_some() {
+        return Err(CwtError::Malformed);
     }
 
     // Verify signature.

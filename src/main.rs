@@ -74,6 +74,9 @@ mod google_signin;
 mod guardian;
 mod identity;
 mod oidc;
+mod passkeys;
+#[cfg(test)]
+mod passkeys_tests;
 mod patreon;
 mod publishing;
 #[cfg(test)]
@@ -466,8 +469,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create the Webauthn instance
-    let rp_id = "identity.arkavo.net";
-    let rp_origin = Url::parse("https://identity.arkavo.net")
+    let rp_id = crate::constants::WEBAUTHN_RP_ID;
+    let rp_origin = Url::parse(crate::constants::WEBAUTHN_RP_ORIGIN)
         .map_err(|e| format!("Failed to parse RP origin URL: {}", e))?;
     let builder = WebauthnBuilder::new(rp_id, &rp_origin)
         .map_err(|e| format!("Failed to create WebAuthn builder: {}", e))?;
@@ -718,6 +721,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
+        // Passkey credential attestations (#104): the IdP vouches that a
+        // passkey belongs to an account (catalog v2 pointer signing), and
+        // says publicly whether it has been revoked.
+        .route(
+            "/passkeys/credential-attestation",
+            post(passkeys::issue_credential_attestation),
+        )
+        .route(
+            "/passkeys/credentials/:credential_id/status",
+            get(passkeys::credential_status),
+        )
         .route("/account", axum::routing::delete(account::delete_account))
         .route("/account/deletions/:id", get(account::get_deletion_status))
         // Entity lookup (service CWT required). Spec §2.4.

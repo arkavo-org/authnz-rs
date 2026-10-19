@@ -12,6 +12,7 @@ mod agent_state;
 mod app_store;
 mod apple_tokens;
 mod guardians;
+mod passkeys;
 mod publishing;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
 #[cfg(test)]
@@ -22,6 +23,7 @@ pub use agent_state::{
 };
 pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, StateOutcome};
 pub use guardians::Guardian;
+pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 
 #[derive(Debug, Serialize, Deserialize)]
