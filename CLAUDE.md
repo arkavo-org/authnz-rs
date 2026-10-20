@@ -353,7 +353,10 @@ appraisal, status)
   the passkey auth CWT, the DeviceCheck CWT and OIDC access tokens on code
   exchange *and* refresh) appends it to `arkavo_entitlements` while the
   account's Patreon snapshot shows an `active_patron` membership of
-  `PATREON_PUBLISHER_CAMPAIGN_ID` at a tier in `PATREON_PUBLISHER_TIER_IDS`
+  `PATREON_PUBLISHER_CAMPAIGN_ID` at a tier in `PATREON_PUBLISHER_TIER_IDS`,
+  **or** the snapshot's owned campaign (Patreon's answer, or the owner
+  fallback's stored one) *is* `PATREON_PUBLISHER_CAMPAIGN_ID` (Arkavo's own
+  account: Patreon does not let a creator pledge to itself),
   **or** a bound App Store Creator Membership is active (`app_store.rs`: a
   non-revoked record of a configured product and environment, unexpired
   counting any billing-retry grace), and the account has no publishing
