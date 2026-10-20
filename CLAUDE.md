@@ -469,6 +469,37 @@ appraisal, status)
   removal route must revoke the row, not delete it. The signing key must stay
   in `/.well-known/cose-keys` while its attestations should verify.
 
+**session.rs** - Passkey session renewal (#108)
+- A session lets a client renew its passkey auth CWT without a new passkey
+  prompt: at most `SESSION_MAX_SECONDS` (24 h) after the passkey assertion,
+  and only while renewals arrive within `SESSION_IDLE_SECONDS` (1 h) of each
+  other (NIST SP 800-63B-4 AAL2). Contract:
+  [docs/session-renewal.md](docs/session-renewal.md).
+- `POST /session`: an *original* passkey auth CWT (no `auth_time`, assertion
+  ≤ `SESSION_OPEN_MAX_AUTH_AGE_SECONDS` = 300 s) plus a device public key
+  (65-byte X9.63 P-256, the client's Secure Enclave key) and its signature
+  over the open message. One session per token (`session_id` derives from
+  the token's `cti`; 409 on a second open).
+- `POST /session/refresh`: the device-key signature over
+  `session_id` + the current single-use credential (`<generation>.<secret>`).
+  The proof is checked **before** the row is touched, then idle, absolute and
+  account liveness, then one conditional `UpdateItem` on the generation and
+  hash rotates the credential. A presented generation below the stored one
+  is reuse (RFC 9700): the session is deleted. Re-reads entitlements and the
+  publishing suspension (`oidc::arkavo_user_claims`); a suspension does not
+  end the session. Every refusal is 401 `{"error":"session_ended","reason"}`.
+- `POST /session/signout`: device-key signature; deletes the row (204,
+  idempotent).
+- **A renewed token carries `auth_time` = the session's assertion time** and
+  `exp` ≤ the 24 h deadline. Every "recent passkey assertion" check reads
+  `cwt::passkey_assertion_time` (`auth_time` else `iat`): enrollment,
+  `oidc::webauthn_auth_time`, `agent::verify_passkey_auth_token` (delegation,
+  recovery, account deletion). A new freshness check must use it, never `iat`.
+- Rows: `identity_links` `session#<id>`, `provider = session`
+  (`db/session.rs`); `expires_at` is written for a future TTL. The deletion
+  sweep's link step removes them.
+- Signatures are raw r‖s (64 bytes), never DER.
+
 **entities.rs** - Service-gated entity lookup (spec §2.4)
 - `GET /entities/:id`: Service-CWT gated; resolves entity by id namespace
 - Id namespaces: `arkavo:<uuid>` (person), `did:key:…` (agent), `device:<key_id>` (device)
@@ -614,7 +645,12 @@ appraisal, status)
 
 When modifying token lifetimes, update these in authn.rs:
 - Registration token: `chrono::Duration::weeks(5148)` (~99 years)
-- Authentication token: `chrono::Duration::hours(1)`
+- Authentication token: `PASSKEY_SESSION_TOKEN_SECONDS` (3600 s; becomes
+  900 s once clients renew, #108). Used only by `mint_auth_token` and the
+  session renewal; DeviceCheck keeps `AUTH_TOKEN_HOURS`.
+- Session: `SESSION_IDLE_SECONDS` (3600), `SESSION_MAX_SECONDS` (86400);
+  `PASSKEY_SESSION_TOKEN_SECONDS <= SESSION_IDLE_SECONDS` is asserted at
+  compile time, or a session dies before its first renewal is due.
 - Session timeout: `Duration::seconds(600)` (10 minutes)
 - Passkey enrollment freshness: `ENROLLMENT_TOKEN_MAX_AGE_SECONDS` (300s).
   Must stay below the auth token lifetime — asserted at compile time in
