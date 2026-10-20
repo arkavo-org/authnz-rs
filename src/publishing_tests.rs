@@ -246,6 +246,35 @@ async fn suspension_withholds_publish_until_lifted() {
     );
 }
 
+/// The owner of Arkavo's campaign (no membership: Patreon does not let it
+/// pledge to itself) publishes through the real mint path, and a suspension
+/// still withholds it.
+#[tokio::test]
+async fn the_publisher_campaign_owner_publishes_unless_suspended() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let mut owner = qualifying_snapshot("creator");
+    owner.campaign_id = Some(ARKAVO_CAMPAIGN.into());
+    owner.memberships.clear();
+    f.patreon = patreon_with(f.user_id, &owner).await;
+
+    let user = f.claims().await;
+    assert_eq!(
+        user.derived_entitlements,
+        vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+    );
+    let auth =
+        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+    assert!(has_publish(&auth), "auth CWT must carry it");
+
+    f.suspend().await;
+    assert!(
+        f.claims().await.derived_entitlements.is_empty(),
+        "suspended ⇒ none"
+    );
+}
+
 #[tokio::test]
 async fn feature_unset_or_non_qualifying_membership_grants_nothing() {
     let Some(mut f) = Fixture::new().await else {

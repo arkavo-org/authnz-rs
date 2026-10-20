@@ -8,17 +8,22 @@
 //! 1. a source qualifies, either one:
 //!    - Patreon: the feature is configured (`PATREON_PUBLISHER_CAMPAIGN_ID`
 //!      and `PATREON_PUBLISHER_TIER_IDS` both set) and the account's
-//!      materialized Patreon snapshot (cached ≤ 5 min) lists a membership of
-//!      that campaign with `patron_status = active_patron` and at least one
-//!      currently entitled tier ID in the configured set — the snapshot's own
-//!      `campaign_id` (the campaign a creator *owns*) is never consulted;
+//!      materialized Patreon snapshot (cached ≤ 5 min) either lists a
+//!      membership of that campaign with `patron_status = active_patron` and
+//!      at least one currently entitled tier ID in the configured set, or
+//!      *owns* that campaign (its own `campaign_id`, which Patreon reports
+//!      per #99). The owner is Arkavo's own account: Patreon does not let a
+//!      creator pledge to its own campaign, so membership can never qualify
+//!      it. Owning any other campaign grants nothing;
 //!    - App Store: the feature is configured (`APP_STORE_*`) and a
 //!      subscription record bound to the account is active
 //!      ([`app_store_active`]);
 //! 2. the account carries no publishing suspension.
 //!
 //! Every failure (Patreon down, deadline passed, DB error, malformed record)
-//! withholds the entitlement. It is never written to
+//! withholds the entitlement, with one exception: while Patreon is
+//! unreachable an owner's fallback snapshot keeps its stored owned campaign,
+//! so the publisher campaign's owner still qualifies. It is never written to
 //! `credentials.entitlements` ([`crate::entitlements::validate_fqns`]
 //! refuses it), so it cannot be delegated to agents, does not appear in
 //! `GET /entities`, and is dropped from the ~99-year registration token.
@@ -110,11 +115,19 @@ impl PublisherConfig {
     }
 }
 
-/// Whether a materialized snapshot qualifies under `cfg`. Pure: membership
-/// only — the suspension check is separate ([`derived_entitlements`]).
+/// Whether a materialized snapshot qualifies under `cfg`: it owns the
+/// publisher campaign, or is an active patron of it at a qualifying tier.
+/// Pure — the suspension check is separate ([`derived_entitlements`]).
+///
+/// The owned `campaign_id` is Patreon's answer at materialization, or, in
+/// the owner fallback while Patreon is unreachable, the one stored from the
+/// last answer; a client cannot set it.
 pub(crate) fn qualifies(cfg: &PublisherConfig, snap: &ArkavoPatreon, now: i64) -> bool {
     if snap.cache_expires_at < now {
         return false;
+    }
+    if snap.campaign_id.as_deref() == Some(cfg.campaign_id.as_str()) {
+        return true;
     }
     snap.memberships.iter().any(|m| {
         m.campaign_id == cfg.campaign_id
@@ -540,13 +553,30 @@ mod tests {
         assert!(!qualifies(&cfg(), &free_follower, now()));
     }
 
-    #[test]
-    fn owning_the_campaign_is_not_membership() {
-        // Staff linked as the *creator* of Arkavo's campaign own it but are
-        // not its patrons; the snapshot's top-level campaign_id is ignored.
+    fn owner_of(campaign: &str) -> ArkavoPatreon {
         let mut s = snap(vec![]);
         s.role = "creator".into();
-        s.campaign_id = Some("arkavo-camp".into());
+        s.campaign_id = Some(campaign.into());
+        s
+    }
+
+    #[test]
+    fn owning_the_publisher_campaign_qualifies() {
+        // Arkavo's own account owns the campaign and cannot pledge to it.
+        assert!(qualifies(&cfg(), &owner_of("arkavo-camp"), now()));
+    }
+
+    #[test]
+    fn owning_another_campaign_does_not_qualify() {
+        assert!(!qualifies(&cfg(), &owner_of("other-camp"), now()));
+        // Nor does a membership-less consumer snapshot.
+        assert!(!qualifies(&cfg(), &snap(vec![]), now()));
+    }
+
+    #[test]
+    fn stale_owner_snapshot_does_not_qualify() {
+        let mut s = owner_of("arkavo-camp");
+        s.cache_expires_at = now() - 1;
         assert!(!qualifies(&cfg(), &s, now()));
     }
 

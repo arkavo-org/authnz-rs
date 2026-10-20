@@ -25,16 +25,22 @@ The entitlement is **computed when a token is minted, and never stored**.
 - **Granted when all of these hold:**
   - at least one source qualifies:
     - **Patreon**: the feature is configured, and the account's Patreon
-      snapshot lists a membership whose `campaign_id` is
+      snapshot either lists a membership whose `campaign_id` is
       `PATREON_PUBLISHER_CAMPAIGN_ID`, whose `patron_status` is
       `active_patron`, and whose currently entitled tier IDs include at least
-      one ID from `PATREON_PUBLISHER_TIER_IDS`; or
+      one ID from `PATREON_PUBLISHER_TIER_IDS`, or **owns**
+      `PATREON_PUBLISHER_CAMPAIGN_ID` (below); or
     - **App Store**: the feature is configured (`APP_STORE_*`) and a
       subscription record bound to the account is active (below);
   - the account has no publishing suspension.
 
-  Only memberships count. A staff account linked as the *creator* of Arkavo's
-  campaign owns that campaign but is not a patron of it, so it does not qualify.
+  **The publisher campaign's owner qualifies** (0.21.1). That is Arkavo's own
+  account, linked as the *creator* of the campaign: Patreon does not let a
+  creator pledge to its own campaign, so no membership could ever qualify it.
+  The owned campaign is the one Patreon reports (`campaign_id` on the
+  snapshot, #99), or, while Patreon is unreachable, the one stored from its
+  last answer (the 60 s owner fallback below). Owning any *other* campaign
+  grants nothing, and a suspension withholds it as it does for a member.
   The two sources are independent: an account with no Patreon link, or with
   Patreon not configured at all, still gets the entitlement from an active App
   Store membership.
@@ -183,7 +189,8 @@ memberships.
 
 - A link whose stored `patreon_tokens.scopes` lacks that scope gets no
   memberships. An owner's snapshot still carries the owned campaign, so it
-  never qualifies. The creator must re-link (`POST /oauth/patreon/link`), and
+  qualifies only if that campaign is `PATREON_PUBLISHER_CAMPAIGN_ID`. The
+  creator must re-link (`POST /oauth/patreon/link`), and
   the app must request `identity.memberships` in the authorize step.
 - An empty `scopes` value (not recorded) is still queried.
 - If the creator fetch fails, or misses the 3 s mint deadline, the creator
