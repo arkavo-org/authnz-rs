@@ -36,8 +36,8 @@ use crate::agent_state::{AppraisalConfig, owner_appraisal_deadline, validate_lab
 use crate::constants::{
     AGENT_CHALLENGE_TTL_SECONDS, AGENT_DELEGATION_DAYS, AGENT_NAME_MAX_LEN,
     AGENT_SHORT_LIVED_TOKEN_MINUTES, AGENT_STATUS_LEASE_SECONDS, AGENT_TOKEN_MINUTES_MAX,
-    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
-    MAX_AGENTS_PER_USER, MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
+    AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS, AGENTS_DELEGATE_SCOPE, MAX_AGENTS_PER_USER,
+    MAX_DELEGATION_DEPTH, SWARM_ID_MAX_LEN,
 };
 use crate::cwt;
 use crate::db::{
@@ -322,6 +322,16 @@ pub(crate) fn verify_passkey_auth_token(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(Uuid, i64), AgentError> {
+    let (user_id, claims) = verify_passkey_auth_claims(app_state, headers)?;
+    Ok((user_id, cwt::passkey_assertion_time(&claims)))
+}
+
+/// [`verify_passkey_auth_token`]'s checks, returning the subject and the
+/// verified claims.
+pub(crate) fn verify_passkey_auth_claims(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, cwt::ArkavoClaims), AgentError> {
     let token = headers
         .get("X-Auth-Token")
         .ok_or(AgentError::MissingToken)?
@@ -342,23 +352,27 @@ pub(crate) fn verify_passkey_auth_token(
     // `aud = "arkavo"` alone does not identify a passkey auth CWT: an OIDC
     // access token for a client (or platform audience) named "arkavo" carries
     // it too, and would otherwise act as the owner here with a refreshable,
-    // never-renewed `auth_time`. `authn::mint_auth_token` never sets `scope`
-    // or `auth_time`; every access token carries `scope`.
-    if claims.custom.scope.is_some() || claims.custom.auth_time.is_some() {
+    // never-renewed `auth_time`. Passkey auth CWTs never carry `scope`; every
+    // user access token does (the code and refresh grants always set it).
+    // The one that does not, `client_credentials`, cannot reach here: its
+    // `sub` is `client:<id>`, not a UUID, and a client_id or platform
+    // audience of "arkavo" fails startup. `auth_time` is allowed: a renewed
+    // passkey token carries it (#108), and it is what the age is read from.
+    if claims.custom.scope.is_some() {
         return Err(AgentError::Unauthorized(
             "X-Auth-Token must be a passkey auth CWT".into(),
         ));
     }
 
     let lifetime = claims.exp.saturating_sub(claims.iat);
-    let max_auth = AUTH_TOKEN_HOURS * 3600 + cwt::DEFAULT_SKEW_SECS;
+    let max_auth = crate::constants::PASSKEY_SESSION_TOKEN_SECONDS + cwt::DEFAULT_SKEW_SECS;
     if lifetime > max_auth {
         return Err(AgentError::Unauthorized(
             "delegator token is not a short-lived auth CWT".into(),
         ));
     }
 
-    Ok((user_id_from_claims(&claims)?, claims.iat))
+    Ok((user_id_from_claims(&claims)?, claims))
 }
 
 /// The operator authorizing an agent: a passkey auth CWT in `X-Auth-Token`

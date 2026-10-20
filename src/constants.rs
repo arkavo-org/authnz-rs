@@ -11,6 +11,27 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// Lifetime of the passkey auth CWT (`POST /authenticate`) and of a renewed
+/// one (`POST /session/refresh`), in seconds. Becomes 900 once clients renew
+/// (#108 rollout order); DeviceCheck keeps [`AUTH_TOKEN_HOURS`].
+pub const PASSKEY_SESSION_TOKEN_SECONDS: i64 = 3600;
+
+/// A session ends when no renewal arrives for this long (#108; NIST SP
+/// 800-63B-4 AAL2 inactivity timeout).
+pub const SESSION_IDLE_SECONDS: i64 = 3600;
+
+/// A session ends this long after the passkey assertion that opened it, however
+/// often it is renewed (#108; AAL2 overall reauthentication timeout).
+pub const SESSION_MAX_SECONDS: i64 = 86_400;
+
+/// How old the passkey assertion behind `POST /session`'s token may be.
+pub const SESSION_OPEN_MAX_AUTH_AGE_SECONDS: i64 = 300;
+
+// A token outliving the idle window would let a session die before its first
+// renewal is due.
+const _: () = assert!(PASSKEY_SESSION_TOKEN_SECONDS <= SESSION_IDLE_SECONDS);
+const _: () = assert!(SESSION_IDLE_SECONDS < SESSION_MAX_SECONDS);
+
 /// `aud` of Arkavo-issued passkey auth and registration CWTs. Reserved: it
 /// may not be an OIDC client_id or the platform audience, because an access
 /// token carrying it would verify wherever a passkey CWT is expected.
