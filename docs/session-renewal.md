@@ -4,7 +4,11 @@ A **session** lets a client renew its passkey auth CWT without asking for
 the passkey again. It follows NIST SP 800-63B-4 at AAL2:
 
 - it lasts at most **24 h** after the passkey assertion that opened it;
-- it ends after **1 h** without a renewal.
+- it ends after **1 h** without a renewal, but never before its last token
+  has expired and a further 360 s (60 s verifier skew + 300 s grace) have
+  passed, so the renewal a 401 from an expired token prompts succeeds.
+  While the token lasts 1 h that is 66 min (`idleTimeoutSeconds` 3960); at
+  15 min it is 1 h.
 
 The renewal is bound to a non-exportable P-256 key the client holds in the
 Secure Enclave (the **device key**), and its credential rotates on every use
@@ -52,7 +56,7 @@ Call it right after `POST /authenticate`, with the token it returned.
 
   ```json
   {"sessionId": "<uuid>", "credential": "<generation>.<secret>",
-   "sessionExpiresAt": 1790086400, "idleTimeoutSeconds": 3600}
+   "sessionExpiresAt": 1790086400, "idleTimeoutSeconds": 3960}
   ```
 
   `sessionExpiresAt` is the assertion time + 86400. The client keeps
@@ -106,7 +110,7 @@ and the client signs in with the passkey:
 | `invalid_proof` | `signature` is not a valid signature by the session's device key. The session is kept. |
 | `invalid_credential` | The credential is not the session's current one and not an older one. The session is kept. |
 | `reused` | An already-spent credential: the session is ended (RFC 9700). |
-| `idle` | No renewal for 1 h. Ended. |
+| `idle` | No renewal for `idleTimeoutSeconds` (3960 s while the token lasts 1 h). Ended. |
 | `expired` | 24 h since the assertion. Ended. |
 | `account_deleted` | The account was deleted. Ended. |
 

@@ -5,7 +5,9 @@
 
 use crate::AppState;
 use crate::authentication_tests::{Registered, registered_account, unique_name};
-use crate::constants::{PASSKEY_SESSION_TOKEN_SECONDS, SESSION_IDLE_SECONDS, SESSION_MAX_SECONDS};
+use crate::constants::{
+    PASSKEY_SESSION_TOKEN_SECONDS, SESSION_IDLE_LIMIT_SECONDS, SESSION_MAX_SECONDS,
+};
 use crate::db::Session;
 use crate::session::{
     Ended, SessionError, open_message, refresh_message, session_id_for, signout_message,
@@ -361,7 +363,7 @@ async fn a_session_renews_rotates_and_ends_on_reuse() {
         session_id_for(&claims_of(&h.state, &sign_in).cti).to_string()
     );
     assert_eq!(opened["sessionExpiresAt"], asserted + SESSION_MAX_SECONDS);
-    assert_eq!(opened["idleTimeoutSeconds"], SESSION_IDLE_SECONDS);
+    assert_eq!(opened["idleTimeoutSeconds"], SESSION_IDLE_LIMIT_SECONDS);
     let first = opened["credential"].as_str().unwrap().to_string();
     assert!(first.starts_with("1."));
 
@@ -568,8 +570,21 @@ async fn idle_and_absolute_timeouts_end_the_session() {
     let device = Device::new();
     let now = Utc::now().timestamp();
 
+    // The last token expired and its skew passed: the renewal its 401
+    // prompts still succeeds.
     let (id, credential) = h
-        .stored(&r, &device, now - 7200, now - SESSION_IDLE_SECONDS)
+        .stored(
+            &r,
+            &device,
+            now - 7200,
+            now - PASSKEY_SESSION_TOKEN_SECONDS - crate::cwt::DEFAULT_SKEW_SECS - 1,
+        )
+        .await;
+    let (st, b) = h.refresh(&device, &id, &credential).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    let (id, credential) = h
+        .stored(&r, &device, now - 7200, now - SESSION_IDLE_LIMIT_SECONDS)
         .await;
     let (st, b) = h.refresh(&device, &id, &credential).await;
     assert_eq!((st, reason(&b)), (StatusCode::UNAUTHORIZED, Some("idle")));

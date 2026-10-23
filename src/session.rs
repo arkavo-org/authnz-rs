@@ -10,7 +10,7 @@
 //! - `POST /session/signout`: the device key ends the session.
 //!
 //! A session lasts at most [`SESSION_MAX_SECONDS`] after its passkey
-//! assertion and ends after [`SESSION_IDLE_SECONDS`] without a renewal. A
+//! assertion and ends after [`SESSION_IDLE_LIMIT_SECONDS`] without a renewal. A
 //! renewed token carries `auth_time` = that assertion, so it never passes
 //! for a fresh sign-in ([`crate::cwt::passkey_assertion_time`]).
 //!
@@ -18,7 +18,7 @@
 
 use crate::AppState;
 use crate::constants::{
-    SESSION_IDLE_SECONDS, SESSION_MAX_SECONDS, SESSION_OPEN_MAX_AUTH_AGE_SECONDS,
+    SESSION_IDLE_LIMIT_SECONDS, SESSION_MAX_SECONDS, SESSION_OPEN_MAX_AUTH_AGE_SECONDS,
 };
 use crate::db::{DynamoDBError, Session, SessionOpened};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -276,7 +276,7 @@ pub async fn open_session(
             session_id,
             credential,
             session_expires_at: asserted_at + SESSION_MAX_SECONDS,
-            idle_timeout_seconds: SESSION_IDLE_SECONDS,
+            idle_timeout_seconds: SESSION_IDLE_LIMIT_SECONDS,
         }),
     ))
 }
@@ -364,7 +364,7 @@ pub async fn refresh_session(
     if now >= deadline {
         return Err(end(&app_state, &session, Ended::Expired).await?);
     }
-    if now >= session.last_renewed_at + SESSION_IDLE_SECONDS {
+    if now >= session.last_renewed_at + SESSION_IDLE_LIMIT_SECONDS {
         return Err(end(&app_state, &session, Ended::Idle).await?);
     }
     let Some(record) = app_state.db_store.get_user_by_id(&session.user_id).await? else {
