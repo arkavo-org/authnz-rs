@@ -107,7 +107,7 @@ async fn an_account_gets_an_attestation_of_its_own_passkey() {
     let bytes = URL_SAFE_NO_PAD
         .decode(body["attestation"].as_str().unwrap())
         .unwrap();
-    let a = credential_attestation::verify(&bytes, &h.state.cwt_verifying_key)
+    let a = credential_attestation::verify(&bytes, &h.state.cwt_keys)
         .expect("the attestation verifies against the CWT signing key");
     assert_eq!(a.sub, r.user_id.to_string(), "sub is the passkey CWT's");
     assert_eq!(a.iss, "https://identity.arkavo.net");

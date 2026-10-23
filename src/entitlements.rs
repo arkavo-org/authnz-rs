@@ -60,7 +60,7 @@ pub fn require_service_cwt_for(
         now: Utc::now().timestamp(),
         skew_secs: cwt::DEFAULT_SKEW_SECS,
     };
-    let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
+    let claims = cwt::verify(&bytes, &app_state.cwt_keys, &opts).map_err(|e| {
         warn!("Rejected service token: {}", e);
         EntitlementError::InvalidToken
     })?;

@@ -298,7 +298,10 @@ pub struct AppState {
     pub encoding_key: Arc<EncodingKey>,
     pub decoding_key: Arc<DecodingKey>,
     pub cwt_signing_key: Arc<p256::ecdsa::SigningKey>,
-    pub cwt_verifying_key: Arc<p256::ecdsa::VerifyingKey>,
+    /// Every key inbound CWTs are verified against, by `kid`: the current
+    /// signing key first, then the `VERIFY_ONLY_KEY_PATHS` keys (#107).
+    /// `cose-keys` and `jwks.json` publish this set.
+    pub cwt_keys: Arc<keys::KeySet>,
     /// RFC 7638 JWK thumbprint as raw 32-byte SHA-256 hash.
     /// JWKS advertises the base64url-encoded form of the same bytes
     /// (see oidc::ec_public_key_to_jwk), so CWT and JWT share the same kid.
@@ -366,7 +369,7 @@ type LoadedKeys = (
     EncodingKey,
     DecodingKey,
     p256::ecdsa::SigningKey,
-    p256::ecdsa::VerifyingKey,
+    keys::KeySet,
     Vec<u8>,
 );
 
@@ -425,11 +428,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = load_config()?;
 
     // Load and validate EC keys
-    let (signing_key, encoding_key, decoding_key, cwt_signing_key, cwt_verifying_key, cwt_kid) =
+    let (signing_key, encoding_key, decoding_key, cwt_signing_key, cwt_keys, cwt_kid) =
         load_ec_keys(
             &settings.sign_key_path,
             &settings.encoding_key_path,
             &settings.decoding_key_path,
+            env::var("VERIFY_ONLY_KEY_PATHS").ok().as_deref(),
         )?;
 
     // Load and cache the apple-app-site-association.json file
@@ -560,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         encoding_key: Arc::new(encoding_key),
         decoding_key: Arc::new(decoding_key),
         cwt_signing_key: Arc::new(cwt_signing_key),
-        cwt_verifying_key: Arc::new(cwt_verifying_key),
+        cwt_keys: Arc::new(cwt_keys),
         cwt_kid: Arc::new(cwt_kid),
         issuer: Arc::new(issuer),
         platform_audience: Arc::new(parse_platform_audience(
@@ -604,7 +608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // OIDC provider configuration (issuer, JWKS, registered clients).
     let oidc_config = Arc::new(
-        OidcConfig::from_env(&settings.decoding_key_path)
+        OidcConfig::from_env(&app_state.cwt_keys)
             .map_err(|e| format!("Failed to load OIDC configuration: {}", e))?,
     );
     let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
@@ -1040,6 +1044,7 @@ fn load_ec_keys(
     sign_key_path: &str,
     encoding_key_path: &str,
     decoding_key_path: &str,
+    verify_only_key_paths: Option<&str>,
 ) -> Result<LoadedKeys, Box<dyn std::error::Error>> {
     debug!("Loading EC signing key from: {}", sign_key_path);
     let signing_key = load_single_ec_key(sign_key_path)?;
@@ -1073,6 +1078,7 @@ fn load_ec_keys(
     // than silently minting tokens nothing can verify.
     let (cwt_signing_key, cwt_verifying_key, cwt_kid) =
         keys::load_cwt_keys(encoding_pem_str, decoding_pem_str)?;
+    let cwt_keys = load_key_set(cwt_verifying_key, cwt_kid.clone(), verify_only_key_paths)?;
 
     debug!("Successfully loaded EC keys");
     Ok((
@@ -1080,9 +1086,39 @@ fn load_ec_keys(
         encoding_key,
         decoding_key,
         cwt_signing_key,
-        cwt_verifying_key,
+        cwt_keys,
         cwt_kid,
     ))
+}
+
+/// The CWT key set (#107): the current key, plus one verify-only key per
+/// comma-separated SPKI PEM path in `VERIFY_ONLY_KEY_PATHS`. An unreadable or
+/// unparsable file, the current key again, or a duplicate fails startup:
+/// a key silently missing from the set would refuse every token it signed.
+fn load_key_set(
+    current: p256::ecdsa::VerifyingKey,
+    current_kid: Vec<u8>,
+    verify_only_key_paths: Option<&str>,
+) -> Result<keys::KeySet, Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    log::info!("CWT signing key kid={}", b64.encode(&current_kid));
+    let mut set = keys::KeySet::new(current, current_kid);
+    for path in verify_only_key_paths
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let pem = std::fs::read_to_string(path)
+            .map_err(|e| format!("VERIFY_ONLY_KEY_PATHS: cannot read {path}: {e}"))?;
+        let (vk, kid) = keys::load_verify_only_key(&pem)
+            .map_err(|e| format!("VERIFY_ONLY_KEY_PATHS: {path}: {e}"))?;
+        log::info!("CWT verify-only key kid={} ({path})", b64.encode(&kid));
+        set.add_verify_only(vk, kid)
+            .map_err(|e| format!("VERIFY_ONLY_KEY_PATHS: {path}: {e}"))?;
+    }
+    Ok(set)
 }
 
 fn load_single_ec_key(key_path: &str) -> Result<SigningKey<NistP256>, Box<dyn std::error::Error>> {
@@ -1311,6 +1347,48 @@ enum LoadKeysError {
 mod tests {
 
     use super::parse_app_attest_app_ids;
+
+    /// `VERIFY_ONLY_KEY_PATHS` (#107): each listed PEM joins the set after
+    /// the current key; an unreadable path, a non-SPKI file, the current key
+    /// again or a duplicate fails startup.
+    #[test]
+    fn verify_only_key_paths_build_the_key_set() {
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+        let dir = std::env::temp_dir().join(format!("authnz-keyset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, scalar: u8| {
+            let vk = *p256::ecdsa::SigningKey::from_slice(&[scalar; 32])
+                .unwrap()
+                .verifying_key();
+            let path = dir.join(name);
+            std::fs::write(&path, vk.to_public_key_pem(LineEnding::LF).unwrap()).unwrap();
+            (vk, path.to_str().unwrap().to_string())
+        };
+        let (current, current_path) = write("current.pem", 0x42);
+        let (_, a) = write("a.pem", 0x07);
+        let (_, b) = write("b.pem", 0x08);
+        let garbage = dir.join("garbage.pem");
+        std::fs::write(&garbage, "not a pem").unwrap();
+        let kid = authnz_rs::keys::thumbprint_kid(&current).unwrap();
+        let load = |paths: Option<&str>| super::load_key_set(current, kid.clone(), paths);
+
+        assert_eq!(load(None).unwrap().iter().count(), 1);
+        assert_eq!(load(Some(" , ")).unwrap().iter().count(), 1);
+        let set = load(Some(&format!("{a}, {b}"))).unwrap();
+        let kids: Vec<Vec<u8>> = set.iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(kids.len(), 3);
+        assert_eq!(kids[0], kid, "current key first");
+
+        for bad in [
+            dir.join("missing.pem").to_str().unwrap().to_string(),
+            garbage.to_str().unwrap().to_string(),
+            current_path,
+            format!("{a},{a}"),
+        ] {
+            assert!(load(Some(&bad)).is_err(), "{bad} must fail startup");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn app_attest_app_id_parses_a_comma_separated_set() {
@@ -1680,7 +1758,7 @@ pub(crate) mod test_helpers {
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(decoding_key),
             cwt_signing_key: Arc::new(cwt_signing_key),
-            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_keys: Arc::new(keys::KeySet::new(cwt_verifying_key, cwt_kid.clone())),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new(crate::constants::DEFAULT_OIDC_ISSUER.to_string()),
             platform_audience: Arc::new(None),

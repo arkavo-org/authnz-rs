@@ -335,7 +335,7 @@ pub(crate) fn verify_passkey_auth_token(
         now: Utc::now().timestamp(),
         skew_secs: cwt::DEFAULT_SKEW_SECS,
     };
-    let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
+    let claims = cwt::verify(&bytes, &app_state.cwt_keys, &opts).map_err(|e| {
         warn!("Rejected delegator token: {}", e);
         AgentError::InvalidToken
     })?;
@@ -390,7 +390,7 @@ pub(crate) async fn authenticate_operator(
         now,
         skew_secs: cwt::DEFAULT_SKEW_SECS,
     };
-    let claims = cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts).map_err(|e| {
+    let claims = cwt::verify(&bytes, &app_state.cwt_keys, &opts).map_err(|e| {
         warn!("Rejected agents:delegate token: {}", e);
         AgentError::InvalidToken
     })?;

@@ -152,7 +152,7 @@ fn verified_claims(c: &Ceremony, token: &str) -> crate::cwt::ArkavoClaims {
     let state = crate::test_helpers::build_test_app_state_with_store(c.store.clone());
     crate::cwt::verify(
         &crate::cwt::decode_from_header(token).expect("the token is base64url"),
-        &state.cwt_verifying_key,
+        &state.cwt_keys,
         &crate::cwt::VerifyOptions {
             expected_iss: Some(&state.issuer),
             expected_aud: Some("arkavo"),

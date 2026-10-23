@@ -35,6 +35,7 @@ when unset.
 | Variable | Purpose |
 |---|---|
 | `SIGN_KEY_PATH`, `ENCODING_KEY_PATH`, `DECODING_KEY_PATH` | EC P-256 keys (attestation envelope; CWT/JWT sign + verify). Encode/decode must be the same key pair or boot fails. |
+| `VERIFY_ONLY_KEY_PATHS` | Comma-separated SPKI PEM paths of extra P-256 public keys that verify but never sign: the next key, published before a rotation, or a retired one, kept while its tokens and attestations must verify (#107). Published in `cose-keys` and `jwks.json` after the current key. A key equal to the current one, a duplicate, or a file that does not parse fails startup. Runbook: [docs/key-rotation.md](docs/key-rotation.md). |
 | `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
@@ -585,6 +586,11 @@ appraisal, status)
   - `/.well-known/jwks.json` — JWKS for `id_token` verifiers (OIDC RPs).
   - `/.well-known/cose-keys` — COSE_Key Set for CWT verifiers (OpenTDF, native).
   - Same `kid` (RFC 7638 thumbprint) in both formats — JWKS advertises the base64url-encoded form; COSE_Key uses raw 32-byte hash.
+  - Both list the **key set** (`keys::KeySet`): the current signing key first,
+    then every `VERIFY_ONLY_KEY_PATHS` key. Every inbound CWT is verified by
+    looking up its protected-header `kid` in the set (`cwt::verify`); an
+    absent or unknown `kid` is `CwtError::UnknownKey`. Only the current key
+    signs.
 - **Discovery doc** (`/.well-known/openid-configuration`) advertises `access_token_format: "application/cwt"` and `cose_keys_uri` for CWT-aware RPs.
 - **PoP**: `cnf` claim (RFC 8747) populated bound-at-issuance with the WebAuthn passkey COSE_Key, App Attest key or agent Ed25519 key. authnz-rs never verifies PoP; the platform KAS will enforce it (DPoP) for agent tokens once opentdf-platform P1 lands (a contract v1 consumer).
 

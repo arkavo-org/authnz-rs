@@ -116,6 +116,11 @@ sudo chmod 600 /etc/authnz-rs/keys/*.pem
 sudo chown $(whoami):$(whoami) /etc/authnz-rs/keys/*.pem
 ```
 
+To rotate the encoding/decoding pair without breaking outstanding tokens and
+catalog attestations, publish the new key first through
+`VERIFY_ONLY_KEY_PATHS` and keep the old one listed after the switch: see
+[key-rotation.md](key-rotation.md).
+
 ## Service Configuration
 
 ### Environment Variables
@@ -141,6 +146,8 @@ TLS_KEY_PATH=/etc/letsencrypt/live/identity.arkavo.net/privkey.pem
 SIGN_KEY_PATH=/etc/authnz-rs/keys/signkey.pem
 ENCODING_KEY_PATH=/etc/authnz-rs/keys/encodekey.pem
 DECODING_KEY_PATH=/etc/authnz-rs/keys/decodekey.pem
+# Verify-only public keys (next or retired; never sign). See docs/key-rotation.md.
+# VERIFY_ONLY_KEY_PATHS=/etc/authnz-rs/keys/decodekey-old.pem
 
 # DynamoDB Configuration (adjust as needed)
 DYNAMODB_CREDENTIALS_TABLE=credentials
@@ -328,7 +335,7 @@ are never revoked by the server (the person can still remove Arkavo under
 Apple Account → Sign in with Apple). Nothing needs repairing after rolling
 forward.
 
-#### App Store membership (0.20.0)
+#### App Store membership (0.21.0)
 
 No new table or IAM grant. A subscription is bound to an account by an
 `identity_links` row `appstore#<original_transaction_id>` (`user_id`,

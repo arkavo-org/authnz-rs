@@ -36,7 +36,6 @@ use jsonwebtoken::{Algorithm, Header, encode};
 use log::{debug, error, info, warn};
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -53,10 +52,10 @@ use uuid::Uuid;
 pub struct OidcConfig {
     pub issuer: String,
     pub clients: HashMap<String, OidcClient>,
-    /// `kid` to advertise in JWKS and embed in JWT headers.
+    /// `kid` embedded in JWT headers: the current signing key's.
     pub signing_kid: String,
-    /// JWK representation of the public signing key.
-    pub jwk: Jwk,
+    /// JWKS keys: the CWT key set as JWKs, current signing key first (#107).
+    pub jwks: Vec<Jwk>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,16 +421,16 @@ impl RefreshTokenStore {
 }
 
 impl OidcConfig {
-    pub fn from_env(decoding_key_path: &str) -> Result<Self, String> {
+    /// `keys` is the CWT key set, so the JWKS and `cose-keys` list the same
+    /// keys under the same `kid`s.
+    pub fn from_env(keys: &crate::keys::KeySet) -> Result<Self, String> {
         let issuer = env::var("OIDC_ISSUER").unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string());
 
-        // Build the JWK from the configured public decoding key.
-        let pem = std::fs::read_to_string(decoding_key_path)
-            .map_err(|e| format!("Failed to read decoding key for JWKS: {}", e))?;
-        let pub_key = PublicKey::from_public_key_pem(&pem)
-            .map_err(|e| format!("Failed to parse decoding key for JWKS: {}", e))?;
-        let jwk = ec_public_key_to_jwk(&pub_key)?;
-        let signing_kid = jwk.kid.clone();
+        let jwks = keys
+            .iter()
+            .map(|(_, vk)| ec_public_key_to_jwk(&PublicKey::from(vk)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let signing_kid = jwks[0].kid.clone();
 
         let clients = load_clients_from_env()?;
 
@@ -439,7 +438,7 @@ impl OidcConfig {
             issuer,
             clients,
             signing_kid,
-            jwk,
+            jwks,
         })
     }
 }
@@ -630,31 +629,30 @@ pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl Into
 
 pub async fn jwks(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl IntoResponse {
     Json(Jwks {
-        keys: vec![oidc.jwk.clone()],
+        keys: oidc.jwks.clone(),
     })
 }
 
-/// Serve the signing key as a COSE_Key Set (RFC 9052 §7) in CBOR form.
+/// Serve the key set as a COSE_Key Set (RFC 9052 §7) in CBOR form.
 ///
 /// CWT verifiers (OpenTDF tdf-rs, native arkavo apps) can fetch the P-256
-/// key in its native COSE format instead of converting from JWK.
-/// Same physical key as `/.well-known/jwks.json`; same `kid` (RFC 7638
+/// keys in their native COSE format instead of converting from JWK.
+/// Same physical keys as `/.well-known/jwks.json`, in the same order (current
+/// signing key first, then the verify-only keys, #107); same `kid`s (RFC 7638
 /// thumbprint bytes).
 pub async fn cose_keys(Extension(app_state): Extension<AppState>) -> impl IntoResponse {
-    let cose_key = crate::cwt::cose_key_from_p256_verifying_key(
-        &app_state.cwt_verifying_key,
-        &app_state.cwt_kid,
-    );
-
     use coset::AsCborValue;
-    let key_value = match cose_key.to_cbor_value() {
-        Ok(v) => v,
-        Err(e) => {
-            error!("cose_keys: CoseKey -> CBOR conversion failed: {:?}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
+    let mut key_values = Vec::new();
+    for (kid, vk) in app_state.cwt_keys.iter() {
+        match crate::cwt::cose_key_from_p256_verifying_key(vk, kid).to_cbor_value() {
+            Ok(v) => key_values.push(v),
+            Err(e) => {
+                error!("cose_keys: CoseKey -> CBOR conversion failed: {:?}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response();
+            }
         }
-    };
-    let set = ciborium::value::Value::Array(vec![key_value]);
+    }
+    let set = ciborium::value::Value::Array(key_values);
 
     let mut bytes = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&set, &mut bytes) {
@@ -1896,7 +1894,7 @@ pub async fn userinfo(
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    let claims = match crate::cwt::verify(&raw, &app_state.cwt_verifying_key, &opts) {
+    let claims = match crate::cwt::verify(&raw, &app_state.cwt_keys, &opts) {
         Ok(c) => c,
         Err(e) => {
             debug!("UserInfo CWT verification failed: {}", e);
@@ -2113,7 +2111,7 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
     };
-    let claims = crate::cwt::verify(&bytes, &app_state.cwt_verifying_key, &opts)
+    let claims = crate::cwt::verify(&bytes, &app_state.cwt_keys, &opts)
         .map_err(|e| AuthorizeError::InvalidArkavoJwt(e.to_string()))?;
 
     let user_id = Uuid::parse_str(&claims.sub)
@@ -2369,7 +2367,7 @@ pub(crate) mod tests {
             issuer: "https://identity.arkavo.net".to_string(),
             clients: HashMap::new(),
             signing_kid,
-            jwk,
+            jwks: vec![jwk],
         })
     }
 
@@ -2834,7 +2832,7 @@ pub(crate) mod tests {
         assert_eq!(v["keys"][0]["crv"], "P-256");
         assert_eq!(v["keys"][0]["alg"], "ES256");
         assert_eq!(v["keys"][0]["use"], "sig");
-        assert_eq!(v["keys"][0]["kid"], oidc.jwk.kid);
+        assert_eq!(v["keys"][0]["kid"], oidc.jwks[0].kid);
     }
 
     #[tokio::test]
@@ -2867,6 +2865,75 @@ pub(crate) mod tests {
             panic!("not an array")
         };
         assert_eq!(arr.len(), 1);
+    }
+
+    /// #107: with a verify-only key in the set, `cose-keys` and `jwks.json`
+    /// both list the two keys, current first, under distinct kids that agree
+    /// across the two formats; a token signed by the verify-only key passes a
+    /// server verifier, and one under an unknown kid does not.
+    #[tokio::test]
+    async fn key_endpoints_and_verifiers_use_the_whole_key_set() {
+        use base64::Engine;
+        use coset::AsCborValue;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let mut app_state = crate::test_helpers::build_test_app_state().await;
+        let retired = p256::ecdsa::SigningKey::from_slice(&[0x07; 32]).unwrap();
+        let retired_kid = crate::keys::thumbprint_kid(retired.verifying_key()).unwrap();
+        let mut set = (*app_state.cwt_keys).clone();
+        set.add_verify_only(*retired.verifying_key(), retired_kid.clone())
+            .unwrap();
+        app_state.cwt_keys = Arc::new(set);
+        let current_kid = app_state.cwt_kid.to_vec();
+        assert_ne!(current_kid, retired_kid);
+
+        let resp = cose_keys(Extension(app_state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ciborium::value::Value::Array(arr) = ciborium::de::from_reader(body.as_ref()).unwrap()
+        else {
+            panic!("not an array")
+        };
+        let cose_kids: Vec<Vec<u8>> = arr
+            .into_iter()
+            .map(|v| coset::CoseKey::from_cbor_value(v).unwrap().key_id)
+            .collect();
+        assert_eq!(cose_kids, vec![current_kid.clone(), retired_kid.clone()]);
+
+        let oidc = OidcConfig::from_env(&app_state.cwt_keys).unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let jwk_kids: Vec<&str> = oidc.jwks.iter().map(|j| j.kid.as_str()).collect();
+        assert_eq!(
+            jwk_kids,
+            vec![b64.encode(&current_kid), b64.encode(&retired_kid)]
+        );
+        assert_eq!(
+            oidc.signing_kid,
+            b64.encode(&current_kid),
+            "id_tokens name the current key"
+        );
+
+        let claims =
+            crate::cwt::ArkavoClaims::auth(&app_state.issuer, &Uuid::new_v4().to_string(), 1, None);
+        let header = |kid: &[u8]| {
+            let token = crate::cwt::mint(&claims, &retired, kid).unwrap();
+            let mut h = HeaderMap::new();
+            h.insert(
+                "X-Auth-Token",
+                crate::cwt::encode_for_header(&token).parse().unwrap(),
+            );
+            h
+        };
+        crate::agent::verify_passkey_auth_token(&app_state, &header(&retired_kid))
+            .expect("a token signed by a verify-only key verifies");
+        assert!(crate::agent::verify_passkey_auth_token(&app_state, &header(b"unknown")).is_err());
     }
 
     #[test]
@@ -2960,7 +3027,7 @@ pub(crate) mod tests {
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
             cwt_signing_key: Arc::new(cwt_signing_key),
-            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_keys: Arc::new(crate::keys::KeySet::new(cwt_verifying_key, cwt_kid.clone())),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
@@ -3085,7 +3152,7 @@ pub(crate) mod tests {
             encoding_key: Arc::new(encoding_key),
             decoding_key: Arc::new(jsonwebtoken::DecodingKey::from_secret(&[])),
             cwt_signing_key: Arc::new(cwt_signing_key),
-            cwt_verifying_key: Arc::new(cwt_verifying_key),
+            cwt_keys: Arc::new(crate::keys::KeySet::new(cwt_verifying_key, cwt_kid.clone())),
             cwt_kid: Arc::new(cwt_kid),
             issuer: Arc::new("https://identity.arkavo.net".to_string()),
             platform_audience: Arc::new(None),
@@ -3655,7 +3722,7 @@ pub(crate) mod tests {
             issuer: "https://identity.arkavo.net".into(),
             signing_kid: "test".into(),
             clients: std::collections::HashMap::new(),
-            jwk: test_jwk(),
+            jwks: vec![test_jwk()],
         };
 
         let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &jwt).await;
@@ -3689,7 +3756,7 @@ pub(crate) mod tests {
             issuer: "https://identity.arkavo.net".into(),
             signing_kid: "test".into(),
             clients: std::collections::HashMap::new(),
-            jwk: test_jwk(),
+            jwks: vec![test_jwk()],
         };
 
         let result = crate::oidc::resolve_from_arkavo_jwt(&app_state, &oidc, &token).await;
@@ -3960,7 +4027,7 @@ pub(crate) mod tests {
             let bytes = crate::cwt::decode_from_header(&auth).unwrap();
             crate::cwt::verify(
                 &bytes,
-                &app_state.cwt_verifying_key,
+                &app_state.cwt_keys,
                 &crate::cwt::VerifyOptions {
                     expected_iss: None,
                     expected_aud: None,
@@ -4074,7 +4141,7 @@ pub(crate) mod tests {
                 crate::cwt::decode_from_header(body["access_token"].as_str().unwrap()).unwrap();
             crate::cwt::verify(
                 &bytes,
-                &app_state.cwt_verifying_key,
+                &app_state.cwt_keys,
                 &crate::cwt::VerifyOptions {
                     expected_iss: Some(&app_state.issuer),
                     expected_aud: Some("arkavo-edge"),

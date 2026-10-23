@@ -39,27 +39,90 @@ pub fn load_cwt_keys(
         return Err("DECODING_KEY_PATH public key does not match ENCODING_KEY_PATH".to_string());
     }
 
-    // kid = RFC 7638 JWK thumbprint, raw 32-byte SHA-256 hash.
-    let kid = {
-        let encoded = verifying_key.to_encoded_point(false);
-        let x = encoded
-            .x()
-            .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
-        let y = encoded
-            .y()
-            .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let thumb_input = format!(
-            "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
-            b64.encode(x),
-            b64.encode(y)
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(thumb_input.as_bytes());
-        hasher.finalize().to_vec()
-    };
-
+    let kid = thumbprint_kid(&verifying_key)?;
     Ok((signing_key, verifying_key, kid))
+}
+
+/// `kid` = RFC 7638 JWK thumbprint of `vk`, as the raw 32-byte SHA-256 hash.
+pub fn thumbprint_kid(vk: &p256::ecdsa::VerifyingKey) -> Result<Vec<u8>, String> {
+    let encoded = vk.to_encoded_point(false);
+    let x = encoded
+        .x()
+        .ok_or_else(|| "EC public key missing x coordinate".to_string())?;
+    let y = encoded
+        .y()
+        .ok_or_else(|| "EC public key missing y coordinate".to_string())?;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let thumb_input = format!(
+        "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+        b64.encode(x),
+        b64.encode(y)
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(thumb_input.as_bytes());
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Parse a verify-only public key (SPKI PEM, one `VERIFY_ONLY_KEY_PATHS`
+/// entry) and derive its `kid` as [`thumbprint_kid`] does.
+pub fn load_verify_only_key(pem: &str) -> Result<(p256::ecdsa::VerifyingKey, Vec<u8>), String> {
+    let pk = p256::PublicKey::from_public_key_pem(pem)
+        .map_err(|e| format!("Failed to parse verify-only key as SPKI PEM: {e}"))?;
+    let vk = p256::ecdsa::VerifyingKey::from(pk);
+    let kid = thumbprint_kid(&vk)?;
+    Ok((vk, kid))
+}
+
+/// The keys this issuer trusts (#107): the current signing key's public half
+/// first, then every verify-only key, each under its `kid`. Every inbound CWT
+/// is checked against the key its protected-header `kid` names, and
+/// `/.well-known/cose-keys` and `jwks.json` publish the set in this order.
+/// Only the current key signs; a verify-only key is the next key published
+/// ahead of a rotation, or a retired one kept while what it signed must still
+/// verify.
+#[derive(Debug, Clone)]
+pub struct KeySet {
+    keys: Vec<(Vec<u8>, p256::ecdsa::VerifyingKey)>,
+}
+
+impl KeySet {
+    /// A set holding only the current key.
+    pub fn new(current: p256::ecdsa::VerifyingKey, kid: Vec<u8>) -> Self {
+        Self {
+            keys: vec![(kid, current)],
+        }
+    }
+
+    /// Add a verify-only key. A `kid` or key already in the set is refused:
+    /// listing the current key again, or one key twice, is a config error.
+    pub fn add_verify_only(
+        &mut self,
+        vk: p256::ecdsa::VerifyingKey,
+        kid: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.keys.iter().any(|(k, v)| *k == kid || *v == vk) {
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            return Err(format!(
+                "verify-only key {} is already in the key set",
+                b64.encode(&kid)
+            ));
+        }
+        self.keys.push((kid, vk));
+        Ok(())
+    }
+
+    /// The key published under `kid`, if any. An empty `kid` names none.
+    pub fn get(&self, kid: &[u8]) -> Option<&p256::ecdsa::VerifyingKey> {
+        if kid.is_empty() {
+            return None;
+        }
+        self.keys.iter().find(|(k, _)| k == kid).map(|(_, v)| v)
+    }
+
+    /// `(kid, key)` pairs, current key first.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &p256::ecdsa::VerifyingKey)> {
+        self.keys.iter().map(|(k, v)| (k.as_slice(), v))
+    }
 }
 
 #[cfg(test)]
@@ -105,6 +168,46 @@ mod tests {
     #[test]
     fn load_cwt_keys_rejects_garbage_pem() {
         assert!(load_cwt_keys("not a pem", "not a pem either").is_err());
+    }
+
+    #[test]
+    fn verify_only_key_kid_matches_load_cwt_keys() {
+        let (encoding_pem, decoding_pem) = test_key_pems(0x42);
+        let (_, vk, kid) = load_cwt_keys(&encoding_pem, &decoding_pem).unwrap();
+        let (vk2, kid2) = load_verify_only_key(&decoding_pem).unwrap();
+        assert_eq!((vk, kid), (vk2, kid2));
+        assert!(
+            load_verify_only_key(&encoding_pem).is_err(),
+            "a private key is not SPKI"
+        );
+    }
+
+    #[test]
+    fn key_set_looks_up_by_kid_and_refuses_duplicates() {
+        let (enc_a, dec_a) = test_key_pems(0x42);
+        let (_, dec_b) = test_key_pems(0x43);
+        let (_, vk_a, kid_a) = load_cwt_keys(&enc_a, &dec_a).unwrap();
+        let (vk_b, kid_b) = load_verify_only_key(&dec_b).unwrap();
+        assert_ne!(kid_a, kid_b);
+
+        let mut set = KeySet::new(vk_a, kid_a.clone());
+        set.add_verify_only(vk_b, kid_b.clone()).unwrap();
+        assert_eq!(set.get(&kid_a), Some(&vk_a));
+        assert_eq!(set.get(&kid_b), Some(&vk_b));
+        assert_eq!(set.get(b"unknown"), None);
+        assert_eq!(set.get(b""), None);
+        let kids: Vec<&[u8]> = set.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            kids,
+            vec![kid_a.as_slice(), kid_b.as_slice()],
+            "current key first"
+        );
+
+        // The current key again, a duplicate, or one key under another kid.
+        assert!(set.add_verify_only(vk_a, kid_a.clone()).is_err());
+        assert!(set.add_verify_only(vk_b, kid_b).is_err());
+        assert!(set.add_verify_only(vk_a, b"other-kid".to_vec()).is_err());
+        assert_eq!(set.iter().count(), 2);
     }
 
     #[test]

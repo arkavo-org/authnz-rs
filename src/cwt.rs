@@ -28,6 +28,9 @@ pub enum CwtError {
     AudienceMismatch,
     #[error("unsupported credential key type (only P-256 EC2 is supported)")]
     UnsupportedKeyType,
+    /// The protected-header `kid` is absent or names no key in the set (#107).
+    #[error("unknown signing key")]
+    UnknownKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,9 +1089,10 @@ pub struct VerifyOptions<'a> {
 
 pub const DEFAULT_SKEW_SECS: i64 = 60;
 
+/// Verify a CWT against the key its protected-header `kid` names in `keys`.
 pub fn verify(
     bytes: &[u8],
-    key: &VerifyingKey,
+    keys: &crate::keys::KeySet,
     opts: &VerifyOptions,
 ) -> Result<ArkavoClaims, CwtError> {
     // RFC 8392 §6: strict require the CWT CBOR tag #6.61 around the
@@ -1107,6 +1111,12 @@ pub fn verify(
     if sign1.protected.header.content_type.is_some() {
         return Err(CwtError::Malformed);
     }
+
+    // The kid picks the key; one outside the set is refused before any
+    // signature check (#107).
+    let key = keys
+        .get(&sign1.protected.header.key_id)
+        .ok_or(CwtError::UnknownKey)?;
 
     // Verify signature.
     sign1
@@ -1179,6 +1189,11 @@ mod tests {
 
     fn test_kid() -> Vec<u8> {
         b"test-kid".to_vec()
+    }
+
+    /// The one-key set tokens minted under `test_kid()` verify against.
+    fn set(vk: &p256::ecdsa::VerifyingKey) -> crate::keys::KeySet {
+        crate::keys::KeySet::new(*vk, test_kid())
     }
 
     #[test]
@@ -1433,8 +1448,43 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let decoded = verify(&bytes, &vk, &opts).expect("verify");
+        let decoded = verify(&bytes, &set(&vk), &opts).expect("verify");
         assert_eq!(decoded.sub, "sub-1");
+    }
+
+    /// #107: with two keys in the set a token signed by either verifies under
+    /// its own kid; an empty or unknown kid is refused, and a kid naming the
+    /// other key does not borrow it.
+    #[test]
+    fn verify_selects_the_key_by_kid() {
+        let (sk_a, vk_a) = test_keypair();
+        let (sk_b, vk_b) = test_keypair();
+        let mut keys = crate::keys::KeySet::new(vk_b, b"kid-b".to_vec());
+        keys.add_verify_only(vk_a, b"kid-a".to_vec()).unwrap();
+
+        let claims = ArkavoClaims::auth("iss-1", "sub-1", 1, None);
+        let opts = VerifyOptions {
+            expected_iss: Some("iss-1"),
+            expected_aud: None,
+            now: claims.iat + 10,
+            skew_secs: 60,
+        };
+        for (sk, kid) in [(&sk_a, &b"kid-a"[..]), (&sk_b, &b"kid-b"[..])] {
+            let bytes = mint(&claims, sk, kid).unwrap();
+            verify(&bytes, &keys, &opts).expect("either key verifies under its kid");
+        }
+        for kid in [&b"kid-c"[..], &b""[..]] {
+            let bytes = mint(&claims, &sk_a, kid).unwrap();
+            assert!(matches!(
+                verify(&bytes, &keys, &opts),
+                Err(CwtError::UnknownKey)
+            ));
+        }
+        let crossed = mint(&claims, &sk_a, b"kid-b").unwrap();
+        assert!(matches!(
+            verify(&crossed, &keys, &opts),
+            Err(CwtError::InvalidSignature)
+        ));
     }
 
     #[test]
@@ -1460,7 +1510,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let result = verify(untagged, &vk, &opts);
+        let result = verify(untagged, &set(&vk), &opts);
         assert!(
             matches!(result, Err(CwtError::Malformed)),
             "got {:?}",
@@ -1481,7 +1531,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk2, &opts);
+        let result = verify(&bytes, &set(&vk2), &opts);
         assert!(matches!(result, Err(CwtError::InvalidSignature)));
     }
 
@@ -1500,7 +1550,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk, &opts);
+        let result = verify(&bytes, &set(&vk), &opts);
         assert!(matches!(
             result,
             Err(CwtError::InvalidSignature) | Err(CwtError::Malformed)
@@ -1537,7 +1587,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk, &opts);
+        let result = verify(&bytes, &set(&vk), &opts);
         assert!(
             matches!(result, Err(CwtError::UnsupportedAlg)),
             "got {:?}",
@@ -1571,7 +1621,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk, &opts);
+        let result = verify(&bytes, &set(&vk), &opts);
         assert!(
             matches!(result, Err(CwtError::UnsupportedAlg)),
             "got {:?}",
@@ -1592,7 +1642,7 @@ mod tests {
             now: claims.exp + 120,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk, &opts);
+        let result = verify(&bytes, &set(&vk), &opts);
         assert!(matches!(result, Err(CwtError::Expired)), "got {:?}", result);
     }
 
@@ -1609,7 +1659,7 @@ mod tests {
             now: claims.iat - 120,
             skew_secs: 60,
         };
-        let result = verify(&bytes, &vk, &opts);
+        let result = verify(&bytes, &set(&vk), &opts);
         assert!(
             matches!(result, Err(CwtError::NotYetValid)),
             "got {:?}",
@@ -1630,7 +1680,7 @@ mod tests {
             now: claims.iat - 30,
             skew_secs: 60,
         };
-        verify(&bytes, &vk, &opts).expect("verify within skew");
+        verify(&bytes, &set(&vk), &opts).expect("verify within skew");
     }
 
     #[test]
@@ -1645,7 +1695,7 @@ mod tests {
             skew_secs: 60,
         };
         assert!(matches!(
-            verify(&bytes, &vk, &opts),
+            verify(&bytes, &set(&vk), &opts),
             Err(CwtError::IssuerMismatch)
         ));
     }
@@ -1662,7 +1712,7 @@ mod tests {
             skew_secs: 60,
         };
         assert!(matches!(
-            verify(&bytes, &vk, &opts),
+            verify(&bytes, &set(&vk), &opts),
             Err(CwtError::AudienceMismatch)
         ));
     }
@@ -1678,7 +1728,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        verify(&bytes, &vk, &opts).expect("verify");
+        verify(&bytes, &set(&vk), &opts).expect("verify");
     }
 
     #[test]
@@ -1696,7 +1746,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        verify(&bytes, &vk, &opts).expect("verify");
+        verify(&bytes, &set(&vk), &opts).expect("verify");
     }
 
     fn sample_cose_key() -> coset::CoseKey {
@@ -1735,7 +1785,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        let decoded = verify(&bytes, &vk, &opts).expect("verify");
+        let decoded = verify(&bytes, &set(&vk), &opts).expect("verify");
         let decoded_cnf = decoded.cnf.expect("cnf present");
         assert_eq!(decoded_cnf.kid, b"cred-id".to_vec());
         // CoseKey roundtrip: compare via CBOR serialization.
@@ -1778,7 +1828,7 @@ mod tests {
             now: claims.iat + 10,
             skew_secs: 60,
         };
-        verify(&decoded, &vk, &opts).expect("verify roundtrip via header transport");
+        verify(&decoded, &set(&vk), &opts).expect("verify roundtrip via header transport");
     }
 
     #[test]
@@ -1844,7 +1894,7 @@ mod tests {
             now: claims.iat + 1,
             skew_secs: DEFAULT_SKEW_SECS,
         };
-        let back = verify(&bytes, &vk, &opts).unwrap();
+        let back = verify(&bytes, &set(&vk), &opts).unwrap();
         assert_eq!(back.custom.act.unwrap()[0].sub, "https://kg.arkavo.net");
         let got = back.custom.arkavo_npe.unwrap();
         assert_eq!(got.npe_type, "agent");
@@ -1901,7 +1951,7 @@ mod tests {
             now: claims.iat,
             skew_secs: 60,
         };
-        let back = verify(&bytes, &vk, &opts)
+        let back = verify(&bytes, &set(&vk), &opts)
             .unwrap()
             .custom
             .arkavo_npe
@@ -2057,7 +2107,7 @@ mod tests {
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let back = verify(
             &bytes,
-            &vk,
+            &set(&vk),
             &VerifyOptions {
                 expected_iss: Some("https://identity.arkavo.net"),
                 expected_aud: Some("https://platform.arkavo.net"),
@@ -2080,7 +2130,7 @@ mod tests {
         let bytes = mint(&claims, &sk, &test_kid()).unwrap();
         let back = verify(
             &bytes,
-            &vk,
+            &set(&vk),
             &VerifyOptions {
                 expected_iss: None,
                 expected_aud: None,
