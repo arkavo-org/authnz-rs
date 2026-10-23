@@ -115,6 +115,19 @@ paths:
   filter and the delete condition) and `revoke_passkey_links_of` sets
   `revoked_at = if_not_exists(revoked_at, deleted_at)`. Read by
   `GET /passkeys/credentials/:id/status` (consistent), never by sign-in.
+- **Passkey session** (#108; `db/session.rs`): `link_pk = session#<session
+  id>`, `provider = session`, `subject` = the id, `user_id`, `public_key` (B,
+  65-byte X9.63 device key), `assertion_at`, `created_at`, `last_renewed_at`,
+  `generation` (N), `credential_hash` (B, SHA-256 of the current
+  credential), `expires_at` (N, `assertion_at + SESSION_MAX_SECONDS`, for a
+  TTL that is not enabled yet). Written by `POST /session` on
+  `attribute_not_exists(link_pk)`, then an `is_account_live` re-check that
+  deletes it if the account died meanwhile. Renewal rotates it with one
+  `UpdateItem` on `generation = :gen AND credential_hash = :old`. Deleted on
+  sign-out and on a refused renewal that ends it (idle, expired, reused,
+  account deleted). No `token_*` attribute and not `provider = passkey`, so
+  the sweep's `delete_identity_links_of` removes it. Read consistently by
+  `get_session`, never by sign-in.
 - **PII**: Deliberately minimal. No email, display name, relay address, or
   `real_user_status` is stored here, even if the IdP returns them. A sealed
   Apple refresh token is not PII.

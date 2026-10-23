@@ -3,7 +3,7 @@ use crate::authn::WebauthnError::{
     CorruptSession, InvalidSessionState, MissingToken, Unknown, UserHasNoCredentials, UserNotFound,
 };
 use crate::constants::{
-    AUTH_TOKEN_HOURS, ENROLLMENT_TOKEN_MAX_AGE_SECONDS, REGISTRATION_TOKEN_WEEKS,
+    ENROLLMENT_TOKEN_MAX_AGE_SECONDS, PASSKEY_SESSION_TOKEN_SECONDS, REGISTRATION_TOKEN_WEEKS,
     RESERVED_USERNAME_PREFIXES,
 };
 use crate::db::DynamoDBError;
@@ -88,7 +88,7 @@ fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
 /// Enrollment freshness is only meaningful if it is stricter than the auth
 /// token's own lifetime — otherwise "freshly minted" and "not yet expired"
 /// would be the same test.
-const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < AUTH_TOKEN_HOURS * 3600);
+const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < PASSKEY_SESSION_TOKEN_SECONDS);
 
 /// Read and validate the session's App Attest registration ticket.
 ///
@@ -236,10 +236,12 @@ pub async fn start_register(
         // recently minted one: `POST /authenticate` mints from a WebAuthn
         // ceremony against an existing passkey, which is the fresh proof this
         // operation actually needs.
-        if !is_fresh_enough_to_enroll(claims.iat, chrono::Utc::now().timestamp()) {
+        // A renewed token's assertion is its `auth_time`, not its `iat` (#108).
+        let asserted_at = crate::cwt::passkey_assertion_time(&claims);
+        if !is_fresh_enough_to_enroll(asserted_at, chrono::Utc::now().timestamp()) {
             warn!(
-                "Rejected passkey enrollment for {}: token iat {} is older than {}s",
-                username, claims.iat, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+                "Rejected passkey enrollment for {}: assertion at {} is older than {}s",
+                username, asserted_at, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
             );
             return Err(WebauthnError::StaleAuthentication);
         }
@@ -871,7 +873,7 @@ impl AttestationEnvelope {
     }
 }
 
-/// Mint the 1-hour WebAuthn auth CWT for `user_id`.
+/// Mint the WebAuthn auth CWT ([`PASSKEY_SESSION_TOKEN_SECONDS`]) for `user_id`.
 ///
 /// `arkavo_user` carries the per-user Arkavo custom claims
 /// (`arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`,
@@ -885,17 +887,7 @@ pub fn mint_auth_token(
     arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
-    let mut claims = crate::cwt::ArkavoClaims::auth(
-        &app_state.issuer,
-        &user_id.to_string(),
-        AUTH_TOKEN_HOURS,
-        app_state.platform_audience.as_deref(),
-    )
-    // This token is only ever minted by the WebAuthn ceremony, so the idp is
-    // fixed. Set it for parity with the OIDC access token, which always
-    // carries `idp` — a verifier keying on it must see the same shape from
-    // either token.
-    .with_idp(IDP_WEBAUTHN);
+    let mut claims = passkey_auth_claims(app_state, user_id);
     if let Some(u) = arkavo_user {
         claims = claims.with_arkavo_user(u);
     }
@@ -904,6 +896,28 @@ pub fn mint_auth_token(
     }
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
+}
+
+/// The registered claims of a passkey auth CWT minted now, shared by
+/// [`mint_auth_token`] and the session renewal (#108) so the two stay one
+/// shape.
+pub(crate) fn passkey_auth_claims(
+    app_state: &AppState,
+    user_id: &Uuid,
+) -> crate::cwt::ArkavoClaims {
+    let mut claims = crate::cwt::ArkavoClaims::auth(
+        &app_state.issuer,
+        &user_id.to_string(),
+        1,
+        app_state.platform_audience.as_deref(),
+    )
+    // This token is only ever minted by the WebAuthn ceremony, so the idp is
+    // fixed. Set it for parity with the OIDC access token, which always
+    // carries `idp` — a verifier keying on it must see the same shape from
+    // either token.
+    .with_idp(IDP_WEBAUTHN);
+    claims.exp = claims.iat + PASSKEY_SESSION_TOKEN_SECONDS;
+    claims
 }
 
 /// Mint the ~99-year WebAuthn account CWT for `user_id`.
@@ -1521,7 +1535,7 @@ mod tests {
 
         // Registered claims are untouched: still the 1-hour "arkavo" auth token.
         assert_eq!(auth.aud, crate::cwt::Audience::Single("arkavo".into()));
-        assert_eq!(auth.exp - auth.iat, AUTH_TOKEN_HOURS * 3600);
+        assert_eq!(auth.exp - auth.iat, PASSKEY_SESSION_TOKEN_SECONDS);
         assert!(auth.cnf.is_none());
     }
 

@@ -1079,6 +1079,15 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
     })
 }
 
+/// When the passkey assertion behind a passkey auth CWT happened: its
+/// `auth_time` when it was renewed (`POST /session/refresh`, #108), else its
+/// `iat` (`POST /authenticate` mints straight after the assertion). Every
+/// "recent assertion" check reads this, never `iat`, so a renewed token never
+/// passes for a fresh sign-in.
+pub fn passkey_assertion_time(claims: &ArkavoClaims) -> i64 {
+    claims.custom.auth_time.unwrap_or(claims.iat)
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifyOptions<'a> {
     pub expected_iss: Option<&'a str>,

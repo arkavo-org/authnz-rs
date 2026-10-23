@@ -83,6 +83,9 @@ mod publishing;
 mod publishing_tests;
 #[cfg(test)]
 mod registration_gate_tests;
+mod session;
+#[cfg(test)]
+mod session_tests;
 mod webvh;
 
 // HTTP/3 server function (feature-gated)
@@ -736,6 +739,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/passkeys/credentials/:credential_id/status",
             get(passkeys::credential_status),
         )
+        // Passkey session renewal (#108): open with a fresh passkey auth CWT
+        // and a device key; renew and sign out with that key's signature.
+        .route("/session", post(session::open_session))
+        .route("/session/refresh", post(session::refresh_session))
+        .route("/session/signout", post(session::signout_session))
         .route("/account", axum::routing::delete(account::delete_account))
         .route("/account/deletions/:id", get(account::get_deletion_status))
         // Entity lookup (service CWT required). Spec §2.4.

@@ -346,6 +346,25 @@ the identity links table already needs (`dynamodb:UpdateItem`, `GetItem`,
 `DeleteItem`, `Scan`) and the credentials table already has (`UpdateItem`,
 `GetItem`).
 
+#### Passkey sessions (0.23.0)
+
+No new table, IAM grant or environment variable. `POST /session` writes an
+`identity_links` row `session#<id>` (`PutItem`, `GetItem`, `UpdateItem`,
+`DeleteItem`, which that table already needs). Each row carries
+`expires_at` (unix seconds, the session's 24 h deadline), so enabling
+DynamoDB TTL on that attribute later removes sessions that simply stop
+renewing; until then they are deleted when a renewal is refused, and by the
+account-deletion sweep. Only rows with `expires_at` are affected:
+
+```bash
+aws dynamodb update-time-to-live --table-name prod-identity-links \
+  --time-to-live-specification "Enabled=true, AttributeName=expires_at"
+```
+
+The auth CWT stays 1 h in this release (`PASSKEY_SESSION_TOKEN_SECONDS`).
+It shortens to 15 min only after ArkavoKit, Creator and the iOS app renew
+(docs/session-renewal.md).
+
 #### `guardians` Table and Agent Trust State
 
 Required before deploying 0.13.0: `POST /guardians` writes the table named

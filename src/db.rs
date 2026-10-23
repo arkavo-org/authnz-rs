@@ -14,6 +14,7 @@ mod apple_tokens;
 mod guardians;
 mod passkeys;
 mod publishing;
+mod session;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
 #[cfg(test)]
 pub(crate) use agent_state::tests as agent_state_test_support;
@@ -25,6 +26,7 @@ pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, StateOutcome};
 pub use guardians::Guardian;
 pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
+pub use session::{Session, SessionOpened};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {

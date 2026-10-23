@@ -21,9 +21,9 @@
 use crate::AppState;
 use crate::apple_signin;
 use crate::constants::{
-    ACCESS_TOKEN_LIFETIME_SECONDS, AGENTS_DELEGATE_SCOPE, AUTH_TOKEN_HOURS,
-    AUTHORIZATION_CODE_LIFETIME_SECONDS, DEFAULT_OIDC_ISSUER, DEFAULT_USER_ENTITLEMENTS,
-    ENTITLEMENT_TDF_CREATE, ENTITLEMENT_TDF_DECRYPT, ID_TOKEN_LIFETIME_SECONDS,
+    ACCESS_TOKEN_LIFETIME_SECONDS, AGENTS_DELEGATE_SCOPE, AUTHORIZATION_CODE_LIFETIME_SECONDS,
+    DEFAULT_OIDC_ISSUER, DEFAULT_USER_ENTITLEMENTS, ENTITLEMENT_TDF_CREATE,
+    ENTITLEMENT_TDF_DECRYPT, ID_TOKEN_LIFETIME_SECONDS,
 };
 use axum::Json;
 use axum::extract::{Extension, Form, Query};
@@ -2067,14 +2067,17 @@ async fn resolve_user(
     Err(AuthorizeError::LoginRequired)
 }
 
-/// The WebAuthn assertion time behind an Arkavo CWT: its `iat`, but only for
-/// the 1-hour auth CWT that `POST /authenticate` mints straight after an
-/// assertion. The ~99-year registration CWT is also `aud = "arkavo"` and
-/// `idp = "webauthn"`; its `iat` is not a recent assertion.
+/// The WebAuthn assertion time behind an Arkavo CWT, but only for the
+/// short-lived auth CWT: `iat` for one `POST /authenticate` minted straight
+/// after an assertion, `auth_time` for a renewed one (#108,
+/// [`crate::cwt::passkey_assertion_time`]). The ~99-year registration CWT is
+/// also `aud = "arkavo"` and `idp = "webauthn"`; its `iat` is not a recent
+/// assertion.
 pub(crate) fn webauthn_auth_time(claims: &crate::cwt::ArkavoClaims) -> Option<i64> {
     let lifetime = claims.exp.saturating_sub(claims.iat);
-    (claims.custom.idp.as_deref() == Some("webauthn") && lifetime <= AUTH_TOKEN_HOURS * 3600)
-        .then_some(claims.iat)
+    (claims.custom.idp.as_deref() == Some("webauthn")
+        && lifetime <= crate::constants::PASSKEY_SESSION_TOKEN_SECONDS)
+        .then(|| crate::cwt::passkey_assertion_time(claims))
 }
 
 /// Whether a space-separated OAuth scope string grants `want`.

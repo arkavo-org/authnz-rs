@@ -11,6 +11,50 @@ pub const REGISTRATION_TOKEN_WEEKS: i64 = 5148;
 /// Also used for the OIDC access_token CWT lifetime.
 pub const AUTH_TOKEN_HOURS: i64 = 1;
 
+/// Lifetime of the passkey auth CWT (`POST /authenticate`) and of a renewed
+/// one (`POST /session/refresh`), in seconds. Becomes 900 once clients renew
+/// (#108 rollout order); DeviceCheck keeps [`AUTH_TOKEN_HOURS`].
+pub const PASSKEY_SESSION_TOKEN_SECONDS: i64 = 3600;
+
+/// A session ends when no renewal arrives for this long (#108; NIST SP
+/// 800-63B-4 AAL2 inactivity timeout).
+pub const SESSION_IDLE_SECONDS: i64 = 3600;
+
+/// A session ends this long after the passkey assertion that opened it, however
+/// often it is renewed (#108; AAL2 overall reauthentication timeout).
+pub const SESSION_MAX_SECONDS: i64 = 86_400;
+
+/// How old the passkey assertion behind `POST /session`'s token may be.
+pub const SESSION_OPEN_MAX_AUTH_AGE_SECONDS: i64 = 300;
+
+/// How long past its last token's `exp` (plus [`crate::cwt::DEFAULT_SKEW_SECS`])
+/// a session still accepts a renewal. A client renews on the 401 that expiry
+/// brings, which arrives at or after `exp`.
+pub const SESSION_RENEWAL_GRACE_SECONDS: i64 = 300;
+
+/// The idle limit enforced: [`SESSION_IDLE_SECONDS`], but never before the
+/// last token has expired and the skew and grace have passed. A renewal is
+/// the server's only sign of activity, so while the token lasts 1 h the
+/// session outlives it (3960 s); at 15 min this is [`SESSION_IDLE_SECONDS`].
+pub const SESSION_IDLE_LIMIT_SECONDS: i64 = {
+    let after_token = PASSKEY_SESSION_TOKEN_SECONDS
+        + crate::cwt::DEFAULT_SKEW_SECS
+        + SESSION_RENEWAL_GRACE_SECONDS;
+    if after_token > SESSION_IDLE_SECONDS {
+        after_token
+    } else {
+        SESSION_IDLE_SECONDS
+    }
+};
+
+// A session that went idle before its last token expired (plus skew and
+// grace) would refuse the renewal that expiry prompts.
+const _: () = assert!(
+    PASSKEY_SESSION_TOKEN_SECONDS + crate::cwt::DEFAULT_SKEW_SECS + SESSION_RENEWAL_GRACE_SECONDS
+        <= SESSION_IDLE_LIMIT_SECONDS
+);
+const _: () = assert!(SESSION_IDLE_LIMIT_SECONDS < SESSION_MAX_SECONDS);
+
 /// `aud` of Arkavo-issued passkey auth and registration CWTs. Reserved: it
 /// may not be an OIDC client_id or the platform audience, because an access
 /// token carrying it would verify wherever a passkey CWT is expected.
