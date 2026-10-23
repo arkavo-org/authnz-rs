@@ -472,8 +472,11 @@ appraisal, status)
 **session.rs** - Passkey session renewal (#108)
 - A session lets a client renew its passkey auth CWT without a new passkey
   prompt: at most `SESSION_MAX_SECONDS` (24 h) after the passkey assertion,
-  and only while renewals arrive within `SESSION_IDLE_SECONDS` (1 h) of each
-  other (NIST SP 800-63B-4 AAL2). Contract:
+  and only while renewals arrive within `SESSION_IDLE_LIMIT_SECONDS` of each
+  other (NIST SP 800-63B-4 AAL2). That is `SESSION_IDLE_SECONDS` (1 h), but
+  never before the last token's `exp` + skew +
+  `SESSION_RENEWAL_GRACE_SECONDS`, so the renewal an expired token's 401
+  prompts succeeds: 3960 s while the token lasts 1 h. Contract:
   [docs/session-renewal.md](docs/session-renewal.md).
 - `POST /session`: an *original* passkey auth CWT (no `auth_time`, assertion
   ≤ `SESSION_OPEN_MAX_AUTH_AGE_SECONDS` = 300 s) plus a device public key
@@ -649,8 +652,10 @@ When modifying token lifetimes, update these in authn.rs:
   900 s once clients renew, #108). Used only by `mint_auth_token` and the
   session renewal; DeviceCheck keeps `AUTH_TOKEN_HOURS`.
 - Session: `SESSION_IDLE_SECONDS` (3600), `SESSION_MAX_SECONDS` (86400);
-  `PASSKEY_SESSION_TOKEN_SECONDS <= SESSION_IDLE_SECONDS` is asserted at
-  compile time, or a session dies before its first renewal is due.
+  the enforced `SESSION_IDLE_LIMIT_SECONDS` is never below
+  `PASSKEY_SESSION_TOKEN_SECONDS` + skew + `SESSION_RENEWAL_GRACE_SECONDS`
+  (asserted at compile time), or the renewal an expired token's 401
+  prompts is refused as idle.
 - Session timeout: `Duration::seconds(600)` (10 minutes)
 - Passkey enrollment freshness: `ENROLLMENT_TOKEN_MAX_AGE_SECONDS` (300s).
   Must stay below the auth token lifetime — asserted at compile time in
