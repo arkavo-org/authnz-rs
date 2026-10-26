@@ -79,3 +79,23 @@ No user data. The attested key is a throwaway bound to no account.
 To regenerate, see Task 0 of
 `docs/superpowers/plans/2026-09-20-app-attest-registration-gate.md` — and read
 "Do not regenerate casually" above first.
+
+## `assertion.json` (#17)
+
+A **real** attest and its first minted assert for one key, captured by
+Arkavo Creator (Debug, signed with Apple Development) on macOS 27 against
+production identity.arkavo.net, account `test-iphone-00`, on 2026-10-26. The
+tests verify the attestation at `verify_at`, then the assertion against the
+key it attested, then mint the device token. The same file is also used to
+check tampers: authData, signature, challenge, key and app.
+
+| Field | Meaning |
+|---|---|
+| top level | as above: `app_id`, `app_id_hash`, `key_id`, `rp_id_hash`, the leaf window, `verify_at` (attest capture time) |
+| `attest` | `challenge`, `client_data_hash` (base64 and hex), `attestation_object`, `captured_at`, `auth_data_counter` (0) |
+| `assert` | `challenge`, `client_data_hash`, `assertion` (standard base64 of the CBOR map `{signature, authenticatorData}`), `captured_at`, `rp_id_hash`, `counter` (from authData, 6) and `counter_before` (5, inferred, not read from the database) |
+
+The five assertions before this one verified and then failed at the mint
+(#118), which is why the counter is 6. The leaf is valid only until
+2026-10-28, so every check of the chain uses `verify_at`, never the wall
+clock.
