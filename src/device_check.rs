@@ -2468,6 +2468,27 @@ mod tests {
     }
 
     #[test]
+    fn real_device_capture_times_sit_inside_the_leaf_window() {
+        // verify_at is the attest capture time, in UTC (the first posting was
+        // 3 h off: local EDT labelled PDT). The chain is checked at it.
+        let f = load_assertion_fixture();
+        let ts = |k: &str| {
+            chrono::DateTime::parse_from_rfc3339(f[k].as_str().unwrap())
+                .unwrap()
+                .timestamp()
+        };
+        let (nb, na) = (ts("leaf_cert_not_before"), ts("leaf_cert_not_after"));
+        let at = f["verify_at"].as_i64().unwrap();
+        let attest = f["attest"]["captured_at"].as_i64().unwrap();
+        let assert_at = f["assert"]["captured_at"].as_i64().unwrap();
+        assert_eq!(at, attest, "verify_at is the attest capture time");
+        assert!(
+            nb <= at && at < assert_at && assert_at <= na,
+            "{nb} {at} {assert_at} {na}"
+        );
+    }
+
+    #[test]
     fn real_device_attestation_yields_the_bound_key() {
         let f = load_assertion_fixture();
         let key = assertion_fixture_key(&f);
