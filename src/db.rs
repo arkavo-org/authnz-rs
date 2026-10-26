@@ -2151,9 +2151,10 @@ pub(crate) fn strip_derived_only(list: Vec<String>, owner: &dyn std::fmt::Displa
         return list;
     }
     warn!(
-        "Stored entitlements for {} contain derived-only {} values; ignoring the stored copies",
+        "Stored entitlements for {} contain derived-only ({} or {}) values; ignoring the stored copies",
         owner,
-        crate::constants::PATREON_ENTITLEMENT_NAMESPACE
+        crate::constants::PATREON_ENTITLEMENT_NAMESPACE,
+        crate::constants::CREATOR_ATTRIBUTE
     );
     list.into_iter().filter(|e| !is_derived_only(e)).collect()
 }

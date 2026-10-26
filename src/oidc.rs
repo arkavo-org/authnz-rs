@@ -2188,7 +2188,8 @@ pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 /// entitlement (#91) are computed here too, from that same snapshot (plus,
 /// for publishing, the account's suspension state), and carried in
 /// `derived_entitlements` — never in `entitlements`, which is the stored
-/// list. Every short-lived human token (passkey auth, DeviceCheck assertion,
+/// list. So is the account's own creator attribute (#117), unconditionally.
+/// Every short-lived human token (passkey auth, DeviceCheck assertion,
 /// OIDC access token on code exchange *and* refresh) goes through this one
 /// builder; the registration token drops the derived part at mint.
 pub(crate) async fn arkavo_user_claims(
@@ -2207,6 +2208,9 @@ pub(crate) async fn arkavo_user_claims(
         .unwrap_or_default();
     derived_entitlements
         .extend(crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await);
+    if let Some(id) = user_id {
+        derived_entitlements.push(crate::constants::creator_entitlement(&id));
+    }
     crate::cwt::ArkavoUserClaims {
         account_id: user.arkavo_account_id.clone(),
         roles: user.roles.clone(),

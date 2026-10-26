@@ -391,9 +391,36 @@ pub const PATREON_CAMPAIGN_FQN_PREFIX: &str = "https://patreon.arkavo.com/attr/c
 pub const PATREON_CAMPAIGN_TIER_FQN_PREFIX: &str =
     "https://patreon.arkavo.com/attr/campaign-tier/value/";
 
+/// The per-creator attribute (#117): `<this>value/<account uuid>`.
+///
+/// Every account holds its own value, derived at mint, so a creator without
+/// a Patreon campaign (App Store–only) can protect recordings and catalog
+/// metadata to itself and still decrypt its own catalog. Never stored or
+/// delegated: a stored or delegated copy would let another holder open that
+/// creator's content.
+///
+/// `arkavo.net` is already a registered namespace in the platform's policy;
+/// the attribute is defined there with no listed values and `anyOf`, like
+/// the Patreon campaign attribute (opentdf-platform#64).
+pub const CREATOR_ATTRIBUTE: &str = "https://arkavo.net/attr/creator/";
+
+/// The account's own creator value, `<CREATOR_ATTRIBUTE>value/<uuid>`, with
+/// the UUID lowercase and hyphenated: the catalog subject, never the
+/// `arkavo:`-prefixed OIDC `sub`.
+pub fn creator_entitlement(user_id: &uuid::Uuid) -> String {
+    format!("{CREATOR_ATTRIBUTE}value/{}", user_id.hyphenated())
+}
+
 /// Whether `fqn` may only be derived at mint, never stored or delegated.
+///
+/// ASCII case-insensitive: hosts are, and the platform lowercases FQNs, so
+/// `https://Patreon.arkavo.com/…` must not slip past as a storable value.
 pub fn is_derived_only(fqn: &str) -> bool {
-    fqn.starts_with(PATREON_ENTITLEMENT_NAMESPACE)
+    let starts = |prefix: &str| {
+        fqn.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    starts(PATREON_ENTITLEMENT_NAMESPACE) || starts(CREATOR_ATTRIBUTE)
 }
 
 /// Patreon OAuth scope a link must hold for its memberships to be readable.
