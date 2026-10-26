@@ -345,6 +345,11 @@ appraisal, status)
   since macOS emits `appattest` even from a dev build and `rpIdHash` already pins the app.
   These checks run **before** the nonce compare: any tamper to them also breaks the nonce, and
   a check shadowed by `NonceMismatch` cannot be tested.
+- Assertions (`verify_assertion`): a CBOR map `{signature, authenticatorData}` with a **DER**
+  signature, never `authData || r‖s`. The signature is ECDSA-SHA256 over
+  `nonce = SHA256(authData || clientDataHash)`, so the digest is `SHA256(nonce)`; `rpIdHash`
+  must equal the binding's `app_id`. The counter is checked only after both pass. No captured
+  real-device assertion fixture yet; the tests build assertions the way the Secure Enclave does.
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage
 

@@ -796,22 +796,6 @@ pub async fn finish_assertion(
         return Err(DeviceCheckError::DeviceNotFound);
     }
 
-    // Decode assertion
-    let assertion_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&request.assertion)
-        .map_err(|e| DeviceCheckError::InvalidAssertion(e.to_string()))?;
-
-    // Parse authenticator data from assertion
-    let auth_data = parse_authenticator_data(&assertion_bytes)?;
-
-    // Verify counter has incremented
-    if auth_data.counter <= binding.counter {
-        return Err(DeviceCheckError::InvalidCounter(format!(
-            "Counter must increment. Expected > {}, got {}",
-            binding.counter, auth_data.counter
-        )));
-    }
-
     // Decode client data hash
     let client_data_hash = base64::engine::general_purpose::STANDARD
         .decode(&request.client_data_hash)
@@ -823,10 +807,22 @@ pub async fn finish_assertion(
         return Err(DeviceCheckError::ChallengeMismatch);
     }
 
-    // Verify signature using stored public key
-    // The assertion contains authenticator data + signature
-    // Signature is over: authData || clientDataHash
-    verify_assertion_signature(&assertion_bytes, &client_data_hash, &binding.public_key)?;
+    // Signature and app first: the counter in an unverified authData is
+    // whatever the caller wrote.
+    let auth_data = verify_assertion(
+        &request.assertion,
+        &client_data_hash,
+        &binding.public_key,
+        &binding.app_id,
+    )?;
+
+    // Verify counter has incremented
+    if auth_data.counter <= binding.counter {
+        return Err(DeviceCheckError::InvalidCounter(format!(
+            "Counter must increment. Expected > {}, got {}",
+            binding.counter, auth_data.counter
+        )));
+    }
 
     // Update counter in database with race condition protection
     // Only update if the counter hasn't been modified by another request
@@ -1124,48 +1120,62 @@ fn parse_authenticator_data(data: &[u8]) -> Result<AuthenticatorData, DeviceChec
     })
 }
 
-fn verify_assertion_signature(
-    assertion_bytes: &[u8],
+/// What `DCAppAttestService.generateAssertion` returns: a CBOR map of two
+/// byte strings. Apple's keys are camelCase, as in [`AttestationObject`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssertionObject {
+    /// ECDSA P-256, DER (X9.62), never raw `r‖s`.
+    signature: Vec<u8>,
+    authenticator_data: Vec<u8>,
+}
+
+/// Verify an App Attest assertion against a bound key; returns its authData.
+///
+/// Apple's steps: `nonce = SHA256(authenticatorData || clientDataHash)`, and
+/// the signature is ECDSA-SHA256 over `nonce`, so the digest is
+/// `SHA256(nonce)`, not `nonce`. `rpIdHash` must be the app the key was
+/// attested for (`app_id`, lowercase hex). The caller checks the counter,
+/// which means nothing until this has passed.
+fn verify_assertion(
+    assertion_b64: &str,
     client_data_hash: &[u8],
     public_key_der: &[u8],
-) -> Result<(), DeviceCheckError> {
-    // App Attest assertion format: authenticatorData || signature
-    // Signature is 64 bytes for P-256 ECDSA (r || s, 32 bytes each)
-    if assertion_bytes.len() < 37 + 64 {
-        return Err(DeviceCheckError::InvalidAssertion(
-            "Assertion too short to contain signature".to_string(),
-        ));
-    }
+    app_id: &str,
+) -> Result<AuthenticatorData, DeviceCheckError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(assertion_b64)
+        .map_err(|e| DeviceCheckError::InvalidAssertion(e.to_string()))?;
+    let assertion: AssertionObject = ciborium::from_reader(&bytes[..]).map_err(|e| {
+        DeviceCheckError::InvalidAssertion(format!("not a CBOR App Attest assertion: {e}"))
+    })?;
 
-    let auth_data_len = assertion_bytes.len() - 64;
-    let auth_data = &assertion_bytes[0..auth_data_len];
-    let signature_bytes = &assertion_bytes[auth_data_len..];
-
-    // Parse the P-256 public key from DER format
     let verifying_key = P256VerifyingKey::from_public_key_der(public_key_der).map_err(|e| {
         DeviceCheckError::InvalidCertificateChain(format!("Failed to parse public key: {}", e))
     })?;
-
-    // Create signature object
-    let signature = P256Signature::from_slice(signature_bytes).map_err(|e| {
+    let signature = P256Signature::from_der(&assertion.signature).map_err(|e| {
         DeviceCheckError::InvalidAssertion(format!("Invalid signature format: {}", e))
     })?;
 
-    // The signed data is: authenticatorData || clientDataHash
-    let mut signed_data = Vec::new();
-    signed_data.extend_from_slice(auth_data);
-    signed_data.extend_from_slice(client_data_hash);
+    let mut nonce_data = assertion.authenticator_data.clone();
+    nonce_data.extend_from_slice(client_data_hash);
+    let nonce = Sha256::digest(&nonce_data);
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        error!("Assertion signature verification failed: {}", e);
+        DeviceCheckError::InvalidAssertion(format!("Signature verification failed: {}", e))
+    })?;
 
-    // Verify the signature
-    verifying_key
-        .verify(&signed_data, &signature)
-        .map_err(|e| {
-            error!("Assertion signature verification failed: {}", e);
-            DeviceCheckError::InvalidAssertion(format!("Signature verification failed: {}", e))
-        })?;
+    let auth_data = parse_authenticator_data(&assertion.authenticator_data)?;
+    if auth_data.rp_id_hash_str != app_id {
+        warn!(
+            "Assertion rpIdHash {} is not the bound app {}",
+            auth_data.rp_id_hash_str, app_id
+        );
+        return Err(DeviceCheckError::AppIdMismatch);
+    }
 
     info!("Assertion signature verified successfully");
-    Ok(())
+    Ok(auth_data)
 }
 
 /// Device class derived from App Attest assertion freshness (spec §1.3).
@@ -2043,21 +2053,206 @@ mod tests {
         assert!(invalid_counter <= old_counter);
     }
 
-    #[test]
-    fn test_signature_verification_input_validation() {
-        // Test that assertion must be long enough to contain signature
-        let short_assertion = vec![0u8; 50]; // Too short (needs at least 37 + 64 = 101)
-        let client_data = vec![0u8; 32];
-        let public_key = vec![0u8; 91]; // Minimal P-256 public key DER
+    /// A device key and an assertion built the way the Secure Enclave builds
+    /// one: CBOR `{signature, authenticatorData}`, DER ECDSA-SHA256 over
+    /// `nonce`. There is no captured assertion fixture yet (#17).
+    mod assertion {
+        use super::super::*;
+        use p256::ecdsa::SigningKey;
+        use p256::ecdsa::signature::Signer;
+        use p256::pkcs8::EncodePublicKey;
 
-        let result = verify_assertion_signature(&short_assertion, &client_data, &public_key);
-        assert!(result.is_err());
+        pub const APP_ID: [u8; 32] = [0xab; 32];
+
+        pub fn key() -> SigningKey {
+            SigningKey::from_slice(&[7u8; 32]).unwrap()
+        }
+
+        pub fn public_der(key: &SigningKey) -> Vec<u8> {
+            key.verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        }
+
+        pub fn auth_data(rp_id_hash: [u8; 32], counter: u32) -> Vec<u8> {
+            let mut d = rp_id_hash.to_vec();
+            d.push(0x40);
+            d.extend_from_slice(&counter.to_be_bytes());
+            d
+        }
+
+        pub fn encode(signature: &[u8], auth_data: &[u8]) -> String {
+            use ciborium::Value;
+            let map = Value::Map(vec![
+                (
+                    Value::Text("signature".into()),
+                    Value::Bytes(signature.into()),
+                ),
+                (
+                    Value::Text("authenticatorData".into()),
+                    Value::Bytes(auth_data.into()),
+                ),
+            ]);
+            let mut out = Vec::new();
+            ciborium::into_writer(&map, &mut out).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(out)
+        }
+
+        /// Sign `message` with ECDSA-SHA256, DER-encoded.
+        pub fn sign(key: &SigningKey, message: &[u8]) -> Vec<u8> {
+            let sig: P256Signature = key.sign(message);
+            sig.to_der().as_bytes().to_vec()
+        }
+
+        pub fn nonce(auth_data: &[u8], client_data_hash: &[u8]) -> Vec<u8> {
+            let mut d = auth_data.to_vec();
+            d.extend_from_slice(client_data_hash);
+            Sha256::digest(&d).to_vec()
+        }
+
+        pub fn genuine(key: &SigningKey, counter: u32, client_data_hash: &[u8]) -> String {
+            let ad = auth_data(APP_ID, counter);
+            encode(&sign(key, &nonce(&ad, client_data_hash)), &ad)
+        }
+    }
+
+    fn cdh() -> Vec<u8> {
+        Sha256::digest(b"challenge").to_vec()
+    }
+
+    #[test]
+    fn assertion_accepts_a_genuine_assertion() {
+        let key = assertion::key();
+        let b64 = assertion::genuine(&key, 7, &cdh());
+        let ad = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .expect("a genuine assertion verifies");
+        assert_eq!(ad.counter, 7);
+    }
+
+    #[test]
+    fn assertion_rejects_the_digest_without_the_second_hash() {
+        // The old verifier's digest: ECDSA-SHA256 over authData || clientDataHash,
+        // i.e. a digest of `nonce` itself. The Secure Enclave signs `nonce` as
+        // the message, so its digest is SHA256(nonce).
+        let key = assertion::key();
+        let ad = assertion::auth_data(assertion::APP_ID, 1);
+        let mut message = ad.clone();
+        message.extend_from_slice(&cdh());
+        let b64 = assertion::encode(&assertion::sign(&key, &message), &ad);
+        let err = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("too short to contain signature")
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
         );
+    }
+
+    #[test]
+    fn assertion_rejects_raw_authdata_and_signature() {
+        // The format the old verifier parsed: authData || r‖s, no CBOR.
+        let key = assertion::key();
+        let ad = assertion::auth_data(assertion::APP_ID, 1);
+        let sig: P256Signature =
+            p256::ecdsa::signature::Signer::sign(&key, &assertion::nonce(&ad, &cdh()));
+        let mut raw = ad.clone();
+        raw.extend_from_slice(&sig.to_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let err = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn assertion_rejects_a_raised_counter() {
+        // Signed at counter 1, presented as counter 1000: the counter the
+        // caller checks is only meaningful because the signature covers it.
+        let key = assertion::key();
+        let signed = assertion::auth_data(assertion::APP_ID, 1);
+        let sig = assertion::sign(&key, &assertion::nonce(&signed, &cdh()));
+        let b64 = assertion::encode(&sig, &assertion::auth_data(assertion::APP_ID, 1000));
+        let err = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn assertion_rejects_another_challenge() {
+        let key = assertion::key();
+        let b64 = assertion::genuine(&key, 1, &cdh());
+        let other = Sha256::digest(b"another challenge").to_vec();
+        let err = verify_assertion(
+            &b64,
+            &other,
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn assertion_rejects_another_key() {
+        let key = assertion::key();
+        let other = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let b64 = assertion::genuine(&key, 1, &cdh());
+        let err = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&other),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn assertion_rejects_another_app() {
+        // Validly signed by the bound key, but for a different rpIdHash.
+        let key = assertion::key();
+        let ad = assertion::auth_data([0xcd; 32], 1);
+        let b64 = assertion::encode(&assertion::sign(&key, &assertion::nonce(&ad, &cdh())), &ad);
+        let err = verify_assertion(
+            &b64,
+            &cdh(),
+            &assertion::public_der(&key),
+            &hex::encode(assertion::APP_ID),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DeviceCheckError::AppIdMismatch), "{err:?}");
     }
 
     #[test]
