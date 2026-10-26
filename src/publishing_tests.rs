@@ -848,11 +848,19 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     let publish = ENTITLEMENT_CREATOR_PUBLISH.to_string();
     let decrypt = "https://arkavo.ai/attr/tdf/value/decrypt".to_string();
     let campaign = "https://patreon.arkavo.com/attr/campaign/value/123".to_string();
+    // Another account's creator value (#117): holding it would open that
+    // creator's content.
+    let others_creator = crate::constants::creator_entitlement(&Uuid::new_v4());
     // A row written before validate_fqns refused the FQNs.
     f.store
         .put_user_entitlements(
             &f.user_id,
-            &[decrypt.clone(), publish.clone(), campaign.clone()],
+            &[
+                decrypt.clone(),
+                publish.clone(),
+                campaign.clone(),
+                others_creator.clone(),
+            ],
         )
         .await
         .unwrap();
@@ -866,21 +874,34 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     );
 
     // Even a stored copy that reached the builder is not emitted while the
-    // account is suspended or unqualified.
+    // account is suspended or unqualified. Only the account's own creator
+    // value, derived, rides alongside the stored list.
+    let own = crate::constants::creator_entitlement(&f.user_id);
     let leaked = AuthenticatedUser::webauthn(
         f.user_id,
-        vec![decrypt.clone(), publish.clone(), campaign.clone()],
+        vec![
+            decrypt.clone(),
+            publish.clone(),
+            campaign.clone(),
+            others_creator.clone(),
+        ],
     );
     f.suspend().await;
     let suspended = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
-    assert_eq!(suspended.effective_entitlements(), vec![decrypt.clone()]);
+    assert_eq!(
+        suspended.effective_entitlements(),
+        vec![decrypt.clone(), own.clone()]
+    );
     f.store
         .lift_publishing_suspension(&f.user_id)
         .await
         .unwrap();
     f.state.publisher = Arc::new(None);
     let unqualified = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
-    assert_eq!(unqualified.effective_entitlements(), vec![decrypt.clone()]);
+    assert_eq!(
+        unqualified.effective_entitlements(),
+        vec![decrypt.clone(), own.clone()]
+    );
 
     // And it cannot be delegated.
     let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, None, None).unwrap();
