@@ -348,8 +348,9 @@ appraisal, status)
 - Assertions (`verify_assertion`): a CBOR map `{signature, authenticatorData}` with a **DER**
   signature, never `authData || r‖s`. The signature is ECDSA-SHA256 over
   `nonce = SHA256(authData || clientDataHash)`, so the digest is `SHA256(nonce)`; `rpIdHash`
-  must equal the binding's `app_id`. The counter is checked only after both pass. No captured
-  real-device assertion fixture yet; the tests build assertions the way the Secure Enclave does.
+  must equal the binding's `app_id`. The counter is checked only after both pass. A real
+  device's attest + first minted assert is pinned in `tests/fixtures/appattest/assertion.json`
+  (#17, Mac, 2026-10-26); the synthetic tests build assertions the way the Secure Enclave does.
 - Monotonic counter enforcement for replay protection
 - Public key extraction and storage: a binding's `public_key` is the credCert's **DER
   SubjectPublicKeyInfo**. Every reader (`verify_assertion`, `cwt::cnf_from_app_attest`) parses
