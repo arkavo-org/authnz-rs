@@ -2607,6 +2607,37 @@ pub(crate) mod tests {
         assert_eq!(claims.roles, vec!["user".to_string()]);
         assert_eq!(claims.entitlements, entitlements);
         assert_eq!(claims.patreon, None);
+        // #117: the account's own creator value, derived, never stored.
+        let own = crate::constants::creator_entitlement(&user_id);
+        assert_eq!(claims.derived_entitlements, vec![own.clone()]);
+        assert_eq!(
+            claims.effective_entitlements(),
+            [entitlements, vec![own]].concat()
+        );
+    }
+
+    /// #117: a service account has no account, so no creator value.
+    #[tokio::test]
+    async fn arkavo_user_claims_for_a_service_account_carry_no_creator_value() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let service = AuthenticatedUser {
+            subject: "client:arkavo-moderation".into(),
+            arkavo_account_id: "client:arkavo-moderation".into(),
+            email: None,
+            email_verified: None,
+            name: None,
+            idp: "client_credentials".into(),
+            roles: vec!["service-account".into()],
+            entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
+            auth_time: None,
+        };
+        let claims = arkavo_user_claims(&app_state, &test_patreon_state(), &service).await;
+        assert!(claims.derived_entitlements.is_empty());
     }
 
     #[tokio::test]
