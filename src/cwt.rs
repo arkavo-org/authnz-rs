@@ -452,12 +452,14 @@ pub fn cnf_from_passkey(passkey: &webauthn_rs::prelude::Passkey) -> Result<Cnf, 
 
 /// Build a Cnf claim from a DeviceCheck/App Attest binding.
 ///
-/// `public_key_bytes` is the device's P-256 public key in uncompressed
-/// SEC1 format (65 bytes: 0x04 || x || y), as stored in the
-/// `device_bindings` DynamoDB table. `device_id` is the App Attest
-/// key ID, used as the cnf.kid.
-pub fn cnf_from_app_attest(public_key_bytes: &[u8], device_id: &[u8]) -> Result<Cnf, CwtError> {
-    let vk = VerifyingKey::from_sec1_bytes(public_key_bytes).map_err(|_| CwtError::Malformed)?;
+/// `public_key_der` is the device's P-256 public key as DER
+/// SubjectPublicKeyInfo, exactly as `finish_attestation` stores it in the
+/// `device_bindings` table (the credCert's SPKI) and as `verify_assertion`
+/// reads it. Not a bare SEC1 point (#118). `device_id` is the App Attest key
+/// ID, used as the cnf.kid.
+pub fn cnf_from_app_attest(public_key_der: &[u8], device_id: &[u8]) -> Result<Cnf, CwtError> {
+    use p256::pkcs8::DecodePublicKey;
+    let vk = VerifyingKey::from_public_key_der(public_key_der).map_err(|_| CwtError::Malformed)?;
     let cose_key = cose_key_from_p256_verifying_key(&vk, device_id);
     Ok(Cnf {
         cose_key,
@@ -1850,13 +1852,30 @@ mod tests {
 
     #[test]
     fn cnf_from_app_attest_constructs_cnf() {
-        // Mock device binding's public key as raw uncompressed P-256 (65 bytes: 0x04 || x || y).
+        // What a device binding stores: the credCert's DER SubjectPublicKeyInfo.
+        use p256::pkcs8::EncodePublicKey;
         let (_sk, vk) = test_keypair();
-        let public_key_bytes = vk.to_encoded_point(false).as_bytes().to_vec();
+        let public_key_der = vk.to_public_key_der().unwrap().as_bytes().to_vec();
         let device_id = b"app-attest-key-id".to_vec();
 
-        let cnf = cnf_from_app_attest(&public_key_bytes, &device_id).expect("build cnf");
+        let cnf = cnf_from_app_attest(&public_key_der, &device_id).expect("build cnf");
         assert_eq!(cnf.kid, device_id);
+        assert_eq!(
+            cnf.cose_key,
+            cose_key_from_p256_verifying_key(&vk, &device_id),
+            "cnf names the bound key"
+        );
+    }
+
+    #[test]
+    fn cnf_from_app_attest_rejects_a_bare_sec1_point() {
+        // A binding never stores one; accepting it would mean two formats.
+        let (_sk, vk) = test_keypair();
+        let point = vk.to_encoded_point(false).as_bytes().to_vec();
+        assert!(matches!(
+            cnf_from_app_attest(&point, b"id"),
+            Err(CwtError::Malformed)
+        ));
     }
 
     #[test]

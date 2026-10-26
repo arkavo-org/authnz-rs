@@ -351,7 +351,9 @@ appraisal, status)
   must equal the binding's `app_id`. The counter is checked only after both pass. No captured
   real-device assertion fixture yet; the tests build assertions the way the Secure Enclave does.
 - Monotonic counter enforcement for replay protection
-- Public key extraction and storage
+- Public key extraction and storage: a binding's `public_key` is the credCert's **DER
+  SubjectPublicKeyInfo**. Every reader (`verify_assertion`, `cwt::cnf_from_app_attest`) parses
+  DER, never a bare SEC1 point (#118: the mint parsed SEC1 and 401'd every real device).
 
 **publishing.rs** - Creator-publishing entitlement (#91)
 - `https://patreon.arkavo.com/attr/arkavo-creator/value/publish` is **derived
