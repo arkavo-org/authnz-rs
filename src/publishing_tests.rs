@@ -219,7 +219,10 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     let binding = crate::device_check::DeviceBinding {
         device_id: "device-pub".into(),
         user_id: f.user_id,
-        public_key: vk.to_encoded_point(false).as_bytes().to_vec(),
+        public_key: {
+            use p256::pkcs8::EncodePublicKey;
+            vk.to_public_key_der().unwrap().as_bytes().to_vec()
+        },
         counter: 1,
         app_id: "app".into(),
         created_at: now,
