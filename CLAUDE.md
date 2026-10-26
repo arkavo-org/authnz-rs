@@ -401,7 +401,18 @@ appraisal, status)
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**
   (`constants::is_derived_only`): refused by `validate_fqns`, stripped from
   stored lists on read and from `effective_entitlements`, so none of it is
-  ever stored, delegated to an agent, or listed by `GET /entities`.
+  ever stored, delegated to an agent, or listed by `GET /entities`. So is
+  the creator attribute below. The check ignores the host's letter case
+  (`https://Patreon.arkavo.com/…` is derived-only too).
+- **Creator attribute** (#117, `constants::creator_entitlement`):
+  `https://arkavo.net/attr/creator/value/<uuid>`, the account's bare
+  lowercase UUID (the catalog subject, never the `arkavo:` OIDC `sub`).
+  `arkavo_user_claims` adds it to every account's own short-lived tokens,
+  unconditionally, in `derived_entitlements` (so the registration token drops
+  it); service accounts get none. App Store–only creators protect recordings
+  and catalog metadata with it (tdf-iroh-s3#38). The platform defines it with
+  no listed values, `anyOf` (opentdf-platform#64). No viewer is granted
+  another creator's value yet.
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within

@@ -1479,7 +1479,10 @@ mod tests {
                 "https://arkavo.ai/attr/tdf/value/create".into(),
                 "https://arkavo.ai/attr/tdf/value/decrypt".into(),
             ],
-            derived_entitlements: vec![crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into()],
+            derived_entitlements: vec![
+                crate::constants::creator_entitlement(&user_id),
+                crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into(),
+            ],
             patreon: Some(sample_patreon()),
         };
 
@@ -1508,6 +1511,13 @@ mod tests {
         );
         assert!(auth.custom.arkavo_roles.is_some());
         assert!(auth.custom.arkavo_entitlements.is_some());
+        // #117: the auth CWT and the access token both carry the account's
+        // own creator value.
+        let own = crate::constants::creator_entitlement(&user_id);
+        for token in [&auth, &access] {
+            let ents = token.custom.arkavo_entitlements.as_ref().unwrap();
+            assert_eq!(ents.iter().filter(|e| **e == own).count(), 1);
+        }
         assert!(auth.custom.arkavo_patreon.is_some());
         assert_eq!(
             auth.custom.arkavo_account_id,
@@ -1558,8 +1568,12 @@ mod tests {
             roles: vec!["user".into()],
             entitlements: vec!["https://arkavo.ai/attr/tdf/value/decrypt".into()],
             // A qualifying user adding a passkey reaches this mint with the
-            // derived publishing entitlement; the ~99-year token must drop it.
-            derived_entitlements: vec![crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into()],
+            // derived publishing entitlement and its own creator value
+            // (#117); the ~99-year token must drop both.
+            derived_entitlements: vec![
+                crate::constants::ENTITLEMENT_CREATOR_PUBLISH.into(),
+                crate::constants::creator_entitlement(&user_id),
+            ],
             patreon: Some(sample_patreon()),
         };
 

@@ -113,6 +113,13 @@ impl Fixture {
         crate::oidc::arkavo_user_claims(&self.state, &self.patreon, &self.webauthn_user()).await
     }
 
+    /// The builder's `derived_entitlements` without the account's own
+    /// creator value (#117), which every account holds whatever its
+    /// publishing state. Asserts that value is there.
+    pub async fn derived(&self) -> Vec<String> {
+        without_own_creator(&self.claims().await, self.user_id)
+    }
+
     pub async fn suspend(&self) {
         let out = self
             .store
@@ -147,6 +154,20 @@ pub(crate) fn has_publish(claims: &ArkavoClaims) -> bool {
         .is_some_and(|e| e.iter().any(|x| x == ENTITLEMENT_CREATOR_PUBLISH))
 }
 
+/// `without_own_creator(&user, f.user_id)` without `user_id`'s own creator value (#117),
+/// asserting it is present exactly once.
+fn without_own_creator(user: &crate::cwt::ArkavoUserClaims, user_id: Uuid) -> Vec<String> {
+    let own = crate::constants::creator_entitlement(&user_id);
+    let mut derived = user.derived_entitlements.clone();
+    assert_eq!(
+        derived.iter().filter(|e| **e == own).count(),
+        1,
+        "every account holds its own creator value"
+    );
+    derived.retain(|e| *e != own);
+    derived
+}
+
 #[tokio::test]
 async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_registration() {
     let Some(f) = Fixture::new().await else {
@@ -154,7 +175,7 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     };
     let user = f.claims().await;
     assert_eq!(
-        user.derived_entitlements,
+        without_own_creator(&user, f.user_id),
         vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
     );
     // The stored list is untouched; the derived one rides alongside it.
@@ -232,7 +253,10 @@ async fn suspension_withholds_publish_until_lifted() {
     };
     f.suspend().await;
     let user = f.claims().await;
-    assert!(user.derived_entitlements.is_empty(), "suspended ⇒ none");
+    assert!(
+        without_own_creator(&user, f.user_id).is_empty(),
+        "suspended ⇒ none"
+    );
     // Membership is still reported; only the derived entitlement is withheld.
     assert!(user.patreon.is_some());
     let auth =
@@ -244,7 +268,7 @@ async fn suspension_withholds_publish_until_lifted() {
         .await
         .unwrap();
     assert_eq!(
-        f.claims().await.derived_entitlements,
+        f.derived().await,
         vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
     );
 }
@@ -264,7 +288,7 @@ async fn the_publisher_campaign_owner_publishes_unless_suspended() {
 
     let user = f.claims().await;
     assert_eq!(
-        user.derived_entitlements,
+        without_own_creator(&user, f.user_id),
         vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
     );
     let auth =
@@ -272,10 +296,7 @@ async fn the_publisher_campaign_owner_publishes_unless_suspended() {
     assert!(has_publish(&auth), "auth CWT must carry it");
 
     f.suspend().await;
-    assert!(
-        f.claims().await.derived_entitlements.is_empty(),
-        "suspended ⇒ none"
-    );
+    assert!(f.derived().await.is_empty(), "suspended ⇒ none");
 }
 
 #[tokio::test]
@@ -284,17 +305,17 @@ async fn feature_unset_or_non_qualifying_membership_grants_nothing() {
         return;
     };
     f.state.publisher = Arc::new(None);
-    assert!(f.claims().await.derived_entitlements.is_empty());
+    assert!(f.derived().await.is_empty());
 
     f.state.publisher = Arc::new(Some(publisher_cfg()));
     let mut lapsed = qualifying_snapshot("consumer");
     lapsed.memberships[0].patron_status = Some("declined_patron".into());
     f.patreon = patreon_with(f.user_id, &lapsed).await;
-    assert!(f.claims().await.derived_entitlements.is_empty());
+    assert!(f.derived().await.is_empty());
 
     // A consumer link qualifies exactly like a creator link.
     f.patreon = patreon_with(f.user_id, &qualifying_snapshot("consumer")).await;
-    assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+    assert_eq!(f.derived().await.len(), 1);
 
     // No Patreon state at all (unlinked / disabled).
     f.patreon = PatreonState::new(
@@ -302,7 +323,7 @@ async fn feature_unset_or_non_qualifying_membership_grants_nothing() {
         None,
         fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None),
     );
-    assert!(f.claims().await.derived_entitlements.is_empty());
+    assert!(f.derived().await.is_empty());
 }
 
 // ---- App Store Creator Membership ----
@@ -369,7 +390,7 @@ mod app_store_source {
         };
         let now = Utc::now().timestamp();
         // Nothing bound yet.
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
 
         put(
             &f,
@@ -380,7 +401,7 @@ mod app_store_source {
         let user = f.claims().await;
         assert!(user.patreon.is_none());
         assert_eq!(
-            user.derived_entitlements,
+            without_own_creator(&user, f.user_id),
             vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
         );
         // Derived, never stored.
@@ -415,7 +436,7 @@ mod app_store_source {
             GraceUpdate::Keep,
         )
         .await;
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
     }
 
     #[tokio::test]
@@ -436,7 +457,7 @@ mod app_store_source {
         )
         .await;
         assert_eq!(
-            f.claims().await.derived_entitlements,
+            f.derived().await,
             vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
         );
     }
@@ -452,12 +473,12 @@ mod app_store_source {
         let otid = unique_otid();
         let mut rec = record(&otid, Environment::Production, now + 3600, now - 100);
         put(&f, &rec, GraceUpdate::Keep).await;
-        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+        assert_eq!(f.derived().await.len(), 1);
 
         rec.revoked_at = Some(now);
         rec.last_signed_at = now;
         put(&f, &rec, GraceUpdate::Keep).await;
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
     }
 
     #[tokio::test]
@@ -473,12 +494,12 @@ mod app_store_source {
         )
         .await;
         f.suspend().await;
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
         f.store
             .lift_publishing_suspension(&f.user_id)
             .await
             .unwrap();
-        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+        assert_eq!(f.derived().await.len(), 1);
     }
 
     #[tokio::test]
@@ -494,7 +515,7 @@ mod app_store_source {
             GraceUpdate::Keep,
         )
         .await;
-        assert_eq!(publish_count(&f.claims().await.derived_entitlements), 1);
+        assert_eq!(publish_count(&f.derived().await), 1);
 
         // Patreon alone still grants once, with the App Store feature on and
         // nothing bound to the account.
@@ -523,12 +544,12 @@ mod app_store_source {
         )
         .await;
         // Sandbox is accepted by default (owner decision).
-        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+        assert_eq!(f.derived().await.len(), 1);
 
         let mut cfg = AppStoreConfig::for_tests(Vec::new());
         cfg.environments = [Environment::Production].into_iter().collect();
         f.state.app_store = Arc::new(Some(cfg));
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
     }
 
     #[tokio::test]
@@ -545,12 +566,12 @@ mod app_store_source {
         )
         .await;
         // Both sources would grant, and the read of the row fails.
-        assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+        assert_eq!(f.derived().await.len(), 1);
         f.state.db_store = Arc::new(
             f.store
                 .with_credentials_table(format!("missing-credentials-{}", Uuid::new_v4().simple())),
         );
-        assert!(f.claims().await.derived_entitlements.is_empty());
+        assert!(f.derived().await.is_empty());
     }
 
     #[tokio::test]
@@ -751,7 +772,7 @@ async fn suspension_endpoint_auth_set_lift_and_audit_fields() {
     );
 
     // Suspension is in force at the next mint.
-    assert!(f.claims().await.derived_entitlements.is_empty());
+    assert!(f.derived().await.is_empty());
 
     // Lift ⇒ 204, idempotent; GET shows not suspended; the entitlement returns.
     let (s, _) = send(&app, req("DELETE", f.user_id, Some(&moderator), None)).await;
@@ -761,7 +782,7 @@ async fn suspension_endpoint_auth_set_lift_and_audit_fields() {
     let (_, g) = send(&app, req("GET", f.user_id, Some(&moderator), None)).await;
     assert_eq!(g["suspended"], false);
     assert!(g.get("suspension").is_none());
-    assert_eq!(f.claims().await.derived_entitlements.len(), 1);
+    assert_eq!(f.derived().await.len(), 1);
 
     // Unknown user ⇒ 404 on every verb, and no row is created.
     let ghost = Uuid::new_v4();
@@ -827,11 +848,19 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     let publish = ENTITLEMENT_CREATOR_PUBLISH.to_string();
     let decrypt = "https://arkavo.ai/attr/tdf/value/decrypt".to_string();
     let campaign = "https://patreon.arkavo.com/attr/campaign/value/123".to_string();
+    // Another account's creator value (#117): holding it would open that
+    // creator's content.
+    let others_creator = crate::constants::creator_entitlement(&Uuid::new_v4());
     // A row written before validate_fqns refused the FQNs.
     f.store
         .put_user_entitlements(
             &f.user_id,
-            &[decrypt.clone(), publish.clone(), campaign.clone()],
+            &[
+                decrypt.clone(),
+                publish.clone(),
+                campaign.clone(),
+                others_creator.clone(),
+            ],
         )
         .await
         .unwrap();
@@ -845,21 +874,34 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     );
 
     // Even a stored copy that reached the builder is not emitted while the
-    // account is suspended or unqualified.
+    // account is suspended or unqualified. Only the account's own creator
+    // value, derived, rides alongside the stored list.
+    let own = crate::constants::creator_entitlement(&f.user_id);
     let leaked = AuthenticatedUser::webauthn(
         f.user_id,
-        vec![decrypt.clone(), publish.clone(), campaign.clone()],
+        vec![
+            decrypt.clone(),
+            publish.clone(),
+            campaign.clone(),
+            others_creator.clone(),
+        ],
     );
     f.suspend().await;
     let suspended = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
-    assert_eq!(suspended.effective_entitlements(), vec![decrypt.clone()]);
+    assert_eq!(
+        suspended.effective_entitlements(),
+        vec![decrypt.clone(), own.clone()]
+    );
     f.store
         .lift_publishing_suspension(&f.user_id)
         .await
         .unwrap();
     f.state.publisher = Arc::new(None);
     let unqualified = crate::oidc::arkavo_user_claims(&f.state, &f.patreon, &leaked).await;
-    assert_eq!(unqualified.effective_entitlements(), vec![decrypt.clone()]);
+    assert_eq!(
+        unqualified.effective_entitlements(),
+        vec![decrypt.clone(), own.clone()]
+    );
 
     // And it cannot be delegated.
     let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, None, None).unwrap();

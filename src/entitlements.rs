@@ -269,6 +269,50 @@ mod tests {
         assert!(parse_user_default_entitlements(Some(&campaign)).is_err());
     }
 
+    /// #117: the creator attribute is derived-only whatever the host's letter
+    /// case, and so is every Patreon value; neighbouring attributes are not.
+    #[test]
+    fn creator_attribute_can_never_be_stored() {
+        let own = crate::constants::creator_entitlement(&uuid::Uuid::new_v4());
+        assert!(own.starts_with("https://arkavo.net/attr/creator/value/"));
+        for derived in [
+            own.clone(),
+            own.replacen("arkavo.net", "ARKAVO.NET", 1),
+            "https://Arkavo.Net/attr/creator/value/x".to_string(),
+            "https://Patreon.arkavo.com/attr/campaign/value/123".to_string(),
+        ] {
+            assert!(crate::constants::is_derived_only(&derived), "{derived}");
+            assert!(
+                matches!(
+                    validate_fqns(&[ENTITLEMENT_READ.into(), derived.clone()]),
+                    Err(EntitlementError::DerivedOnly(_))
+                ),
+                "{derived}"
+            );
+            assert!(parse_user_default_entitlements(Some(&derived)).is_err());
+        }
+        for stored in [
+            "https://arkavo.net/attr/creators/value/x",
+            "https://arkavo.net/attr/other/value/x",
+            "https://arkavo.ai/attr/tdf/value/decrypt",
+        ] {
+            assert!(!crate::constants::is_derived_only(stored), "{stored}");
+        }
+        assert_eq!(
+            crate::db::strip_derived_only(vec![ENTITLEMENT_READ.into(), own], &"test"),
+            vec![ENTITLEMENT_READ.to_string()]
+        );
+    }
+
+    #[test]
+    fn creator_value_is_the_bare_lowercase_uuid() {
+        let id = uuid::Uuid::parse_str("5C1F0E7A-2B8D-4C0F-9A51-3F2B6D8E4A10").unwrap();
+        assert_eq!(
+            crate::constants::creator_entitlement(&id),
+            "https://arkavo.net/attr/creator/value/5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10"
+        );
+    }
+
     const ENTITLEMENT_READ: &str = "https://arkavo.ai/attr/action/value/read";
 
     #[test]
