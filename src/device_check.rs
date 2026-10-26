@@ -2292,11 +2292,12 @@ mod tests {
         let user_id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now().timestamp();
 
-        // Sample P-256 public key for cnf (uncompressed SEC1).
+        // Sample P-256 public key for cnf, stored as attest stores it: DER SPKI.
+        use p256::pkcs8::EncodePublicKey;
         let scalar = p256::FieldBytes::from([0x99u8; 32]);
         let secret = p256::SecretKey::from_bytes(&scalar).expect("scalar");
         let vk: p256::ecdsa::VerifyingKey = *p256::ecdsa::SigningKey::from(&secret).verifying_key();
-        let pubkey = vk.to_encoded_point(false).as_bytes().to_vec();
+        let pubkey = vk.to_public_key_der().unwrap().as_bytes().to_vec();
 
         let binding = DeviceBinding {
             device_id: "device-1".to_string(),
@@ -2324,6 +2325,96 @@ mod tests {
         assert_eq!(npe.npe_type, "device");
         assert_eq!(npe.class.as_deref(), Some("attested"));
         assert_eq!(npe.device_id.as_deref(), Some("device-1"));
+    }
+
+    /// The cnf of a minted assertion token, decoded.
+    fn minted_cnf(token: &str) -> crate::cwt::Cnf {
+        use coset::CborSerializable;
+        let raw = crate::cwt::decode_from_header(token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap())
+            .unwrap()
+            .cnf
+            .expect("cnf present")
+    }
+
+    /// #118: a genuine attestation's stored key mints a token. The binding
+    /// holds `extract_public_key_from_cert`'s output (the credCert's DER
+    /// SPKI); the mint used to parse it as a SEC1 point and answer 401.
+    #[tokio::test]
+    async fn a_genuinely_attested_key_mints_a_device_token() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let att = fixture_attestation(&load_fixture());
+        let cred_cert = &att.att_stmt.x5c[0];
+        let stored = extract_public_key_from_cert(cred_cert).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let binding = DeviceBinding {
+            device_id: "fixture-key".to_string(),
+            user_id: uuid::Uuid::new_v4(),
+            public_key: stored,
+            counter: 1,
+            app_id: "app-id".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let token = mint_assertion_token(&app_state, &binding, None, now)
+            .expect("a stored attested key must mint");
+
+        let (_, cert) = X509Certificate::from_der(cred_cert).unwrap();
+        let vk =
+            P256VerifyingKey::from_sec1_bytes(&cert.public_key().subject_public_key.data).unwrap();
+        let cnf = minted_cnf(&token);
+        assert_eq!(cnf.kid, b"fixture-key".to_vec());
+        assert_eq!(
+            cnf.cose_key,
+            crate::cwt::cose_key_from_p256_verifying_key(&vk, b"fixture-key"),
+            "cnf is the attested key"
+        );
+    }
+
+    /// #118: the key `verify_assertion` checks a signature with is the key
+    /// the token is bound to, read from the same stored bytes.
+    #[tokio::test]
+    async fn a_verified_assertion_mints_a_token_bound_to_its_key() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let key = assertion::key();
+        let stored = assertion::public_der(&key);
+        let app_id = hex::encode(assertion::APP_ID);
+
+        let ad = verify_assertion(
+            &assertion::genuine(&key, 2, &cdh()),
+            &cdh(),
+            &stored,
+            &app_id,
+        )
+        .expect("assertion verifies against the stored key");
+        let now = chrono::Utc::now().timestamp();
+        let binding = DeviceBinding {
+            device_id: "device-2".to_string(),
+            user_id: uuid::Uuid::new_v4(),
+            public_key: stored,
+            counter: ad.counter,
+            app_id,
+            created_at: now,
+            updated_at: now,
+        };
+        let token = mint_assertion_token(&app_state, &binding, None, now).expect("mint");
+        assert_eq!(
+            minted_cnf(&token).cose_key,
+            crate::cwt::cose_key_from_p256_verifying_key(key.verifying_key(), b"device-2")
+        );
     }
 
     #[tokio::test]
