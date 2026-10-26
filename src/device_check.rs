@@ -2417,6 +2417,206 @@ mod tests {
         );
     }
 
+    /// `assertion.json` (#17): one real key's attest and its first minted
+    /// assert, captured on a Mac by Arkavo Creator against production.
+    fn load_assertion_fixture() -> serde_json::Value {
+        let raw = std::fs::read_to_string("tests/fixtures/appattest/assertion.json")
+            .expect("#17 fixture missing: tests/fixtures/appattest/assertion.json");
+        serde_json::from_str(&raw).expect("fixture is not valid JSON")
+    }
+
+    fn b64(s: &serde_json::Value) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_str().unwrap())
+            .unwrap()
+    }
+
+    /// The fixture's key, verified the way `finish_attestation` verifies it,
+    /// with the chain checked at capture time.
+    fn assertion_fixture_key(f: &serde_json::Value) -> AttestedKey {
+        let app_ids = vec![f["app_id_hash"].as_str().unwrap().to_string()];
+        verify_attestation_at(
+            f["attest"]["challenge"].as_str().unwrap(),
+            f["key_id"].as_str().unwrap(),
+            f["attest"]["attestation_object"].as_str().unwrap(),
+            f["attest"]["client_data_hash"].as_str().unwrap(),
+            &VerifyOptions {
+                expected_app_ids: &app_ids,
+                require_app_id: true,
+            },
+            ASN1Time::from_timestamp(f["verify_at"].as_i64().unwrap()).unwrap(),
+        )
+        .expect("the fixture's attestation verifies")
+    }
+
+    /// The fixture's assertion with one byte string changed, re-encoded.
+    fn tampered_assertion(f: &serde_json::Value, field: &str, at: usize) -> String {
+        use base64::Engine as _;
+        let mut map: ciborium::Value =
+            ciborium::from_reader(&b64(&f["assert"]["assertion"])[..]).unwrap();
+        for (k, v) in map.as_map_mut().unwrap() {
+            if k.as_text() == Some(field) {
+                let bytes = v.as_bytes_mut().unwrap();
+                let i = at.min(bytes.len() - 1);
+                bytes[i] ^= 0x01;
+            }
+        }
+        let mut out = Vec::new();
+        ciborium::into_writer(&map, &mut out).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out)
+    }
+
+    #[test]
+    fn real_device_attestation_yields_the_bound_key() {
+        let f = load_assertion_fixture();
+        let key = assertion_fixture_key(&f);
+        assert_eq!(key.key_id, f["key_id"].as_str().unwrap());
+        assert_eq!(key.rp_id_hash_str, f["app_id_hash"].as_str().unwrap());
+        assert_eq!(key.counter, 0);
+        // Both challenges hash to their recorded client data hashes.
+        for step in ["attest", "assert"] {
+            let got = Sha256::digest(f[step]["challenge"].as_str().unwrap().as_bytes());
+            assert_eq!(
+                &got[..],
+                b64(&f[step]["client_data_hash"]).as_slice(),
+                "{step}"
+            );
+        }
+    }
+
+    /// #17: the first genuine Apple assertion through `verify_assertion`. Its
+    /// CBOR `{signature, authenticatorData}`, the DER signature and the
+    /// `SHA256(nonce)` digest are what #116 implemented from Apple's docs.
+    #[test]
+    fn real_device_assertion_verifies_against_the_attested_key() {
+        let f = load_assertion_fixture();
+        let key = assertion_fixture_key(&f);
+        let ad = verify_assertion(
+            f["assert"]["assertion"].as_str().unwrap(),
+            &b64(&f["assert"]["client_data_hash"]),
+            &key.public_key,
+            &key.rp_id_hash_str,
+        )
+        .expect("a genuine assertion verifies");
+        assert_eq!(ad.counter as i64, f["assert"]["counter"].as_i64().unwrap());
+        assert_eq!(
+            ad.rp_id_hash_str,
+            f["assert"]["rp_id_hash"].as_str().unwrap()
+        );
+        assert!(
+            (ad.counter as i64) > f["assert"]["counter_before"].as_i64().unwrap(),
+            "the counter the handler compares against advanced"
+        );
+    }
+
+    #[test]
+    fn real_device_assertion_refuses_every_tamper() {
+        let f = load_assertion_fixture();
+        let key = assertion_fixture_key(&f);
+        let cdh = b64(&f["assert"]["client_data_hash"]);
+        let app = key.rp_id_hash_str.clone();
+        let check = |assertion: &str, cdh: &[u8], pk: &[u8], app: &str| {
+            verify_assertion(assertion, cdh, pk, app).unwrap_err()
+        };
+
+        // The counter (authData[33..37]) and the flags are signed.
+        for at in [32, 36] {
+            let err = check(
+                &tampered_assertion(&f, "authenticatorData", at),
+                &cdh,
+                &key.public_key,
+                &app,
+            );
+            assert!(
+                matches!(err, DeviceCheckError::InvalidAssertion(_)),
+                "authData[{at}]: {err:?}"
+            );
+        }
+        // The signature itself (its last byte is inside `s`).
+        let err = check(
+            &tampered_assertion(&f, "signature", usize::MAX),
+            &cdh,
+            &key.public_key,
+            &app,
+        );
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+        // Another challenge.
+        let other = Sha256::digest(f["attest"]["challenge"].as_str().unwrap().as_bytes());
+        let err = check(
+            f["assert"]["assertion"].as_str().unwrap(),
+            &other,
+            &key.public_key,
+            &app,
+        );
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+        // Another key: the other real fixture's attested key.
+        let old = fixture_attestation(&load_fixture());
+        let old_key = extract_public_key_from_cert(&old.att_stmt.x5c[0]).unwrap();
+        let err = check(
+            f["assert"]["assertion"].as_str().unwrap(),
+            &cdh,
+            &old_key,
+            &app,
+        );
+        assert!(
+            matches!(err, DeviceCheckError::InvalidAssertion(_)),
+            "{err:?}"
+        );
+        // Another app: genuinely signed, but bound to a different rpIdHash.
+        let ios = "543398d88f303adedb67445ee9edbf1e1733a73d92bf6992cfbf228d60763cf8";
+        let err = check(
+            f["assert"]["assertion"].as_str().unwrap(),
+            &cdh,
+            &key.public_key,
+            ios,
+        );
+        assert!(matches!(err, DeviceCheckError::AppIdMismatch), "{err:?}");
+    }
+
+    /// The whole server path on real bytes: attest stores the key, the
+    /// assertion verifies against it, and the mint binds the token to it.
+    #[tokio::test]
+    async fn real_device_assertion_mints_a_device_token() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let f = load_assertion_fixture();
+        let key = assertion_fixture_key(&f);
+        let ad = verify_assertion(
+            f["assert"]["assertion"].as_str().unwrap(),
+            &b64(&f["assert"]["client_data_hash"]),
+            &key.public_key,
+            &key.rp_id_hash_str,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let binding = DeviceBinding {
+            device_id: key.key_id.clone(),
+            user_id: uuid::Uuid::new_v4(),
+            public_key: key.public_key.clone(),
+            counter: ad.counter,
+            app_id: key.rp_id_hash_str.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        let token = mint_assertion_token(&app_state, &binding, None, now).expect("mint");
+        let vk = P256VerifyingKey::from_public_key_der(&key.public_key).unwrap();
+        assert_eq!(
+            minted_cnf(&token).cose_key,
+            crate::cwt::cose_key_from_p256_verifying_key(&vk, key.key_id.as_bytes())
+        );
+    }
+
     #[tokio::test]
     async fn inbound_jwt_rejected_at_assertion_challenge() {
         unsafe {
