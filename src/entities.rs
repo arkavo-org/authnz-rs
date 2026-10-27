@@ -106,13 +106,21 @@ pub async fn get_entity(
                 .ok_or(EntityError::NotFound)?;
             let (class, expiry) =
                 crate::device_check::device_class(b.updated_at, Utc::now().timestamp());
+            let mut npe = serde_json::json!({"type": "device", "class": class.as_str(), "attestation_expiry": expiry, "device_id": b.device_id});
+            let (app_id_hash, app_env) = crate::device_check::device_app_claims(&app_state, &b);
+            if let Some(v) = app_id_hash {
+                npe["app_id_hash"] = v.into();
+            }
+            if let Some(v) = app_env {
+                npe["app_env"] = v.into();
+            }
             EntityRepresentation {
                 id,
                 category: "environment",
                 npe_type: Some("device"),
                 claims: serde_json::json!({
                     "arkavo_account_id": b.user_id,
-                    "arkavo_npe": {"type": "device", "class": class.as_str(), "attestation_expiry": expiry, "device_id": b.device_id},
+                    "arkavo_npe": npe,
                 }),
             }
         }

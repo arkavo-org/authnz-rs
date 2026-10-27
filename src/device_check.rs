@@ -100,6 +100,12 @@ pub struct DeviceBinding {
     pub public_key: Vec<u8>,
     pub counter: u32,
     pub app_id: String,
+    /// The App Attest environment the key was attested in (#114). `None` on
+    /// a binding written before it was stored: the aaguid was checked but not
+    /// kept, so such a binding mints no `app_env` until the device attests
+    /// again.
+    #[serde(default)]
+    pub app_env: Option<AppEnv>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -176,6 +182,7 @@ pub struct AttestedKey {
     pub public_key: Vec<u8>,
     pub rp_id_hash_str: String,
     pub counter: u32,
+    pub app_env: AppEnv,
 }
 
 /// How strictly [`verify_attestation`] treats the app-id configuration.
@@ -322,11 +329,11 @@ pub fn verify_attestation_at(
     // Runs before the nonce compare: every tamper here also changes the
     // nonce, and a check shadowed by NonceMismatch is a check nobody can test.
     let credential = parse_attested_credential(&attestation.auth_data)?;
-    if !ACCEPTED_AAGUIDS.contains(&credential.aaguid) {
+    let Some(app_env) = AppEnv::from_aaguid(&credential.aaguid) else {
         return Err(DeviceCheckError::InvalidAaguid(hex::encode(
             credential.aaguid,
         )));
-    }
+    };
     let key_hash = attested_key_hash(&attestation.att_stmt.x5c[0])?;
     let canonical_key_id = base64::engine::general_purpose::STANDARD.encode(key_hash);
     if key_id != canonical_key_id || credential.credential_id != key_hash.as_slice() {
@@ -366,6 +373,7 @@ pub fn verify_attestation_at(
         public_key,
         rp_id_hash_str: auth_data.rp_id_hash_str,
         counter: auth_data.counter,
+        app_env,
     })
 }
 
@@ -694,6 +702,7 @@ pub async fn finish_attestation(
         public_key: public_key.clone(),
         counter: 0,
         app_id: attested.rp_id_hash_str.clone(),
+        app_env: Some(attested.app_env),
         created_at: Utc::now().timestamp(),
         updated_at: Utc::now().timestamp(),
     };
@@ -1047,8 +1056,44 @@ struct AuthenticatorData {
 /// developer builds `appattestdevelop`; macOS always emits `appattest`, even
 /// for a locally signed build. `rpIdHash` already pins Team + Bundle ID, so a
 /// development key still needs our signing identity — the check exists to
-/// refuse anything that is not App Attest at all.
-const ACCEPTED_AAGUIDS: [[u8; 16]; 2] = [*b"appattest\0\0\0\0\0\0\0", *b"appattestdevelop"];
+/// refuse anything that is not App Attest at all. Both are accepted; which
+/// one a key carried is stored on its binding and minted as `app_env`
+/// (#114), so the platform can require `production`.
+const AAGUID_PRODUCTION: [u8; 16] = *b"appattest\0\0\0\0\0\0\0";
+const AAGUID_DEVELOPMENT: [u8; 16] = *b"appattestdevelop";
+
+/// The App Attest environment a key was attested in, from its aaguid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppEnv {
+    Production,
+    Development,
+}
+
+impl AppEnv {
+    fn from_aaguid(aaguid: &[u8; 16]) -> Option<Self> {
+        match *aaguid {
+            AAGUID_PRODUCTION => Some(AppEnv::Production),
+            AAGUID_DEVELOPMENT => Some(AppEnv::Development),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppEnv::Production => "production",
+            AppEnv::Development => "development",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "production" => Some(AppEnv::Production),
+            "development" => Some(AppEnv::Development),
+            _ => None,
+        }
+    }
+}
 
 /// authData's attested credential data, present only in an attestation.
 struct AttestedCredential<'a> {
@@ -1211,6 +1256,23 @@ pub fn device_class(last_assertion_at: i64, now: i64) -> (DeviceClass, i64) {
     }
 }
 
+/// A binding's `arkavo_npe.app_id_hash` and `app_env` (#114), shared by the
+/// device token and `GET /entities/device:<key_id>`.
+///
+/// The hash (lowercase hex `rpIdHash`) is present only while the configured
+/// `APP_ATTEST_APP_ID` set accepts it: a binding made with the set unset, or
+/// for an app since removed from it, names an app nobody checked, and a
+/// verifier must not take it for one of ours. The environment comes from the
+/// aaguid, verified on every path; a binding from before #114 has none.
+pub fn device_app_claims(
+    app_state: &AppState,
+    binding: &DeviceBinding,
+) -> (Option<String>, Option<String>) {
+    let app_id_hash = app_id_is_accepted(&binding.app_id, &app_state.app_attest_app_id)
+        .then(|| binding.app_id.to_ascii_lowercase());
+    (app_id_hash, binding.app_env.map(|e| e.as_str().into()))
+}
+
 /// Mint a CWT assertion token for a successfully-attested device.
 ///
 /// The token audience is `"arkavo:devicecheck"` (plus the configured
@@ -1230,6 +1292,7 @@ pub fn mint_assertion_token(
 ) -> Result<String, DeviceCheckError> {
     let cnf = crate::cwt::cnf_from_app_attest(&binding.public_key, binding.device_id.as_bytes())?;
     let (class, attestation_expiry) = device_class(now, now); // assertion just verified
+    let (app_id_hash, app_env) = device_app_claims(app_state, binding);
     let mut claims = crate::cwt::ArkavoClaims::devicecheck(
         &app_state.issuer,
         &binding.user_id.to_string(),
@@ -1242,6 +1305,8 @@ pub fn mint_assertion_token(
         class: Some(class.as_str().into()),
         attestation_expiry: Some(attestation_expiry),
         device_id: Some(binding.device_id.clone()),
+        app_id_hash,
+        app_env,
         delegation_id: None,
         depth: None,
         chain: None,
@@ -1909,6 +1974,7 @@ mod tests {
             public_key: vec![1, 2, 3],
             rp_id_hash_str: "ea2d".into(),
             counter: 0,
+            app_env: super::AppEnv::Development,
         };
         assert_eq!(k.key_id, "k");
         assert_eq!(k.counter, 0);
@@ -2305,6 +2371,7 @@ mod tests {
             public_key: pubkey,
             counter: 1,
             app_id: "app-id".to_string(),
+            app_env: None,
             created_at: now,
             updated_at: now,
         };
@@ -2361,6 +2428,7 @@ mod tests {
             public_key: stored,
             counter: 1,
             app_id: "app-id".to_string(),
+            app_env: None,
             created_at: now,
             updated_at: now,
         };
@@ -2407,6 +2475,7 @@ mod tests {
             public_key: stored,
             counter: ad.counter,
             app_id,
+            app_env: None,
             created_at: now,
             updated_at: now,
         };
@@ -2495,6 +2564,7 @@ mod tests {
         assert_eq!(key.key_id, f["key_id"].as_str().unwrap());
         assert_eq!(key.rp_id_hash_str, f["app_id_hash"].as_str().unwrap());
         assert_eq!(key.counter, 0);
+        assert_eq!(key.app_env, AppEnv::Production, "macOS has no sandbox");
         // Both challenges hash to their recorded client data hashes.
         for step in ["attest", "assert"] {
             let got = Sha256::digest(f[step]["challenge"].as_str().unwrap().as_bytes());
@@ -2627,6 +2697,7 @@ mod tests {
             public_key: key.public_key.clone(),
             counter: ad.counter,
             app_id: key.rp_id_hash_str.clone(),
+            app_env: Some(key.app_env),
             created_at: now,
             updated_at: now,
         };
@@ -2635,6 +2706,83 @@ mod tests {
         assert_eq!(
             minted_cnf(&token).cose_key,
             crate::cwt::cose_key_from_p256_verifying_key(&vk, key.key_id.as_bytes())
+        );
+    }
+
+    /// The device NPE of a minted assertion token, decoded.
+    fn minted_npe(token: &str) -> crate::cwt::ArkavoNpe {
+        use coset::CborSerializable;
+        let raw = crate::cwt::decode_from_header(token).unwrap();
+        let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
+        let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
+        crate::cwt::claims_from_cbor(sign1.payload.as_ref().unwrap())
+            .unwrap()
+            .custom
+            .arkavo_npe
+            .expect("arkavo_npe present")
+    }
+
+    /// #114: the real Mac binding's token names its app and environment, and
+    /// the hash only while the configured set accepts it.
+    #[tokio::test]
+    async fn the_device_token_carries_the_attested_app_and_environment() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let base = crate::test_helpers::build_test_app_state().await;
+        let f = load_assertion_fixture();
+        let key = assertion_fixture_key(&f);
+        let now = chrono::Utc::now().timestamp();
+        let mut binding = DeviceBinding {
+            device_id: key.key_id.clone(),
+            user_id: uuid::Uuid::new_v4(),
+            public_key: key.public_key.clone(),
+            counter: 6,
+            app_id: key.rp_id_hash_str.clone(),
+            app_env: Some(key.app_env),
+            created_at: now,
+            updated_at: now,
+        };
+        let with_ids = |ids: Vec<String>| {
+            let mut s = base.clone();
+            s.app_attest_app_id = std::sync::Arc::new(ids);
+            s
+        };
+
+        // Configured (in upper case, as an operator might paste it): the
+        // hash is minted, lowercase, with the environment.
+        let accepted = with_ids(vec![
+            "00".repeat(32),
+            key.rp_id_hash_str.to_ascii_uppercase(),
+        ]);
+        let npe = minted_npe(&mint_assertion_token(&accepted, &binding, None, now).unwrap());
+        assert_eq!(
+            npe.app_id_hash.as_deref(),
+            Some(key.rp_id_hash_str.as_str())
+        );
+        assert_eq!(
+            npe.app_id_hash.as_deref(),
+            Some(f["app_id_hash"].as_str().unwrap())
+        );
+        assert_eq!(npe.app_env.as_deref(), Some("production"));
+
+        // Not in the set, or no set at all: nobody checked the app, so no
+        // hash. The environment still comes from the verified aaguid.
+        for state in [with_ids(vec!["00".repeat(32)]), with_ids(Vec::new())] {
+            let npe = minted_npe(&mint_assertion_token(&state, &binding, None, now).unwrap());
+            assert_eq!(npe.app_id_hash, None);
+            assert_eq!(npe.app_env.as_deref(), Some("production"));
+        }
+
+        // A binding from before #114 kept no environment, so mints none.
+        binding.app_env = None;
+        let npe = minted_npe(&mint_assertion_token(&accepted, &binding, None, now).unwrap());
+        assert_eq!(npe.app_env, None);
+        assert_eq!(
+            npe.app_id_hash.as_deref(),
+            Some(key.rp_id_hash_str.as_str())
         );
     }
 
@@ -2776,6 +2924,12 @@ mod tests {
         assert_eq!(attested.rp_id_hash_str, app_id);
         assert_eq!(attested.counter, 0);
         assert!(!attested.public_key.is_empty());
+        // A Mac attestation is always production, even from a dev build.
+        assert_eq!(attested.app_env, AppEnv::Production);
+        assert_eq!(
+            attested.app_env.as_str(),
+            f["environment"].as_str().unwrap()
+        );
     }
 
     #[test]
@@ -3013,6 +3167,24 @@ mod tests {
             matches!(err, DeviceCheckError::NonceMismatch),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn the_aaguid_names_the_environment() {
+        assert_eq!(
+            AppEnv::from_aaguid(b"appattest\0\0\0\0\0\0\0"),
+            Some(AppEnv::Production)
+        );
+        assert_eq!(
+            AppEnv::from_aaguid(b"appattestdevelop"),
+            Some(AppEnv::Development)
+        );
+        assert_eq!(AppEnv::from_aaguid(&[0u8; 16]), None);
+        assert_eq!(AppEnv::from_aaguid(b"appattest\0\0\0\0\0\0\x01"), None);
+        for env in [AppEnv::Production, AppEnv::Development] {
+            assert_eq!(AppEnv::parse(env.as_str()), Some(env));
+        }
+        assert_eq!(AppEnv::parse("Production"), None);
     }
 
     #[test]
