@@ -1079,7 +1079,7 @@ impl DynamoDBStore {
             self.device_bindings_table, binding.device_id
         );
 
-        match self
+        let mut put = self
             .client
             .put_item()
             .table_name(&self.device_bindings_table)
@@ -1100,7 +1100,11 @@ impl DynamoDBStore {
             .item(
                 "updated_at",
                 AttributeValue::N(binding.updated_at.to_string()),
-            )
+            );
+        if let Some(env) = binding.app_env {
+            put = put.item("app_env", AttributeValue::S(env.as_str().to_string()));
+        }
+        match put
             // Re-attesting the SAME device under the same account is allowed
             // (it resets `counter` to 0, which is what a fresh attestation
             // means); repointing an existing key_id at a different account is
@@ -1295,6 +1299,28 @@ impl DynamoDBStore {
             .map_err(|_| DynamoDBError::Internal("Invalid app_id format".into()))?
             .to_string();
 
+        // Optional, unlike the rest (#114): bindings written before it was
+        // stored have none, and refusing them would answer every existing
+        // device Device Not Found. A value this build cannot read is treated
+        // the same way: the token then carries no `app_env`, which the
+        // platform reads as unproven, rather than the device losing its token.
+        let app_env = match item.get("app_env") {
+            None => None,
+            Some(v) => {
+                let parsed = v
+                    .as_s()
+                    .ok()
+                    .and_then(|s| crate::device_check::AppEnv::parse(s));
+                if parsed.is_none() {
+                    warn!(
+                        "Unreadable app_env on device binding {}: {:?}",
+                        device_id, v
+                    );
+                }
+                parsed
+            }
+        };
+
         let created_at = item
             .get("created_at")
             .ok_or_else(|| DynamoDBError::Internal("No created_at found".into()))?
@@ -1317,6 +1343,7 @@ impl DynamoDBStore {
             public_key,
             counter,
             app_id,
+            app_env,
             created_at,
             updated_at,
         })

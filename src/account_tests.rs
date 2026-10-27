@@ -76,6 +76,7 @@ fn binding(device_id: &str, user_id: Uuid) -> DeviceBinding {
         public_key: vec![4; 65],
         counter: 0,
         app_id: "app".into(),
+        app_env: Some(crate::device_check::AppEnv::Production),
         created_at: 1,
         updated_at: 1,
     }
@@ -532,4 +533,34 @@ async fn sweep_frees_the_subscription_for_another_account() {
         LinkOutcome::Bound
     );
     assert_eq!(p.store.app_store_link_owner(&otid).await.unwrap(), Some(b));
+}
+
+/// #114: a binding stores its App Attest environment, and one written
+/// before it was stored (no `app_env` attribute) still reads, as `None`.
+#[tokio::test]
+async fn a_device_binding_keeps_its_app_environment() {
+    let Some(p) = Plane::new().await else { return };
+    let (uid, _) = p.user(&[]).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    let with_env = format!("dev-env-{suffix}");
+    p.store
+        .create_device_binding(&binding(&with_env, uid))
+        .await
+        .unwrap();
+    let read = p
+        .store
+        .get_device_binding(&with_env)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.app_env, Some(crate::device_check::AppEnv::Production));
+
+    let legacy = format!("dev-legacy-{suffix}");
+    let mut b = binding(&legacy, uid);
+    b.app_env = None;
+    p.store.create_device_binding(&b).await.unwrap();
+    let read = p.store.get_device_binding(&legacy).await.unwrap().unwrap();
+    assert_eq!(read.app_env, None);
+    assert_eq!(read.app_id, "app");
 }

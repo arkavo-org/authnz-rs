@@ -225,6 +225,7 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
         },
         counter: 1,
         app_id: "app".into(),
+        app_env: Some(crate::device_check::AppEnv::Production),
         created_at: now,
         updated_at: now,
     };

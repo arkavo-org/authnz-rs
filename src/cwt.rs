@@ -58,6 +58,11 @@ pub struct ArkavoNpe {
     pub class: Option<String>,
     pub attestation_expiry: Option<i64>,
     pub device_id: Option<String>,
+    /// Device only (#114): the attested `rpIdHash`, lowercase hex, present
+    /// only while `APP_ATTEST_APP_ID` accepts it.
+    pub app_id_hash: Option<String>,
+    /// Device only (#114): `production` | `development`, from the aaguid.
+    pub app_env: Option<String>,
     pub delegation_id: Option<String>,
     pub depth: Option<u8>,
     pub chain: Option<Vec<String>>,
@@ -634,6 +639,12 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
         if let Some(v) = &n.device_id {
             m.push((Value::Text("device_id".into()), Value::Text(v.clone())));
         }
+        if let Some(v) = &n.app_id_hash {
+            m.push((Value::Text("app_id_hash".into()), Value::Text(v.clone())));
+        }
+        if let Some(v) = &n.app_env {
+            m.push((Value::Text("app_env".into()), Value::Text(v.clone())));
+        }
         if let Some(v) = &n.delegation_id {
             m.push((Value::Text("delegation_id".into()), Value::Text(v.clone())));
         }
@@ -990,6 +1001,8 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     class: None,
                     attestation_expiry: None,
                     device_id: None,
+                    app_id_hash: None,
+                    app_env: None,
                     delegation_id: None,
                     depth: None,
                     chain: None,
@@ -1006,6 +1019,10 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                         (Value::Text(k), Value::Text(v)) if k == "device_id" => {
                             n.device_id = Some(v)
                         }
+                        (Value::Text(k), Value::Text(v)) if k == "app_id_hash" => {
+                            n.app_id_hash = Some(v)
+                        }
+                        (Value::Text(k), Value::Text(v)) if k == "app_env" => n.app_env = Some(v),
                         (Value::Text(k), Value::Text(v)) if k == "delegation_id" => {
                             n.delegation_id = Some(v)
                         }
@@ -1030,6 +1047,8 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                                     | "class"
                                     | "attestation_expiry"
                                     | "device_id"
+                                    | "app_id_hash"
+                                    | "app_env"
                                     | "delegation_id"
                                     | "depth"
                                     | "chain"
@@ -1893,6 +1912,8 @@ mod tests {
             class: None,
             attestation_expiry: None,
             device_id: None,
+            app_id_hash: None,
+            app_env: None,
             delegation_id: Some("deleg-1".into()),
             depth: Some(0),
             chain: Some(vec![]),
@@ -1968,6 +1989,8 @@ mod tests {
                 class: Some("attested".into()),
                 attestation_expiry: Some(1_800_000_000),
                 device_id: Some("keyid".into()),
+                app_id_hash: Some("ab12".into()),
+                app_env: Some("production".into()),
                 delegation_id: None,
                 depth: None,
                 chain: None,
@@ -1986,6 +2009,8 @@ mod tests {
             .unwrap();
         assert_eq!(back.class.as_deref(), Some("attested"));
         assert_eq!(back.attestation_expiry, Some(1_800_000_000));
+        assert_eq!(back.app_id_hash.as_deref(), Some("ab12"));
+        assert_eq!(back.app_env.as_deref(), Some("production"));
     }
 
     /// Hand-craft a minimal well-formed claims map (iss/sub/aud/exp/iat/cti)
@@ -2036,6 +2061,24 @@ mod tests {
             "got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn npe_app_fields_of_the_wrong_type_are_malformed() {
+        for key in ["app_id_hash", "app_env"] {
+            let npe = Value::Map(vec![
+                (Value::Text("type".into()), Value::Text("device".into())),
+                (Value::Text(key.into()), Value::Bytes(vec![0xab, 0x12])),
+            ]);
+            let result = claims_from_cbor(&claims_bytes_with_npe((
+                Value::Text("arkavo_npe".into()),
+                npe,
+            )));
+            assert!(
+                matches!(result, Err(CwtError::Malformed)),
+                "{key}: got {result:?}"
+            );
+        }
     }
 
     #[test]
