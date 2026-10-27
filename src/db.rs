@@ -1158,6 +1158,13 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.device_bindings_table)
             .key("device_id", AttributeValue::S(device_id.to_string()))
+            // Strongly consistent: an assert can follow its bind by two round
+            // trips, and a stale replica answers Device Not Found, which an
+            // App Attest client reads as "drop the key". The counter read here
+            // is also the expected value of `update_device_counter`'s
+            // conditional write, so a stale one fails a genuine assertion
+            // (#122).
+            .consistent_read(true)
             .send()
             .await
         {
