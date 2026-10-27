@@ -155,8 +155,22 @@ pub(crate) async fn derived_entitlements(
     user_id: Option<Uuid>,
     snap: Option<&ArkavoPatreon>,
 ) -> Vec<String> {
+    try_derived_entitlements(app_state, user_id, snap)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`derived_entitlements`] with a failed publishing-state read returned, not
+/// withheld: `GET /entities` answers it with a 5xx so a resolver keeps its
+/// last answer, where a 200 without the entitlement would be cached as a
+/// fresh negative.
+pub(crate) async fn try_derived_entitlements(
+    app_state: &AppState,
+    user_id: Option<Uuid>,
+    snap: Option<&ArkavoPatreon>,
+) -> Result<Vec<String>, DynamoDBError> {
     let Some(user_id) = user_id else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let now = Utc::now().timestamp();
     let patreon_ok = match (app_state.publisher.as_ref().as_ref(), snap) {
@@ -165,31 +179,31 @@ pub(crate) async fn derived_entitlements(
     };
     let app_store_cfg = app_state.app_store.as_ref().as_ref();
     if !patreon_ok && app_store_cfg.is_none() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let state = match app_state.db_store.get_publishing_state(&user_id).await {
         Ok(Some(state)) => state,
-        Ok(None) => return Vec::new(),
+        Ok(None) => return Ok(Vec::new()),
         Err(e) => {
             warn!(
-                "Publishing state lookup failed for user {}: {} — failing closed (no \
-                 publishing entitlement)",
+                "Publishing state lookup failed for user {}: {} — no publishing entitlement \
+                 (a mint fails closed, /entities answers 5xx)",
                 user_id, e
             );
-            return Vec::new();
+            return Err(e);
         }
     };
     let app_store_ok =
         app_store_cfg.is_some_and(|cfg| app_store_active(cfg, &state.app_store, now));
     if !patreon_ok && !app_store_ok {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if state.suspension.is_some() {
         info!(
             "Publishing entitlement withheld for user {}: publishing is suspended",
             user_id
         );
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // Every Sandbox grant is visible (TestFlight and App Review buy there).
     if let Some(cfg) = app_store_cfg.filter(|_| app_store_ok) {
@@ -205,7 +219,7 @@ pub(crate) async fn derived_entitlements(
             );
         }
     }
-    vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+    Ok(vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()])
 }
 
 // --------- Admin: publishing suspension ---------

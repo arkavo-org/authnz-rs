@@ -2197,28 +2197,41 @@ pub(crate) async fn arkavo_user_claims(
     patreon: &crate::patreon::PatreonState,
     user: &AuthenticatedUser,
 ) -> crate::cwt::ArkavoUserClaims {
-    let snap = match arkavo_user_uuid(user) {
+    let user_id = arkavo_user_uuid(user);
+    let snap = match user_id {
         Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
         None => None,
     };
-    arkavo_user_claims_from(app_state, user, snap).await
+    let publish = crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
+    assemble_user_claims(user, user_id, snap, publish)
 }
 
-/// [`arkavo_user_claims`] from a Patreon snapshot the caller materialized
-/// itself: `GET /entities` does, so it can answer 503 when the account is
-/// linked and no snapshot was available, where a mint just omits the claim.
-pub(crate) async fn arkavo_user_claims_from(
+/// [`arkavo_user_claims`] for `GET /entities`, which materializes the Patreon
+/// snapshot itself and answers a 5xx where a mint fails closed: no snapshot
+/// for a linked account (the caller's 503), or a failed publishing-state read
+/// (returned here). A resolver must not cache either as "not entitled".
+pub(crate) async fn try_arkavo_user_claims_from(
     app_state: &AppState,
     user: &AuthenticatedUser,
     snap: Option<crate::cwt::ArkavoPatreon>,
-) -> crate::cwt::ArkavoUserClaims {
+) -> Result<crate::cwt::ArkavoUserClaims, crate::db::DynamoDBError> {
     let user_id = arkavo_user_uuid(user);
+    let publish =
+        crate::publishing::try_derived_entitlements(app_state, user_id, snap.as_ref()).await?;
+    Ok(assemble_user_claims(user, user_id, snap, publish))
+}
+
+fn assemble_user_claims(
+    user: &AuthenticatedUser,
+    user_id: Option<Uuid>,
+    snap: Option<crate::cwt::ArkavoPatreon>,
+    publish: Vec<String>,
+) -> crate::cwt::ArkavoUserClaims {
     let mut derived_entitlements = snap
         .as_ref()
         .map(|s| crate::patreon::campaign_entitlements(s, Utc::now().timestamp()))
         .unwrap_or_default();
-    derived_entitlements
-        .extend(crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await);
+    derived_entitlements.extend(publish);
     if let Some(id) = user_id {
         derived_entitlements.push(crate::constants::creator_entitlement(&id));
     }

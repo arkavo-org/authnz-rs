@@ -84,7 +84,9 @@ pub async fn get_entity(
                 outcome => outcome.snapshot(),
             };
             let user = crate::oidc::AuthenticatedUser::webauthn(u.user_id, u.entitlements);
-            let claims = crate::oidc::arkavo_user_claims_from(&app_state, &user, snap).await;
+            let claims = crate::oidc::try_arkavo_user_claims_from(&app_state, &user, snap)
+                .await
+                .map_err(|e| EntityError::Database(Box::new(e)))?;
             let mut body = serde_json::json!({
                 "sub": user.subject,
                 "arkavo_account_id": u.user_id,
