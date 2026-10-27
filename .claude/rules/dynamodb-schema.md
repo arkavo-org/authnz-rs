@@ -60,6 +60,10 @@ paths:
   - public_key (Binary) - Attested public key from certificate
   - counter (Number) - Monotonic counter for replay protection
   - app_id (String) - rpIdHash for App ID validation
+  - app_env (String, optional; #114) - `production` | `development`, from the
+    attestation's aaguid. Absent on bindings written before #114; read as
+    absent (never an error) when missing or unreadable, so the token carries
+    no `app_env`
   - created_at (Number) - Unix timestamp
   - updated_at (Number) - Unix timestamp (updated on each assertion)
 

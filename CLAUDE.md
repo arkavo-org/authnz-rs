@@ -624,7 +624,14 @@ appraisal, status)
        - Counter has incremented (counter > stored_counter)
        - Challenge matches expected hash
        - Signature is valid (verified against the stored public key)
-     - Server updates counter, issues new CWT (aud `arkavo:devicecheck`)
+     - Server updates counter, issues new CWT (aud `arkavo:devicecheck`).
+       Its `arkavo_npe` names the app (#114): `app_id_hash` is the binding's
+       `rpIdHash` (lowercase hex), present only while `APP_ATTEST_APP_ID`
+       accepts it; `app_env` is `production` (aaguid `appattest`) or
+       `development` (`appattestdevelop`), stored on the binding at attest.
+       A binding from before #114 has no `app_env` and mints none until the
+       device attests a new key. `GET /entities/device:<key_id>` carries the
+       same two fields (`device_check::device_app_claims`).
 
 ### Security Architecture
 

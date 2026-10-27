@@ -12,7 +12,9 @@ paths:
 - **Replay protection**: Monotonic counter must increment with each assertion
 - **Nonce binding**: Challenge bound to attestation/assertion via SHA256
 - **Device verification**: Proves request comes from genuine Apple device running unmodified app
-- Assertion CWT carries `arkavo_npe = {type: device, class, attestation_expiry, device_id}` and, when `OIDC_PLATFORM_AUDIENCE` is set, that audience.
+- Assertion CWT carries `arkavo_npe = {type: device, class, attestation_expiry, device_id, app_id_hash?, app_env?}` and, when `OIDC_PLATFORM_AUDIENCE` is set, that audience.
+  `app_id_hash` (lowercase hex `rpIdHash`) only while `APP_ATTEST_APP_ID` accepts it;
+  `app_env` (`production`|`development`, from the aaguid) only on bindings attested since #114.
 
 ### Requirements
 - iOS 14+ with Secure Enclave support
