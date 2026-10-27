@@ -1,9 +1,12 @@
 //! Service-gated entity lookup (spec §2.4). Resolves an entity id to the same
 //! shape the platform ERS sees, for gateway audit/admin use without a token.
+//! A person is what that account's own token would carry if minted now: the
+//! platform ERS's live source reads it in place of the token's Patreon claims.
 
 use crate::AppState;
 use crate::db::DynamoDBError;
-use crate::entitlements::{EntitlementError, require_service_cwt};
+use crate::entitlements::{EntitlementError, require_service_cwt_for};
+use crate::patreon::{Materialized, PatreonState};
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path},
@@ -51,10 +54,17 @@ pub struct EntityRepresentation {
 /// GET /entities/:id
 pub async fn get_entity(
     Extension(app_state): Extension<AppState>,
+    Extension(patreon): Extension<PatreonState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, EntityError> {
-    require_service_cwt(&app_state, &headers)?;
+    let allow: Vec<String> = app_state
+        .entity_client_ids
+        .iter()
+        .chain(app_state.admin_client_ids.iter())
+        .cloned()
+        .collect();
+    require_service_cwt_for(&app_state, &headers, &allow)?;
     let db = &app_state.db_store;
     let rep = match parse_entity_id(&id)? {
         EntityId::Person(uid) => {
@@ -63,18 +73,34 @@ pub async fn get_entity(
                 .await
                 .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
+            // A mint omits the claim on both; a resolver must not read
+            // "unavailable" as "no memberships" and cache it.
+            let snap = match crate::patreon::materialize_for_user_resolved(
+                &app_state, &patreon, u.user_id,
+            )
+            .await
+            {
+                Materialized::Unavailable => return Err(EntityError::PatreonUnavailable),
+                outcome => outcome.snapshot(),
+            };
+            let user = crate::oidc::AuthenticatedUser::webauthn(u.user_id, u.entitlements);
+            let claims = crate::oidc::arkavo_user_claims_from(&app_state, &user, snap).await;
+            let mut body = serde_json::json!({
+                "sub": user.subject,
+                "arkavo_account_id": u.user_id,
+                "username": u.username,
+                "did": u.did,
+                "arkavo_roles": claims.roles,
+                "arkavo_entitlements": claims.effective_entitlements(),
+            });
+            if let Some(p) = &claims.patreon {
+                body["arkavo_patreon"] = crate::cwt::patreon_to_json(p);
+            }
             EntityRepresentation {
                 id,
                 category: "subject",
                 npe_type: None,
-                claims: serde_json::json!({
-                    "sub": format!("arkavo:{}", u.user_id),
-                    "arkavo_account_id": u.user_id,
-                    "username": u.username,
-                    "did": u.did,
-                    "arkavo_roles": ["user"],
-                    "arkavo_entitlements": u.entitlements,
-                }),
+                claims: body,
             }
         }
         EntityId::Agent(did) => {
@@ -136,6 +162,9 @@ pub enum EntityError {
     BadId(String),
     #[error("Entity not found")]
     NotFound,
+    /// The account is Patreon-linked and no snapshot could be produced.
+    #[error("patreon_unavailable")]
+    PatreonUnavailable,
     #[error("Database error: {0}")]
     Database(#[from] Box<DynamoDBError>),
 }
@@ -145,8 +174,17 @@ impl IntoResponse for EntityError {
         if let EntityError::Auth(e) = self {
             return e.into_response();
         }
+        if let EntityError::PatreonUnavailable = self {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "patreon_unavailable"})),
+            )
+                .into_response();
+        }
         let (status, body) = match &self {
-            EntityError::Auth(_) => unreachable!("handled above"),
+            EntityError::Auth(_) | EntityError::PatreonUnavailable => {
+                unreachable!("handled above")
+            }
             EntityError::BadId(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EntityError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EntityError::Database(e) => match e.as_ref() {
@@ -164,6 +202,83 @@ impl IntoResponse for EntityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn patreon_unavailable_is_a_503_with_a_stable_token() {
+        use axum::response::IntoResponse;
+        let resp = EntityError::PatreonUnavailable.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "patreon_unavailable"})
+        );
+    }
+
+    /// An `ENTITY_CLIENT_IDS` client reads `/entities` and nothing more.
+    #[tokio::test]
+    async fn entity_clients_pass_the_entities_gate_but_not_the_admin_one() {
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let patreon = PatreonState::new(
+            None,
+            None,
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None),
+        );
+        let service = |sub: &str| {
+            let claims = crate::cwt::ArkavoClaims::auth(&app_state.issuer, sub, 1, None)
+                .with_arkavo_roles(vec!["service-account".into()]);
+            let token = crate::cwt::encode_for_header(
+                &crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Auth-Token", token.parse().unwrap());
+            headers
+        };
+        let status = |r: Result<axum::response::Response, EntityError>| match r {
+            Ok(resp) => resp.status(),
+            Err(e) => e.into_response().status(),
+        };
+        let call = |headers: HeaderMap| {
+            get_entity(
+                Extension(app_state.clone()),
+                Extension(patreon.clone()),
+                headers,
+                Path("bogus".into()),
+            )
+        };
+
+        // Past the gate, an unknown namespace is 400; refused, 403.
+        let reader = service("client:entity-reader");
+        assert_eq!(
+            status(call(reader.clone()).await.map(IntoResponse::into_response)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(
+                call(service("client:it"))
+                    .await
+                    .map(IntoResponse::into_response)
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(
+                call(service("client:mcp-edge"))
+                    .await
+                    .map(IntoResponse::into_response)
+            ),
+            StatusCode::FORBIDDEN
+        );
+        assert!(matches!(
+            crate::entitlements::require_service_cwt(&app_state, &reader),
+            Err(EntitlementError::Forbidden)
+        ));
+    }
 
     #[test]
     fn table_not_exists_maps_to_service_unavailable_like_agent_errors() {

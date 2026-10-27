@@ -2197,11 +2197,22 @@ pub(crate) async fn arkavo_user_claims(
     patreon: &crate::patreon::PatreonState,
     user: &AuthenticatedUser,
 ) -> crate::cwt::ArkavoUserClaims {
-    let user_id = arkavo_user_uuid(user);
-    let snap = match user_id {
+    let snap = match arkavo_user_uuid(user) {
         Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
         None => None,
     };
+    arkavo_user_claims_from(app_state, user, snap).await
+}
+
+/// [`arkavo_user_claims`] from a Patreon snapshot the caller materialized
+/// itself: `GET /entities` does, so it can answer 503 when the account is
+/// linked and no snapshot was available, where a mint just omits the claim.
+pub(crate) async fn arkavo_user_claims_from(
+    app_state: &AppState,
+    user: &AuthenticatedUser,
+    snap: Option<crate::cwt::ArkavoPatreon>,
+) -> crate::cwt::ArkavoUserClaims {
+    let user_id = arkavo_user_uuid(user);
     let mut derived_entitlements = snap
         .as_ref()
         .map(|s| crate::patreon::campaign_entitlements(s, Utc::now().timestamp()))
@@ -3079,6 +3090,7 @@ pub(crate) mod tests {
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
@@ -3204,6 +3216,7 @@ pub(crate) mod tests {
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),

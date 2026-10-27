@@ -242,7 +242,7 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     assert!(!has_publish(&reg), "registration token must not carry it");
     assert_eq!(reg.custom.arkavo_entitlements, Some(f.stored.clone()));
 
-    // Never stored, so never delegable to agents nor visible in /entities.
+    // Never stored, so never delegable to agents (/entities derives it live).
     let stored = f.store.get_user_entitlements(&f.user_id).await.unwrap();
     assert!(!stored.contains(&ENTITLEMENT_CREATOR_PUBLISH.to_string()));
 }
@@ -926,5 +926,46 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// `GET /entities` shows a person as a fresh mint would: the same
+/// `arkavo_entitlements` (stored + derived) and the same `arkavo_patreon`, so
+/// the platform ERS's live source can stand in for the token's Patreon claims.
+#[tokio::test]
+async fn entities_person_is_the_fresh_mint_view() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let user = f.claims().await;
+    let token =
+        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+
+    let app = Router::new()
+        .route("/entities/:id", get(crate::entities::get_entity))
+        .layer(Extension(f.patreon.clone()))
+        .layer(Extension(f.state.clone()));
+    let (status, body) = send(
+        &app,
+        Request::get(format!("/entities/arkavo:{}", f.user_id))
+            .header("X-Auth-Token", service_token(&f.state, "entity-reader"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = &body["claims"];
+    assert_eq!(claims["sub"], json!(format!("arkavo:{}", f.user_id)));
+    assert_eq!(claims["arkavo_account_id"], json!(f.user_id.to_string()));
+    assert_eq!(
+        claims["arkavo_entitlements"],
+        json!(token.custom.arkavo_entitlements.unwrap())
+    );
+    let entitlements = claims["arkavo_entitlements"].as_array().unwrap();
+    assert!(entitlements.contains(&json!(ENTITLEMENT_CREATOR_PUBLISH)));
+    assert!(entitlements.contains(&json!(crate::constants::creator_entitlement(&f.user_id))));
+    assert_eq!(
+        claims["arkavo_patreon"],
+        crate::cwt::patreon_to_json(token.custom.arkavo_patreon.as_ref().unwrap())
     );
 }
