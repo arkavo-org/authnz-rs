@@ -331,6 +331,10 @@ pub struct AppState {
     /// OIDC client_ids allowed to call PUT /admin/users/:id/entitlements and
     /// GET /entities/:id (`ADMIN_CLIENT_IDS`). Empty ⇒ no client is authorized.
     pub admin_client_ids: Arc<Vec<String>>,
+    /// client_ids whose service CWTs may read `GET /entities/:id` and nothing
+    /// else (`ENTITY_CLIENT_IDS`): the platform ERS's live source. Kept off
+    /// the admin list, which also grants `PUT` entitlements.
+    pub entity_client_ids: Arc<Vec<String>>,
     /// OIDC client_ids that may request the `agents:delegate` scope and whose
     /// access tokens `POST /agents/authorize` accepts
     /// (`AGENT_DELEGATE_CLIENT_IDS`). Empty ⇒ the scope is refused everywhere.
@@ -533,6 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ADMIN_CLIENT_IDS is empty: PUT /admin/users/:id/entitlements and GET /entities/:id will 403"
         );
     }
+    let entity_client_ids = parse_id_list(env::var("ENTITY_CLIENT_IDS").ok());
     let agent_delegate_client_ids = parse_id_list(env::var("AGENT_DELEGATE_CLIENT_IDS").ok());
     if agent_delegate_client_ids.is_empty() {
         log::warn!(
@@ -576,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
+        entity_client_ids: Arc::new(entity_client_ids),
         agent_delegate_client_ids: Arc::new(agent_delegate_client_ids),
         agent_status_client_ids: Arc::new(agent_status_client_ids),
         moderation_client_ids: Arc::new(moderation_client_ids),
@@ -1777,6 +1783,7 @@ pub(crate) mod test_helpers {
                 minutes: 15,
             }),
             admin_client_ids: Arc::new(vec!["it".into()]),
+            entity_client_ids: Arc::new(vec!["entity-reader".into()]),
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),

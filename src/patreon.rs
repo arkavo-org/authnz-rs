@@ -1288,17 +1288,42 @@ pub async fn materialize_for_user(
     }
     match lookup_link(app_state, state, user_id).await {
         LinkLookup::Cached(snap) => Some(snap),
-        LinkLookup::Absent => None,
+        LinkLookup::Absent | LinkLookup::Failed => None,
         LinkLookup::Link(link) => materialize_link(app_state, state, &link).await,
     }
 }
 
-/// What a mint knows before any Patreon call: a cached snapshot, no link
-/// (or a failed lookup — both fail closed), or the stored link to query.
+/// What a mint knows before any Patreon call: a cached snapshot, no link, a
+/// failed lookup (a mint fails closed on both), or the stored link to query.
 enum LinkLookup {
     Cached(ArkavoPatreon),
     Absent,
+    Failed,
     Link(Box<PatreonLink>),
+}
+
+/// What [`materialize_for_user_resolved`] produced. A mint needs only the
+/// snapshot ([`Materialized::snapshot`]); a resolver reading `GET /entities`
+/// must also tell "no link" (a fresh negative it may cache) from "linked,
+/// but nothing could be produced" (unavailable: it keeps its last answer).
+#[derive(Debug)]
+pub enum Materialized {
+    /// Patreon is not configured, or the account has no link.
+    NotLinked,
+    /// Cached, live, or a creator's fallback.
+    Snapshot(ArkavoPatreon),
+    /// The link read failed or timed out, or the account is linked and no
+    /// snapshot (not even a creator fallback) could be produced in time.
+    Unavailable,
+}
+
+impl Materialized {
+    pub fn snapshot(self) -> Option<ArkavoPatreon> {
+        match self {
+            Materialized::Snapshot(s) => Some(s),
+            Materialized::NotLinked | Materialized::Unavailable => None,
+        }
+    }
 }
 
 /// The cache and `patreon_tokens` reads that precede any Patreon call.
@@ -1326,7 +1351,7 @@ async fn lookup_link(app_state: &AppState, state: &PatreonState, user_id: Uuid) 
                 "Patreon link lookup failed for user {}: {} — failing closed (no claim)",
                 user_id, e
             );
-            LinkLookup::Absent
+            LinkLookup::Failed
         }
     }
 }
@@ -1417,8 +1442,20 @@ pub async fn materialize_for_user_bounded(
     state: &PatreonState,
     user_id: Uuid,
 ) -> Option<ArkavoPatreon> {
+    materialize_for_user_resolved(app_state, state, user_id)
+        .await
+        .snapshot()
+}
+
+/// [`materialize_for_user_bounded`], keeping apart what a mint collapses
+/// into "no claim": no link versus nothing available (see [`Materialized`]).
+pub async fn materialize_for_user_resolved(
+    app_state: &AppState,
+    state: &PatreonState,
+    user_id: Uuid,
+) -> Materialized {
     if !state.is_enabled() {
-        return None;
+        return Materialized::NotLinked;
     }
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(PATREON_MATERIALIZE_DEADLINE_SECONDS);
@@ -1426,8 +1463,9 @@ pub async fn materialize_for_user_bounded(
     // Cancelling the lookup is safe: it only reads.
     let link = match tokio::time::timeout_at(deadline, lookup_link(app_state, state, user_id)).await
     {
-        Ok(LinkLookup::Cached(snap)) => return Some(snap),
-        Ok(LinkLookup::Absent) => return None,
+        Ok(LinkLookup::Cached(snap)) => return Materialized::Snapshot(snap),
+        Ok(LinkLookup::Absent) => return Materialized::NotLinked,
+        Ok(LinkLookup::Failed) => return Materialized::Unavailable,
         Ok(LinkLookup::Link(link)) => link,
         Err(_) => {
             warn!(
@@ -1435,7 +1473,7 @@ pub async fn materialize_for_user_bounded(
                  closed (no claim)",
                 user_id, PATREON_MATERIALIZE_DEADLINE_SECONDS
             );
-            return None;
+            return Materialized::Unavailable;
         }
     };
     let fallback = owner_fallback(&link, Utc::now().timestamp());
@@ -1443,7 +1481,7 @@ pub async fn materialize_for_user_bounded(
     let app = app_state.clone();
     let patreon = state.clone();
     let handle = tokio::spawn(async move { materialize_link(&app, &patreon, &link).await });
-    match tokio::time::timeout_at(deadline, handle).await {
+    let snap = match tokio::time::timeout_at(deadline, handle).await {
         Ok(Ok(snap)) => snap,
         Ok(Err(e)) => {
             warn!(
@@ -1473,7 +1511,8 @@ pub async fn materialize_for_user_bounded(
             }
             fallback
         }
-    }
+    };
+    snap.map_or(Materialized::Unavailable, Materialized::Snapshot)
 }
 
 /// Persist a rotated Patreon token bundle, if one was produced. Best-effort:
@@ -3696,6 +3735,74 @@ mod tests {
             1,
             "the second mint must not query Patreon"
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_materialization_with_patreon_off_is_not_linked() {
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let sealer = TokenSealer::Plaintext;
+        let state = PatreonState {
+            oauth: None,
+            ..enabled_state(
+                &sealer,
+                unreachable_patreon_http(),
+                PATREON_TOKEN_URL.into(),
+                PATREON_IDENTITY_URL.into(),
+            )
+        };
+        assert!(matches!(
+            materialize_for_user_resolved(&app_state, &state, Uuid::new_v4()).await,
+            Materialized::NotLinked
+        ));
+    }
+
+    /// A mint omits the claim both for no link and for a link whose Patreon
+    /// read failed; `/entities` must tell them apart.
+    #[tokio::test]
+    async fn resolved_materialization_tells_no_link_from_unavailable() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let app_state =
+            crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
+        let sealer = TokenSealer::Plaintext;
+        let state = enabled_state(
+            &sealer,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        );
+
+        assert!(matches!(
+            materialize_for_user_resolved(&app_state, &state, Uuid::new_v4()).await,
+            Materialized::NotLinked
+        ));
+
+        let consumer = consumer_link_with_token(&sealer, b"access").await;
+        app_state
+            .db_store
+            .put_patreon_link(&consumer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            materialize_for_user_resolved(&app_state, &state, consumer.user_id).await,
+            Materialized::Unavailable
+        ));
+        assert!(
+            materialize_for_user_bounded(&app_state, &state, consumer.user_id)
+                .await
+                .is_none()
+        );
+
+        let creator = creator_link_with_token(&sealer, b"access", "").await;
+        app_state.db_store.put_patreon_link(&creator).await.unwrap();
+        match materialize_for_user_resolved(&app_state, &state, creator.user_id).await {
+            Materialized::Snapshot(s) => {
+                assert_eq!(s.campaign_id.as_deref(), Some("creators-own"));
+                assert!(s.memberships.is_empty());
+            }
+            other => panic!("creator fallback expected, got {other:?}"),
+        }
     }
 
     #[test]

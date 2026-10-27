@@ -242,7 +242,7 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     assert!(!has_publish(&reg), "registration token must not carry it");
     assert_eq!(reg.custom.arkavo_entitlements, Some(f.stored.clone()));
 
-    // Never stored, so never delegable to agents nor visible in /entities.
+    // Never stored, so never delegable to agents (/entities derives it live).
     let stored = f.store.get_user_entitlements(&f.user_id).await.unwrap();
     assert!(!stored.contains(&ENTITLEMENT_CREATOR_PUBLISH.to_string()));
 }
@@ -926,5 +926,96 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// `GET /entities` shows a person as a fresh mint would: the same
+/// `arkavo_entitlements` (stored + derived) and the same `arkavo_patreon`, so
+/// the platform ERS's live source can stand in for the token's Patreon claims.
+#[tokio::test]
+async fn entities_person_is_the_fresh_mint_view() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let user = f.claims().await;
+    let token =
+        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+
+    let app = Router::new()
+        .route("/entities/:id", get(crate::entities::get_entity))
+        .layer(Extension(f.patreon.clone()))
+        .layer(Extension(f.state.clone()));
+    let (status, body) = send(
+        &app,
+        Request::get(format!("/entities/arkavo:{}", f.user_id))
+            .header("X-Auth-Token", service_token(&f.state, "entity-reader"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = &body["claims"];
+    assert_eq!(claims["sub"], json!(format!("arkavo:{}", f.user_id)));
+    assert_eq!(claims["arkavo_account_id"], json!(f.user_id.to_string()));
+    assert_eq!(
+        claims["arkavo_entitlements"],
+        json!(token.custom.arkavo_entitlements.unwrap())
+    );
+    let entitlements = claims["arkavo_entitlements"].as_array().unwrap();
+    assert!(entitlements.contains(&json!(ENTITLEMENT_CREATOR_PUBLISH)));
+    assert!(entitlements.contains(&json!(crate::constants::creator_entitlement(&f.user_id))));
+    assert_eq!(
+        claims["arkavo_patreon"],
+        crate::cwt::patreon_to_json(token.custom.arkavo_patreon.as_ref().unwrap())
+    );
+}
+
+/// A failed publishing-state read: a mint withholds the entitlement, but
+/// `/entities` must see the error (it answers 5xx, so the platform keeps its
+/// last answer) rather than a 200 without it.
+#[tokio::test]
+async fn a_failed_publishing_read_is_an_error_for_entities_not_a_negative() {
+    let dead = aws_sdk_dynamodb::config::Builder::new()
+        .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+        .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+            "x", "x", None, None, "dead",
+        ))
+        .endpoint_url("http://127.0.0.1:1")
+        .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+        .build();
+    let store = Arc::new(DynamoDBStore::with_client(
+        aws_sdk_dynamodb::Client::from_conf(dead),
+        "credentials".into(),
+        "handles".into(),
+        "device_bindings".into(),
+        "identity_links".into(),
+        "patreon_tokens".into(),
+        "agent_delegations".into(),
+        "device_attest_keys".into(),
+        "guardians".into(),
+        Vec::new(),
+    ));
+    let mut state = crate::test_helpers::build_test_app_state_with_store(store);
+    state.publisher = Arc::new(Some(publisher_cfg()));
+    let snap = qualifying_snapshot("consumer");
+    let id = Uuid::new_v4();
+    let user_id = Some(id);
+
+    assert!(
+        crate::publishing::try_derived_entitlements(&state, user_id, Some(&snap))
+            .await
+            .is_err()
+    );
+    assert!(
+        crate::publishing::derived_entitlements(&state, user_id, Some(&snap))
+            .await
+            .is_empty()
+    );
+    let user = AuthenticatedUser::webauthn(id, Vec::new());
+    assert!(
+        crate::oidc::try_arkavo_user_claims_from(&state, &user, Some(snap))
+            .await
+            .is_err()
     );
 }

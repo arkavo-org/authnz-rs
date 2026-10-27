@@ -178,6 +178,12 @@ AGENT_STATUS_CLIENT_IDS=<platform agent_status client_id>
 # AGENT_OWNER_APPRAISAL_TTL_SECONDS=43200
 # AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS=900
 
+# The platform ERS's live Patreon source reads GET /entities/arkavo:<uuid>
+# with this client's service CWT (production: opentdf-platform, the same
+# client that reads publishing suspensions). Read-only: never put it on
+# ADMIN_CLIENT_IDS, which also grants PUT /admin/users/:id/entitlements.
+# ENTITY_CLIENT_IDS=opentdf-platform
+
 # App Attest registration gate — see docs/app-attest-gate-deployment.md before
 # setting these. The table is inert until the gate ships; APP_ATTEST_APP_ID is
 # not, and the gate fails closed when it is unset.

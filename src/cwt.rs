@@ -684,6 +684,31 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     Ok(bytes)
 }
 
+/// The `arkavo_patreon` claim as JSON, converted from the very map a token
+/// encodes, so `GET /entities` cannot drift from the token's shape.
+pub fn patreon_to_json(p: &ArkavoPatreon) -> serde_json::Value {
+    cbor_to_json(patreon_to_cbor(p))
+}
+
+/// Only what [`patreon_to_cbor`] produces: text, integers, arrays and
+/// text-keyed maps.
+fn cbor_to_json(v: Value) -> serde_json::Value {
+    match v {
+        Value::Text(s) => s.into(),
+        Value::Integer(i) => i64::try_from(i).map_or(serde_json::Value::Null, Into::into),
+        Value::Array(a) => a.into_iter().map(cbor_to_json).collect(),
+        Value::Map(m) => serde_json::Value::Object(
+            m.into_iter()
+                .filter_map(|(k, v)| match k {
+                    Value::Text(k) => Some((k, cbor_to_json(v))),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
     let mut entries: Vec<(Value, Value)> = Vec::new();
     entries.push((Value::Text("role".into()), Value::Text(p.role.clone())));
@@ -1358,6 +1383,61 @@ mod tests {
         let bytes = claims_to_cbor(&c).expect("encode");
         let decoded = claims_from_cbor(&bytes).expect("decode");
         assert_eq!(decoded.custom.arkavo_patreon, Some(snap));
+    }
+
+    #[test]
+    fn patreon_json_is_the_token_map() {
+        let snap = ArkavoPatreon {
+            role: "creator".into(),
+            patreon_user_id: "patreon-user-7".into(),
+            campaign_id: Some("111".into()),
+            memberships: vec![
+                ArkavoPatreonMembership {
+                    campaign_id: "222".into(),
+                    patron_status: Some("active_patron".into()),
+                    tier_ids: vec!["9".into()],
+                    tier_slugs: vec!["gold".into()],
+                },
+                ArkavoPatreonMembership {
+                    campaign_id: "333".into(),
+                    patron_status: None,
+                    tier_ids: vec![],
+                    tier_slugs: vec![],
+                },
+            ],
+            owned_tiers: OwnedCampaignTiers {
+                ids: vec!["5".into()],
+                slugs: vec!["owned".into()],
+            },
+            verified_at: 1_700_000_000,
+            cache_expires_at: 1_700_000_300,
+        };
+        // Optional keys are omitted as in the token, and the owned tiers,
+        // which feed entitlements only, are not in the claim.
+        assert_eq!(
+            patreon_to_json(&snap),
+            serde_json::json!({
+                "role": "creator",
+                "patreon_user_id": "patreon-user-7",
+                "campaign_id": "111",
+                "memberships": [
+                    {"campaign_id": "222", "patron_status": "active_patron",
+                     "tier_ids": ["9"], "tier_slugs": ["gold"]},
+                    {"campaign_id": "333", "tier_ids": []},
+                ],
+                "verified_at": 1_700_000_000,
+                "cache_expires_at": 1_700_000_300,
+            })
+        );
+        let consumer = ArkavoPatreon {
+            role: "consumer".into(),
+            campaign_id: None,
+            memberships: vec![],
+            ..snap
+        };
+        let json = patreon_to_json(&consumer);
+        assert!(json.get("campaign_id").is_none());
+        assert!(json.get("memberships").is_none());
     }
 
     #[test]

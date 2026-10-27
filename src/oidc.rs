@@ -2202,12 +2202,36 @@ pub(crate) async fn arkavo_user_claims(
         Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
         None => None,
     };
+    let publish = crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
+    assemble_user_claims(user, user_id, snap, publish)
+}
+
+/// [`arkavo_user_claims`] for `GET /entities`, which materializes the Patreon
+/// snapshot itself and answers a 5xx where a mint fails closed: no snapshot
+/// for a linked account (the caller's 503), or a failed publishing-state read
+/// (returned here). A resolver must not cache either as "not entitled".
+pub(crate) async fn try_arkavo_user_claims_from(
+    app_state: &AppState,
+    user: &AuthenticatedUser,
+    snap: Option<crate::cwt::ArkavoPatreon>,
+) -> Result<crate::cwt::ArkavoUserClaims, crate::db::DynamoDBError> {
+    let user_id = arkavo_user_uuid(user);
+    let publish =
+        crate::publishing::try_derived_entitlements(app_state, user_id, snap.as_ref()).await?;
+    Ok(assemble_user_claims(user, user_id, snap, publish))
+}
+
+fn assemble_user_claims(
+    user: &AuthenticatedUser,
+    user_id: Option<Uuid>,
+    snap: Option<crate::cwt::ArkavoPatreon>,
+    publish: Vec<String>,
+) -> crate::cwt::ArkavoUserClaims {
     let mut derived_entitlements = snap
         .as_ref()
         .map(|s| crate::patreon::campaign_entitlements(s, Utc::now().timestamp()))
         .unwrap_or_default();
-    derived_entitlements
-        .extend(crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await);
+    derived_entitlements.extend(publish);
     if let Some(id) = user_id {
         derived_entitlements.push(crate::constants::creator_entitlement(&id));
     }
@@ -3079,6 +3103,7 @@ pub(crate) mod tests {
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
@@ -3204,6 +3229,7 @@ pub(crate) mod tests {
             agent_delegate_client_ids: Arc::new(vec!["arkavo-edge".into()]),
             agent_status_client_ids: Arc::new(vec!["platform-status".into()]),
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
+            entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
