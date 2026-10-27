@@ -533,15 +533,19 @@ appraisal, status)
 - Claims include authorization profile (entitlements, roles) and entity-specific metadata (device class, agent depth/chain)
 - Gate: service CWT on `ENTITY_CLIENT_IDS` ∪ `ADMIN_CLIENT_IDS`
 - **A person is the live view of a fresh mint** (0.26.0): its claims are
-  what that account's own token would carry at that moment, from the same
-  builder (`oidc::arkavo_user_claims_from`): `arkavo_entitlements` stored +
+  what that account's own token would carry at that moment (any human
+  token: Apple and Google sign-ins also carry roles `["user"]` and
+  `sub` `arkavo:<uuid>`), from the same builder
+  (`oidc::try_arkavo_user_claims_from`): `arkavo_entitlements` stored +
   derived (Patreon campaign/tier values, publish, creator) and
   `arkavo_patreon` as the token's map in JSON. The platform ERS's live
   source reads it instead of token claims, so tokens can later shed the
   Patreon data. A Patreon-linked account for which nothing (cached, live or
   creator fallback) could be produced is 503 `{"error":"patreon_unavailable"}`,
   never a 200 without Patreon data: the resolver treats 503 as unavailable
-  (keeps its last answer) and a 200 as a fresh negative. Agents never get
+  (keeps its last answer) and a 200 as a fresh negative. Likewise a failed
+  publishing-state read is a 500 (`publishing::try_derived_entitlements`),
+  never a 200 missing the publish value; a mint withholds it. Agents never get
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
 
