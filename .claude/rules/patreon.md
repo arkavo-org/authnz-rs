@@ -35,8 +35,11 @@ paths:
 - **Token sealing**: AES-256-GCM under a per-row 256-bit DEK; the DEK is
   KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
   GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
-- **Membership materialization**: surfaced *only* in tokens, as the
-  `arkavo_patreon` claim, never through an endpoint. Every human token goes
+- **Membership materialization**: surfaced in tokens, as the
+  `arkavo_patreon` claim, and to service resolvers (the platform ERS's live
+  source) through `GET /entities/arkavo:<uuid>` (`ENTITY_CLIENT_IDS` ∪
+  `ADMIN_CLIENT_IDS`), which returns what a fresh mint would carry. Never
+  through a user-facing endpoint. Every human token goes
   through the one builder `oidc::arkavo_user_claims` (passkey auth CWT,
   DeviceCheck CWT, OIDC access token on code exchange and refresh), which
   calls [`materialize_for_user_bounded`] (3 s deadline) before minting. For
@@ -101,7 +104,11 @@ paths:
 - **Fail-closed**: when Patreon is unreachable, the link is absent, or the
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of
-  the claim as "no entitlement".
+  the claim as "no entitlement". `/entities` must not collapse those cases:
+  `materialize_for_user_resolved` returns `NotLinked` (200 without
+  `arkavo_patreon`, a fresh negative), a snapshot, or `Unavailable` (linked,
+  or the link read failed, and nothing was produced: 503
+  `patreon_unavailable`, so the resolver keeps its last answer).
 - Patreon support is **optional**: with no Patreon clients registered (via
   `PATREON_CLIENT_<TAG>_ID/_SECRET/_REDIRECT_URIS` tagged vars or the legacy
   `PATREON_CLIENT_ID`/`PATREON_CLIENT_SECRET`/`PATREON_REDIRECT_URIS` trio),
