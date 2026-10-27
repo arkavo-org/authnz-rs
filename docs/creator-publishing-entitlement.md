@@ -64,7 +64,8 @@ The entitlement is **computed when a token is minted, and never stored**.
     entitlements, including when an existing account adds a passkey);
   - `credentials.entitlements`. `PUT /admin/users/:id/entitlements` and
     `USER_DEFAULT_ENTITLEMENTS` refuse this FQN, so it cannot be delegated to
-    agents and does not appear in `GET /entities/:id`. A copy already stored
+    agents. `GET /entities/arkavo:<uuid>` shows it only as the live
+    derivation, the same one a mint makes. A copy already stored
     on a row from before this change is dropped whenever the list is read
     (tokens, agent delegation and re-mint, `/entities`), with a warning in
     the log; only the mint-time derivation can emit the FQN.

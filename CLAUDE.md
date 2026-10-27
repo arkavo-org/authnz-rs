@@ -39,6 +39,7 @@ when unset.
 | `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
+| `ENTITY_CLIENT_IDS` | client_ids whose service CWTs may call `GET /entities/:id` only (read-only; production: `opentdf-platform`, the platform ERS's live Patreon source). `ADMIN_CLIENT_IDS` are accepted there too. Never put a resolver on the admin list: that also grants `PUT` entitlements. |
 | `AGENT_DELEGATE_CLIENT_IDS` | OIDC client_ids that may request the `agents:delegate` scope, and whose access tokens `POST /agents/authorize` (and quarantine, recover and appraisal) accept as `Authorization: Bearer` (production: `arkavo-edge`). Empty ⇒ the scope is refused for every client. |
 | `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/:did/status` (intended for the platform entity resolver's `agent_status` client). Empty ⇒ 403, and the platform withholds every agent's entitlements. |
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
@@ -375,7 +376,8 @@ appraisal, status)
 - Carried in `ArkavoUserClaims::derived_entitlements`, so
   `mint_registration_token` drops it (~99-year token), and
   `entitlements::validate_fqns` refuses to store it (never delegable to
-  agents, never in `GET /entities`).
+  agents). `GET /entities/arkavo:<uuid>` shows it because it derives it the
+  same way a mint does, never because it is stored.
 - `PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`: service CWT on
   `MODERATION_CLIENT_IDS`; the suspension (`suspended_by`, `suspended_at`,
   `reason`, `report_id`) is a map attribute on the `credentials` row and is
@@ -401,8 +403,9 @@ appraisal, status)
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**
   (`constants::is_derived_only`): refused by `validate_fqns`, stripped from
   stored lists on read and from `effective_entitlements`, so none of it is
-  ever stored, delegated to an agent, or listed by `GET /entities`. So is
-  the creator attribute below. The check ignores the host's letter case
+  ever stored or delegated to an agent. `GET /entities/arkavo:<uuid>` lists
+  it only as the live, mint-time derivation (entities.rs), never from
+  storage. So is the creator attribute below. The check ignores the host's letter case
   (`https://Patreon.arkavo.com/…` is derived-only too).
 - **Creator attribute** (#117, `constants::creator_entitlement`):
   `https://arkavo.net/attr/creator/value/<uuid>`, the account's bare
@@ -528,6 +531,19 @@ appraisal, status)
 - Unknown namespace → HTTP 400 (BadId); missing entity → HTTP 404 (NotFound)
 - Category mapping: Person → "subject"; Agent and Device → "environment" — with npe_type (None/"agent"/"device")
 - Claims include authorization profile (entitlements, roles) and entity-specific metadata (device class, agent depth/chain)
+- Gate: service CWT on `ENTITY_CLIENT_IDS` ∪ `ADMIN_CLIENT_IDS`
+- **A person is the live view of a fresh mint** (0.26.0): its claims are
+  what that account's own token would carry at that moment, from the same
+  builder (`oidc::arkavo_user_claims_from`): `arkavo_entitlements` stored +
+  derived (Patreon campaign/tier values, publish, creator) and
+  `arkavo_patreon` as the token's map in JSON. The platform ERS's live
+  source reads it instead of token claims, so tokens can later shed the
+  Patreon data. A Patreon-linked account for which nothing (cached, live or
+  creator fallback) could be produced is 503 `{"error":"patreon_unavailable"}`,
+  never a 200 without Patreon data: the resolver treats 503 as unavailable
+  (keeps its last answer) and a 200 as a fresh negative. Agents never get
+  derived values. Contract agreed with the opentdf-platform session
+  2026-10-27; change it only with them.
 
 ### Key Data Flow
 
