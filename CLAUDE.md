@@ -403,8 +403,23 @@ appraisal, status)
   `GET /campaigns/<cid>?include=tiers` and are saved on the `patreon_tokens`
   row (`campaign_tier_ids` / `campaign_tier_slugs`) so a failed fetch or the
   owner fallback keeps the last ones fetched.
-  What the platform's arkavo-mode ERS consumes in place of
-  `arkavo_patreon`, which is still minted until the platform cuts over.
+  The only list anyone authorizes on: the platform and iroh grant from
+  `arkavo_entitlements`; `arkavo_patreon` is for display (and iroh's
+  publish check reads its `role` and `campaign_id`).
+- **The token carries the subscription** (#128, owner decision
+  2026-10-28): `arkavo_patreon` is never dropped. Each active membership
+  adds `campaign_name` (Patreon `campaign.name`, ≤ 64 bytes) and
+  `creator_sub` (the bare UUID of the account owning the campaign, from its
+  `identity_links` row `patreon-campaign#<cid>`); a creator adds
+  `owned_campaign {id, name?, tiers[{id, title?, amount_cents?,
+  published?}]}` beside the unchanged top-level `campaign_id` (text) and
+  `role`. A token carries at most `MAX_CLAIM_MEMBERSHIPS` (75) memberships,
+  active only, Arkavo's publisher campaign first, and derives its campaign
+  values from the same 75 (`patreon::claim_snapshot`, warn log when it
+  drops any); the cached snapshot keeps them all. 75 keeps a patron's CWT
+  near 44 KB, under the 64 KiB HTTP/2 header limit
+  (`MAX_REQUEST_HEADER_LIST_BYTES`); it rises once the title-slug tier form
+  is retired.
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**
   (`constants::is_derived_only`): refused by `validate_fqns`, stripped from
   stored lists on read and from `effective_entitlements`, so none of it is
@@ -543,9 +558,10 @@ appraisal, status)
   `sub` `arkavo:<uuid>`), from the same builder
   (`oidc::try_arkavo_user_claims_from`): `arkavo_entitlements` stored +
   derived (Patreon campaign/tier values, publish, creator) and
-  `arkavo_patreon` as the token's map in JSON. The platform ERS's live
-  source reads it instead of token claims, so tokens can later shed the
-  Patreon data. A Patreon-linked account for which nothing (cached, live or
+  `arkavo_patreon` as the token's map in JSON (#128's names, `creator_sub`
+  and `owned_campaign` included). A service's escape hatch: no decision
+  path calls it (the platform grants from the token; opentdf-platform#68
+  closed unmerged). A Patreon-linked account for which nothing (cached, live or
   creator fallback) could be produced is 503 `{"error":"patreon_unavailable"}`,
   never a 200 without Patreon data: the resolver treats 503 as unavailable
   (keeps its last answer) and a 200 as a fresh negative. Likewise a failed

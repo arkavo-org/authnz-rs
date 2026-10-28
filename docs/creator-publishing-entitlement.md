@@ -47,7 +47,9 @@ The entitlement is **computed when a token is minted, and never stored**.
 - **Link role does not matter.** Consumer and creator links qualify in the same
   way: every link fetches memberships with the same `/identity` call and the
   same refresh-on-401 path. A creator's `arkavo_patreon` claim keeps its owned
-  `campaign_id` and also lists its memberships. Since #99 the role is not the
+  `campaign_id` (and, since #128, `owned_campaign` beside it) and also lists
+  its memberships. A token carries at most 75 active memberships, Arkavo's
+  campaign always first, so the publish entitlement never drops. Since #99 the role is not the
   client's: it is `creator` when Patreon reports an owned campaign.
 - **Where it appears:** it is appended to `arkavo_entitlements`, after the
   stored list, on:

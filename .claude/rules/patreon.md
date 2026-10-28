@@ -43,9 +43,10 @@ paths:
   KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
   GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
 - **Membership materialization**: surfaced in tokens, as the
-  `arkavo_patreon` claim, and to service resolvers (the platform ERS's live
-  source) through `GET /entities/arkavo:<uuid>` (`ENTITY_CLIENT_IDS` ∪
-  `ADMIN_CLIENT_IDS`), which returns what a fresh mint would carry. Never
+  `arkavo_patreon` claim, which the token always carries (#128: the signed
+  CWT is the carrier, and tokens never drop it), and to services through
+  `GET /entities/arkavo:<uuid>` (`ENTITY_CLIENT_IDS` ∪ `ADMIN_CLIENT_IDS`),
+  which returns what a fresh mint would carry. Never
   through a user-facing endpoint. Every human token goes
   through the one builder `oidc::arkavo_user_claims` (passkey auth CWT,
   DeviceCheck CWT, OIDC access token on code exchange and refresh), which
@@ -103,11 +104,43 @@ paths:
   one conditional `UpdateItem` on the same Patreon user and `linked_at`). A
   failed tier read keeps the stored list (of the same campaign only), as do
   the owner fallback and a missed mint deadline, so a creator is never
-  locked out of their own content by a Patreon outage. The owned tiers are
-  not in the `arkavo_patreon` claim. The platform's arkavo-mode ERS only lowercases, so values
+  locked out of their own content by a Patreon outage. The owned tier ids
+  and slugs feed entitlements only; the claim lists the ladder as
+  `owned_campaign` (below). The platform's arkavo-mode ERS only lowercases, so values
   must be canonical: non-numeric ids and non-`slugify_tier` slugs are
   dropped. The whole `https://patreon.arkavo.com/` namespace is derived-only
   (`constants::is_derived_only`).
+- **What the claim carries** (#128): each active membership's
+  `campaign_name` and `creator_sub`, a creator's `owned_campaign`, at most
+  75 memberships.
+  - Reads: the `/identity` read adds `fields[campaign]=name` (every included
+    campaign: the memberships' and the owned one); the tier read asks
+    `fields[tier]=title,amount_cents,published`. A 400 to a read asking for
+    them is retried once without them (`get_patreon_json`): a refused
+    display field must never fail a mint. Text passes `display_text`
+    (trimmed, no control characters, ≤ 64 bytes).
+  - The owned campaign's name and ladder are stored on the `patreon_tokens`
+    row (`campaign_name`, `campaign_tiers`) with the tier lists, so the
+    owner fallback carries them in an outage; a read without a name keeps
+    the stored one.
+  - `creator_sub`: an `identity_links` row `patreon-campaign#<cid>` →
+    `user_id` (`db/patreon_campaigns.rs`), claimed on every live
+    materialization that sees the account own the campaign and at link
+    (`attribute_not_exists(link_pk) OR user_id = :uid`; another account's
+    claim is logged and its patrons get no `creator_sub`), and given up
+    (conditional on `user_id`) when Patreon says the account owns another
+    campaign or none. Each live snapshot batch-reads the rows for its
+    active memberships (`with_creator_subs`) and is cached with them; a
+    failed read leaves them unset. Account deletion removes the rows with
+    the other links.
+  - The cap: `claim_snapshot` (in the one claim builder) keeps active
+    memberships only, Arkavo's publisher campaign first, then Patreon's
+    order, at most `MAX_CLAIM_MEMBERSHIPS`, and the campaign values are
+    derived from that same list. Publishing is derived from the full
+    snapshot.
+  - `campaign_id` stays top-level text, creators only: iroh's v2 publish
+    check reads it (and `role`) and refuses a number. Never move it into
+    `owned_campaign`.
 - **Fail-closed**: when Patreon is unreachable, the link is absent, or the
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of
