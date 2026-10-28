@@ -237,6 +237,16 @@ paths:
     Carried forward by every whole-row put (token rotation). Absent or
     malformed reads as empty. A re-link writes them empty until the next
     fetch.
+  - campaign_tiers (List of Map, optional; creator only) - The owned
+    campaign's tier ladder for the entity view: each `{id S, title S?,
+    amount_cents N?, published BOOL?}`, in Patreon's order. campaign_name
+    (String, optional; creator only) - the owned campaign's display name.
+    Written and removed with the tier lists by `put_patreon_ownership` (a
+    read without a name keeps the stored one; the name is removed only when
+    none was ever read) and carried forward by a
+    whole-row put. A row written before them reads as empty and is filled by
+    the next successful materialization (its changed `owned_tiers` triggers
+    the write). Never encoded in a token.
 - **Encryption**: Envelope. A DynamoDB-only compromise yields ciphertext
   blobs but no plaintext tokens — recovery additionally requires
   `kms:Decrypt` on the configured key.

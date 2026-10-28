@@ -558,6 +558,12 @@ appraisal, status)
   500 as the service route (one builder, `person_view`); `id` is the
   canonical `arkavo:<uuid>`, never `me`. The static route takes precedence
   over `/entities/:id`. Contract: [docs/entity-view.md](docs/entity-view.md).
+- **View-only Patreon data** (0.28.0, #128 rework): the person view's
+  `arkavo_patreon` is the token's map (`cwt::patreon_to_json`) plus
+  `memberships[].campaign_name` and a creator's `owned_campaign {id, name?,
+  tiers[{id, title?, amount_cents?, published?}]}` (`cwt::patreon_view_json`).
+  Never in a token: `patreon_to_cbor` is unchanged and a test pins the token
+  bytes. Tokens are to shrink, not grow (owner decision 2026-10-27).
 
 ### Key Data Flow
 

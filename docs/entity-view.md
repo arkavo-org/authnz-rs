@@ -80,8 +80,35 @@ Present only when the account has a Patreon link and a snapshot.
 | `role` | `creator` when Patreon reports an owned campaign, else `consumer`. |
 | `patreon_user_id` | The linked Patreon user. |
 | `campaign_id` | The owned campaign. Present for creators only. |
-| `memberships` | Omitted when empty. Each entry has `campaign_id`, `patron_status` (absent when Patreon sent none; only `active_patron` entitles), `tier_ids`, and `tier_slugs` (omitted when empty). |
+| `memberships` | Omitted when empty. Each entry has `campaign_id`, `patron_status` (absent when Patreon sent none; only `active_patron` entitles), `tier_ids`, `tier_slugs` (omitted when empty) and `campaign_name` (view only). |
+| `owned_campaign` | View only, creators only (see below). |
 | `verified_at`, `cache_expires_at` | When the snapshot was read, and when it goes stale (Unix seconds). |
+
+The token's `arkavo_patreon` is this map without the two view-only keys
+(`memberships[].campaign_name`, `owned_campaign`). They are never put in a
+token.
+
+- **`campaign_name`**: Patreon's `campaign.name`, the campaign's display
+  name. It is trimmed, has control characters removed, and is cut to 200
+  UTF-8 bytes. It is absent when Patreon sent none, and for up to 5
+  minutes after a deploy (a snapshot cached before it).
+- **`owned_campaign`**: present while `role` is `creator`:
+
+  ```json
+  {"id": "42", "name": "My Campaign",
+   "tiers": [{"id": "10", "title": "Free", "amount_cents": 0, "published": true},
+             {"id": "11", "title": "Supporter", "amount_cents": 500, "published": false}]}
+  ```
+
+  - `tiers` lists every tier of the campaign in Patreon's order, with
+    `title`, `amount_cents` (US cents) and `published` when Patreon sent
+    them.
+  - When Patreon cannot be reached, the last ladder read is served from
+    storage, so Creator's protect step still works.
+  - A creator whose ladder has not been read since this field was added
+    gets `{"id": …}` entries only, until the next successful read.
+  - `name` is absent when the link lacks the `campaigns` scope and no
+    name was ever read.
 
 Readers must ignore keys they do not know: new keys are added without
 notice.

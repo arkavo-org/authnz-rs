@@ -115,6 +115,18 @@ paths:
   must be canonical: non-numeric ids and non-`slugify_tier` slugs are
   dropped. The whole `https://patreon.arkavo.com/` namespace is derived-only
   (`constants::is_derived_only`).
+- **Names and the ladder, view only** (#128 rework): the `/identity` read
+  adds `fields[campaign]=name` (every included campaign: the memberships'
+  and the owned one), and the tier read asks
+  `fields[tier]=title,amount_cents,published`. No extra Patreon call. They
+  fill `ArkavoPatreonMembership.campaign_name` and
+  `OwnedCampaignTiers.{name, ladder}`, which `cwt::patreon_view_json` shows
+  in the entity view and `patreon_to_cbor` never encodes. Text passes
+  `display_text` (trimmed, no control characters, ≤ 200 bytes). The name
+  and ladder are stored on the `patreon_tokens` row with the tier lists
+  (`campaign_name`, `campaign_tiers`), so the owner fallback serves them in
+  an outage; a name the read did not bring keeps the stored one. No
+  `creator_sub`: iroh answers campaign → creator (tdf-iroh-s3#49).
 - **Fail-closed**: when Patreon is unreachable, the link is absent, or the
   cached snapshot is stale, the mint path **omits** the `arkavo_patreon`
   claim entirely — downstream KAS / policy enforcers must treat absence of
