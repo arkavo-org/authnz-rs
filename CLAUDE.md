@@ -597,6 +597,13 @@ appraisal, status)
    - Validates client (arkavo, arkavocreator) and provider parameters
    - Sanitizes OAuth codes and error messages to prevent injection
    - Redirects to app-specific deep links (e.g., `arkavo://oauth/patreon?code=...`)
+   - Forwards the provider's `state` verbatim on both the code and the error
+     redirect (`...?code=<code>&state=<state>`, #129) when it passes
+     `validate_oauth_state` (1–100 ASCII alphanumerics, `-`, `_`); a malformed
+     `state` bounces as `error=invalid_state` without it, an absent one as
+     before. The **client** verifies `state`; the server never does (it holds
+     none): a client that posts a bounced code to `POST /oauth/patreon/link`
+     without comparing it can be made to link an attacker's Patreon account
 
 5. **OIDC Provider Flow (for OpenTDF and other RPs)**:
    - Relying party (RP) redirects user-agent to `/oauth/authorize?response_type=code&client_id=...&redirect_uri=...&scope=openid&state=...&nonce=...`

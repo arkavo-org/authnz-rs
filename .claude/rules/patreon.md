@@ -32,6 +32,13 @@ paths:
     5. Persists the encrypted token bundle (access + refresh) in
        `patreon_tokens` keyed by arkavo `user_id`.
     6. Invalidates the membership materialization cache for the user.
+- **`state` is the client's to verify, never the server's.** The link
+  endpoint takes no `state`, and the scheme bounce
+  (`GET /oauth/:client/patreon`, `main.rs`) holds none: it forwards
+  Patreon's `state` to `<scheme>://oauth/patreon?code=…&state=…` (and on
+  `error=`) so the app can compare it with the one it generated before it
+  posts the code here (#129). A client that skips the compare lets a forged
+  `code` link the attacker's Patreon account to the signed-in user.
 - **Token sealing**: AES-256-GCM under a per-row 256-bit DEK; the DEK is
   KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
   GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
