@@ -193,15 +193,38 @@ pub struct ArkavoPatreon {
 /// The tiers of a creator's own campaign, in the same two shapes a
 /// membership carries its entitled tiers: Patreon tier ids and the
 /// deduplicated title slugs (an independent set, not parallel to `ids`).
+/// `ids` and `slugs` feed `arkavo_entitlements` only; `name` and `ladder`
+/// are the token's `owned_campaign` (#128).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnedCampaignTiers {
     pub ids: Vec<String>,
     pub slugs: Vec<String>,
+    /// The campaign's display name (Patreon `campaign.name`).
+    pub name: Option<String>,
+    /// Every tier in Patreon's order, with what Creator's protect sheet
+    /// shows. Empty until the first fetch after this field was added; the
+    /// claim then lists the tier ids alone.
+    pub ladder: Vec<OwnedTier>,
+}
+
+/// One tier of a creator's own campaign, as `owned_campaign.tiers` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTier {
+    pub id: String,
+    pub title: Option<String>,
+    pub amount_cents: Option<i64>,
+    pub published: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArkavoPatreonMembership {
     pub campaign_id: String,
+    /// The campaign's display name (Patreon `campaign.name`, `display_text`).
+    /// Encoded on `active_patron` memberships only (#128).
+    pub campaign_name: Option<String>,
+    /// The bare account UUID of the Arkavo account that owns the campaign
+    /// (its `patreon-campaign#<cid>` row), when one does (#128).
+    pub creator_sub: Option<String>,
     /// Patreon's `patron_status` string. `active_patron`, `declined_patron`,
     /// `former_patron`, or absent (then `None`). Only `active_patron` should
     /// be treated as conferring entitlement by downstream policy.
@@ -690,12 +713,13 @@ pub fn patreon_to_json(p: &ArkavoPatreon) -> serde_json::Value {
     cbor_to_json(patreon_to_cbor(p))
 }
 
-/// Only what [`patreon_to_cbor`] produces: text, integers, arrays and
-/// text-keyed maps.
+/// Only what [`patreon_to_cbor`] produces: text, integers, booleans,
+/// arrays and text-keyed maps.
 fn cbor_to_json(v: Value) -> serde_json::Value {
     match v {
         Value::Text(s) => s.into(),
         Value::Integer(i) => i64::try_from(i).map_or(serde_json::Value::Null, Into::into),
+        Value::Bool(b) => b.into(),
         Value::Array(a) => a.into_iter().map(cbor_to_json).collect(),
         Value::Map(m) => serde_json::Value::Object(
             m.into_iter()
@@ -707,6 +731,94 @@ fn cbor_to_json(v: Value) -> serde_json::Value {
         ),
         _ => serde_json::Value::Null,
     }
+}
+
+/// Patreon's `patron_status` for a paying patron: the only status that
+/// entitles, and the only one whose membership carries its campaign name.
+pub const ACTIVE_PATRON: &str = "active_patron";
+
+/// `owned_campaign`: `{id, name?, tiers: [{id, title?, amount_cents?,
+/// published?}]}`. A ladder not read since #128 lists the tier ids alone.
+fn owned_campaign_to_cbor(campaign_id: &str, owned: &OwnedCampaignTiers) -> Value {
+    let text = |k: &str, v: &str| (Value::Text(k.into()), Value::Text(v.into()));
+    let tiers: Vec<Value> = if owned.ladder.is_empty() {
+        owned
+            .ids
+            .iter()
+            .map(|id| Value::Map(vec![text("id", id)]))
+            .collect()
+    } else {
+        owned
+            .ladder
+            .iter()
+            .map(|t| {
+                let mut tier = vec![text("id", &t.id)];
+                if let Some(v) = &t.title {
+                    tier.push(text("title", v));
+                }
+                if let Some(v) = t.amount_cents {
+                    tier.push((Value::Text("amount_cents".into()), Value::Integer(v.into())));
+                }
+                if let Some(v) = t.published {
+                    tier.push((Value::Text("published".into()), Value::Bool(v)));
+                }
+                Value::Map(tier)
+            })
+            .collect()
+    };
+    let mut campaign = vec![text("id", campaign_id)];
+    if let Some(name) = &owned.name {
+        campaign.push(text("name", name));
+    }
+    campaign.push((Value::Text("tiers".into()), Value::Array(tiers)));
+    Value::Map(campaign)
+}
+
+/// The decoded `owned_campaign`: its name and ladder. A ladder of ids alone
+/// decodes as tiers with no title.
+fn owned_campaign_from_cbor(v: Value) -> Result<(Option<String>, Vec<OwnedTier>), CwtError> {
+    let Value::Map(entries) = v else {
+        return Err(CwtError::Malformed);
+    };
+    let mut name = None;
+    let mut ladder = Vec::new();
+    for (k, v) in entries {
+        match (k, v) {
+            (Value::Text(k), Value::Text(v)) if k == "name" => name = Some(v),
+            (Value::Text(k), Value::Array(tiers)) if k == "tiers" => {
+                for tier in tiers {
+                    let Value::Map(fields) = tier else {
+                        return Err(CwtError::Malformed);
+                    };
+                    let mut t = OwnedTier {
+                        id: String::new(),
+                        title: None,
+                        amount_cents: None,
+                        published: None,
+                    };
+                    for (fk, fv) in fields {
+                        match (fk, fv) {
+                            (Value::Text(k), Value::Text(v)) if k == "id" => t.id = v,
+                            (Value::Text(k), Value::Text(v)) if k == "title" => t.title = Some(v),
+                            (Value::Text(k), Value::Integer(n)) if k == "amount_cents" => {
+                                t.amount_cents = i64::try_from(i128::from(n)).ok()
+                            }
+                            (Value::Text(k), Value::Bool(b)) if k == "published" => {
+                                t.published = Some(b)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if t.id.is_empty() {
+                        return Err(CwtError::Malformed);
+                    }
+                    ladder.push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((name, ladder))
 }
 
 fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
@@ -750,10 +862,32 @@ fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
                         ),
                     ));
                 }
+                // Names only where they entitle, to bound the token (#128).
+                if let Some(name) = &m.campaign_name
+                    && m.patron_status.as_deref() == Some(ACTIVE_PATRON)
+                {
+                    m_entries.push((
+                        Value::Text("campaign_name".into()),
+                        Value::Text(name.clone()),
+                    ));
+                }
+                if let Some(sub) = &m.creator_sub {
+                    m_entries.push((Value::Text("creator_sub".into()), Value::Text(sub.clone())));
+                }
                 Value::Map(m_entries)
             })
             .collect();
         entries.push((Value::Text("memberships".into()), Value::Array(arr)));
+    }
+    // Beside `campaign_id`, never in place of it: iroh's publish check reads
+    // that one (top-level text) and not this.
+    if p.role == "creator"
+        && let Some(cid) = &p.campaign_id
+    {
+        entries.push((
+            Value::Text("owned_campaign".into()),
+            owned_campaign_to_cbor(cid, &p.owned_tiers),
+        ));
     }
     entries.push((
         Value::Text("verified_at".into()),
@@ -776,6 +910,7 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
     let mut memberships: Vec<ArkavoPatreonMembership> = Vec::new();
     let mut verified_at: Option<i64> = None;
     let mut cache_expires_at: Option<i64> = None;
+    let mut owned_tiers = OwnedCampaignTiers::default();
 
     for (k, vv) in entries {
         let key = match k {
@@ -795,6 +930,8 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                     let mut m_status: Option<String> = None;
                     let mut m_tiers: Vec<String> = Vec::new();
                     let mut m_slugs: Vec<String> = Vec::new();
+                    let mut m_name: Option<String> = None;
+                    let mut m_creator: Option<String> = None;
                     for (mk, mv) in m_entries {
                         let mkey = match mk {
                             Value::Text(s) => s,
@@ -803,6 +940,8 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                         match (mkey.as_str(), mv) {
                             ("campaign_id", Value::Text(s)) => m_campaign_id = Some(s),
                             ("patron_status", Value::Text(s)) => m_status = Some(s),
+                            ("campaign_name", Value::Text(s)) => m_name = Some(s),
+                            ("creator_sub", Value::Text(s)) => m_creator = Some(s),
                             ("tier_ids", Value::Array(a)) => {
                                 m_tiers = a
                                     .into_iter()
@@ -825,6 +964,8 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                         }
                     }
                     memberships.push(ArkavoPatreonMembership {
+                        creator_sub: m_creator,
+                        campaign_name: m_name,
                         campaign_id: m_campaign_id.ok_or(CwtError::Malformed)?,
                         patron_status: m_status,
                         tier_ids: m_tiers,
@@ -840,6 +981,11 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
                 let v: i128 = n.into();
                 cache_expires_at = Some(i64::try_from(v).map_err(|_| CwtError::Malformed)?);
             }
+            ("owned_campaign", v) => {
+                // Name and ladder only: the tier ids and slugs that feed
+                // entitlements are derived at mint, never read back.
+                (owned_tiers.name, owned_tiers.ladder) = owned_campaign_from_cbor(v)?;
+            }
             _ => {}
         }
     }
@@ -848,7 +994,7 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
         patreon_user_id: patreon_user_id.ok_or(CwtError::Malformed)?,
         campaign_id,
         memberships,
-        owned_tiers: OwnedCampaignTiers::default(),
+        owned_tiers,
         verified_at: verified_at.ok_or(CwtError::Malformed)?,
         cache_expires_at: cache_expires_at.ok_or(CwtError::Malformed)?,
     })
@@ -1362,12 +1508,16 @@ mod tests {
             campaign_id: None,
             memberships: vec![
                 ArkavoPatreonMembership {
+                    creator_sub: None,
+                    campaign_name: None,
                     campaign_id: "camp-1".into(),
                     patron_status: Some("active_patron".into()),
                     tier_ids: vec!["tier-gold".into(), "tier-vip".into()],
                     tier_slugs: vec!["gold".into(), "vip".into()],
                 },
                 ArkavoPatreonMembership {
+                    creator_sub: None,
+                    campaign_name: None,
                     campaign_id: "camp-2".into(),
                     patron_status: Some("former_patron".into()),
                     tier_ids: vec![],
@@ -1393,12 +1543,16 @@ mod tests {
             campaign_id: Some("111".into()),
             memberships: vec![
                 ArkavoPatreonMembership {
+                    creator_sub: None,
+                    campaign_name: None,
                     campaign_id: "222".into(),
                     patron_status: Some("active_patron".into()),
                     tier_ids: vec!["9".into()],
                     tier_slugs: vec!["gold".into()],
                 },
                 ArkavoPatreonMembership {
+                    creator_sub: None,
+                    campaign_name: None,
                     campaign_id: "333".into(),
                     patron_status: None,
                     tier_ids: vec![],
@@ -1408,12 +1562,14 @@ mod tests {
             owned_tiers: OwnedCampaignTiers {
                 ids: vec!["5".into()],
                 slugs: vec!["owned".into()],
+                ..Default::default()
             },
             verified_at: 1_700_000_000,
             cache_expires_at: 1_700_000_300,
         };
-        // Optional keys are omitted as in the token, and the owned tiers,
-        // which feed entitlements only, are not in the claim.
+        // Optional keys are omitted as in the token. The owned tier ids and
+        // slugs feed entitlements only; a ladder not read yet is listed by
+        // its ids as `owned_campaign` (#128).
         assert_eq!(
             patreon_to_json(&snap),
             serde_json::json!({
@@ -1425,6 +1581,7 @@ mod tests {
                      "tier_ids": ["9"], "tier_slugs": ["gold"]},
                     {"campaign_id": "333", "tier_ids": []},
                 ],
+                "owned_campaign": {"id": "111", "tiers": [{"id": "5"}]},
                 "verified_at": 1_700_000_000,
                 "cache_expires_at": 1_700_000_300,
             })
@@ -1438,6 +1595,114 @@ mod tests {
         let json = patreon_to_json(&consumer);
         assert!(json.get("campaign_id").is_none());
         assert!(json.get("memberships").is_none());
+    }
+
+    /// #128: the token carries each active membership's campaign name and
+    /// creator, and a creator's `owned_campaign` beside its `campaign_id`.
+    /// A name on a membership that does not entitle is left out.
+    #[test]
+    fn token_carries_names_creator_sub_and_the_owned_ladder() {
+        let member = |cid: &str, status: &str| ArkavoPatreonMembership {
+            creator_sub: None,
+            campaign_name: Some(format!("Campaign {cid}")),
+            campaign_id: cid.into(),
+            patron_status: Some(status.into()),
+            tier_ids: vec!["9".into()],
+            tier_slugs: vec!["gold".into()],
+        };
+        let mut active = member("222", "active_patron");
+        active.creator_sub = Some("6f1c2d3e-4b5a-4c6d-8e7f-0123456789ab".into());
+        let snap = ArkavoPatreon {
+            role: "creator".into(),
+            patreon_user_id: "p-7".into(),
+            campaign_id: Some("111".into()),
+            memberships: vec![active, member("333", "declined_patron")],
+            owned_tiers: OwnedCampaignTiers {
+                ids: vec!["5".into(), "6".into()],
+                slugs: vec!["owned".into()],
+                name: Some("Mine".into()),
+                ladder: vec![
+                    OwnedTier {
+                        id: "5".into(),
+                        title: Some("Owned".into()),
+                        amount_cents: Some(300),
+                        published: Some(true),
+                    },
+                    OwnedTier {
+                        id: "6".into(),
+                        title: None,
+                        amount_cents: None,
+                        published: None,
+                    },
+                ],
+            },
+            verified_at: 1_700_000_000,
+            cache_expires_at: 1_700_000_300,
+        };
+        assert_eq!(
+            patreon_to_json(&snap),
+            serde_json::json!({
+                "role": "creator",
+                "patreon_user_id": "p-7",
+                "campaign_id": "111",
+                "memberships": [
+                    {"campaign_id": "222", "patron_status": "active_patron",
+                     "tier_ids": ["9"], "tier_slugs": ["gold"],
+                     "campaign_name": "Campaign 222",
+                     "creator_sub": "6f1c2d3e-4b5a-4c6d-8e7f-0123456789ab"},
+                    {"campaign_id": "333", "patron_status": "declined_patron",
+                     "tier_ids": ["9"], "tier_slugs": ["gold"]},
+                ],
+                "owned_campaign": {
+                    "id": "111",
+                    "name": "Mine",
+                    "tiers": [
+                        {"id": "5", "title": "Owned", "amount_cents": 300, "published": true},
+                        {"id": "6"},
+                    ],
+                },
+                "verified_at": 1_700_000_000,
+                "cache_expires_at": 1_700_000_300,
+            })
+        );
+
+        // Round trip: everything but what feeds entitlements (tier ids and
+        // slugs, derived at mint) and the unencoded name.
+        let bytes = claims_to_cbor(
+            &ArkavoClaims::oidc_access("iss-1", "arkavo:u", "opentdf", 1)
+                .with_arkavo_patreon(snap.clone()),
+        )
+        .unwrap();
+        let decoded = claims_from_cbor(&bytes)
+            .unwrap()
+            .custom
+            .arkavo_patreon
+            .unwrap();
+        let mut want = snap.clone();
+        want.memberships[1].campaign_name = None;
+        want.owned_tiers.ids.clear();
+        want.owned_tiers.slugs.clear();
+        assert_eq!(decoded, want);
+
+        // A ladder not read since #128: the tier ids alone.
+        let unread = ArkavoPatreon {
+            owned_tiers: OwnedCampaignTiers {
+                ids: vec!["5".into(), "6".into()],
+                ..Default::default()
+            },
+            ..snap.clone()
+        };
+        assert_eq!(
+            patreon_to_json(&unread)["owned_campaign"],
+            serde_json::json!({"id": "111", "tiers": [{"id": "5"}, {"id": "6"}]})
+        );
+        // A consumer has none.
+        let consumer = ArkavoPatreon {
+            role: "consumer".into(),
+            campaign_id: None,
+            ..snap
+        };
+        assert!(patreon_to_json(&consumer).get("owned_campaign").is_none());
     }
 
     #[test]

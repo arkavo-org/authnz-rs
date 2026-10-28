@@ -132,6 +132,15 @@ paths:
   account deleted). No `token_*` attribute and not `provider = passkey`, so
   the sweep's `delete_identity_links_of` removes it. Read consistently by
   `get_session`, never by sign-in.
+- **Patreon campaign owner** (#128; `db/patreon_campaigns.rs`): `link_pk =
+  patreon-campaign#<campaign id>`, `provider = patreon-campaign`, `subject` =
+  the campaign id, `user_id` (the owning account), `linked_at`. One account
+  per campaign: written by a conditional `UpdateItem` on
+  `attribute_not_exists(link_pk) OR user_id = :uid`, deleted on `user_id =
+  :uid` when Patreon says the account no longer owns it. Read in batches of
+  100 (`BatchGetItem`, eventually consistent) for patrons' `creator_sub`.
+  The deletion sweep's `delete_identity_links_of` removes it. No sign-in
+  path reads it.
 - **PII**: Deliberately minimal. No email, display name, relay address, or
   `real_user_status` is stored here, even if the IdP returns them. A sealed
   Apple refresh token is not PII.
@@ -237,6 +246,16 @@ paths:
     Carried forward by every whole-row put (token rotation). Absent or
     malformed reads as empty. A re-link writes them empty until the next
     fetch.
+  - campaign_tiers (List of Map, optional; creator only; #128) - The owned
+    campaign's tier ladder, as the token's `owned_campaign.tiers`: each
+    `{id S, title S?, amount_cents N?, published BOOL?}`, in Patreon's order.
+    campaign_name (String, optional; creator only) - the owned campaign's
+    display name. Written and removed with the tier lists by
+    `put_patreon_ownership` (a read without a name keeps the stored one; the
+    name is removed only when none was ever read) and carried forward by a
+    whole-row put. A row written before them reads as empty and is filled by
+    the next successful materialization (its changed `owned_tiers` triggers
+    the write).
 - **Encryption**: Envelope. A DynamoDB-only compromise yields ciphertext
   blobs but no plaintext tokens — recovery additionally requires
   `kms:Decrypt` on the configured key.

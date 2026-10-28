@@ -2203,7 +2203,7 @@ pub(crate) async fn arkavo_user_claims(
         None => None,
     };
     let publish = crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
-    assemble_user_claims(user, user_id, snap, publish)
+    assemble_user_claims(app_state, user, user_id, snap, publish)
 }
 
 /// [`arkavo_user_claims`] for `GET /entities`, which materializes the Patreon
@@ -2218,15 +2218,26 @@ pub(crate) async fn try_arkavo_user_claims_from(
     let user_id = arkavo_user_uuid(user);
     let publish =
         crate::publishing::try_derived_entitlements(app_state, user_id, snap.as_ref()).await?;
-    Ok(assemble_user_claims(user, user_id, snap, publish))
+    Ok(assemble_user_claims(
+        app_state, user, user_id, snap, publish,
+    ))
 }
 
 fn assemble_user_claims(
+    app_state: &AppState,
     user: &AuthenticatedUser,
     user_id: Option<Uuid>,
     snap: Option<crate::cwt::ArkavoPatreon>,
     publish: Vec<String>,
 ) -> crate::cwt::ArkavoUserClaims {
+    // The claim and the campaign values derived from it carry the same
+    // capped, active-only memberships (#128).
+    let publisher = app_state
+        .publisher
+        .as_ref()
+        .as_ref()
+        .map(|p| p.campaign_id.as_str());
+    let snap = snap.map(|s| crate::patreon::claim_snapshot(s, publisher, user_id));
     let mut derived_entitlements = snap
         .as_ref()
         .map(|s| crate::patreon::campaign_entitlements(s, Utc::now().timestamp()))
@@ -2382,6 +2393,113 @@ pub(crate) mod tests {
     use axum::routing::get;
     use p256::SecretKey;
     use tower::ServiceExt;
+
+    /// #128: a patron's token carries at most 75 active memberships, each
+    /// with a 64-byte name and a creator, and the campaign values derived
+    /// from the same 75; it stays well under the 64 KiB HTTP/2 header limit.
+    #[tokio::test]
+    async fn a_patron_token_is_capped_at_75_active_memberships() {
+        use crate::cwt::{ArkavoPatreon, ArkavoPatreonMembership};
+        use p256::pkcs8::EncodePublicKey;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let uid = Uuid::new_v4();
+        let now = Utc::now().timestamp();
+        let member = |i: usize, status: &str| ArkavoPatreonMembership {
+            campaign_id: format!("{}", 10_000_000 + i),
+            campaign_name: Some("N".repeat(64)),
+            creator_sub: Some(Uuid::new_v4().to_string()),
+            patron_status: Some(status.into()),
+            tier_ids: vec![format!("{}", 20_000_000 + i)],
+            tier_slugs: vec!["gold-supporter".into()],
+        };
+        let mut memberships: Vec<_> = (0..100).map(|i| member(i, "active_patron")).collect();
+        memberships.insert(3, member(500, "former_patron"));
+        let snap = ArkavoPatreon {
+            role: "consumer".into(),
+            patreon_user_id: "87654321".into(),
+            campaign_id: None,
+            memberships,
+            owned_tiers: Default::default(),
+            verified_at: now,
+            cache_expires_at: now + 300,
+        };
+        let snap_for_size = snap.clone();
+        let user = AuthenticatedUser::webauthn(
+            uid,
+            crate::constants::DEFAULT_USER_ENTITLEMENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let claims = assemble_user_claims(&app_state, &user, Some(uid), Some(snap), Vec::new());
+        let carried = &claims.patreon.as_ref().unwrap().memberships;
+        assert_eq!(carried.len(), crate::patreon::MAX_CLAIM_MEMBERSHIPS);
+        assert!(
+            carried
+                .iter()
+                .all(|m| m.patron_status.as_deref() == Some("active_patron"))
+        );
+        assert_eq!(carried[0].campaign_id, "10000000");
+        assert_eq!(carried[74].campaign_id, "10000074");
+        // The derived campaign values cover exactly the carried memberships.
+        let campaigns = claims
+            .derived_entitlements
+            .iter()
+            .filter(|e| e.contains("/attr/campaign/value/"))
+            .count();
+        assert_eq!(campaigns, 75);
+
+        let spki = p256::ecdsa::SigningKey::from_slice(&[9u8; 32])
+            .unwrap()
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap();
+        let cnf = crate::cwt::cnf_from_app_attest(spki.as_bytes(), &[7u8; 32]).unwrap();
+        let token =
+            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf.clone()))
+                .unwrap();
+        assert!(token.len() < 48 * 1024, "{} bytes", token.len());
+
+        // The worst creator: the same memberships and a 40-tier campaign with
+        // 64-byte titles. The ladder lists 25; all 40 tiers keep their
+        // entitlement values; the token stays under the 64 KiB header limit
+        // with room for the other headers.
+        let mut creator = snap_for_size;
+        creator.role = "creator".into();
+        creator.campaign_id = Some("12345678".into());
+        creator.owned_tiers = crate::cwt::OwnedCampaignTiers {
+            ids: (0..40).map(|i| format!("{}", 30_000_000 + i)).collect(),
+            slugs: (0..40).map(|i| format!("tier-title-{i}")).collect(),
+            name: Some("N".repeat(64)),
+            ladder: (0..40)
+                .map(|i| crate::cwt::OwnedTier {
+                    id: format!("{}", 30_000_000 + i),
+                    title: Some("T".repeat(64)),
+                    amount_cents: Some(500 * i),
+                    published: Some(true),
+                })
+                .collect(),
+        };
+        let claims = assemble_user_claims(&app_state, &user, Some(uid), Some(creator), Vec::new());
+        assert_eq!(
+            claims.patreon.as_ref().unwrap().owned_tiers.ladder.len(),
+            25
+        );
+        let owned_tier_values = claims
+            .derived_entitlements
+            .iter()
+            .filter(|e| e.contains("/campaign-tier/value/12345678_"))
+            .count();
+        assert_eq!(owned_tier_values, 80);
+        let token =
+            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf)).unwrap();
+        assert!(token.len() < 60 * 1024, "{} bytes", token.len());
+    }
 
     fn test_jwk() -> Jwk {
         // Deterministic test key derived from a fixed seed.
