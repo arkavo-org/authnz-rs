@@ -1446,6 +1446,7 @@ mod tests {
             patreon_user_id: "patreon-user-42".into(),
             campaign_id: None,
             memberships: vec![crate::cwt::ArkavoPatreonMembership {
+                campaign_name: None,
                 campaign_id: "camp-1".into(),
                 patron_status: Some("active_patron".into()),
                 tier_ids: vec!["tier-gold".into()],

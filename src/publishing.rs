@@ -501,6 +501,7 @@ mod tests {
 
     fn member(campaign: &str, status: Option<&str>, tiers: &[&str]) -> ArkavoPatreonMembership {
         ArkavoPatreonMembership {
+            campaign_name: None,
             campaign_id: campaign.into(),
             patron_status: status.map(Into::into),
             tier_ids: tiers.iter().map(|t| t.to_string()).collect(),

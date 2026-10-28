@@ -387,6 +387,13 @@ impl DynamoDBStore {
                 .item(OWNED_TIER_IDS, string_list(&link.owned_tiers.ids))
                 .item(OWNED_TIER_SLUGS, string_list(&link.owned_tiers.slugs));
         }
+        if !link.owned_tiers.ladder.is_empty() {
+            item_builder =
+                item_builder.item(OWNED_TIER_LADDER, ladder_list(&link.owned_tiers.ladder));
+        }
+        if let Some(name) = &link.owned_tiers.name {
+            item_builder = item_builder.item(OWNED_CAMPAIGN_NAME, AttributeValue::S(name.clone()));
+        }
 
         match item_builder.send().await {
             Ok(_) => Ok(()),
@@ -438,17 +445,29 @@ impl DynamoDBStore {
             .expression_attribute_names("#cid", "campaign_id")
             .expression_attribute_names("#ids", OWNED_TIER_IDS)
             .expression_attribute_names("#slugs", OWNED_TIER_SLUGS)
+            .expression_attribute_names("#ladder", OWNED_TIER_LADDER)
+            .expression_attribute_names("#cname", OWNED_CAMPAIGN_NAME)
             .expression_attribute_values(":pid", AttributeValue::S(patreon_user_id.to_string()))
             .expression_attribute_values(":la", AttributeValue::N(linked_at.to_string()));
+        const SET_OWNED: &str =
+            "SET #role = :role, #cid = :cid, #ids = :ids, #slugs = :slugs, #ladder = :ladder";
         update = match campaign_id {
-            Some(cid) => update
-                .update_expression("SET #role = :role, #cid = :cid, #ids = :ids, #slugs = :slugs")
-                .expression_attribute_values(":role", AttributeValue::S("creator".into()))
-                .expression_attribute_values(":cid", AttributeValue::S(cid.to_string()))
-                .expression_attribute_values(":ids", string_list(&tiers.ids))
-                .expression_attribute_values(":slugs", string_list(&tiers.slugs)),
+            Some(cid) => {
+                let update = update
+                    .expression_attribute_values(":role", AttributeValue::S("creator".into()))
+                    .expression_attribute_values(":cid", AttributeValue::S(cid.to_string()))
+                    .expression_attribute_values(":ids", string_list(&tiers.ids))
+                    .expression_attribute_values(":slugs", string_list(&tiers.slugs))
+                    .expression_attribute_values(":ladder", ladder_list(&tiers.ladder));
+                match &tiers.name {
+                    Some(name) => update
+                        .update_expression(format!("{SET_OWNED}, #cname = :cname"))
+                        .expression_attribute_values(":cname", AttributeValue::S(name.clone())),
+                    None => update.update_expression(format!("{SET_OWNED} REMOVE #cname")),
+                }
+            }
             None => update
-                .update_expression("SET #role = :role REMOVE #cid, #ids, #slugs")
+                .update_expression("SET #role = :role REMOVE #cid, #ids, #slugs, #ladder, #cname")
                 .expression_attribute_values(":role", AttributeValue::S("consumer".into())),
         };
         match update.send().await {
@@ -2070,9 +2089,70 @@ impl DynamoDBStore {
 /// `patreon_tokens` attributes holding a creator link's owned campaign tiers.
 const OWNED_TIER_IDS: &str = "campaign_tier_ids";
 const OWNED_TIER_SLUGS: &str = "campaign_tier_slugs";
+/// The ladder and the campaign's name, for the entity view (and its creator
+/// fallback) only.
+const OWNED_TIER_LADDER: &str = "campaign_tiers";
+const OWNED_CAMPAIGN_NAME: &str = "campaign_name";
 
 fn string_list(values: &[String]) -> AttributeValue {
     AttributeValue::L(values.iter().cloned().map(AttributeValue::S).collect())
+}
+
+fn ladder_list(tiers: &[crate::cwt::OwnedTier]) -> AttributeValue {
+    AttributeValue::L(
+        tiers
+            .iter()
+            .map(|t| {
+                let mut m = std::collections::HashMap::from([(
+                    "id".to_string(),
+                    AttributeValue::S(t.id.clone()),
+                )]);
+                if let Some(v) = &t.title {
+                    m.insert("title".into(), AttributeValue::S(v.clone()));
+                }
+                if let Some(v) = t.amount_cents {
+                    m.insert("amount_cents".into(), AttributeValue::N(v.to_string()));
+                }
+                if let Some(v) = t.published {
+                    m.insert("published".into(), AttributeValue::Bool(v));
+                }
+                AttributeValue::M(m)
+            })
+            .collect(),
+    )
+}
+
+/// A stored ladder. Absent (rows written before it) or malformed reads as
+/// empty, like the tier lists: the next successful tier fetch rewrites it.
+fn read_owned_ladder(
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> Vec<crate::cwt::OwnedTier> {
+    let Some(v) = item.get(OWNED_TIER_LADDER) else {
+        return Vec::new();
+    };
+    let parsed: Option<Vec<crate::cwt::OwnedTier>> = v.as_l().ok().and_then(|l| {
+        l.iter()
+            .map(|e| {
+                let m = e.as_m().ok()?;
+                Some(crate::cwt::OwnedTier {
+                    id: m.get("id")?.as_s().ok()?.clone(),
+                    title: m.get("title").and_then(|v| v.as_s().ok()).cloned(),
+                    amount_cents: m
+                        .get("amount_cents")
+                        .and_then(|v| v.as_n().ok())
+                        .and_then(|n| n.parse().ok()),
+                    published: m.get("published").and_then(|v| v.as_bool().ok()).copied(),
+                })
+            })
+            .collect()
+    });
+    parsed.unwrap_or_else(|| {
+        warn!(
+            "Malformed patreon field {}; reading it as empty",
+            OWNED_TIER_LADDER
+        );
+        Vec::new()
+    })
 }
 
 /// A stored owned-tier list. Absent (rows written before #99) reads as empty,
@@ -2157,6 +2237,11 @@ fn item_to_patreon_link(
     let owned_tiers = crate::cwt::OwnedCampaignTiers {
         ids: read_owned_tier_list(item, OWNED_TIER_IDS),
         slugs: read_owned_tier_list(item, OWNED_TIER_SLUGS),
+        name: item
+            .get(OWNED_CAMPAIGN_NAME)
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        ladder: read_owned_ladder(item),
     };
 
     Ok(crate::patreon::PatreonLink {
@@ -2520,6 +2605,21 @@ pub(crate) mod tests {
         let tiers = crate::cwt::OwnedCampaignTiers {
             ids: vec!["10".into(), "11".into()],
             slugs: vec!["free".into()],
+            name: Some("Arkavo".into()),
+            ladder: vec![
+                crate::cwt::OwnedTier {
+                    id: "10".into(),
+                    title: Some("Free".into()),
+                    amount_cents: Some(0),
+                    published: Some(true),
+                },
+                crate::cwt::OwnedTier {
+                    id: "11".into(),
+                    title: None,
+                    amount_cents: None,
+                    published: None,
+                },
+            ],
         };
         // No row: nothing is created.
         assert!(
@@ -2562,6 +2662,20 @@ pub(crate) mod tests {
         let rotated = store.get_patreon_link(user_id).await.unwrap().unwrap();
         assert_eq!(rotated.owned_tiers, tiers);
         assert_eq!(rotated.campaign_id.as_deref(), Some("42"));
+
+        // A read that brought no name removes the stored one.
+        let unnamed = crate::cwt::OwnedCampaignTiers {
+            name: None,
+            ..tiers.clone()
+        };
+        assert!(
+            store
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &unnamed)
+                .await
+                .unwrap()
+        );
+        let stored = store.get_patreon_link(user_id).await.unwrap().unwrap();
+        assert_eq!(stored.owned_tiers, unnamed);
 
         // Patreon now says it owns none: back to a consumer row.
         assert!(

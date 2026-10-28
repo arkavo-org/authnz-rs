@@ -177,7 +177,7 @@ async fn person_view(
         "arkavo_entitlements": claims.effective_entitlements(),
     });
     if let Some(p) = &claims.patreon {
-        body["arkavo_patreon"] = crate::cwt::patreon_to_json(p);
+        body["arkavo_patreon"] = crate::cwt::patreon_view_json(p);
     }
     Ok(EntityRepresentation {
         id,
