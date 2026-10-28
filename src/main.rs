@@ -923,11 +923,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             },
                         );
 
-                        if let Err(err) = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
-                        .await
+                        if let Err(err) = connection_builder()
+                            .serve_connection(
+                                hyper_util::rt::TokioIo::new(tls_stream),
+                                hyper_service,
+                            )
+                            .await
                         {
                             eprintln!("Error serving connection: {:?}", err);
                         }
@@ -944,12 +945,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| format!("Server error: {}", e))?;
+        serve_plain(listener, app).await?;
     }
 
     Ok(())
+}
+
+/// Largest HTTP/2 request header list accepted (RFC 9113 §6.5.2: names +
+/// values + 32 per field). hyper's default is 16 KiB, but a patron's passkey
+/// CWT in `X-Auth-Token` grows by about 400 bytes per active Patreon
+/// membership and passes 16 KiB at about 37. HTTP/1.1 (hyper's ~400 KB read
+/// buffer) and HTTP/3 (h3, unbounded) already accept more.
+const MAX_REQUEST_HEADER_LIST_BYTES: u32 = 64 * 1024;
+
+/// The HTTP/1.1 + HTTP/2 connection builder for both TCP listeners.
+fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http2()
+        .max_header_list_size(MAX_REQUEST_HEADER_LIST_BYTES);
+    builder
+}
+
+/// The plain-HTTP listener (no TLS: development). `axum::serve` cannot set
+/// HTTP/2 limits, so connections go through [`connection_builder`] here too.
+async fn serve_plain(listener: tokio::net::TcpListener, app: Router) -> Result<(), String> {
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("Failed to accept connection: {}", e))?;
+        let tower_service = app.clone();
+        tokio::spawn(async move {
+            let hyper_service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    tower_service.clone().call(request)
+                },
+            );
+            if let Err(err) = connection_builder()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_service)
+                .await
+            {
+                eprintln!("Error serving connection: {:?}", err);
+            }
+        });
+    }
 }
 
 // Health check handlers
@@ -1519,6 +1560,33 @@ mod tests {
             alt_svc_header_value(8443).to_str().unwrap(),
             "h3=\":8443\"; ma=86400"
         );
+    }
+
+    /// An HTTP/2 request whose headers total 48 KiB is served; one past the
+    /// 64 KiB limit is not (hyper's default would refuse both).
+    #[tokio::test]
+    async fn http2_accepts_header_lists_up_to_64_kib() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        tokio::spawn(serve_plain(listener, app));
+
+        let status = |header_bytes: usize| async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client, conn) = h2::client::handshake(tcp).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let request = http::Request::get(format!("http://{addr}/health"))
+                .header("x-auth-token", "a".repeat(header_bytes))
+                .body(())
+                .unwrap();
+            let mut client = client.ready().await.ok()?;
+            let (response, _) = client.send_request(request, true).ok()?;
+            Some(response.await.ok()?.status())
+        };
+        assert_eq!(status(48 * 1024).await, Some(StatusCode::OK));
+        assert_ne!(status(65 * 1024).await, Some(StatusCode::OK));
     }
 
     #[tokio::test]

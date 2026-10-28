@@ -10,7 +10,7 @@ WebAuthn-based authentication and authorization service built with Rust, Axum, a
 HTTP/2 accepts request header lists up to 64 KiB (`MAX_REQUEST_HEADER_LIST_BYTES`,
 `main.rs` `connection_builder`, both TCP listeners); hyper's 16 KiB default
 refused a patron's passkey CWT past about 37 active Patreon memberships
-(about 400 bytes each). Answering 431 above it. Keep it at or above the
+(about 400 bytes each); a larger list gets 431. Keep it at or above the
 largest token identity mints.
 
 ## Development Commands
