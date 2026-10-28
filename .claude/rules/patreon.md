@@ -117,8 +117,11 @@ paths:
     campaign: the memberships' and the owned one); the tier read asks
     `fields[tier]=title,amount_cents,published`. A 400 to a read asking for
     them is retried once without them (`get_patreon_json`): a refused
-    display field must never fail a mint. Text passes `display_text`
-    (trimmed, no control characters, ≤ 64 bytes).
+    display field must never fail a mint. Such a snapshot, and one whose
+    `creator_sub` read failed, is cached for
+    `PATREON_FAILURE_CACHE_TTL_SECONDS` (60 s), not 5 min, so the names
+    return soon. Text passes `display_text` (trimmed, no control
+    characters, ≤ 64 bytes).
   - The owned campaign's name and ladder are stored on the `patreon_tokens`
     row (`campaign_name`, `campaign_tiers`) with the tier lists, so the
     owner fallback carries them in an outage; a read without a name keeps
@@ -137,7 +140,9 @@ paths:
     memberships only, Arkavo's publisher campaign first, then Patreon's
     order, at most `MAX_CLAIM_MEMBERSHIPS`, and the campaign values are
     derived from that same list. Publishing is derived from the full
-    snapshot.
+    snapshot. `owned_campaign.tiers` lists at most `MAX_CLAIM_OWNED_TIERS`
+    (25, filled from the ids when the ladder was never read); the owned
+    tier ids stay whole, so every owned tier keeps its entitlement values.
   - `campaign_id` stays top-level text, creators only: iroh's v2 publish
     check reads it (and `role`) and refuses a number. Never move it into
     `owned_campaign`.

@@ -1471,11 +1471,17 @@ async fn with_creator_subs(app_state: &AppState, mut snap: ArkavoPatreon) -> Ark
                 m.creator_sub = owners.get(&m.campaign_id).map(Uuid::to_string);
             }
         }
-        Err(e) => warn!(
-            "Patreon campaign owners unreadable for {} campaigns: {} — no creator_sub this time",
-            campaigns.len(),
-            e
-        ),
+        Err(e) => {
+            warn!(
+                "Patreon campaign owners unreadable for {} campaigns: {} — no creator_sub this time",
+                campaigns.len(),
+                e
+            );
+            // Cached briefly, so `creator_sub` returns at the next read.
+            snap.cache_expires_at = snap
+                .cache_expires_at
+                .min(Utc::now().timestamp() + PATREON_FAILURE_CACHE_TTL_SECONDS);
+        }
     }
     snap
 }
@@ -1485,6 +1491,12 @@ async fn with_creator_subs(app_state: &AppState, mut snap: ArkavoPatreon) -> Ark
 /// request-header limit of identity, iroh and arks; 75 is about 44 KB. Rises
 /// once the title-slug tier form is retired (Creator#122).
 pub(crate) const MAX_CLAIM_MEMBERSHIPS: usize = 75;
+
+/// Most tiers a creator's token lists in `owned_campaign.tiers` (#128),
+/// for the same header budget: about 130 bytes each, so 25 add about 3 KB
+/// beside the 75 memberships. Display only: every owned tier still yields
+/// its entitlement values.
+pub(crate) const MAX_CLAIM_OWNED_TIERS: usize = 25;
 
 /// The snapshot a token carries, and derives its campaign values from:
 /// active memberships only, `keep_first` (Arkavo's publisher campaign, so
@@ -1517,6 +1529,32 @@ pub(crate) fn claim_snapshot(
         active.truncate(MAX_CLAIM_MEMBERSHIPS);
     }
     snap.memberships = active;
+    // The ladder is for display; its tiers' entitlements come from the ids,
+    // which stay whole so a creator always opens its own content. A ladder
+    // not read since #128 is listed by its ids, under the same cap.
+    if snap.owned_tiers.ladder.is_empty() {
+        snap.owned_tiers.ladder = snap
+            .owned_tiers
+            .ids
+            .iter()
+            .map(|id| OwnedTier {
+                id: id.clone(),
+                title: None,
+                amount_cents: None,
+                published: None,
+            })
+            .collect();
+    }
+    if snap.owned_tiers.ladder.len() > MAX_CLAIM_OWNED_TIERS {
+        warn!(
+            "Patreon: {} of {} owned tiers left out of the token's owned_campaign for user {} (cap {})",
+            snap.owned_tiers.ladder.len() - MAX_CLAIM_OWNED_TIERS,
+            snap.owned_tiers.ladder.len(),
+            user_id.map_or_else(|| "?".into(), |u| u.to_string()),
+            MAX_CLAIM_OWNED_TIERS
+        );
+        snap.owned_tiers.ladder.truncate(MAX_CLAIM_OWNED_TIERS);
+    }
     snap
 }
 
@@ -1850,6 +1888,9 @@ async fn materialize_from_link(
     let campaign_id = read
         .owned_campaign
         .unwrap_or_else(|| link.campaign_id.clone());
+    // A read Patreon answered without the display fields is cached only
+    // briefly, so the names come back at the next read rather than in 5 min.
+    let mut degraded = read.degraded;
     let owned_tiers = match campaign_id.as_deref() {
         None => OwnedCampaignTiers::default(),
         Some(cid) => {
@@ -1860,7 +1901,9 @@ async fn materialize_from_link(
                 OwnedCampaignTiers::default()
             };
             let stored_name = stored.name.clone();
-            let mut tiers = owned_campaign_tiers(state, link, cid, &access_token, stored).await;
+            let (mut tiers, tiers_degraded) =
+                owned_campaign_tiers(state, link, cid, &access_token, stored).await;
+            degraded |= tiers_degraded;
             // The name comes from `/identity` (asked only with `campaigns`);
             // without it, the stored one.
             tiers.name = read.campaign_names.get(cid).cloned().or(stored_name);
@@ -1874,7 +1917,12 @@ async fn materialize_from_link(
         memberships: read.memberships,
         owned_tiers,
         verified_at: now,
-        cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
+        cache_expires_at: now
+            + if degraded {
+                PATREON_FAILURE_CACHE_TTL_SECONDS
+            } else {
+                PATREON_CACHE_TTL_SECONDS
+            },
     };
     Ok((snap, refreshed))
 }
@@ -1894,6 +1942,8 @@ struct IdentityRead {
     owned_campaign: Option<Option<String>>,
     /// Campaign id to display name, for every campaign the read included.
     campaign_names: HashMap<String, String>,
+    /// Patreon refused the name field, so the read was made without it.
+    degraded: bool,
 }
 
 /// Read the linked identity, transparently refreshing the access token once
@@ -2019,21 +2069,24 @@ fn identity_read_url(identity_url: &str, query: IdentityQuery, names: bool) -> S
 
 /// GET a Patreon document as JSON, asking `url` first and, if Patreon
 /// answers 400, `without_view_fields` once. Only the first asks for the
-/// entity view's display fields (campaign names, tier amounts): a refusal
-/// of those must never cost a read that entitlements depend on, or every
-/// mint would fail closed over a display name.
+/// display fields (campaign names, tier amounts): a refusal of those must
+/// never cost a read that entitlements depend on, or every mint would fail
+/// closed over a display name. With the document, whether that retry was
+/// needed: the snapshot is then cached only briefly, so the names return
+/// soon.
 async fn get_patreon_json(
     http: &reqwest::Client,
     access_token: &str,
     url: &str,
     without_view_fields: &str,
     what: &str,
-) -> Result<serde_json::Value, PatreonError> {
+) -> Result<(serde_json::Value, bool), PatreonError> {
     let send = |url: &str| http.get(url).bearer_auth(access_token).send();
     let mut resp = send(url)
         .await
         .map_err(|e| PatreonError::Api(format!("{what} GET: {e}")))?;
-    if resp.status() == reqwest::StatusCode::BAD_REQUEST && url != without_view_fields {
+    let refused = resp.status() == reqwest::StatusCode::BAD_REQUEST && url != without_view_fields;
+    if refused {
         warn!(
             "Patreon refused the view-only fields on the {what} read (400); reading without them"
         );
@@ -2046,9 +2099,11 @@ async fn get_patreon_json(
         let body = resp.text().await.unwrap_or_default();
         return Err(identity_fetch_error(status, &body));
     }
-    resp.json()
+    let body = resp
+        .json()
         .await
-        .map_err(|e| PatreonError::Api(format!("{what} JSON parse: {e}")))
+        .map_err(|e| PatreonError::Api(format!("{what} JSON parse: {e}")))?;
+    Ok((body, refused))
 }
 
 /// One `/identity` round-trip for what `query` asks: campaign id +
@@ -2059,7 +2114,7 @@ async fn fetch_identity_read(
     identity_url: &str,
     query: IdentityQuery,
 ) -> Result<IdentityRead, PatreonError> {
-    let body = get_patreon_json(
+    let (body, degraded) = get_patreon_json(
         http,
         access_token,
         &identity_read_url(identity_url, query, true),
@@ -2080,22 +2135,24 @@ async fn fetch_identity_read(
         memberships,
         owned_campaign: query.owned_campaign.then(|| find_campaign_id(&body)),
         campaign_names,
+        degraded,
     })
 }
 
 /// The owned campaign's tiers: fetched from Patreon, or `stored` when the
 /// fetch cannot run (a non-numeric campaign id, a recorded scope list
 /// without `campaigns`) or fails. Never an error: a Patreon outage must not
-/// lock a creator out of their own content.
+/// lock a creator out of their own content. `true` when Patreon refused the
+/// tier amounts and the ladder was read without them.
 async fn owned_campaign_tiers(
     state: &PatreonState,
     link: &PatreonLink,
     campaign_id: &str,
     access_token: &str,
     stored: OwnedCampaignTiers,
-) -> OwnedCampaignTiers {
+) -> (OwnedCampaignTiers, bool) {
     if !is_patreon_id(campaign_id) {
-        return stored;
+        return (stored, false);
     }
     if !scopes_allow(&link.scopes, PATREON_CAMPAIGNS_SCOPE) {
         info!(
@@ -2105,10 +2162,10 @@ async fn owned_campaign_tiers(
             PATREON_CAMPAIGNS_SCOPE,
             stored.ids.len()
         );
-        return stored;
+        return (stored, false);
     }
     match fetch_campaign_tiers(&state.http, access_token, &state.campaigns_url, campaign_id).await {
-        Ok(tiers) => tiers,
+        Ok(read) => read,
         Err(e) => {
             warn!(
                 "Patreon tier fetch failed for campaign {}: {} — keeping the {} stored tiers",
@@ -2116,7 +2173,7 @@ async fn owned_campaign_tiers(
                 e,
                 stored.ids.len()
             );
-            stored
+            (stored, false)
         }
     }
 }
@@ -2129,9 +2186,9 @@ async fn fetch_campaign_tiers(
     access_token: &str,
     campaigns_url: &str,
     campaign_id: &str,
-) -> Result<OwnedCampaignTiers, PatreonError> {
+) -> Result<(OwnedCampaignTiers, bool), PatreonError> {
     let url = format!("{campaigns_url}/{campaign_id}?include=tiers&fields%5Btier%5D=title");
-    let body = get_patreon_json(
+    let (body, degraded) = get_patreon_json(
         http,
         access_token,
         &format!("{url},amount_cents,published"),
@@ -2140,6 +2197,7 @@ async fn fetch_campaign_tiers(
     )
     .await?;
     parse_campaign_tiers(&body, campaign_id)
+        .map(|tiers| (tiers, degraded))
         .ok_or_else(|| PatreonError::Api("campaign response has no tiers for the campaign".into()))
 }
 
@@ -3583,9 +3641,72 @@ mod tests {
         assert_eq!(&ids[1..4], ["100", "101", "102"]);
         assert!(!ids.contains(&"999"));
         // Without a publisher (or one not a member), Patreon's order.
-        let plain = claim_snapshot(snap, Some("4242"), None);
+        let plain = claim_snapshot(snap.clone(), Some("4242"), None);
         assert_eq!(plain.memberships[0].campaign_id, "100");
         assert_eq!(plain.memberships[74].campaign_id, "174");
+
+        // A creator's ladder is listed up to 25 tiers (filled from the ids
+        // when not read yet); the ids, which feed entitlements, stay whole.
+        let ids: Vec<String> = (0..30).map(|i| format!("{}", 500 + i)).collect();
+        let creator = ArkavoPatreon {
+            role: "creator".into(),
+            campaign_id: Some("42".into()),
+            owned_tiers: OwnedCampaignTiers {
+                ids: ids.clone(),
+                ..Default::default()
+            },
+            ..snap
+        };
+        let capped = claim_snapshot(creator, None, None);
+        assert_eq!(capped.owned_tiers.ids, ids);
+        assert_eq!(capped.owned_tiers.ladder.len(), MAX_CLAIM_OWNED_TIERS);
+        assert_eq!(capped.owned_tiers.ladder[24].id, "524");
+        assert_eq!(capped.owned_tiers.ladder[0].title, None);
+    }
+
+    /// An unreadable owner table costs `creator_sub`, never the snapshot,
+    /// and the snapshot is cached briefly so it returns soon.
+    #[tokio::test]
+    async fn unreadable_campaign_owners_shorten_the_cache() {
+        let dead = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "x", "x", None, None, "dead",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+            .build();
+        let store = crate::db::DynamoDBStore::with_client(
+            aws_sdk_dynamodb::Client::from_conf(dead),
+            "credentials".into(),
+            "handles".into(),
+            "device_bindings".into(),
+            "identity_links".into(),
+            "patreon_tokens".into(),
+            "agent_delegations".into(),
+            "device_attest_keys".into(),
+            "guardians".into(),
+            Vec::new(),
+        );
+        let app_state =
+            crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
+        let now = Utc::now().timestamp();
+        let snap = ArkavoPatreon {
+            role: "consumer".into(),
+            patreon_user_id: "p".into(),
+            campaign_id: None,
+            memberships: vec![membership("123", Some(ACTIVE_PATRON), &["9"], &[])],
+            owned_tiers: Default::default(),
+            verified_at: now,
+            cache_expires_at: now + PATREON_CACHE_TTL_SECONDS,
+        };
+        let filled = with_creator_subs(&app_state, snap).await;
+        assert_eq!(filled.memberships.len(), 1);
+        assert_eq!(filled.memberships[0].creator_sub, None);
+        assert!(
+            filled.cache_expires_at <= Utc::now().timestamp() + PATREON_FAILURE_CACHE_TTL_SECONDS
+        );
     }
 
     /// `creator_sub` comes from the campaign-owner rows, on active
@@ -3853,6 +3974,10 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(snap.owned_tiers, mock_owned_42());
         assert_eq!(snap.memberships.len(), 1);
+        assert_eq!(
+            snap.cache_expires_at - snap.verified_at,
+            PATREON_CACHE_TTL_SECONDS
+        );
         // Trimmed, control characters dropped.
         assert_eq!(
             snap.memberships[0].campaign_name.as_deref(),
@@ -3974,6 +4099,11 @@ mod tests {
         let (snap, _) = materialize_from_link(&state, &link).await.unwrap();
         // The refused tier read and its retry.
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Cached briefly, so the names come back at the next read.
+        assert_eq!(
+            snap.cache_expires_at - snap.verified_at,
+            PATREON_FAILURE_CACHE_TTL_SECONDS
+        );
         assert_eq!(snap.role, "creator");
         assert_eq!(snap.memberships.len(), 1);
         assert_eq!(snap.memberships[0].campaign_name, None);

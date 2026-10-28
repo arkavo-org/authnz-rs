@@ -416,10 +416,12 @@ appraisal, status)
   `role`. A token carries at most `MAX_CLAIM_MEMBERSHIPS` (75) memberships,
   active only, Arkavo's publisher campaign first, and derives its campaign
   values from the same 75 (`patreon::claim_snapshot`, warn log when it
-  drops any); the cached snapshot keeps them all. 75 keeps a patron's CWT
-  near 44 KB, under the 64 KiB HTTP/2 header limit
-  (`MAX_REQUEST_HEADER_LIST_BYTES`); it rises once the title-slug tier form
-  is retired.
+  drops any); the cached snapshot keeps them all. `owned_campaign.tiers`
+  lists at most `MAX_CLAIM_OWNED_TIERS` (25; every owned tier still yields
+  its entitlement values). A patron's CWT at the cap is about 44.8 KB, a
+  creator's with 40 tiers about 56.9 KB, under the 64 KiB HTTP/2 header
+  limit (`MAX_REQUEST_HEADER_LIST_BYTES`); the caps rise once the
+  title-slug tier form is retired.
 - **The whole `https://patreon.arkavo.com/` namespace is derived-only**
   (`constants::is_derived_only`): refused by `validate_fqns`, stripped from
   stored lists on read and from `effective_entitlements`, so none of it is

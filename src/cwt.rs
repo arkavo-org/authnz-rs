@@ -1567,8 +1567,9 @@ mod tests {
             verified_at: 1_700_000_000,
             cache_expires_at: 1_700_000_300,
         };
-        // Optional keys are omitted as in the token, and the owned tiers,
-        // which feed entitlements only, are not in the claim.
+        // Optional keys are omitted as in the token. The owned tier ids and
+        // slugs feed entitlements only; a ladder not read yet is listed by
+        // its ids as `owned_campaign` (#128).
         assert_eq!(
             patreon_to_json(&snap),
             serde_json::json!({
@@ -1580,6 +1581,7 @@ mod tests {
                      "tier_ids": ["9"], "tier_slugs": ["gold"]},
                     {"campaign_id": "333", "tier_ids": []},
                 ],
+                "owned_campaign": {"id": "111", "tiers": [{"id": "5"}]},
                 "verified_at": 1_700_000_000,
                 "cache_expires_at": 1_700_000_300,
             })

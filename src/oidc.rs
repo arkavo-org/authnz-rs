@@ -2428,6 +2428,7 @@ pub(crate) mod tests {
             verified_at: now,
             cache_expires_at: now + 300,
         };
+        let snap_for_size = snap.clone();
         let user = AuthenticatedUser::webauthn(
             uid,
             crate::constants::DEFAULT_USER_ENTITLEMENTS
@@ -2460,8 +2461,44 @@ pub(crate) mod tests {
             .unwrap();
         let cnf = crate::cwt::cnf_from_app_attest(spki.as_bytes(), &[7u8; 32]).unwrap();
         let token =
-            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf)).unwrap();
+            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf.clone()))
+                .unwrap();
         assert!(token.len() < 48 * 1024, "{} bytes", token.len());
+
+        // The worst creator: the same memberships and a 40-tier campaign with
+        // 64-byte titles. The ladder lists 25; all 40 tiers keep their
+        // entitlement values; the token stays under the 64 KiB header limit
+        // with room for the other headers.
+        let mut creator = snap_for_size;
+        creator.role = "creator".into();
+        creator.campaign_id = Some("12345678".into());
+        creator.owned_tiers = crate::cwt::OwnedCampaignTiers {
+            ids: (0..40).map(|i| format!("{}", 30_000_000 + i)).collect(),
+            slugs: (0..40).map(|i| format!("tier-title-{i}")).collect(),
+            name: Some("N".repeat(64)),
+            ladder: (0..40)
+                .map(|i| crate::cwt::OwnedTier {
+                    id: format!("{}", 30_000_000 + i),
+                    title: Some("T".repeat(64)),
+                    amount_cents: Some(500 * i),
+                    published: Some(true),
+                })
+                .collect(),
+        };
+        let claims = assemble_user_claims(&app_state, &user, Some(uid), Some(creator), Vec::new());
+        assert_eq!(
+            claims.patreon.as_ref().unwrap().owned_tiers.ladder.len(),
+            25
+        );
+        let owned_tier_values = claims
+            .derived_entitlements
+            .iter()
+            .filter(|e| e.contains("/campaign-tier/value/12345678_"))
+            .count();
+        assert_eq!(owned_tier_values, 80);
+        let token =
+            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf)).unwrap();
+        assert!(token.len() < 60 * 1024, "{} bytes", token.len());
     }
 
     fn test_jwk() -> Jwk {
