@@ -1881,7 +1881,7 @@ async fn fetch_identity_with_refresh(
 /// entitled tiers (needs `identity.memberships`) and/or the owned `campaign`
 /// relationship (needs `campaigns`). We never request the `email` field —
 /// minimum-PII, never read.
-fn identity_read_url(identity_url: &str, query: IdentityQuery) -> String {
+fn identity_read_url(identity_url: &str, query: IdentityQuery, names: bool) -> String {
     let mut include: Vec<&str> = Vec::new();
     if query.memberships {
         include.extend([
@@ -1899,8 +1899,44 @@ fn identity_read_url(identity_url: &str, query: IdentityQuery) -> String {
     }
     // Every campaign included (memberships' and the owned one) gets its
     // display name, for the entity view only.
-    url.push_str("&fields%5Bcampaign%5D=name");
+    if names && (query.memberships || query.owned_campaign) {
+        url.push_str("&fields%5Bcampaign%5D=name");
+    }
     url
+}
+
+/// GET a Patreon document as JSON, asking `url` first and, if Patreon
+/// answers 400, `without_view_fields` once. Only the first asks for the
+/// entity view's display fields (campaign names, tier amounts): a refusal
+/// of those must never cost a read that entitlements depend on, or every
+/// mint would fail closed over a display name.
+async fn get_patreon_json(
+    http: &reqwest::Client,
+    access_token: &str,
+    url: &str,
+    without_view_fields: &str,
+    what: &str,
+) -> Result<serde_json::Value, PatreonError> {
+    let send = |url: &str| http.get(url).bearer_auth(access_token).send();
+    let mut resp = send(url)
+        .await
+        .map_err(|e| PatreonError::Api(format!("{what} GET: {e}")))?;
+    if resp.status() == reqwest::StatusCode::BAD_REQUEST && url != without_view_fields {
+        warn!(
+            "Patreon refused the view-only fields on the {what} read (400); reading without them"
+        );
+        resp = send(without_view_fields)
+            .await
+            .map_err(|e| PatreonError::Api(format!("{what} GET: {e}")))?;
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(identity_fetch_error(status, &body));
+    }
+    resp.json()
+        .await
+        .map_err(|e| PatreonError::Api(format!("{what} JSON parse: {e}")))
 }
 
 /// One `/identity` round-trip for what `query` asks: campaign id +
@@ -1911,22 +1947,14 @@ async fn fetch_identity_read(
     identity_url: &str,
     query: IdentityQuery,
 ) -> Result<IdentityRead, PatreonError> {
-    let url = identity_read_url(identity_url, query);
-    let resp = http
-        .get(&url)
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|e| PatreonError::Api(format!("identity GET: {}", e)))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(identity_fetch_error(status, &body));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| PatreonError::Api(format!("identity JSON parse: {}", e)))?;
+    let body = get_patreon_json(
+        http,
+        access_token,
+        &identity_read_url(identity_url, query, true),
+        &identity_read_url(identity_url, query, false),
+        "identity",
+    )
+    .await?;
     let campaign_names = campaign_names_from_included(&body);
     let mut memberships = if query.memberships {
         parse_memberships_from_identity(&body)
@@ -1990,24 +2018,15 @@ async fn fetch_campaign_tiers(
     campaigns_url: &str,
     campaign_id: &str,
 ) -> Result<OwnedCampaignTiers, PatreonError> {
-    let url = format!(
-        "{campaigns_url}/{campaign_id}?include=tiers&fields%5Btier%5D=title,amount_cents,published"
-    );
-    let resp = http
-        .get(&url)
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|e| PatreonError::Api(format!("campaign GET: {}", e)))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(identity_fetch_error(status, &body));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| PatreonError::Api(format!("campaign JSON parse: {}", e)))?;
+    let url = format!("{campaigns_url}/{campaign_id}?include=tiers&fields%5Btier%5D=title");
+    let body = get_patreon_json(
+        http,
+        access_token,
+        &format!("{url},amount_cents,published"),
+        &url,
+        "campaign",
+    )
+    .await?;
     parse_campaign_tiers(&body, campaign_id)
         .ok_or_else(|| PatreonError::Api("campaign response has no tiers for the campaign".into()))
 }
@@ -3444,6 +3463,7 @@ mod tests {
                     memberships,
                     owned_campaign,
                 },
+                true,
             )
         };
         let both = url(true, true);
@@ -3464,6 +3484,16 @@ mod tests {
             assert!(!u.contains("email"), "{u}");
             assert!(u.ends_with("&fields%5Bcampaign%5D=name"), "{u}");
         }
+        // The retry after Patreon refuses the view-only field.
+        let without = identity_read_url(
+            "https://p/identity",
+            IdentityQuery {
+                memberships: true,
+                owned_campaign: true,
+            },
+            false,
+        );
+        assert!(!without.contains("fields%5Bcampaign%5D"), "{without}");
     }
 
     #[tokio::test]
@@ -3503,6 +3533,16 @@ mod tests {
         owns: Option<&'static str>,
         campaign_status: &'static str,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_creator_mock_refusing(owns, campaign_status, false).await
+    }
+
+    /// [`spawn_creator_mock`], answering 400 to any read that asks for the
+    /// view-only fields when `refuse_view_fields`.
+    async fn spawn_creator_mock_refusing(
+        owns: Option<&'static str>,
+        campaign_status: &'static str,
+        refuse_view_fields: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3516,10 +3556,18 @@ mod tests {
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
                     let request_line = req.lines().next().unwrap_or_default();
-                    let (status_line, body) = if request_line
-                        .starts_with("GET /v2/campaigns/42?include=tiers")
-                    {
+                    let refused = refuse_view_fields
+                        && (request_line.contains("amount_cents")
+                            || request_line.contains("fields%5Bcampaign%5D"));
+                    if request_line.starts_with("GET /v2/campaigns/42") {
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let (status_line, body) = if refused {
+                        (
+                            "HTTP/1.1 400 Bad Request",
+                            r#"{"errors":[{"code_name":"ParameterInvalid"}]}"#.to_string(),
+                        )
+                    } else if request_line.starts_with("GET /v2/campaigns/42?include=tiers") {
                         // Amounts and publication only when asked for.
                         let (free, supporter) = if request_line
                             .contains("fields%5Btier%5D=title,amount_cents,published")
@@ -3725,6 +3773,45 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         // Memberships are unaffected.
         assert_eq!(snap.memberships.len(), 1);
+    }
+
+    /// A Patreon that refuses the view-only fields costs only the view's
+    /// extras: both reads are retried without them, so memberships, the
+    /// owned tiers and every entitlement survive.
+    #[tokio::test]
+    async fn refused_view_fields_are_retried_without_them() {
+        let sealer = TokenSealer::Plaintext;
+        let link = owning_creator_link(&sealer, "identity identity.memberships campaigns").await;
+        let (identity_url, hits) =
+            spawn_creator_mock_refusing(Some("42"), "HTTP/1.1 200 OK", true).await;
+        let state = enabled_state(
+            &sealer,
+            reqwest::Client::new(),
+            PATREON_TOKEN_URL.into(),
+            identity_url,
+        );
+        let (snap, _) = materialize_from_link(&state, &link).await.unwrap();
+        // The refused tier read and its retry.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(snap.role, "creator");
+        assert_eq!(snap.memberships.len(), 1);
+        assert_eq!(snap.memberships[0].campaign_name, None);
+        let titled = |id: &str, title: &str| OwnedTier {
+            id: id.into(),
+            title: Some(title.into()),
+            amount_cents: None,
+            published: None,
+        };
+        assert_eq!(
+            snap.owned_tiers,
+            OwnedCampaignTiers {
+                ladder: vec![titled("10", "Free"), titled("11", "Supporter")],
+                ..owned(&["10", "11"], &["free", "supporter"])
+            }
+        );
+        let ents = campaign_entitlements(&snap, Utc::now().timestamp());
+        assert!(ents.contains(&format!("{CT}42_tier-11")), "{ents:?}");
+        assert!(ents.contains(&format!("{C}123")), "{ents:?}");
     }
 
     #[tokio::test]

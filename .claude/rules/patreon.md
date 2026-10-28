@@ -118,7 +118,9 @@ paths:
 - **Names and the ladder, view only** (#128 rework): the `/identity` read
   adds `fields[campaign]=name` (every included campaign: the memberships'
   and the owned one), and the tier read asks
-  `fields[tier]=title,amount_cents,published`. No extra Patreon call. They
+  `fields[tier]=title,amount_cents,published`. No extra Patreon call, except
+  that a 400 to a read asking for them is retried once without them
+  (`get_patreon_json`): a refused display field must never fail a mint. They
   fill `ArkavoPatreonMembership.campaign_name` and
   `OwnedCampaignTiers.{name, ladder}`, which `cwt::patreon_view_json` shows
   in the entity view and `patreon_to_cbor` never encodes. Text passes
