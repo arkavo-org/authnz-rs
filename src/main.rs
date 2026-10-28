@@ -1229,19 +1229,19 @@ impl FromStr for OAuthProvider {
 // Sanitize the OAuth code
 fn sanitize_code(code: &str) -> String {
     // OAuth codes are typically alphanumeric with possibly some special characters
-    // Remove any characters that aren't alphanumeric, '-', or '_'
+    // Remove any characters that aren't ASCII alphanumeric, '-', or '_'
     code.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(1024) // Reasonable length limit for OAuth codes
         .collect()
 }
 
 // Sanitize error messages
 fn sanitize_error(error: &str) -> String {
-    // Only allow alphanumeric characters and underscores in error messages
+    // Only allow ASCII alphanumeric characters and underscores in error messages
     error
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
         .take(100) // Reasonable length limit for error messages
         .collect()
 }
@@ -1256,22 +1256,38 @@ impl OAuthProvider {
         }
     }
 
-    fn get_redirect_uri(&self, code: &str, client: OAuthClient) -> String {
-        format!(
-            "{}://oauth/{}?code={}",
-            client.as_scheme(),
-            self.as_str(),
-            sanitize_code(code)
+    fn get_redirect_uri(&self, code: &str, client: OAuthClient, state: Option<&str>) -> String {
+        with_state(
+            format!(
+                "{}://oauth/{}?code={}",
+                client.as_scheme(),
+                self.as_str(),
+                sanitize_code(code)
+            ),
+            state,
         )
     }
 
-    fn get_error_uri(&self, error: &str, client: OAuthClient) -> String {
-        format!(
-            "{}://oauth/{}?error={}",
-            client.as_scheme(),
-            self.as_str(),
-            sanitize_error(error)
+    fn get_error_uri(&self, error: &str, client: OAuthClient, state: Option<&str>) -> String {
+        with_state(
+            format!(
+                "{}://oauth/{}?error={}",
+                client.as_scheme(),
+                self.as_str(),
+                sanitize_error(error)
+            ),
+            state,
         )
+    }
+}
+
+// Forward the provider's `state` so the app can compare it with the one it
+// sent (#129); the server holds none and never verifies it. Callers pass
+// only a value that passed `validate_oauth_state`, which is URL-safe as is.
+fn with_state(uri: String, state: Option<&str>) -> String {
+    match state {
+        Some(state) => format!("{uri}&state={state}"),
+        None => uri,
     }
 }
 
@@ -1310,43 +1326,46 @@ async fn handle_oauth_callback(
     let query = uri.query().unwrap_or_default();
     let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
 
-    // Validate state parameter if provider requires it
-    if let Some(state) = params.get("state")
-        && !validate_oauth_state(state)
-    {
-        error!("Invalid OAuth state parameter for {:?}", provider);
-        return Redirect::temporary(&provider.get_error_uri("invalid_state", client));
-    }
+    // A malformed state is refused and never echoed; a valid one is
+    // forwarded on every redirect below for the app to verify.
+    let state = match params.get("state").map(|s| s.as_ref()) {
+        Some(state) if !validate_oauth_state(state) => {
+            error!("Invalid OAuth state parameter for {:?}", provider);
+            return Redirect::temporary(&provider.get_error_uri("invalid_state", client, None));
+        }
+        state => state,
+    };
 
     // Handle the authorization code
     match params.get("code").map(|s| s.as_ref()) {
         Some(code) if !code.is_empty() => {
             debug!("Processing OAuth code for {:?}", provider);
-            Redirect::temporary(&provider.get_redirect_uri(code, client))
+            Redirect::temporary(&provider.get_redirect_uri(code, client, state))
         }
         _ => {
             // Check for error parameters from OAuth provider
             if let Some(error) = params.get("error").map(|s| s.as_ref()) {
                 error!("OAuth error from provider: {}", error);
-                return Redirect::temporary(&provider.get_error_uri(error, client));
+                return Redirect::temporary(&provider.get_error_uri(error, client, state));
             }
 
             error!("No code provided in OAuth callback for {:?}", provider);
-            Redirect::temporary(&provider.get_error_uri("no_code", client))
+            Redirect::temporary(&provider.get_error_uri("no_code", client, state))
         }
     }
 }
 
 // Validate OAuth state parameter
 fn validate_oauth_state(state: &str) -> bool {
-    // State should be alphanumeric and reasonable length
+    // State should be ASCII alphanumeric and reasonable length: it is
+    // forwarded into the redirect's query unencoded (`with_state`).
     if state.len() > 100 || state.is_empty() {
         return false;
     }
 
     state
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1625,6 +1644,76 @@ mod tests {
         assert_eq!(location, "arkavo://oauth/patreon?error=access_denied");
     }
 
+    async fn bounce(uri: &str) -> String {
+        let response = create_test_app()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// #129: the provider's `state` reaches the app on every redirect, so the
+    /// app can refuse a callback it did not start before posting the code.
+    #[tokio::test]
+    async fn bounce_forwards_state() {
+        assert_eq!(
+            bounce("/oauth/arkavocreator/patreon?code=X&state=S-1_a").await,
+            "arkavocreator://oauth/patreon?code=X&state=S-1_a"
+        );
+        assert_eq!(
+            bounce("/oauth/arkavocreator/patreon?state=S&code=X").await,
+            "arkavocreator://oauth/patreon?code=X&state=S"
+        );
+        assert_eq!(
+            bounce("/oauth/arkavo/patreon?error=access_denied&state=S").await,
+            "arkavo://oauth/patreon?error=access_denied&state=S"
+        );
+        assert_eq!(
+            bounce("/oauth/arkavo/patreon?state=S").await,
+            "arkavo://oauth/patreon?error=no_code&state=S"
+        );
+    }
+
+    /// A malformed `state` is refused and never echoed into the redirect.
+    #[tokio::test]
+    async fn bounce_refuses_a_malformed_state_without_echoing_it() {
+        for state in ["", "a%26code%3DY", "%3Cx%3E", "%C3%A9t%C3%A9"] {
+            assert_eq!(
+                bounce(&format!(
+                    "/oauth/arkavocreator/patreon?code=X&state={state}"
+                ))
+                .await,
+                "arkavocreator://oauth/patreon?error=invalid_state",
+                "state {state:?}"
+            );
+        }
+        let long = "a".repeat(101);
+        assert_eq!(
+            bounce(&format!("/oauth/arkavo/patreon?code=X&state={long}")).await,
+            "arkavo://oauth/patreon?error=invalid_state"
+        );
+    }
+
+    /// Non-ASCII in `code` or `error` is dropped, never put in `Location`.
+    #[tokio::test]
+    async fn bounce_keeps_the_redirect_ascii() {
+        assert_eq!(
+            bounce("/oauth/arkavo/patreon?code=a%C3%A9b").await,
+            "arkavo://oauth/patreon?code=ab"
+        );
+        assert_eq!(
+            bounce("/oauth/arkavo/patreon?error=den%C3%AFed").await,
+            "arkavo://oauth/patreon?error=dened"
+        );
+    }
+
     #[test]
     fn test_provider_from_str() {
         assert!(matches!(
@@ -1669,6 +1758,7 @@ mod tests {
         assert!(!validate_oauth_state(""));
         assert!(!validate_oauth_state("invalid<script>state"));
         assert!(!validate_oauth_state(&"a".repeat(101)));
+        assert!(!validate_oauth_state("\u{e9}t\u{e9}"));
     }
 }
 
