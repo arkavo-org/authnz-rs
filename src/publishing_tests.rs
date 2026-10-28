@@ -970,6 +970,64 @@ async fn entities_person_is_the_fresh_mint_view() {
     );
 }
 
+/// `GET /entities/me` answers the caller with exactly the view the service
+/// route gives for that account, never cached; a passkey CWT whose account
+/// does not exist (or was deleted) is 401.
+#[tokio::test]
+async fn entities_me_is_the_callers_service_view() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let user = f.claims().await;
+    let own = crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap();
+    let app = Router::new()
+        .route("/entities/me", get(crate::entities::get_own_entity))
+        .route("/entities/:id", get(crate::entities::get_entity))
+        .layer(Extension(f.patreon.clone()))
+        .layer(Extension(f.state.clone()));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/entities/me")
+                .header("X-Auth-Token", &own)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let mine: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let (status, service) = send(
+        &app,
+        Request::get(format!("/entities/arkavo:{}", f.user_id))
+            .header("X-Auth-Token", service_token(&f.state, "entity-reader"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mine, service);
+    assert_eq!(mine["id"], json!(format!("arkavo:{}", f.user_id)));
+
+    let gone = crate::authn::mint_auth_token(&f.state, &Uuid::new_v4(), None, None).unwrap();
+    let (status, _) = send(
+        &app,
+        Request::get("/entities/me")
+            .header("X-Auth-Token", gone)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 /// A failed publishing-state read: a mint withholds the entitlement, but
 /// `/entities` must see the error (it answers 5xx, so the platform keeps its
 /// last answer) rather than a 200 without it.

@@ -1,16 +1,17 @@
 //! Service-gated entity lookup (spec §2.4). Resolves an entity id to the same
 //! shape the platform ERS sees, for gateway audit/admin use without a token.
 //! A person is what that account's own token would carry if minted now: the
-//! platform ERS's live source reads it in place of the token's Patreon claims.
+//! platform ERS's live source reads it in place of the token's Patreon claims,
+//! and the account itself reads it at `GET /entities/me` (docs/entity-view.md).
 
 use crate::AppState;
-use crate::db::DynamoDBError;
+use crate::db::{DynamoDBError, UserCredentials};
 use crate::entitlements::{EntitlementError, require_service_cwt_for};
 use crate::patreon::{Materialized, PatreonState};
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -73,37 +74,7 @@ pub async fn get_entity(
                 .await
                 .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
-            // A mint omits the claim on both; a resolver must not read
-            // "unavailable" as "no memberships" and cache it.
-            let snap = match crate::patreon::materialize_for_user_resolved(
-                &app_state, &patreon, u.user_id,
-            )
-            .await
-            {
-                Materialized::Unavailable => return Err(EntityError::PatreonUnavailable),
-                outcome => outcome.snapshot(),
-            };
-            let user = crate::oidc::AuthenticatedUser::webauthn(u.user_id, u.entitlements);
-            let claims = crate::oidc::try_arkavo_user_claims_from(&app_state, &user, snap)
-                .await
-                .map_err(|e| EntityError::Database(Box::new(e)))?;
-            let mut body = serde_json::json!({
-                "sub": user.subject,
-                "arkavo_account_id": u.user_id,
-                "username": u.username,
-                "did": u.did,
-                "arkavo_roles": claims.roles,
-                "arkavo_entitlements": claims.effective_entitlements(),
-            });
-            if let Some(p) = &claims.patreon {
-                body["arkavo_patreon"] = crate::cwt::patreon_to_json(p);
-            }
-            EntityRepresentation {
-                id,
-                category: "subject",
-                npe_type: None,
-                claims: body,
-            }
+            person_view(&app_state, &patreon, u, id).await?
         }
         EntityId::Agent(did) => {
             let d = db
@@ -156,10 +127,73 @@ pub async fn get_entity(
     Ok(Json(rep))
 }
 
+/// GET /entities/me: the caller's own person view, for the apps, which read
+/// their Patreon subscription here rather than from the token. A passkey
+/// auth CWT (a session-renewed one included), then the account row: tokens
+/// outlive a deleted account, which is 401 here, never 404.
+pub async fn get_own_entity(
+    Extension(app_state): Extension<AppState>,
+    Extension(patreon): Extension<PatreonState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, EntityError> {
+    let (user_id, _) = crate::agent::verify_passkey_auth_claims(&app_state, &headers)
+        .map_err(|e| EntityError::Unauthorized(e.to_string()))?;
+    let u = app_state
+        .db_store
+        .get_user_by_id(&user_id)
+        .await
+        .map_err(|e| EntityError::Database(Box::new(e)))?
+        .ok_or_else(|| EntityError::Unauthorized("account does not exist".into()))?;
+    let id = format!("arkavo:{}", u.user_id);
+    let rep = person_view(&app_state, &patreon, u, id).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(rep)))
+}
+
+/// A person as a token minted for it now would carry it, from the same
+/// builder. Both routes answer with this, so they cannot drift.
+async fn person_view(
+    app_state: &AppState,
+    patreon: &PatreonState,
+    u: UserCredentials,
+    id: String,
+) -> Result<EntityRepresentation, EntityError> {
+    // A mint omits the claim on both; a resolver must not read
+    // "unavailable" as "no memberships" and cache it.
+    let snap =
+        match crate::patreon::materialize_for_user_resolved(app_state, patreon, u.user_id).await {
+            Materialized::Unavailable => return Err(EntityError::PatreonUnavailable),
+            outcome => outcome.snapshot(),
+        };
+    let user = crate::oidc::AuthenticatedUser::webauthn(u.user_id, u.entitlements);
+    let claims = crate::oidc::try_arkavo_user_claims_from(app_state, &user, snap)
+        .await
+        .map_err(|e| EntityError::Database(Box::new(e)))?;
+    let mut body = serde_json::json!({
+        "sub": user.subject,
+        "arkavo_account_id": u.user_id,
+        "username": u.username,
+        "did": u.did,
+        "arkavo_roles": claims.roles,
+        "arkavo_entitlements": claims.effective_entitlements(),
+    });
+    if let Some(p) = &claims.patreon {
+        body["arkavo_patreon"] = crate::cwt::patreon_to_json(p);
+    }
+    Ok(EntityRepresentation {
+        id,
+        category: "subject",
+        npe_type: None,
+        claims: body,
+    })
+}
+
 #[derive(Error, Debug)]
 pub enum EntityError {
     #[error(transparent)]
     Auth(#[from] EntitlementError),
+    /// `/entities/me`: no passkey auth CWT, or its account is gone.
+    #[error("{0}")]
+    Unauthorized(String),
     #[error("Unrecognized entity id: {0}")]
     BadId(String),
     #[error("Entity not found")]
@@ -187,6 +221,7 @@ impl IntoResponse for EntityError {
             EntityError::Auth(_) | EntityError::PatreonUnavailable => {
                 unreachable!("handled above")
             }
+            EntityError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             EntityError::BadId(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EntityError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EntityError::Database(e) => match e.as_ref() {
@@ -280,6 +315,63 @@ mod tests {
             crate::entitlements::require_service_cwt(&app_state, &reader),
             Err(EntitlementError::Forbidden)
         ));
+    }
+
+    /// `/entities/me` is matched before `/entities/:id` and takes only a
+    /// passkey auth CWT: no token, a service CWT and the 99-year registration
+    /// token are all 401 (never `/entities/:id`'s 400 or 403).
+    #[tokio::test]
+    async fn entities_me_takes_only_a_passkey_auth_cwt() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let patreon = PatreonState::new(
+            None,
+            None,
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None),
+        );
+        let app = Router::new()
+            .route("/entities/me", get(get_own_entity))
+            .route("/entities/:id", get(get_entity))
+            .layer(Extension(patreon))
+            .layer(Extension(app_state.clone()));
+        let status = |token: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::get("/entities/me");
+                if let Some(t) = token {
+                    req = req.header("X-Auth-Token", t);
+                }
+                app.oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(status(None).await, StatusCode::UNAUTHORIZED);
+
+        let service = crate::cwt::ArkavoClaims::auth(&app_state.issuer, "client:it", 1, None)
+            .with_arkavo_roles(vec!["service-account".into()]);
+        let service = crate::cwt::encode_for_header(
+            &crate::cwt::mint(&service, &app_state.cwt_signing_key, &app_state.cwt_kid).unwrap(),
+        );
+        assert_eq!(status(Some(service)).await, StatusCode::UNAUTHORIZED);
+
+        let user_id = Uuid::new_v4();
+        let registration = crate::authn::mint_registration_token(
+            &app_state,
+            &user_id,
+            None,
+            crate::cwt::cnf_from_ed25519(&[7u8; 32], b"kid"),
+        )
+        .unwrap();
+        assert_eq!(status(Some(registration)).await, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

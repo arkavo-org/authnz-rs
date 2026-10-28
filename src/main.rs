@@ -752,7 +752,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/session/signout", post(session::signout_session))
         .route("/account", axum::routing::delete(account::delete_account))
         .route("/account/deletions/:id", get(account::get_deletion_status))
-        // Entity lookup (service CWT required). Spec §2.4.
+        // Entity lookup (service CWT required). Spec §2.4. `/entities/me`
+        // (the caller's own passkey CWT) takes precedence over `:id`.
+        .route("/entities/me", get(entities::get_own_entity))
         .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
