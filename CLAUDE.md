@@ -7,6 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 WebAuthn-based authentication and authorization service built with Rust, Axum, and DynamoDB. The system provides passwordless authentication using FIDO2/WebAuthn passkeys, **CWT (COSE_Sign1, ES256) tokens for Arkavo-issued credentials, JWT for OIDC `id_token`**, and decentralized identity (DID) support.
 
 **Protocol Support**: HTTP/1.1, HTTP/2 with TLS 1.3, and HTTP/3 (QUIC) when built with `--features http3`.
+HTTP/2 accepts request header lists up to 64 KiB (`MAX_REQUEST_HEADER_LIST_BYTES`,
+`main.rs` `connection_builder`, both TCP listeners); hyper's 16 KiB default
+refused a patron's passkey CWT past about 37 active Patreon memberships
+(about 400 bytes each). Answering 431 above it. Keep it at or above the
+largest token identity mints.
 
 ## Development Commands
 
