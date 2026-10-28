@@ -41,6 +41,8 @@ pub(crate) fn qualifying_snapshot(role: &str) -> ArkavoPatreon {
         patreon_user_id: "p-pub".into(),
         campaign_id: (role == "creator").then(|| "creators-own-campaign".into()),
         memberships: vec![ArkavoPatreonMembership {
+            creator_sub: None,
+            campaign_name: Some("Arkavo".into()),
             campaign_id: ARKAVO_CAMPAIGN.into(),
             patron_status: Some("active_patron".into()),
             tier_ids: vec![PUBLISH_TIER.into()],
@@ -964,9 +966,20 @@ async fn entities_person_is_the_fresh_mint_view() {
     let entitlements = claims["arkavo_entitlements"].as_array().unwrap();
     assert!(entitlements.contains(&json!(ENTITLEMENT_CREATOR_PUBLISH)));
     assert!(entitlements.contains(&json!(crate::constants::creator_entitlement(&f.user_id))));
+    // The token's map, names and owned campaign included (#128).
+    let snap = user.patreon.as_ref().unwrap();
     assert_eq!(
         claims["arkavo_patreon"],
         crate::cwt::patreon_to_json(token.custom.arkavo_patreon.as_ref().unwrap())
+    );
+    assert_eq!(claims["arkavo_patreon"], crate::cwt::patreon_to_json(snap));
+    assert_eq!(
+        claims["arkavo_patreon"]["memberships"][0]["campaign_name"],
+        json!("Arkavo")
+    );
+    assert_eq!(
+        claims["arkavo_patreon"]["owned_campaign"],
+        json!({"id": "creators-own-campaign", "tiers": []})
     );
 }
 
