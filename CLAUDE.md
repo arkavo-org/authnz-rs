@@ -548,6 +548,16 @@ appraisal, status)
   never a 200 missing the publish value; a mint withholds it. Agents never get
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
+- `GET /entities/me` (0.27.0): the same person view for the caller's own
+  account, for the apps (arkavo-ios, Creator), which read their Patreon
+  subscription here once tokens shed it (owner decision 2026-10-27). Auth
+  is a passkey auth CWT in `X-Auth-Token` (`agent::verify_passkey_auth_claims`:
+  a session-renewed one is accepted; registration tokens, OIDC access
+  tokens and NPE tokens are refused), then the account row: a deleted
+  account is 401, never 404. `Cache-Control: no-store`. Same body, 503 and
+  500 as the service route (one builder, `person_view`); `id` is the
+  canonical `arkavo:<uuid>`, never `me`. The static route takes precedence
+  over `/entities/:id`. Contract: [docs/entity-view.md](docs/entity-view.md).
 
 ### Key Data Flow
 

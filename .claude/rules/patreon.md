@@ -9,9 +9,10 @@ paths:
   (`patreon#<patreon_user_id> → arkavo_user_id`, conditional put for
   cross-account uniqueness) plus encrypted token bundle in
   `patreon_tokens`.
-- `POST /oauth/patreon/link`: **Auth-required** link path (the *only* new
-  endpoint surface for Patreon — there is deliberately no `/me/patreon`,
-  `/entitlements/...`, or status endpoint). Body:
+- `POST /oauth/patreon/link`: **Auth-required** link path, the only
+  Patreon *write* surface. There is no `/me/patreon`, `/entitlements/...`
+  or Patreon status endpoint: an account reads its own subscription
+  through the entity view, `GET /entities/me` (below). Body:
   `{ "code": "<oauth-code>", "redirect_uri": "<a registered redirect URI>" }`.
   A `role` field is accepted and **ignored** (#99): whether a link is a
   creator's is whether Patreon says the account owns a campaign. The
@@ -43,10 +44,16 @@ paths:
   KMS-wrapped using `PATREON_KMS_KEY_ID`. One wrapped DEK per row, distinct
   GCM nonces for the access vs refresh ciphertexts (never reuse key+nonce).
 - **Membership materialization**: surfaced in tokens, as the
-  `arkavo_patreon` claim, and to service resolvers (the platform ERS's live
+  `arkavo_patreon` claim, and in the entity view, which returns what a
+  fresh mint would carry: to service resolvers (the platform ERS's live
   source) through `GET /entities/arkavo:<uuid>` (`ENTITY_CLIENT_IDS` ∪
-  `ADMIN_CLIENT_IDS`), which returns what a fresh mint would carry. Never
-  through a user-facing endpoint. Every human token goes
+  `ADMIN_CLIENT_IDS`), and to the account itself through `GET /entities/me`
+  (its own passkey auth CWT). **The entity view, not the token, is where
+  the subscription travels** (owner decision 2026-10-27): tokens shed
+  `arkavo_patreon` and the Patreon FQNs once the platform reads `/entities`
+  (opentdf-platform#68) and the apps read `/entities/me`; creator tokens
+  keep `{role, campaign_id}` until iroh's publish check has a replacement.
+  Contract: `docs/entity-view.md`. Every human token goes
   through the one builder `oidc::arkavo_user_claims` (passkey auth CWT,
   DeviceCheck CWT, OIDC access token on code exchange and refresh), which
   calls [`materialize_for_user_bounded`] (3 s deadline) before minting. For
