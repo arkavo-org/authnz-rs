@@ -70,7 +70,7 @@ pub struct AccountDeletion {
     pub deleted_at: i64,
     pub completed_at: Option<i64>,
     pub attempts: u32,
-    /// The handle row to remove (`<username>.arkavo.social`). Held only until
+    /// The handle to retire (`<label>.arkavo.social`). Held only until
     /// the sweep completes, since it names the deleted username.
     pub handle: Option<String>,
 }
@@ -309,27 +309,40 @@ impl DynamoDBStore {
         Ok(())
     }
 
-    /// Remove the handle row, only while it is still the deleted account's
-    /// (the name is free the moment the account is deleted, and a new owner
-    /// may already have claimed it).
-    pub async fn delete_handle_if_owned(
+    /// Retire the deleted account's handle (#132): remove the row's `did` and
+    /// `user_id` and set `retired_at`, so the resolveHandle Lambda answers 404
+    /// and no account is ever issued the handle again (registration refuses a
+    /// handle with any row). Writes a retired row when there was none: an
+    /// account registered without a did:webvh signer has no handle row, but
+    /// its handle was issued all the same. A row that is another account's, or
+    /// a legacy seed with no `user_id`, is left as it is: it already keeps the
+    /// handle from being issued. Idempotent; the first `retired_at` sticks.
+    pub async fn retire_handle_if_owned(
         &self,
         handle: &str,
         user_id: &Uuid,
+        retired_at: i64,
     ) -> Result<(), DynamoDBError> {
         let result = self
             .client
-            .delete_item()
+            .update_item()
             .table_name(&self.handles_table)
             .key("handle", s(&handle.to_lowercase()))
-            .condition_expression("user_id = :uid")
+            .update_expression("SET retired_at = if_not_exists(retired_at, :t) REMOVE #did, #uid")
+            .condition_expression(
+                "attribute_not_exists(handle) OR #uid = :uid OR attribute_exists(retired_at)",
+            )
+            .expression_attribute_names("#did", "did")
+            .expression_attribute_names("#uid", "user_id")
             .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .expression_attribute_values(":t", n(retired_at))
             .send()
             .await;
         match result {
             Ok(_) => Ok(()),
             Err(e) => match classify(e, &self.handles_table) {
-                // Absent, or someone else's now: nothing of ours to remove.
+                // Someone else's, or a legacy seed: not ours to retire, and
+                // already never issued again.
                 DynamoDBError::ConditionalConflict => Ok(()),
                 other => Err(other),
             },
@@ -572,6 +585,22 @@ impl DynamoDBStore {
 
 #[cfg(test)]
 impl DynamoDBStore {
+    /// The raw handle row, if it exists.
+    pub(crate) async fn raw_handle_item(
+        &self,
+        handle: &str,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        self.client
+            .get_item()
+            .table_name(&self.handles_table)
+            .key("handle", s(&handle.to_lowercase()))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap()
+            .item
+    }
+
     /// The `user_id` a handle row names, if the row exists.
     pub(crate) async fn handle_owner(&self, handle: &str) -> Option<String> {
         self.client

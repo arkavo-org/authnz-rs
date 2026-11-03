@@ -182,6 +182,20 @@ pub async fn start_register(
                 break existing_user;
             }
             Ok(None) => {
+                // A handle is issued once (#132). Before `create_user`, so a
+                // refused registrant leaves no row behind.
+                let handle = crate::db::handle_for_new_account(&username);
+                match app_state.db_store.handle_has_row(&handle).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        warn!("Refused registration of {username}: handle {handle} was issued");
+                        return Err(WebauthnError::UsernameUnavailable);
+                    }
+                    Err(err) => {
+                        error!("Handle lookup for {} failed: {:?}", username, err);
+                        return Err(WebauthnError::DynamoDBOperationError(Box::new(err)));
+                    }
+                }
                 info!("User not found, creating new user: {}", username);
                 match app_state.db_store.create_user(&username, &params.did).await {
                     Ok(new_user) => break new_user,
@@ -418,13 +432,16 @@ pub async fn finish_register(
             // `X-Auth-Token` for the now-non-empty credential list, locking
             // the user out. A claims-less account token still works for
             // `POST /authenticate`, which mints a fully-claimed auth token.
-            let arkavo_user = match app_state.db_store.get_user_by_id(&user_id).await {
+            let (arkavo_user, handle) = match app_state.db_store.get_user_by_id(&user_id).await {
                 Ok(Some(record)) => {
                     let user = crate::oidc::AuthenticatedUser::webauthn(
                         record.user_id,
                         record.entitlements,
                     );
-                    Some(crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await)
+                    (
+                        Some(crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await),
+                        Some(record.handle),
+                    )
                 }
                 Ok(None) => {
                     error!(
@@ -432,7 +449,7 @@ pub async fn finish_register(
                          without arkavo claims",
                         user_id
                     );
-                    None
+                    (None, None)
                 }
                 Err(e) => {
                     error!(
@@ -440,16 +457,20 @@ pub async fn finish_register(
                          account token without arkavo claims",
                         user_id, e
                     );
-                    None
+                    (None, None)
                 }
             };
+            // The handle `create_user` stored. Unreadable, it is the one a
+            // registration issues, which is what was stored.
+            let handle = handle.unwrap_or_else(|| crate::db::handle_for_new_account(&username));
 
             let token = mint_registration_token(&app_state, &user_id, arkavo_user.as_ref(), cnf)?;
 
             // did:webvh passport: build (and, with the `webvh` feature + a KMS
             // signer, sign + persist) the DID log for this passkey. Non-fatal —
             // a webvh failure must never break WebAuthn registration.
-            crate::webvh::on_passkey_registered(&app_state, &user_id, &username, &passkey).await;
+            crate::webvh::on_passkey_registered(&app_state, &user_id, &username, &handle, &passkey)
+                .await;
 
             // Create response with token in header
             let mut response = Json(envelope).into_response();
@@ -837,7 +858,9 @@ struct AuthResponse {
     token: String,
     /// The signed-in account's alias. The client cannot learn it from the
     /// token, which carries only the account UUID. Empty, and so left out,
-    /// on a failed ceremony.
+    /// on a failed ceremony. Despite the name this is the **username**, a
+    /// changeable label, not the permanent handle (#132); changing the field
+    /// or its value needs ArkavoKit, which stores it.
     #[serde(skip_serializing_if = "String::is_empty")]
     handle: String,
 }
@@ -1055,6 +1078,12 @@ pub enum WebauthnError {
     InvalidUsername(String),
     #[error("username is reserved for federated identities")]
     ReservedUsername,
+    /// The username's handle was issued before (#132): to a deleted
+    /// account, whose handle is retired, to another account, or as a legacy
+    /// seed. A handle is never issued twice, and a new account's handle is
+    /// its username's.
+    #[error("username is not available")]
+    UsernameUnavailable,
     #[error("authentication is too old; re-authenticate to add a passkey")]
     StaleAuthentication,
     /// No valid App Attest registration ticket in the session.
@@ -1148,6 +1177,12 @@ impl IntoResponse for WebauthnError {
             WebauthnError::ReservedUsername => (
                 StatusCode::FORBIDDEN,
                 "Username is reserved for federated identities".to_string(),
+            ),
+            // 409, not 403: the attestation 403s must stay distinguishable,
+            // and nothing the caller presents changes this answer.
+            WebauthnError::UsernameUnavailable => (
+                StatusCode::CONFLICT,
+                "Username is not available".to_string(),
             ),
             WebauthnError::StaleAuthentication => (
                 StatusCode::UNAUTHORIZED,
@@ -1266,6 +1301,12 @@ mod tests {
     fn test_reserved_username_error_is_forbidden() {
         let response = WebauthnError::ReservedUsername.into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn an_issued_handle_is_a_conflict() {
+        let response = WebauthnError::UsernameUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

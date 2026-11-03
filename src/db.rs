@@ -29,10 +29,23 @@ pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 pub use session::{Session, SessionOpened};
 
+/// The handle a new account with `username` is issued:
+/// `<username>.arkavo.social`, lowercased. Only for issuing one at
+/// registration and reading a row from before the `handle` attribute; every
+/// other path reads [`UserCredentials::handle`], because the username is a
+/// changeable label and the handle is permanent (#132).
+pub fn handle_for_new_account(username: &str) -> String {
+    format!("{}.arkavo.social", username.to_lowercase())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCredentials {
     pub user_id: Uuid,
     pub username: String,
+    /// The account's permanent handle (`<label>.arkavo.social`), stored at
+    /// registration. A row from before the attribute reads as the handle its
+    /// username was issued, which is the same thing while no rename exists.
+    pub handle: String,
     pub credentials: Vec<Passkey>,
     pub did: String,
     /// Attribute FQNs the user holds. Populated from the `entitlements`
@@ -531,7 +544,12 @@ impl DynamoDBStore {
             .item("handle", AttributeValue::S(handle.to_lowercase()))
             .item("did", AttributeValue::S(did.to_string()))
             .item("user_id", AttributeValue::S(user_id.to_string()))
-            .condition_expression("attribute_not_exists(handle) OR user_id = :uid")
+            // A retired handle has no `user_id`, so it already fails the
+            // ownership test; the explicit clause keeps that true should a
+            // retired row ever keep one.
+            .condition_expression(
+                "attribute_not_exists(handle) OR (user_id = :uid AND attribute_not_exists(retired_at))",
+            )
             .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
             .send()
             .await;
@@ -542,7 +560,7 @@ impl DynamoDBStore {
                     && se.err().meta().code() == Some("ConditionalCheckFailedException")
                 {
                     warn!(
-                        "put_handle: {} owned by another user — write refused",
+                        "put_handle: {} owned by another user or retired — write refused",
                         handle
                     );
                     return Err(DynamoDBError::LinkConflict);
@@ -550,6 +568,24 @@ impl DynamoDBStore {
                 Err(DynamoDBError::SdkError(err.to_string()))
             }
         }
+    }
+
+    /// Whether `handle` has a row in the handles table, of any kind: an
+    /// account's, one retired by a deletion, or a legacy seed. A handle is
+    /// issued once (#132), so registration refuses a new account whose handle
+    /// has one. Strongly consistent, so a retirement is seen at once.
+    pub async fn handle_has_row(&self, handle: &str) -> Result<bool, DynamoDBError> {
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.handles_table)
+            .key("handle", AttributeValue::S(handle.to_lowercase()))
+            .projection_expression("handle")
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| self.map_get_item_err(&self.handles_table, e))?;
+        Ok(result.item.is_some())
     }
 
     /// Point identity links at another table, to make their writes fail.
@@ -710,6 +746,7 @@ impl DynamoDBStore {
         let user = UserCredentials {
             user_id: Uuid::new_v4(),
             username: username.to_string(),
+            handle: handle_for_new_account(username),
             credentials: Vec::new(),
             did: did.to_string(),
             entitlements: self.default_entitlements.clone(),
@@ -722,6 +759,7 @@ impl DynamoDBStore {
             .table_name(&self.credentials_table)
             .item("user_id", AttributeValue::S(user.user_id.to_string()))
             .item("username", AttributeValue::S(username.to_string()))
+            .item("handle", AttributeValue::S(user.handle.clone()))
             .item("credentials", AttributeValue::L(vec![]))
             .item("did", AttributeValue::S(user.did.clone()))
             .item(
@@ -991,6 +1029,10 @@ impl DynamoDBStore {
             .map_err(|_| DynamoDBError::Internal("Invalid username format".into()))?
             .to_string();
         log::debug!("Parsed username: {}", username);
+        let handle = match item.get("handle").and_then(|av| av.as_s().ok()) {
+            Some(h) => h.clone(),
+            None => handle_for_new_account(&username),
+        };
         let credentials = if let Some(creds_av) = item.get("credentials") {
             if let Ok(creds_str) = creds_av.as_s() {
                 // Deserialize from JSON string
@@ -1038,6 +1080,7 @@ impl DynamoDBStore {
         Ok(UserCredentials {
             user_id,
             username,
+            handle,
             credentials,
             did,
             entitlements,
@@ -2340,10 +2383,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_new_account_is_issued_its_lowercased_username_handle() {
+        assert_eq!(handle_for_new_account("Alice"), "alice.arkavo.social");
+    }
+
+    #[test]
+    fn a_row_without_a_handle_reads_as_its_username_handle() {
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "user_id".into(),
+            AttributeValue::S(Uuid::new_v4().to_string()),
+        );
+        item.insert("username".into(), AttributeValue::S("alice".into()));
+        item.insert("did".into(), AttributeValue::S("did:key:z6Mkx".into()));
+        let user = DynamoDBStore::parse_user_credentials(&item, &[]).unwrap();
+        assert_eq!(user.handle, "alice.arkavo.social");
+
+        // A stored handle wins over the username: the username may change.
+        item.insert("username".into(), AttributeValue::S("alicia".into()));
+        item.insert(
+            "handle".into(),
+            AttributeValue::S("alice.arkavo.social".into()),
+        );
+        let user = DynamoDBStore::parse_user_credentials(&item, &[]).unwrap();
+        assert_eq!(user.handle, "alice.arkavo.social");
+    }
+
+    #[test]
     fn test_user_credentials_structure() {
         let user = UserCredentials {
             user_id: Uuid::new_v4(),
             username: "testuser".to_string(),
+            handle: format!("{}.arkavo.social", "testuser"),
             credentials: vec![],
             did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
             entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
@@ -2362,6 +2433,7 @@ pub(crate) mod tests {
         let original = UserCredentials {
             user_id: Uuid::new_v4(),
             username: "alice".to_string(),
+            handle: format!("{}.arkavo.social", "alice"),
             credentials: vec![],
             did: "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string(),
             entitlements: crate::constants::DEFAULT_USER_ENTITLEMENTS
