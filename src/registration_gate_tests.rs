@@ -455,6 +455,7 @@ async fn a_username_whose_handle_was_issued_is_refused() {
         let handle = crate::db::handle_for_new_account(&c.username);
         let other = uuid::Uuid::new_v4();
         if retired {
+            c.store.claim_handle_row(&handle, &other).await.unwrap();
             c.store
                 .retire_handle_if_owned(&handle, &other, 1)
                 .await

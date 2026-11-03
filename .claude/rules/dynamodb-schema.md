@@ -57,13 +57,17 @@ paths:
 - **Format**: Handles are "{username}.arkavo.social" at registration
   (`db::handle_for_new_account`), then permanent: a later username change
   does not touch the row (#132)
-- **Retired** (account deletion): `retire_handle_if_owned`, one `UpdateItem`
-  on `attribute_not_exists(handle) OR user_id = :uid OR
-  attribute_exists(retired_at)`, sets `retired_at = if_not_exists(...)` and
-  removes `did` and `user_id`. The row is never deleted. With no `did` the
-  resolveHandle Lambda (`ProjectionExpression='did'`) reads an empty or
-  absent `Item` and answers 404. Written even when the account had no row, so the handle is
-  reserved all the same. `put_handle` refuses a retired row.
+- **Claimed, then retired** (account deletion). Before the tombstone,
+  `claim_handle_row` (`SET user_id` on `attribute_not_exists(handle) OR
+  user_id = :uid`; a failure fails the request) makes sure the handle has a
+  row, so no registrant is issued it once the tombstone frees the username.
+  Then `retire_handle_if_owned` (request, best effort, and the sweep), one
+  `UpdateItem` on `user_id = :uid OR attribute_exists(retired_at)`, sets
+  `retired_at = if_not_exists(...)` and removes `did` and `user_id`. It never
+  writes a missing row (that could be a handle a new account is being
+  issued). The row is never deleted. With no `did` the resolveHandle Lambda
+  (`ProjectionExpression='did'`) reads an empty or absent `Item` and answers
+  404. `put_handle` refuses a retired row.
 - **Issued once**: `start_register` refuses a new username (409) whose
   handle has a row of any kind (`handle_has_row`, consistent read).
 

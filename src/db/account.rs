@@ -309,14 +309,48 @@ impl DynamoDBStore {
         Ok(())
     }
 
+    /// Make sure the account's handle has a row naming it before its
+    /// tombstone takes the username out of `username-index` (#132).
+    /// Registration refuses a handle with any row, so from here until the
+    /// row is retired no registrant can be issued the handle. Writes a row
+    /// with only `user_id` when there was none (an account registered without
+    /// a did:webvh signer); the resolveHandle Lambda reads no `did` from it
+    /// and answers 404, and the account's own `put_handle` may still fill it.
+    /// A row that is another account's, retired, or a legacy seed with no
+    /// `user_id` is left as it is: it already keeps the handle from being
+    /// issued.
+    pub async fn claim_handle_row(
+        &self,
+        handle: &str,
+        user_id: &Uuid,
+    ) -> Result<(), DynamoDBError> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.handles_table)
+            .key("handle", s(&handle.to_lowercase()))
+            .update_expression("SET #uid = :uid")
+            .condition_expression("attribute_not_exists(handle) OR #uid = :uid")
+            .expression_attribute_names("#uid", "user_id")
+            .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => match classify(e, &self.handles_table) {
+                DynamoDBError::ConditionalConflict => Ok(()),
+                other => Err(other),
+            },
+        }
+    }
+
     /// Retire the deleted account's handle (#132): remove the row's `did` and
     /// `user_id` and set `retired_at`, so the resolveHandle Lambda answers 404
-    /// and no account is ever issued the handle again (registration refuses a
-    /// handle with any row). Writes a retired row when there was none: an
-    /// account registered without a did:webvh signer has no handle row, but
-    /// its handle was issued all the same. A row that is another account's, or
-    /// a legacy seed with no `user_id`, is left as it is: it already keeps the
-    /// handle from being issued. Idempotent; the first `retired_at` sticks.
+    /// and the row keeps the handle from ever being issued again. Only a row
+    /// the account holds ([`Self::claim_handle_row`] made sure there is one)
+    /// or one already retired: never a missing row, which could be a handle a
+    /// new account is being issued. Idempotent; the first `retired_at`
+    /// sticks.
     pub async fn retire_handle_if_owned(
         &self,
         handle: &str,
@@ -329,9 +363,7 @@ impl DynamoDBStore {
             .table_name(&self.handles_table)
             .key("handle", s(&handle.to_lowercase()))
             .update_expression("SET retired_at = if_not_exists(retired_at, :t) REMOVE #did, #uid")
-            .condition_expression(
-                "attribute_not_exists(handle) OR #uid = :uid OR attribute_exists(retired_at)",
-            )
+            .condition_expression("#uid = :uid OR attribute_exists(retired_at)")
             .expression_attribute_names("#did", "did")
             .expression_attribute_names("#uid", "user_id")
             .expression_attribute_values(":uid", s(&user_id.to_string()))
@@ -341,8 +373,8 @@ impl DynamoDBStore {
         match result {
             Ok(_) => Ok(()),
             Err(e) => match classify(e, &self.handles_table) {
-                // Someone else's, or a legacy seed: not ours to retire, and
-                // already never issued again.
+                // Absent, someone else's, or a legacy seed: not ours to
+                // retire.
                 DynamoDBError::ConditionalConflict => Ok(()),
                 other => Err(other),
             },

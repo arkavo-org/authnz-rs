@@ -392,6 +392,21 @@ async fn a_deleted_accounts_handle_is_never_issued_again() {
     assert_eq!(st, StatusCode::ACCEPTED);
     retired_at(&p, &handle).await;
 
+    // Retirement never writes a row it does not find held: a missing row
+    // could be a handle a new account is being issued. The claim before the
+    // tombstone is what makes the row exist, and on its own it already
+    // refuses a registrant, should the retirement in the request fail.
+    let handle = format!("unclaimed-{}.arkavo.social", Uuid::new_v4().simple());
+    let uid = Uuid::new_v4();
+    p.store
+        .retire_handle_if_owned(&handle, &uid, 1)
+        .await
+        .unwrap();
+    assert!(!p.store.handle_has_row(&handle).await.unwrap());
+    p.store.claim_handle_row(&handle, &uid).await.unwrap();
+    assert!(p.store.handle_has_row(&handle).await.unwrap());
+    assert_eq!(p.store.handle_owner(&handle).await, Some(uid.to_string()));
+
     // Another account's row (a handle reissued before 0.27.1) is left alone,
     // by the request and by the sweep.
     let (uid, cwt) = p.user(&[]).await;

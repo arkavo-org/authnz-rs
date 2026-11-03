@@ -448,11 +448,14 @@ appraisal, status)
   one put on `LIVE_ROW`) holding only `user_id`, `deleted_at`, `deletion_id`,
   `deletion_state`, `deletion_attempts` and, until the sweep completes,
   `deletion_handle`. `get_user_by_id` reports a tombstone as absent, and with
-  no `username` it leaves the `username-index` GSI. The handle row is
-  **retired** in the request (and again by the sweep):
-  `retire_handle_if_owned` removes `did` and `user_id` and sets `retired_at`,
-  so the resolveHandle Lambda answers 404 and the handle, and with it the
-  username, is never issued again (#132).
+  no `username` it leaves the `username-index` GSI. **Before** the tombstone,
+  `claim_handle_row` makes sure the handle has a row naming the account (a
+  failure fails the request), so registration, which refuses a handle with
+  any row, cannot issue it in the gap. After it, the row is **retired**
+  (best effort, and again by the sweep): `retire_handle_if_owned` removes
+  `did` and `user_id` and sets `retired_at`, so the resolveHandle Lambda
+  answers 404 and the handle, and with it the username, is never issued
+  again (#132). Retirement never writes a missing row.
 - **Every write to a credentials row carries `LIVE_ROW`**
   (`attribute_exists(user_id) AND attribute_not_exists(deleted_at)`):
   `add_credential`, `put_user_entitlements`, `put_webvh_log` (was an upsert),
@@ -467,7 +470,7 @@ appraisal, status)
   owner, `agent::active_delegation` and `GET /agents/:did/status` check the
   delegation's `root_user_id`. A new token-accepting path must do the same.
 - **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` retires
-  the handle (writing a retired row if there was none), deletes device
+  the handle, deletes device
   bindings, identity links (scan: no `user_id` GSI; an
   Apple link holding a token is left for the last step) and the
   Patreon token row (Patreon has no revocation endpoint), revokes (never

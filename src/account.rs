@@ -199,6 +199,10 @@ pub async fn delete_account(
         error!("No randomness for a deletion id: {e}");
         AccountError::Internal
     })?;
+    // Before the tombstone frees the username: from here the handle has a
+    // row, so no registrant is issued it before it is retired (#132). Not
+    // best effort; without the row the window lasts until the sweep.
+    db.claim_handle_row(&handle, &user_id).await?;
 
     let deletion = match db
         .tombstone_account(&user_id, &deletion_id, Some(&handle), now)
