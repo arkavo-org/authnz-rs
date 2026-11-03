@@ -448,8 +448,11 @@ appraisal, status)
   one put on `LIVE_ROW`) holding only `user_id`, `deleted_at`, `deletion_id`,
   `deletion_state`, `deletion_attempts` and, until the sweep completes,
   `deletion_handle`. `get_user_by_id` reports a tombstone as absent, and with
-  no `username` it leaves the `username-index` GSI, so the name is
-  **reusable immediately**. The handle row is deleted in the request too.
+  no `username` it leaves the `username-index` GSI. The handle row is
+  **retired** in the request (and again by the sweep):
+  `retire_handle_if_owned` removes `did` and `user_id` and sets `retired_at`,
+  so the resolveHandle Lambda answers 404 and the handle, and with it the
+  username, is never issued again (#132).
 - **Every write to a credentials row carries `LIVE_ROW`**
   (`attribute_exists(user_id) AND attribute_not_exists(deleted_at)`):
   `add_credential`, `put_user_entitlements`, `put_webvh_log` (was an upsert),
@@ -463,8 +466,9 @@ appraisal, status)
   `/device-check/attest`; and for agent tokens, which name the agent not the
   owner, `agent::active_delegation` and `GET /agents/:did/status` check the
   delegation's `root_user_id`. A new token-accepting path must do the same.
-- **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` deletes
-  the handle, device bindings, identity links (scan: no `user_id` GSI; an
+- **After `ACCOUNT_DELETION_GRACE_SECONDS` (60 s)**, `account::sweep` retires
+  the handle (writing a retired row if there was none), deletes device
+  bindings, identity links (scan: no `user_id` GSI; an
   Apple link holding a token is left for the last step) and the
   Patreon token row (Patreon has no revocation endpoint), revokes (never
   deletes) the passkey index rows (#104), invalidates the
@@ -582,8 +586,22 @@ appraisal, status)
      `device_attest_keys` budget, and removes it: one attestation, one account.
    - Client requests `/register/:username?handle=...&did=...`
    - Validates DID format and handle consistency
-   - A deleted account's username is free at once (its tombstone has no
-     `username`); a new registrant gets a new `user_id` and DID
+   - **The handle is permanent; the username is a changeable label** (owner
+     decision 2026-11-03, #132). The handle `<username>.arkavo.social` is
+     stored on the `credentials` row at `create_user` (`handle`; a row from
+     before 0.27.1 reads as `<username>.arkavo.social`), and every reader
+     uses `UserCredentials::handle` (deletion, webvh `alsoKnownAs`, the
+     `prod-handles` row), never re-deriving it from the username
+   - **A handle is never issued twice.** A new username (no live user row) is
+     refused with 409 `Username is not available` when its handle already has
+     a `handles` row of any kind: retired by a deletion, another account's, or
+     a legacy seed. Checked after the ticket and before `create_user`, so a
+     refused registrant leaves no row. So a deleted account's username is not
+     registrable again until registration can issue a handle different from
+     the username
+   - Legacy DIDs embed the username (`dids:<username>`) and
+     `/dids/:username/…` looks the user up by current username, so **no rename
+     may ship** before those routes resolve by the permanent path (#132)
    - Rejects the `apple-` / `google-` username namespace (HTTP 403): those rows
      are IdP-provisioned with zero credentials, and the zero-credential
      exemption below would otherwise let anyone knowing the IdP `sub` enroll a
