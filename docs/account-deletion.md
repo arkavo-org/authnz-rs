@@ -69,15 +69,18 @@ credential (128 random bits), so keep it private.
 - The account record is deleted: passkeys, username, DID and DID log
   (`/dids/<username>/did.json` and `did.jsonl` return 404), entitlements, and
   any moderation record.
-- The handle `<username>.arkavo.social` is released.
+- The handle `<username>.arkavo.social` is retired. It stops resolving, and
+  it is never issued to anyone again.
 - **Every token the account holds stops working**, in every app, whatever its
   expiry: the long-lived registration token, auth tokens, OIDC access and
   refresh tokens, and agent credentials. The account's agent delegations are
   revoked in the same request, and the agent status the platform checks
   (`GET /agents/:did/status`) refuses any agent whose owner is deleted, so an
   agent token minted before the deletion stops working too.
-- The username can be registered again by anyone. A new registrant gets a new
-  account id and a new DID; nothing of the old account carries over.
+- The username cannot be registered again. A handle is permanent and is
+  issued once, and a new account's handle is its username's, so registering
+  the username answers 409 `Username is not available`. (Before 0.27.1 the
+  username and handle were freed at once.)
 
 **Within 5 minutes** (`completes_by`; normally about 1 minute):
 

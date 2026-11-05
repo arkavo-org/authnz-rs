@@ -417,6 +417,18 @@ async fn a_soft_authenticator_with_a_ticket_registers_and_spends_it() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key("x-auth-token"));
     assert_eq!(c.credential_count().await, 1);
+    // The handle is stored, not re-derived from the username later (#132).
+    let user = c
+        .store
+        .get_user_by_name(&c.username)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = c.store.raw_credentials_item(&user.user_id).await.unwrap();
+    assert_eq!(
+        row.get("handle").and_then(|v| v.as_s().ok()),
+        Some(&format!("{}.arkavo.social", c.username))
+    );
     assert_eq!(
         c.registrations().await,
         Some(1),
@@ -430,6 +442,41 @@ async fn a_soft_authenticator_with_a_ticket_registers_and_spends_it() {
         StatusCode::FORBIDDEN,
         "one ticket buys one account"
     );
+}
+
+/// A handle is issued once (#132), so a new account whose username's handle
+/// has a row of any kind is refused, before `create_user`.
+#[tokio::test]
+async fn a_username_whose_handle_was_issued_is_refused() {
+    for retired in [true, false] {
+        let Some(c) = Ceremony::begin().await else {
+            return;
+        };
+        let handle = crate::db::handle_for_new_account(&c.username);
+        let other = uuid::Uuid::new_v4();
+        if retired {
+            c.store.claim_handle_row(&handle, &other).await.unwrap();
+            c.store
+                .retire_handle_if_owned(&handle, &other, 1)
+                .await
+                .unwrap();
+        } else {
+            c.store
+                .put_handle(&handle, "did:webvh:other", &other)
+                .await
+                .unwrap();
+        }
+
+        let response = c.get(&register_uri(&c.username)).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT, "retired={retired}");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Username is not available");
+        let row = c.store.get_user_by_name(&c.username).await.unwrap();
+        assert!(row.is_none(), "a refused registrant leaves no row");
+    }
 }
 
 #[tokio::test]

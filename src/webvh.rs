@@ -272,6 +272,7 @@ pub async fn on_passkey_registered(
     app_state: &crate::AppState,
     user_id: &Uuid,
     username: &str,
+    handle: &str,
     passkey: &Passkey,
 ) {
     let multibase = match passkey_to_multibase(passkey) {
@@ -282,8 +283,11 @@ pub async fn on_passkey_registered(
         }
     };
     let did_key = passkey_to_did_key(passkey).unwrap_or_else(|_| format!("did:key:{multibase}"));
-    // ATProto handles are lowercase; keep alsoKnownAs / the handle key consistent.
-    let also_known_as = vec![format!("at://{}.arkavo.social", username.to_lowercase())];
+    // The account's stored handle, never one derived from the username: the
+    // username may change, the handle does not (#132). ATProto handles are
+    // lowercase; keep alsoKnownAs and the handle key consistent.
+    let handle = handle.to_lowercase();
+    let also_known_as = vec![format!("at://{handle}")];
     let did_document = build_did_document("{DID}", &multibase, &also_known_as);
     info!(
         "webvh: passport document ready for {username} (auth key {did_key}, aka {:?})",
@@ -312,7 +316,6 @@ pub async fn on_passkey_registered(
             }
         }
         let address = format!("https://identity.arkavo.net/dids/{username}");
-        let handle = format!("{}.arkavo.social", username.to_lowercase());
         match log_emit::create_passport_log(sign_key, &address, did_document).await {
             Ok((did, log)) => {
                 // Persist the log FIRST and treat a persist failure as
@@ -370,7 +373,7 @@ pub async fn well_known_did_json(
                     // key and the ATProto handle convention.
                     let uname = username.to_lowercase();
                     let did_web = format!("did:web:identity.arkavo.net:dids:{uname}");
-                    let aka = vec![format!("at://{uname}.arkavo.social")];
+                    let aka = vec![format!("at://{}", user.handle.to_lowercase())];
                     let doc = build_did_document(&did_web, &multibase, &aka);
                     (
                         StatusCode::OK,

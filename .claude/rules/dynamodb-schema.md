@@ -8,7 +8,10 @@ paths:
 
 ### credentials table
 - **Primary Key**: user_id (String/UUID)
-- **Attributes**: username (String), credentials (List of JSON strings), did (String),
+- **Attributes**: username (String), handle (String, the permanent
+  `<label>.arkavo.social` written by `create_user`; absent on rows from before
+  0.27.1, which read it as `<username>.arkavo.social`), credentials (List of
+  JSON strings), did (String),
   entitlements (List of String, attribute FQNs; never contains the derived
   creator-publishing FQN), webvh_log (String, optional)
 - **publishing_suspension** (Map, optional; #91): present only while a
@@ -50,8 +53,23 @@ paths:
 ### handles table
 - **Primary Key**: handle (String)
 - **Attributes**: did (String), user_id (String/UUID, the owning account;
-  `put_handle` and the deletion sweep's delete are both conditional on it)
-- **Format**: Handles are "{username}.arkavo.social"
+  `put_handle` is conditional on it), retired_at (Number, optional)
+- **Format**: Handles are "{username}.arkavo.social" at registration
+  (`db::handle_for_new_account`), then permanent: a later username change
+  does not touch the row (#132)
+- **Claimed, then retired** (account deletion). Before the tombstone,
+  `claim_handle_row` (`SET user_id` on `attribute_not_exists(handle) OR
+  user_id = :uid`; a failure fails the request) makes sure the handle has a
+  row, so no registrant is issued it once the tombstone frees the username.
+  Then `retire_handle_if_owned` (request, best effort, and the sweep), one
+  `UpdateItem` on `user_id = :uid OR attribute_exists(retired_at)`, sets
+  `retired_at = if_not_exists(...)` and removes `did` and `user_id`. It never
+  writes a missing row (that could be a handle a new account is being
+  issued). The row is never deleted. With no `did` the resolveHandle Lambda
+  (`ProjectionExpression='did'`) reads an empty or absent `Item` and answers
+  404. `put_handle` refuses a retired row.
+- **Issued once**: `start_register` refuses a new username (409) whose
+  handle has a row of any kind (`handle_has_row`, consistent read).
 
 ### device_bindings table
 - **Primary Key**: device_id (String) - Key ID from App Attest

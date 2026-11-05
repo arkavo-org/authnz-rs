@@ -143,10 +143,10 @@ async fn deletion_removes_the_account_then_everything_bound_to_it() {
         crate::constants::ACCOUNT_DELETION_COMPLETES_WITHIN_SECONDS
     );
 
-    // The account is gone at once, and its name and handle are free.
+    // The account is gone at once, and its handle retired.
     assert!(p.store.get_user_by_id(&uid).await.unwrap().is_none());
     assert!(p.store.get_user_by_name(&username).await.unwrap().is_none());
-    assert_eq!(p.store.handle_owner(&handle).await, None);
+    let retired = retired_at(&p, &handle).await;
     let row = p.store.raw_credentials_item(&uid).await.unwrap();
     for gone in [
         "username",
@@ -208,6 +208,11 @@ async fn deletion_removes_the_account_then_everything_bound_to_it() {
     );
     assert!(p.store.get_device_binding(&device).await.unwrap().is_none());
     assert!(p.store.get_patreon_link(uid).await.unwrap().is_none());
+    assert_eq!(
+        retired_at(&p, &handle).await,
+        retired,
+        "the sweep keeps the first retirement"
+    );
     let d = p.store.get_agent_delegation(&did).await.unwrap().unwrap();
     assert!(d.revoked_at.is_some(), "delegation not revoked");
     assert_eq!(d.name, "");
@@ -330,47 +335,89 @@ async fn writes_after_deletion_are_refused() {
     assert!(!row.contains_key("publishing_suspension"));
 }
 
-/// The name is free immediately; a new owner's handle is not swept away.
+/// The handle row is retired: kept, naming neither a DID nor an account.
+/// Returns its `retired_at`.
+async fn retired_at(p: &Plane, handle: &str) -> i64 {
+    let row = p
+        .store
+        .raw_handle_item(handle)
+        .await
+        .expect("a retired handle keeps its row");
+    assert!(!row.contains_key("did"), "a retired handle still resolves");
+    assert!(
+        !row.contains_key("user_id"),
+        "a retired handle still names the account"
+    );
+    row.get("retired_at")
+        .and_then(|v| v.as_n().ok())
+        .expect("retired_at")
+        .parse()
+        .unwrap()
+}
+
+/// A deleted account's handle is never issued again (#132).
 #[tokio::test]
-async fn a_deleted_username_can_be_registered_again() {
+async fn a_deleted_accounts_handle_is_never_issued_again() {
     let Some(p) = Plane::new().await else { return };
     let app = router(&p);
+    let handle_of = |uid: Uuid| {
+        let store = p.store.clone();
+        async move { store.get_user_by_id(&uid).await.unwrap().unwrap().handle }
+    };
+
+    // A published handle is retired in the request, and nobody can claim it.
     let (uid, cwt) = p.user(&[]).await;
-    let username = p
-        .store
-        .get_user_by_id(&uid)
-        .await
-        .unwrap()
-        .unwrap()
-        .username;
-    let handle = format!("{username}.arkavo.social");
+    let handle = handle_of(uid).await;
     p.store
         .put_handle(&handle, "did:webvh:old", &uid)
         .await
         .unwrap();
     let (st, _) = delete_account(&app, &cwt).await;
     assert_eq!(st, StatusCode::ACCEPTED);
-
-    let newcomer = p
-        .store
-        .create_user(&username, "did:key:z6Mknewcomer")
-        .await
-        .unwrap();
-    assert_ne!(newcomer.user_id, uid);
-    assert_eq!(
+    retired_at(&p, &handle).await;
+    assert!(p.store.handle_has_row(&handle).await.unwrap());
+    assert!(matches!(
         p.store
-            .get_user_by_name(&username)
-            .await
-            .unwrap()
-            .unwrap()
-            .user_id,
-        newcomer.user_id
-    );
+            .put_handle(&handle, "did:webvh:new", &Uuid::new_v4())
+            .await,
+        Err(crate::db::DynamoDBError::LinkConflict)
+    ));
+
+    // An account with no handle row (registered without a did:webvh signer)
+    // still had its handle issued: deletion writes it retired.
+    let (uid, cwt) = p.user(&[]).await;
+    let handle = handle_of(uid).await;
+    assert!(!p.store.handle_has_row(&handle).await.unwrap());
+    let (st, _) = delete_account(&app, &cwt).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    retired_at(&p, &handle).await;
+
+    // Retirement never writes a row it does not find held: a missing row
+    // could be a handle a new account is being issued. The claim before the
+    // tombstone is what makes the row exist, and on its own it already
+    // refuses a registrant, should the retirement in the request fail.
+    let handle = format!("unclaimed-{}.arkavo.social", Uuid::new_v4().simple());
+    let uid = Uuid::new_v4();
     p.store
-        .put_handle(&handle, "did:webvh:new", &newcomer.user_id)
+        .retire_handle_if_owned(&handle, &uid, 1)
         .await
         .unwrap();
+    assert!(!p.store.handle_has_row(&handle).await.unwrap());
+    p.store.claim_handle_row(&handle, &uid).await.unwrap();
+    assert!(p.store.handle_has_row(&handle).await.unwrap());
+    assert_eq!(p.store.handle_owner(&handle).await, Some(uid.to_string()));
 
+    // Another account's row (a handle reissued before 0.27.1) is left alone,
+    // by the request and by the sweep.
+    let (uid, cwt) = p.user(&[]).await;
+    let handle = handle_of(uid).await;
+    let other = Uuid::new_v4();
+    p.store
+        .put_handle(&handle, "did:webvh:other", &other)
+        .await
+        .unwrap();
+    let (st, _) = delete_account(&app, &cwt).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
     crate::account::run_once(
         &p.store,
         &patreon_off(),
@@ -379,10 +426,9 @@ async fn a_deleted_username_can_be_registered_again() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        p.store.handle_owner(&handle).await,
-        Some(newcomer.user_id.to_string())
-    );
+    assert_eq!(p.store.handle_owner(&handle).await, Some(other.to_string()));
+    let row = p.store.raw_handle_item(&handle).await.unwrap();
+    assert!(!row.contains_key("retired_at"));
 }
 
 /// Every OIDC path that trusts a token refuses a deleted account's.

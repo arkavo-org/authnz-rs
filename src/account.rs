@@ -9,9 +9,12 @@
 //!    any publishing suspension go with it. From then on every token the
 //!    account still holds is refused, however long it has left: the
 //!    ~99-year registration token, auth CWTs, OIDC codes, access and refresh
-//!    tokens, and the agent plane. The username is free to register again.
-//! 2. **After [`ACCOUNT_DELETION_GRACE_SECONDS`]:** [`sweep`] removes what is
-//!    bound to the account in other tables: the handle, App Attest device
+//!    tokens, and the agent plane. The handle is retired (its row stays,
+//!    naming no DID or account), so it, and the username it was issued
+//!    from, is never issued again (#132).
+//! 2. **After [`ACCOUNT_DELETION_GRACE_SECONDS`]:** [`sweep`] retires the
+//!    handle again and removes what is bound to the account in other tables:
+//!    App Attest device
 //!    bindings, every Apple/Google/Patreon identity link except an Apple link
 //!    holding a token (passkey index rows are kept and marked revoked, #104),
 //!    the Patreon token row (sealed tokens and wrapped key;
@@ -54,11 +57,6 @@ use log::{error, info, warn};
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
-
-/// The handle row a username owns.
-fn handle_for(username: &str) -> String {
-    format!("{}.arkavo.social", username.to_lowercase())
-}
 
 /// `<user_id>.<128 random bits, hex>`. The user id locates the tombstone; the
 /// random part is what makes the id a secret worth checking.
@@ -196,11 +194,15 @@ pub async fn delete_account(
     let Some(user) = db.get_user_by_id(&user_id).await? else {
         return Err(AccountError::Unauthorized("account does not exist".into()));
     };
-    let handle = handle_for(&user.username);
+    let handle = user.handle;
     let deletion_id = new_deletion_id(&user_id).map_err(|e| {
         error!("No randomness for a deletion id: {e}");
         AccountError::Internal
     })?;
+    // Before the tombstone frees the username: from here the handle has a
+    // row, so no registrant is issued it before it is retired (#132). Not
+    // best effort; without the row the window lasts until the sweep.
+    db.claim_handle_row(&handle, &user_id).await?;
 
     let deletion = match db
         .tombstone_account(&user_id, &deletion_id, Some(&handle), now)
@@ -216,11 +218,11 @@ pub async fn delete_account(
     // The deletion id is a bearer secret for the status endpoint: not logged.
     info!("audit account_deletion outcome=accepted user_id={user_id}");
 
-    // Free the name at once (a new owner may register it in the next
-    // second) and drop the cached Patreon snapshot. Best effort: the sweep
-    // does both again.
-    if let Err(e) = db.delete_handle_if_owned(&handle, &user_id).await {
-        warn!("Deleting the handle of deleted account {user_id} failed (sweep retries): {e}");
+    // Retire the handle at once, so it stops resolving and is never issued
+    // again (#132), and drop the cached Patreon snapshot. Best effort: the
+    // sweep does both again.
+    if let Err(e) = db.retire_handle_if_owned(&handle, &user_id, now).await {
+        warn!("Retiring the handle of deleted account {user_id} failed (sweep retries): {e}");
     }
     patreon.cache.invalidate(user_id).await;
     // Revoke the account's agents now, not after the grace: the status
@@ -274,7 +276,8 @@ pub(crate) async fn sweep(
 ) -> Result<(), SweepError> {
     let uid = &deletion.user_id;
     if let Some(handle) = &deletion.handle {
-        db.delete_handle_if_owned(handle, uid).await?;
+        db.retire_handle_if_owned(handle, uid, deletion.deleted_at)
+            .await?;
     }
     db.delete_patreon_link(uid).await?;
     patreon.cache.invalidate(*uid).await;
@@ -486,10 +489,5 @@ mod tests {
         ] {
             assert_eq!(user_id_of(&bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn handles_are_lowercased() {
-        assert_eq!(handle_for("Alice"), "alice.arkavo.social");
     }
 }
