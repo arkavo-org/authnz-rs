@@ -579,6 +579,25 @@ appraisal, status)
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
 
+**site.rs** - Home page and site icons (#138)
+- Apple Passwords shows a site's icon beside its passkeys, and every Arkavo
+  passkey's site is the RP ID, `identity.arkavo.net`. That host serves:
+  - `GET /`: a small HTML page titled `Arkavo`
+    (`apple-mobile-web-app-title` too) that links the icons and arkavo.com.
+    **Never redirect `/` off-domain**: an icon fetcher that follows the
+    redirect lands on a host with no touch icon.
+  - `/apple-touch-icon.png` and `/apple-touch-icon-precomposed.png`
+    (180×180, opaque);
+  - `/favicon-32x32.png`;
+  - `/favicon.ico` (16, 32, 48).
+- The files are built into the binary from `assets/site/`
+  (`include_bytes!`/`include_str!`), unlike the AASA, which is read from
+  disk at boot. The PNGs are the sailboat mark (`AppLogo.png`, 1800×1800, in
+  the app repo) flattened onto white. Regenerate them from it rather than
+  editing them by hand.
+- The RP ID does not change for this (`WEBAUTHN_RP_ID`): every passkey is
+  bound to it.
+
 ### Key Data Flow
 
 1. **Registration Flow**:
