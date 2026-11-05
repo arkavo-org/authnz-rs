@@ -86,6 +86,7 @@ mod registration_gate_tests;
 mod session;
 #[cfg(test)]
 mod session_tests;
+mod site;
 mod webvh;
 
 // HTTP/3 server function (feature-gated)
@@ -667,6 +668,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // build our application with routes
     let app = Router::<()>::new()
+        // Home page and site icons for Apple Passwords (#138); see site.rs.
+        .merge(site::routes())
         .route("/health", get(health_get).head(health_head))
         .route(
             "/.well-known/apple-app-site-association",
