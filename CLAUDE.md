@@ -68,6 +68,7 @@ when unset.
 | `PATREON_CLIENT_<TAG>_ID`, `_SECRET`, `_REDIRECT_URIS`; `PATREON_KMS_KEY_ID` | One Patreon OAuth client per tag (legacy untagged `PATREON_CLIENT_ID/_SECRET/_REDIRECT_URIS` still works). A redirect URI may belong to one client only. Any malformed registration or missing KMS key disables Patreon entirely (link endpoint ⇒ 503). |
 | `APP_ATTEST_APP_ID` | **Comma-separated set** of hex SHA-256 of `<TeamID>.<BundleID>`, one per app that registers users. An attestation is accepted when its `rpIdHash` matches any member; a single value is a one-element set. When non-empty, `POST /device-check/attest` enforces the match. Unset ⇒ recorded but not enforced (warns). **Mandatory on the registration-gate path**, where unset fails closed. |
 | `WEBVH_SIGN_KEY_PATH` | Ed25519 key file for the did:webvh log (`--features webvh`). Unset ⇒ DID doc only, no signed log. |
+| `SITE_ASSETS_DIR` | Directory holding the operator's home page and site icons (`index.html`, `apple-touch-icon.png`, `favicon-32x32.png`, `favicon.ico`), served at `/` and the icon paths (`site.rs`, #138). Read once at boot. Unset ⇒ those paths answer 404. A directory that cannot be read, or holds none of the files, fails startup. |
 
 ## Architecture
 
@@ -578,6 +579,25 @@ appraisal, status)
   never a 200 missing the publish value; a mint withholds it. Agents never get
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
+
+**site.rs** - The operator's home page and site icons (#138)
+- **authnz-rs carries no branding: any organization can deploy it.** Never
+  commit an organization's logos, page text or other assets; the operator
+  supplies them, like the AASA file.
+- Apple Passwords shows a site's icon beside its passkeys, and a passkey's
+  site is the RP ID. With `SITE_ASSETS_DIR` set, each file present there is
+  read once at boot and served at a fixed path (`site::FILES`):
+  - `index.html` at `GET /`;
+  - `apple-touch-icon.png` at `/apple-touch-icon.png` and
+    `/apple-touch-icon-precomposed.png` (180×180, opaque);
+  - `favicon-32x32.png`;
+  - `favicon.ico`.
+- Only those names are read, so nothing else in the directory is exposed.
+  An absent file leaves its path to the 404 fallback. A directory that
+  cannot be read, or holds none of the files, fails boot.
+- The page should not redirect off-domain: an icon fetcher that follows
+  the redirect lands on a host that may have no touch icon.
+- Arkavo's files live in `production/site/` on the prod box (gitignored).
 
 ### Key Data Flow
 
