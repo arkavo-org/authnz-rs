@@ -447,6 +447,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load and cache the apple-app-site-association.json file
     let apple_app_site_association = load_apple_app_site_association().await?;
 
+    // The operator's home page and site icons (#138): SITE_ASSETS_DIR, read
+    // once here. A directory that cannot be read, or holds none of the files,
+    // fails boot.
+    let site_assets = site::SiteAssets::from_env()?;
+    match &site_assets {
+        Some(assets) => log::info!("Site assets: serving {}", assets.served_paths().join(", ")),
+        None => log::info!(
+            "{} unset: / and the site icons answer 404",
+            site::SITE_ASSETS_DIR_ENV
+        ),
+    }
+
     // Set up TLS if enabled
     let tls_acceptor = if settings.tls_enabled {
         let certs = {
@@ -668,8 +680,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // build our application with routes
     let app = Router::<()>::new()
-        // Home page and site icons for Apple Passwords (#138); see site.rs.
-        .merge(site::routes())
+        // The operator's home page and site icons (#138); see site.rs.
+        .merge(site::routes(site_assets.as_ref()))
         .route("/health", get(health_get).head(health_head))
         .route(
             "/.well-known/apple-app-site-association",
