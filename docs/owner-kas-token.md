@@ -1,7 +1,8 @@
 # Owner-KAS token (`POST /owner-kas/token`)
 
 authnz-rs#146. Agreed with arkavo-ios on 2026-11-08 and approved by the owner
-the same day. The design it serves is arkavo-ios's owner-KAS design, §4.1
+the same day. The design it serves is arkavo-ios's owner-KAS design, §4.1, at
+https://github.com/arkavo-org/arkavo-ios/blob/9326c382739c66cd921cd8a0dacde685a7d4d943/docs/superpowers/specs/2026-11-08-owner-kas-design.md
 (arkavo-ios#78), which names this file as the source of the same contract.
 Change this contract only together with arkavo-ios and arkavo-rs.
 
