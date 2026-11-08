@@ -3262,7 +3262,7 @@ pub(crate) mod tests {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
-            local_kas_mints: Arc::default(),
+            owner_kas_mints: Arc::default(),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -3390,7 +3390,7 @@ pub(crate) mod tests {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
-            local_kas_mints: Arc::default(),
+            owner_kas_mints: Arc::default(),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };

@@ -485,24 +485,24 @@ appraisal, status)
   `user_id`); the tombstone drops `market_links`. The purchase is then free
   for another account.
 
-**local_kas.rs** - Owner-held local KAS token (#146)
-- arkavo-ios's owner-held local KAS (design §4.1, ADR-0072) has the owner's
+**owner_kas.rs** - Owner KAS token (#146)
+- arkavo-ios's owner KAS (design §4.1, ADR-0072) has the owner's
   phone decide each key release. A receiver's request reaches it through a
   relay and must not carry the receiver's session token, so identity mints a
-  dedicated one. Contract: [docs/local-kas-token.md](docs/local-kas-token.md),
+  dedicated one. Contract: [docs/owner-kas-token.md](docs/owner-kas-token.md),
   agreed with arkavo-ios 2026-11-08; change it only with them.
-- `POST /local-kas/token` (passkey auth CWT in `X-Auth-Token`, original or
+- `POST /owner-kas/token` (passkey auth CWT in `X-Auth-Token`, original or
   renewed; live account), body `{route_id, cnf_key}`: `route_id` a canonical
   ULID (26 uppercase Crockford, first `0`–`7`, never normalized), `cnf_key`
   unpadded base64url of a 65-byte P-256 point on the curve. 200
   `{token, expires_at}`; 401 `unauthorized`; 400 `invalid_request` /
   `invalid_route_id` / `invalid_cnf_key` (decided before the account read);
-  429 `rate_limited` + `Retry-After` past `LOCAL_KAS_MINTS_PER_MINUTE` (30,
+  429 `rate_limited` + `Retry-After` past `OWNER_KAS_MINTS_PER_MINUTE` (30,
   in process). Stateless; the route's existence is not checked.
-- Format (`authnz_rs::local_kas_token`): tag 61 + COSE_Sign1, ES256, protected
-  **content type `application/local-kas+cwt`**, so `cwt::verify` refuses it
+- Format (`authnz_rs::owner_kas_token`): tag 61 + COSE_Sign1, ES256, protected
+  **content type `application/owner-kas+cwt`**, so `cwt::verify` refuses it
   everywhere in identity. Claims exactly `iss`, `sub` (bare UUID), `aud`
-  `local-kas:<route_id>`, `exp` = `iat` + 900, `iat`, `cti`, `cnf` `{1:
+  `owner-kas:<route_id>`, `exp` = `iat` + 900, `iat`, `cti`, `cnf` `{1:
   {1:2, -1:1, -2:x, -3:y}}` (no `kid`), `arkavo_handle` (the permanent
   handle, lowercase, never the username), in deterministic CBOR order. No
   entitlement, Patreon data or email: it lands on another user's phone.

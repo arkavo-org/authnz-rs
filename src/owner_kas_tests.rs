@@ -1,10 +1,10 @@
-//! `POST /local-kas/token` (#146) through the real handler. Refusals decided
+//! `POST /owner-kas/token` (#146) through the real handler. Refusals decided
 //! before the account read need no database; the rest return early unless
 //! `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it.
 
 use super::*;
 use crate::test_helpers::{auth_cwt_aged, build_test_app_state, build_test_app_state_with_store};
-use authnz_rs::constants::LOCAL_KAS_MINTS_PER_MINUTE;
+use authnz_rs::constants::OWNER_KAS_MINTS_PER_MINUTE;
 use authnz_rs::cwt::CwtError;
 use axum::body::Body;
 use axum::http::Request;
@@ -30,9 +30,9 @@ async fn post_token(
     body: Value,
 ) -> (StatusCode, HeaderMap, Value) {
     let app = Router::new()
-        .route("/local-kas/token", post(token_handler))
+        .route("/owner-kas/token", post(token_handler))
         .layer(Extension(state.clone()));
-    let mut req = Request::post("/local-kas/token").header("content-type", "application/json");
+    let mut req = Request::post("/owner-kas/token").header("content-type", "application/json");
     if let Some(t) = token {
         req = req.header("X-Auth-Token", t);
     }
@@ -67,10 +67,10 @@ async fn only_a_passkey_auth_cwt_may_mint() {
     let (st, _, _) = post_token(&state, Some(&access), good_body()).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
-    // Nor is a local-KAS token: its content type fails `cwt::verify`.
-    let (x, y) = authnz_rs::local_kas_token::parse_cnf_key(&request_key()).unwrap();
-    let lk = authnz_rs::local_kas_token::mint(
-        &LocalKasToken {
+    // Nor is a owner-KAS token: its content type fails `cwt::verify`.
+    let (x, y) = authnz_rs::owner_kas_token::parse_cnf_key(&request_key()).unwrap();
+    let lk = authnz_rs::owner_kas_token::mint(
+        &OwnerKasToken {
             iss: state.issuer.to_string(),
             sub: uid.to_string(),
             route_id: ROUTE.into(),
@@ -128,8 +128,8 @@ async fn mints_past_the_limit_are_429_with_retry_after() {
     let state = build_test_app_state().await;
     let uid = Uuid::new_v4();
     let now = Utc::now().timestamp();
-    for _ in 0..LOCAL_KAS_MINTS_PER_MINUTE {
-        state.local_kas_mints.admit(&uid, now).unwrap();
+    for _ in 0..OWNER_KAS_MINTS_PER_MINUTE {
+        state.owner_kas_mints.admit(&uid, now).unwrap();
     }
     let cwt = auth_cwt_aged(&state, uid, 0);
     let (st, h, body) = post_token(&state, Some(&cwt), good_body()).await;
@@ -143,7 +143,7 @@ async fn mints_past_the_limit_are_429_with_retry_after() {
 fn the_limit_is_per_account_and_per_minute() {
     let limiter = MintLimiter::default();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    for _ in 0..LOCAL_KAS_MINTS_PER_MINUTE {
+    for _ in 0..OWNER_KAS_MINTS_PER_MINUTE {
         limiter.admit(&a, 1_000).unwrap();
     }
     assert_eq!(limiter.admit(&a, 1_010), Err(50));
@@ -160,7 +160,7 @@ async fn a_live_account_gets_a_token_for_the_route_and_key() {
     let state = build_test_app_state_with_store(store.clone());
     let name = format!("lk-{}", &Uuid::new_v4().simple().to_string()[..12]);
     let user = store
-        .create_user(&name, "did:key:z6Mklocalkas")
+        .create_user(&name, "did:key:z6Mkownerkas")
         .await
         .unwrap();
     let key = request_key();
@@ -176,7 +176,7 @@ async fn a_live_account_gets_a_token_for_the_route_and_key() {
     assert_eq!(h["cache-control"], "no-store");
 
     let bytes = authnz_rs::cwt::decode_from_header(body["token"].as_str().unwrap()).unwrap();
-    let t = authnz_rs::local_kas_token::verify(&bytes, &state.cwt_keys, before, 60).unwrap();
+    let t = authnz_rs::owner_kas_token::verify(&bytes, &state.cwt_keys, before, 60).unwrap();
     assert_eq!(t.iss, *state.issuer);
     assert_eq!(t.sub, user.user_id.to_string());
     assert_eq!(t.route_id, ROUTE);
@@ -184,7 +184,7 @@ async fn a_live_account_gets_a_token_for_the_route_and_key() {
     assert_eq!(body["expires_at"], json!(t.exp));
     assert_eq!(t.handle, format!("{name}.arkavo.social"));
     assert_eq!(
-        authnz_rs::local_kas_token::parse_cnf_key(&key),
+        authnz_rs::owner_kas_token::parse_cnf_key(&key),
         Some((t.x, t.y))
     );
 

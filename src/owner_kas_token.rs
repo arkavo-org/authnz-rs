@@ -1,7 +1,7 @@
-//! Local-KAS tokens (#146): the credential a receiver's request carries to an
+//! Owner-KAS tokens (#146): the credential a receiver's request carries to an
 //! owner's phone.
 //!
-//! arkavo-ios's owner-held local KAS (design §4.1, arkavo-ios ADR-0072) has
+//! arkavo-ios's owner KAS (design §4.1, arkavo-ios ADR-0072) has
 //! the owner's phone, not a server, decide each key release. A receiver's
 //! request reaches that phone through a relay, so it must not carry the
 //! receiver's session token. It carries this token instead: bound to one
@@ -17,7 +17,7 @@
 //!   and the owner's phone accepts only this type.
 //! - Payload: a CBOR map with exactly these keys, in deterministic order
 //!   (RFC 8949 §4.2.1): `iss` (1), `sub` (2, the receiver's bare lowercase
-//!   UUID), `aud` (3, `local-kas:<route_id>`), `exp` (4), `iat` (6), `cti`
+//!   UUID), `aud` (3, `owner-kas:<route_id>`), `exp` (4), `iat` (6), `cti`
 //!   (7, 16 bytes), `cnf` (8, `{1: COSE_Key {1: 2, -1: 1, -2: x, -3: y}}`, no
 //!   `kid` and no `alg`), and `arkavo_handle` (the receiver's permanent
 //!   handle, lowercase).
@@ -32,10 +32,10 @@ use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, iana};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer, signature::Verifier};
 
 /// The protected header's `content type` (label 3).
-pub const CONTENT_TYPE: &str = "application/local-kas+cwt";
+pub const CONTENT_TYPE: &str = "application/owner-kas+cwt";
 
 /// `aud` is this prefix followed by the route id.
-pub const AUDIENCE_PREFIX: &str = "local-kas:";
+pub const AUDIENCE_PREFIX: &str = "owner-kas:";
 
 /// The payload key of the receiver's handle.
 pub const HANDLE_CLAIM: &str = "arkavo_handle";
@@ -48,9 +48,9 @@ pub const LIFETIME_SECONDS: i64 = 900;
 /// Crockford base-32 in canonical (uppercase) form: no I, L, O or U.
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// A local-KAS token's payload.
+/// A owner-KAS token's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalKasToken {
+pub struct OwnerKasToken {
     pub iss: String,
     /// The receiver's bare lowercase account UUID, as in the passkey CWT.
     pub sub: String,
@@ -114,7 +114,7 @@ fn cnf_cbor(x: &[u8; 32], y: &[u8; 32]) -> Value {
 }
 
 /// Sign `t` with `key` under `kid`: the tag-61 CWT bytes.
-pub fn mint(t: &LocalKasToken, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
+pub fn mint(t: &OwnerKasToken, key: &SigningKey, kid: &[u8]) -> Result<Vec<u8>, CwtError> {
     let int = |n: i64| Value::Integer(n.into());
     let payload = Value::Map(vec![
         (int(1), Value::Text(t.iss.clone())),
@@ -165,7 +165,7 @@ pub fn verify(
     keys: &crate::keys::KeySet,
     now: i64,
     skew_secs: i64,
-) -> Result<LocalKasToken, CwtError> {
+) -> Result<OwnerKasToken, CwtError> {
     let sign1 =
         coset::CoseSign1::from_slice(strip_cwt_tag(bytes)?).map_err(|_| CwtError::Malformed)?;
     let header = &sign1.protected.header;
@@ -198,7 +198,7 @@ pub fn verify(
     Ok(t)
 }
 
-fn parse_payload(bytes: &[u8]) -> Result<LocalKasToken, CwtError> {
+fn parse_payload(bytes: &[u8]) -> Result<OwnerKasToken, CwtError> {
     let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
@@ -232,7 +232,7 @@ fn parse_payload(bytes: &[u8]) -> Result<LocalKasToken, CwtError> {
         .and_then(|b| b.as_slice().try_into().ok())
         .ok_or(CwtError::Malformed)?;
     let (x, y) = parse_cnf(get(&int_key(8))?)?;
-    Ok(LocalKasToken {
+    Ok(OwnerKasToken {
         iss: text(get(&int_key(1))?)?,
         sub: text(get(&int_key(2))?)?,
         route_id,
@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use p256::elliptic_curve::rand_core::OsRng;
 
-    const KID: &[u8] = b"local-kas-test-kid";
+    const KID: &[u8] = b"owner-kas-test-kid";
     const ROUTE: &str = "01JC0000000000000000000000";
 
     fn request_key() -> ([u8; 32], [u8; 32], String) {
@@ -299,9 +299,9 @@ mod tests {
         )
     }
 
-    fn sample(now: i64) -> LocalKasToken {
+    fn sample(now: i64) -> OwnerKasToken {
         let (x, y, _) = request_key();
-        LocalKasToken {
+        OwnerKasToken {
             iss: "https://identity.arkavo.net".into(),
             sub: "0a1b2c3d-0000-4000-8000-000000000001".into(),
             route_id: ROUTE.into(),
@@ -412,7 +412,7 @@ mod tests {
         );
         assert_eq!(
             entries[2].1,
-            Value::Text(format!("local-kas:{ROUTE}")),
+            Value::Text(format!("owner-kas:{ROUTE}")),
             "aud is one text string"
         );
         // cnf = {1: {1: 2, -1: 1, -2: x, -3: y}}, no kid or alg.
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_cwt_is_not_a_local_kas_token() {
+    fn a_session_cwt_is_not_a_owner_kas_token() {
         let (sk, set) = signer();
         let now = chrono::Utc::now().timestamp();
         let session = crate::cwt::ArkavoClaims::auth("https://identity.arkavo.net", "u", 1, None);
@@ -493,7 +493,7 @@ mod tests {
             Err(CwtError::NotYetValid)
         ));
 
-        let long = LocalKasToken {
+        let long = OwnerKasToken {
             exp: now + LIFETIME_SECONDS + 1,
             ..t.clone()
         };

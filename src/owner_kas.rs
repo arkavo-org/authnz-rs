@@ -1,15 +1,15 @@
-//! `POST /local-kas/token` (#146): the token a receiver's request carries to
-//! an owner's phone in arkavo-ios's owner-held local KAS.
+//! `POST /owner-kas/token` (#146): the token a receiver's request carries to
+//! an owner's phone in arkavo-ios's owner KAS.
 //!
 //! The receiver's session token must never reach another user's device
 //! (arkavo-ios ADR-0072), so identity mints a dedicated one: `aud`
-//! `local-kas:<route_id>`, `cnf` the receiver's per-attempt request key,
+//! `owner-kas:<route_id>`, `cnf` the receiver's per-attempt request key,
 //! 900 s, and the receiver's handle so the owner can see who is asking. The
-//! format is `authnz_rs::local_kas_token`. Identity keeps nothing: the mint is
+//! format is `authnz_rs::owner_kas_token`. Identity keeps nothing: the mint is
 //! stateless and does not check that the route exists.
 
 use crate::AppState;
-use authnz_rs::local_kas_token::{self, LIFETIME_SECONDS, LocalKasToken};
+use authnz_rs::owner_kas_token::{self, LIFETIME_SECONDS, OwnerKasToken};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
 
-use authnz_rs::constants::LOCAL_KAS_MINTS_PER_MINUTE;
+use authnz_rs::constants::OWNER_KAS_MINTS_PER_MINUTE;
 
 const ERR_UNAUTHORIZED: &str = "unauthorized";
 const ERR_INVALID_REQUEST: &str = "invalid_request";
@@ -31,7 +31,7 @@ const ERR_RATE_LIMITED: &str = "rate_limited";
 const ERR_SERVER: &str = "server_error";
 
 /// Mints per account in the current minute, in process. Only Open and "Try
-/// again" mint on the app, so [`LOCAL_KAS_MINTS_PER_MINUTE`] is ample; the
+/// again" mint on the app, so [`OWNER_KAS_MINTS_PER_MINUTE`] is ample; the
 /// limit keeps one account from making identity sign without bound.
 #[derive(Default)]
 pub struct MintLimiter {
@@ -46,7 +46,7 @@ impl MintLimiter {
         let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, (start, _)| now - *start < WINDOW);
         let (start, count) = map.entry(*user_id).or_insert((now, 0));
-        if *count >= LOCAL_KAS_MINTS_PER_MINUTE {
+        if *count >= OWNER_KAS_MINTS_PER_MINUTE {
             return Err((*start + WINDOW - now).max(1) as u64);
         }
         *count += 1;
@@ -69,14 +69,14 @@ fn refuse(status: StatusCode, error: &str) -> Response {
         .into_response()
 }
 
-/// `POST /local-kas/token`, body `{"route_id", "cnf_key"}`.
+/// `POST /owner-kas/token`, body `{"route_id", "cnf_key"}`.
 ///
 /// The receiver's passkey auth CWT in `X-Auth-Token` (original or renewed),
 /// for a live account: 401 `unauthorized` otherwise. Then 400
 /// `invalid_request` (not that JSON object), `invalid_route_id` (not a
 /// canonical ULID) or `invalid_cnf_key` (not an unpadded base64url P-256
 /// point); 429 `rate_limited` with `Retry-After` past
-/// [`LOCAL_KAS_MINTS_PER_MINUTE`]; 200 `{token, expires_at}`.
+/// [`OWNER_KAS_MINTS_PER_MINUTE`]; 200 `{token, expires_at}`.
 pub(crate) async fn token_handler(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -85,23 +85,23 @@ pub(crate) async fn token_handler(
     let user_id = match crate::agent::verify_passkey_auth_token(&app_state, &headers) {
         Ok((user_id, _)) => user_id,
         Err(e) => {
-            warn!("audit local_kas_token outcome=unauthorized reason={e}");
+            warn!("audit owner_kas_token outcome=unauthorized reason={e}");
             return refuse(StatusCode::UNAUTHORIZED, ERR_UNAUTHORIZED);
         }
     };
     let Ok(request) = serde_json::from_slice::<TokenRequest>(&body) else {
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_REQUEST);
     };
-    if !local_kas_token::is_route_id(&request.route_id) {
+    if !owner_kas_token::is_route_id(&request.route_id) {
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_ROUTE_ID);
     }
-    let Some((x, y)) = local_kas_token::parse_cnf_key(&request.cnf_key) else {
+    let Some((x, y)) = owner_kas_token::parse_cnf_key(&request.cnf_key) else {
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_CNF_KEY);
     };
 
     let now = Utc::now().timestamp();
-    if let Err(retry_after) = app_state.local_kas_mints.admit(&user_id, now) {
-        warn!("audit local_kas_token outcome=rate_limited user_id={user_id}");
+    if let Err(retry_after) = app_state.owner_kas_mints.admit(&user_id, now) {
+        warn!("audit owner_kas_token outcome=rate_limited user_id={user_id}");
         let mut response = refuse(StatusCode::TOO_MANY_REQUESTS, ERR_RATE_LIMITED);
         response
             .headers_mut()
@@ -115,17 +115,17 @@ pub(crate) async fn token_handler(
         Ok(Some(user)) => user,
         Ok(None) => {
             warn!(
-                "audit local_kas_token outcome=unauthorized reason=account_gone user_id={user_id}"
+                "audit owner_kas_token outcome=unauthorized reason=account_gone user_id={user_id}"
             );
             return refuse(StatusCode::UNAUTHORIZED, ERR_UNAUTHORIZED);
         }
         Err(e) => {
-            error!("local-KAS token: account lookup failed for {user_id}: {e}");
+            error!("owner-KAS token: account lookup failed for {user_id}: {e}");
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
         }
     };
 
-    let token = LocalKasToken {
+    let token = OwnerKasToken {
         iss: app_state.issuer.to_string(),
         // Exactly the passkey auth CWT's `sub` (authn::mint_auth_token).
         sub: user_id.to_string(),
@@ -137,18 +137,18 @@ pub(crate) async fn token_handler(
         y,
         handle: user.handle.to_lowercase(),
     };
-    let bytes = match local_kas_token::mint(&token, &app_state.cwt_signing_key, &app_state.cwt_kid)
+    let bytes = match owner_kas_token::mint(&token, &app_state.cwt_signing_key, &app_state.cwt_kid)
     {
         Ok(b) => b,
         Err(e) => {
-            error!("Signing a local-KAS token failed: {e}");
+            error!("Signing a owner-KAS token failed: {e}");
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
         }
     };
     // The route id is routing data the relay sees too; the token is not
     // logged.
     info!(
-        "audit local_kas_token outcome=issued user_id={user_id} route_id={}",
+        "audit owner_kas_token outcome=issued user_id={user_id} route_id={}",
         token.route_id
     );
     (
@@ -162,5 +162,5 @@ pub(crate) async fn token_handler(
 }
 
 #[cfg(test)]
-#[path = "local_kas_tests.rs"]
+#[path = "owner_kas_tests.rs"]
 mod tests;

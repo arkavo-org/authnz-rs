@@ -1,13 +1,13 @@
-# Local-KAS token (`POST /local-kas/token`)
+# Owner-KAS token (`POST /owner-kas/token`)
 
 authnz-rs#146. Agreed with arkavo-ios on 2026-11-08 and approved by the owner
-the same day. The design it serves is arkavo-ios
-`docs/superpowers/specs/2026-11-08-local-kas-design.md` §4.1 (arkavo-ios#78).
+the same day. The design it serves is arkavo-ios's owner-KAS design, §4.1
+(arkavo-ios#78), which names this file as the source of the same contract.
 Change this contract only together with arkavo-ios and arkavo-rs.
 
 ## Why
 
-In arkavo-ios's owner-held local KAS, the owner's iPhone, not a server,
+In arkavo-ios's owner KAS, the owner's iPhone, not a server,
 decides each key release. A receiver's request reaches that phone through a
 relay (arkavo-rs, platform.arkavo.net). The receiver's session token must
 never reach another user's device (arkavo-ios ADR-0072), so the request
@@ -17,7 +17,7 @@ receiver's per-attempt request key, and it lives 900 s.
 ## Request
 
 ```
-POST /local-kas/token
+POST /owner-kas/token
 X-Auth-Token: <passkey auth CWT>
 Content-Type: application/json
 
@@ -59,7 +59,7 @@ only on Open and "Try again", never while polling.
 
 - **Protected header**: `alg` (1) ES256, `kid` (4) the signing key's id in
   `/.well-known/cose-keys`, `content type` (3)
-  **`application/local-kas+cwt`**. Unprotected header empty; external AAD
+  **`application/owner-kas+cwt`**. Unprotected header empty; external AAD
   empty.
 - **Payload**: a CBOR map with exactly these keys, in this (deterministic,
   RFC 8949 §4.2.1) order:
@@ -68,7 +68,7 @@ only on Open and "Try again", never while polling.
 |---|---|---|
 | 1 | `iss` | `https://identity.arkavo.net` (`OIDC_ISSUER`) |
 | 2 | `sub` | the receiver's bare lowercase account UUID, as in the passkey CWT |
-| 3 | `aud` | `local-kas:<route_id>`, one text string |
+| 3 | `aud` | `owner-kas:<route_id>`, one text string |
 | 4 | `exp` | `iat` + 900 |
 | 6 | `iat` | mint time, unix seconds |
 | 7 | `cti` | 16 random bytes |
@@ -83,13 +83,13 @@ token lands on another user's phone.
 1. Strip tag 61. Require ES256, exactly the content type above, a `kid` in
    identity's COSE key set, and a valid signature.
 2. Require exactly the payload keys above, `iss` as above, `aud` equal to
-   `local-kas:` + the owner's own route id, and `exp - iat` ≤ 900.
+   `owner-kas:` + the owner's own route id, and `exp - iat` ≤ 900.
 3. Check `exp` and `iat` against the phone's clock when it services the
    request, with 60 s of skew. The phone has no trusted submission time, so
    900 s is the owner's window to answer.
 4. Verify the OpenRequest's signature under the `cnf` key.
 
-`local_kas_token::verify` in this repository is a reference implementation
+`owner_kas_token::verify` in this repository is a reference implementation
 of steps 1–3.
 
 ## What refuses it
@@ -97,6 +97,6 @@ of steps 1–3.
 - **Identity**: `cwt::verify` refuses any protected content type, so the
   token passes no identity route. `GET /oauth/userinfo` also takes only an
   access token whose `aud` names a registered OIDC client.
-- **Every other relying party** must refuse the `local-kas:` audience. No
+- **Every other relying party** must refuse the `owner-kas:` audience. No
   service enforces `cnf`, so a verifier that checks neither the audience nor
   the content type would take this token as the receiver for up to 900 s.
