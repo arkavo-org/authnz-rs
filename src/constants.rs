@@ -229,6 +229,12 @@ pub const MARKET_FETCH_DEADLINE_SECONDS: u64 = 3;
 /// Largest claim response body read. A claim is a few hundred bytes.
 pub const MARKET_CLAIM_MAX_BYTES: usize = 16 * 1024;
 
+/// `POST /market/link` fetches the claim fresh, for an id the caller chose,
+/// and the market rate-limits identity as one client (20 req/s, bursts of
+/// 60). So each account may make at most this many link fetches a minute
+/// (429 beyond it), and one account cannot spend the budget mints need.
+pub const MARKET_LINK_FETCHES_PER_MINUTE: u32 = 5;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single

@@ -457,8 +457,12 @@ appraisal, status)
   index, so `market_links` is how a mint finds the links. 200 `{tier,
   entitlements, token_can_publish}`; 409 `already_linked` (another live
   account) or `revoked` (the market answers 410); 400 `invalid_claim` (404,
-  a claim that does not verify, a test-mode claim while test mode is off);
-  503 `market_unavailable` (anything else, or unconfigured).
+  no purchase id, a test-mode claim while test mode is off); 503
+  `market_unavailable` (anything else, a fresh claim that does not verify
+  included: that is an operator fault, not a bad paste; or unconfigured);
+  429 `rate_limited` past `MARKET_LINK_FETCHES_PER_MINUTE` (5) link fetches
+  per account (each link fetches fresh, and the market limits identity as
+  one client).
 - Claim checks (`verify_claim`): compact JWS, `alg` ES256, `typ` JWT, a
   pinned `kid`, the signature, `iss` = `MARKET_ISSUER`, `aud` =
   `OIDC_ISSUER`, `jti` = the link key, a known `tier` (`lifetime` ⇒ every

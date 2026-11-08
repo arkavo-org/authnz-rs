@@ -30,6 +30,7 @@ use crate::AppState;
 use crate::constants::{
     ENTITLEMENT_CREATOR_PUBLISH, MARKET_CACHE_TTL_SECONDS, MARKET_CLAIM_MAX_BYTES,
     MARKET_FAILURE_CACHE_TTL_SECONDS, MARKET_FETCH_DEADLINE_SECONDS,
+    MARKET_LINK_FETCHES_PER_MINUTE,
 };
 use crate::db::{DynamoDBError, MarketLinkOutcome};
 use axum::body::Bytes;
@@ -50,6 +51,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use uuid::Uuid;
 
 const JTI_PREFIX: &str = "market#";
 const LIVE_PREFIX: &str = "cs_live_";
@@ -509,6 +511,8 @@ pub struct MarketSource {
     http: reqwest::Client,
     cache: Mutex<HashMap<SessionId, CacheEntry>>,
     fetches: AtomicU64,
+    /// Link fetches per account in the current minute: (window start, count).
+    link_fetches: Mutex<HashMap<Uuid, (i64, u32)>>,
 }
 
 impl MarketSource {
@@ -524,7 +528,24 @@ impl MarketSource {
             http,
             cache: Mutex::new(HashMap::new()),
             fetches: AtomicU64::new(0),
+            link_fetches: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Admit one `POST /market/link` fetch for `user_id`: at most
+    /// [`MARKET_LINK_FETCHES_PER_MINUTE`] per account in a fixed 60 s window.
+    /// `Err(seconds)`: refused, retry after that many seconds. In process,
+    /// so per instance.
+    fn admit_link(&self, user_id: &Uuid, now: i64) -> Result<(), u64> {
+        const WINDOW: i64 = 60;
+        let mut map = self.link_fetches.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (start, _)| now - *start < WINDOW);
+        let (start, count) = map.entry(*user_id).or_insert((now, 0));
+        if *count >= MARKET_LINK_FETCHES_PER_MINUTE {
+            return Err((*start + WINDOW - now).max(1) as u64);
+        }
+        *count += 1;
+        Ok(())
     }
 
     /// Read the configuration from the environment; `None` when it is off.
@@ -777,6 +798,7 @@ const ERR_INVALID: &str = "invalid_claim";
 const ERR_REVOKED: &str = "revoked";
 const ERR_ALREADY_LINKED: &str = "already_linked";
 const ERR_UNAVAILABLE: &str = "market_unavailable";
+const ERR_RATE_LIMITED: &str = "rate_limited";
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -810,11 +832,13 @@ struct Trace {
 ///
 /// Order: the feature is configured (503), the caller authenticates and still
 /// exists (401), the body names a purchase (400 `invalid_claim`), a test-mode
-/// purchase only while test mode is on (400, before any fetch), the market
-/// is asked fresh (`410` ⇒ 409 `revoked`; `404` or a claim that does not
-/// verify ⇒ 400 `invalid_claim`; anything else ⇒ 503 `market_unavailable`),
-/// then the link is written (another live account's ⇒ 409
-/// `already_linked`; the caller deleted meanwhile ⇒ 401).
+/// purchase only while test mode is on (400, before any fetch), the
+/// caller's link fetches are within [`MARKET_LINK_FETCHES_PER_MINUTE`] (429
+/// `rate_limited`), the market is asked fresh (`410` ⇒ 409 `revoked`; `404`
+/// ⇒ 400 `invalid_claim`; anything else, a claim that does not verify
+/// included, ⇒ 503 `market_unavailable`), then the link is written (another
+/// live account's ⇒ 409 `already_linked`; the caller deleted meanwhile ⇒
+/// 401).
 pub(crate) async fn link_handler(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -861,6 +885,17 @@ async fn post_link(
         trace.outcome = "test_mode";
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID);
     }
+    // Every link fetches fresh, on an id the caller chose. The market limits
+    // identity's egress as one client, so one account must not be able to
+    // spend that budget and make other accounts' mints fail closed.
+    if let Err(retry_after) = source.admit_link(&caller.user_id, Utc::now().timestamp()) {
+        trace.outcome = "rate_limited";
+        let mut response = refuse(StatusCode::TOO_MANY_REQUESTS, ERR_RATE_LIMITED);
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, retry_after.into());
+        return response;
+    }
 
     let tier = match source.fresh_status(&id).await {
         ClaimStatus::Valid(tier) => tier,
@@ -868,9 +903,17 @@ async fn post_link(
             trace.outcome = "revoked";
             return refuse(StatusCode::CONFLICT, ERR_REVOKED);
         }
-        ClaimStatus::NotFound | ClaimStatus::Invalid => {
-            trace.outcome = "invalid";
+        ClaimStatus::NotFound => {
+            trace.outcome = "not_found";
             return refuse(StatusCode::BAD_REQUEST, ERR_INVALID);
+        }
+        // The claim was fetched fresh from the market, so one that does not
+        // verify is the operators' fault (a key rotated before it was
+        // pinned), not a bad paste: the caller should try again, not give up
+        // on the purchase (contract, linking step 2).
+        ClaimStatus::Invalid => {
+            trace.outcome = "unverifiable";
+            return refuse(StatusCode::SERVICE_UNAVAILABLE, ERR_UNAVAILABLE);
         }
         ClaimStatus::Unavailable => {
             trace.outcome = "unavailable";

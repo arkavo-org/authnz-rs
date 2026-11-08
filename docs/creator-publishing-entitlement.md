@@ -223,9 +223,15 @@ market pushes nothing. Contract: arkavo-com/market
   | Linked, or already this account's | `200 {"tier","livemode","entitlements","token_can_publish"}` |
   | Another live account holds it | `409 {"error":"already_linked"}` |
   | The market answers `410` (refunded, or a dispute lost) | `409 {"error":"revoked"}` |
-  | The market answers `404`; the claim does not verify; no purchase id in the body; a test-mode id while test mode is off | `400 {"error":"invalid_claim"}` |
-  | Anything else from the market; the feature is off | `503 {"error":"market_unavailable"}` |
+  | The market answers `404`; no purchase id in the body; a test-mode id while test mode is off | `400 {"error":"invalid_claim"}` |
+  | Anything else from the market, including a claim that does not verify (fetched fresh, so an operator fault such as an unpinned key, not a bad paste); the feature is off | `503 {"error":"market_unavailable"}` |
+  | More than 5 link fetches by the account in a minute (`MARKET_LINK_FETCHES_PER_MINUTE`) | `429 {"error":"rate_limited"}` with `Retry-After` |
   | No valid token, or the account was deleted | `401` |
+
+  The link limit exists because every link fetches fresh, on an id the
+  caller chose, and the market rate-limits identity as one client (20
+  requests a second, bursts of 60): one account must not spend the budget
+  other accounts' mints need. It is per instance.
 
   A purchase linked to a deleted account that the sweep has not reached yet
   moves to the caller. `entitlements` is what the tier grants; a suspension
@@ -406,7 +412,9 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
 
    - **Before enabling it, confirm the offer's `checkRefunds` is on** on the
      market host (it defaults to off). With it off, a refunded purchase keeps
-     answering `200` and keeps the entitlement;
+     answering `200` and keeps the entitlement. Turning it on first needs the
+     market's Stripe restricted key to read PaymentIntents, Charges and
+     Disputes; without that every claim fetch answers `503`;
    - fetch `https://market.arkavo.com/.well-known/jwks.json`, check the key
      with the market's operator out of band (it is a rotation channel, not a
      trust anchor), and save it as the file `MARKET_CLAIM_KEYS_PATH` names;

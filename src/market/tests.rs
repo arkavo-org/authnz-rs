@@ -76,7 +76,7 @@ fn payload(issuer: &str, audience: &str, id: &SessionId, overrides: Value) -> Va
         "aud": audience,
         "jti": id.jti(),
         "tier": "lifetime",
-        "offer": "arkavo-creator-membership",
+        "offer": "arkavo-lifetime-creator-membership",
         "amount": 49_900,
         "currency": "USD",
         "livemode": id.livemode(),
@@ -406,6 +406,27 @@ fn a_test_mode_claim_verifies_only_while_test_mode_is_on() {
         verify_claim(&cfg, &mismatch, &id),
         Err(ClaimError::ModeMismatch)
     );
+}
+
+/// The market signs with ring, which does not normalise S, so about half
+/// its claims carry a high S. p256 verifies those; this pins it, so an
+/// upgrade that starts refusing high S fails here, not on half the claims.
+#[test]
+fn a_high_s_signature_verifies() {
+    let k = key();
+    let cfg = MarketConfig::for_tests(ISSUER, AUDIENCE, &k);
+    let id = live_id();
+    let low = claim_for(&k, &cfg, &id, json!({}));
+    let (input, sig_b64) = low.rsplit_once('.').unwrap();
+    let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig_b64).unwrap()).unwrap();
+    let (r, s) = sig.split_scalars();
+    let high = Signature::from_scalars(r, -*s).unwrap();
+    assert!(
+        high.normalize_s().is_some(),
+        "the negated S is the high one"
+    );
+    let claim = format!("{input}.{}", URL_SAFE_NO_PAD.encode(high.to_bytes()));
+    assert!(verify_claim(&cfg, &claim, &id).is_ok());
 }
 
 #[test]
@@ -936,6 +957,22 @@ async fn link_is_503_unconfigured_and_401_without_a_token() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[test]
+fn link_fetches_are_limited_per_account_per_minute() {
+    let source = MarketSource::new(MarketConfig::for_tests(ISSUER, AUDIENCE, &key())).unwrap();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let t = 1_800_000_000;
+    for _ in 0..MARKET_LINK_FETCHES_PER_MINUTE {
+        assert!(source.admit_link(&a, t).is_ok());
+    }
+    assert_eq!(source.admit_link(&a, t), Err(60));
+    assert_eq!(source.admit_link(&a, t + 45), Err(15));
+    // Another account has its own budget.
+    assert!(source.admit_link(&b, t + 45).is_ok());
+    // The next window admits again.
+    assert!(source.admit_link(&a, t + 60).is_ok());
+}
+
 /// A user, a token for it, and the link route with a local market.
 struct LinkFixture {
     store: Arc<DynamoDBStore>,
@@ -1056,7 +1093,13 @@ async fn link_refuses_what_the_market_does_not_vouch_for() {
     for (id, want, error) in [
         (&refunded, StatusCode::CONFLICT, "revoked"),
         (&unknown, StatusCode::BAD_REQUEST, "invalid_claim"),
-        (&unpinned, StatusCode::BAD_REQUEST, "invalid_claim"),
+        // Fetched fresh from the market: a claim that does not verify is the
+        // operators' fault (an unpinned key), so "try again", not "bad claim".
+        (
+            &unpinned,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "market_unavailable",
+        ),
         (&down, StatusCode::SERVICE_UNAVAILABLE, "market_unavailable"),
     ] {
         let (status, body) = f.link(&token, id).await;
@@ -1090,6 +1133,40 @@ async fn link_refuses_what_the_market_does_not_vouch_for() {
     }
     let state = f.store.get_publishing_state(&user).await.unwrap().unwrap();
     assert!(state.market_links.is_empty());
+}
+
+#[tokio::test]
+async fn link_is_429_past_the_per_account_limit() {
+    let Some(f) = LinkFixture::new().await else {
+        return;
+    };
+    let (_, token) = f.user().await;
+    for _ in 0..MARKET_LINK_FETCHES_PER_MINUTE {
+        let (status, _) = f.link(&token, &live_id()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let hits = f.h.market.hits();
+    let claim = f.h.claim(&f.h.valid(), json!({}));
+    let resp = f
+        .app
+        .clone()
+        .oneshot(link_request(
+            Some(&token),
+            json!({ "claim": claim }).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = resp.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry));
+    assert_eq!(f.h.market.hits(), hits, "refused before any fetch");
+    // Another account is not held back.
+    let (_, other) = f.user().await;
+    assert_eq!(f.link(&other, &f.h.valid()).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
