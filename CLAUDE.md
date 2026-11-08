@@ -52,6 +52,7 @@ when unset.
 | `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
 | `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. All three required; any unset ⇒ the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
+| `MARKET_ISSUER`, `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE` | market.arkavo.com lifetime membership (#141, `market.rs`). `MARKET_ISSUER` (`https://market.arkavo.com`) is the claims' `iss` and the base of `<issuer>/claim/<checkoutSessionId>`. `MARKET_CLAIM_KEYS_PATH` is a JWK Set file of the **pinned** P-256 claim keys; each `kid` must be its RFC 7638 thumbprint. The market's `/.well-known/jwks.json` is a rotation channel to read, never a trust anchor. The expected `aud` is `OIDC_ISSUER`. `MARKET_ACCEPT_TEST_MODE=true` accepts Stripe test-mode claims (default off). The first two are required; either unset ⇒ off (startup log line) and `POST /market/link` answers 503. A set but unusable value also leaves it off (warn). |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
@@ -375,10 +376,11 @@ appraisal, status)
   account: Patreon does not let a creator pledge to itself),
   **or** a bound App Store Creator Membership is active (`app_store.rs`: a
   non-revoked record of a configured product and environment, unexpired
-  counting any billing-retry grace), and the account has no publishing
-  suspension. One `get_publishing_state` read (the `credentials` row,
-  strongly consistent) yields the suspension and the App Store records, and
-  happens only when a source can grant. Fails closed.
+  counting any billing-retry grace), **or** a linked market.arkavo.com
+  lifetime claim still verifies (`market.rs`), and the account has no
+  publishing suspension. One `get_publishing_state` read (the `credentials`
+  row, strongly consistent) yields the suspension, the App Store records and
+  the market links, and happens only when a source can grant. Fails closed.
 - Carried in `ArkavoUserClaims::derived_entitlements`, so
   `mint_registration_token` drops it (~99-year token), and
   `entitlements::validate_fqns` refuses to store it (never delegable to
@@ -439,6 +441,48 @@ appraisal, status)
   and catalog metadata with it (tdf-iroh-s3#38). The platform defines it with
   no listed values, `anyOf` (opentdf-platform#64). No viewer is granted
   another creator's value yet.
+
+**market.rs** - market.arkavo.com lifetime membership (#141)
+- Treated like Patreon (#91): identity stores only the link and asks the
+  market at every mint (cached). It stores no purchase, price, refund or
+  revocation, and the market pushes nothing. Contract: arkavo-com/market
+  `docs/market-identity-interface.md`.
+- `POST /market/link` (`X-Auth-Token` passkey CWT, live account), body
+  `{"claim": "<jws>"}`: reads `jti` (`market#cs_live_…` / `market#cs_test_…`)
+  from the pasted claim **unverified**, fetches the claim fresh and verifies
+  that, then writes `identity_links` `market#<cs id>` → `user_id` (absent or
+  already the caller's; a deleted owner's link moves) and `ADD`s the id to
+  the `credentials` row's `market_links` set under `LIVE_ROW` (its failure
+  deletes the link and answers 401). `identity_links` has no `user_id`
+  index, so `market_links` is how a mint finds the links. 200 `{tier,
+  entitlements, token_can_publish}`; 409 `already_linked` (another live
+  account) or `revoked` (the market answers 410); 400 `invalid_claim` (404,
+  no purchase id, a test-mode claim while test mode is off); 503
+  `market_unavailable` (anything else, a fresh claim that does not verify
+  included: that is an operator fault, not a bad paste; or unconfigured);
+  429 `rate_limited` past `MARKET_LINK_FETCHES_PER_MINUTE` (5) link fetches
+  per account (each link fetches fresh, and the market limits identity as
+  one client).
+- Claim checks (`verify_claim`): compact JWS, `alg` ES256, `typ` JWT, a
+  pinned `kid`, the signature, `iss` = `MARKET_ISSUER`, `aud` =
+  `OIDC_ISSUER`, `jti` = the link key, a known `tier` (`lifetime` ⇒ every
+  paid entitlement: today the publish FQN), `livemode` accepted and agreeing
+  with the `jti` prefix. No `exp`: the claim is fetched fresh.
+- At mint: each `market_links` id is fetched (`GET <issuer>/claim/<id>`,
+  `Accept: application/json`, no credentials, redirects not followed,
+  `MARKET_FETCH_DEADLINE_SECONDS`) **alongside** Patreon's materialization,
+  not after it (`publishing::load_sources`). 200 and verified ⇒ grants; 410
+  or 404 ⇒ nothing; anything else ⇒ nothing (fails closed, no last-good
+  fallback, owner decision 2026-11-07). Outcomes are cached in process 5
+  min, failures 60 s, a deadline miss included (a hung market must not make
+  every mint wait); cached answers are read before any fetch. Skipped when an App Store membership already grants.
+  `/entities` answers 503 `market_unavailable` when the market could not
+  answer and no other source grants.
+- A checkout session id is the purchase's bearer secret: never log it
+  (`SessionId::log_ref`, a hash prefix, names it in logs).
+- Deletion: the sweep's link step removes `market#` rows (they carry
+  `user_id`); the tombstone drops `market_links`. The purchase is then free
+  for another account.
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
@@ -576,7 +620,9 @@ appraisal, status)
   never a 200 without Patreon data: the resolver treats 503 as unavailable
   (keeps its last answer) and a 200 as a fresh negative. Likewise a failed
   publishing-state read is a 500 (`publishing::try_derived_entitlements`),
-  never a 200 missing the publish value; a mint withholds it. Agents never get
+  never a 200 missing the publish value; a mint withholds it. So is a linked
+  market purchase that could not be checked while no other source grants
+  (#141): 503 `{"error":"market_unavailable"}`. Agents never get
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
 

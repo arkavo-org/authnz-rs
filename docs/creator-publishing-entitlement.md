@@ -1,17 +1,21 @@
 # Creator-publishing entitlement
 
-Issue [#91](https://github.com/arkavo-org/authnz-rs/issues/91). Code: `src/publishing.rs`,
-`src/app_store.rs`, `src/db/app_store.rs`, `src/db/publishing.rs`, `oidc::arkavo_user_claims`, `patreon::materialize_from_link`.
+Issue [#91](https://github.com/arkavo-org/authnz-rs/issues/91); the market source
+[#141](https://github.com/arkavo-org/authnz-rs/issues/141). Code: `src/publishing.rs`,
+`src/app_store.rs`, `src/db/app_store.rs`, `src/market.rs`, `src/db/market.rs`,
+`src/db/publishing.rs`, `oidc::arkavo_user_claims`, `patreon::materialize_from_link`.
 
 ## Behaviour
 
-An account may publish while it holds either of two memberships:
+An account may publish while it holds any of three memberships:
 
 - its linked Patreon identity is a paying patron of Arkavo's own campaign at a
-  qualifying tier; or
+  qualifying tier;
 - it has an active App Store Creator Membership (the auto-renewable
   subscription, bought in Arkavo Creator and bound to the account through
-  `POST /app-store/transactions`).
+  `POST /app-store/transactions`); or
+- it has linked a lifetime membership bought on market.arkavo.com
+  (`POST /market/link`) that the market still vouches for.
 
 authnz-rs proves this with the entitlement
 
@@ -19,7 +23,7 @@ authnz-rs proves this with the entitlement
 https://patreon.arkavo.com/attr/arkavo-creator/value/publish
 ```
 
-It is the same FQN whichever source grants it, and one FQN even when both do.
+It is the same FQN whichever source grants it, and one FQN even when several do.
 The entitlement is **computed when a token is minted, and never stored**.
 
 - **Granted when all of these hold:**
@@ -31,7 +35,9 @@ The entitlement is **computed when a token is minted, and never stored**.
       one ID from `PATREON_PUBLISHER_TIER_IDS`, or **owns**
       `PATREON_PUBLISHER_CAMPAIGN_ID` (below); or
     - **App Store**: the feature is configured (`APP_STORE_*`) and a
-      subscription record bound to the account is active (below);
+      subscription record bound to the account is active (below); or
+    - **market.arkavo.com**: the feature is configured (`MARKET_*`) and a
+      purchase linked to the account has a claim that verifies (below);
   - the account has no publishing suspension.
 
   **The publisher campaign's owner qualifies** (0.21.1). That is Arkavo's own
@@ -41,9 +47,9 @@ The entitlement is **computed when a token is minted, and never stored**.
   snapshot, #99), or, while Patreon is unreachable, the one stored from its
   last answer (the 60 s owner fallback below). Owning any *other* campaign
   grants nothing, and a suspension withholds it as it does for a member.
-  The two sources are independent: an account with no Patreon link, or with
+  The sources are independent: an account with no Patreon link, or with
   Patreon not configured at all, still gets the entitlement from an active App
-  Store membership.
+  Store membership or a market purchase.
 - **Link role does not matter.** Consumer and creator links qualify in the same
   way: every link fetches memberships with the same `/identity` call and the
   same refresh-on-401 path. A creator's `arkavo_patreon` claim keeps its owned
@@ -72,16 +78,26 @@ The entitlement is **computed when a token is minted, and never stored**.
     (tokens, agent delegation and re-mint, `/entities`), with a warning in
     the log; only the mint-time derivation can emit the FQN.
 - **Fails closed.** Each source fails closed on its own. These withhold the
-  **Patreon source** only; the App Store source is unaffected, so an account
-  with an active App Store membership still gets the entitlement:
+  **Patreon source** only; the other sources are unaffected:
   - Patreon is unreachable;
   - the 3 s materialization deadline passes;
   - the snapshot is stale.
 
+  These withhold the **market source** only:
+  - the market is unreachable, answers anything but `200`, `404` or `410`, or
+    serves a claim that does not verify;
+  - the 3 s market deadline passes.
+
   These withhold the entitlement whichever source would have granted it:
-  - the read of the account's publishing state (suspension and App Store
-    records) fails;
+  - the read of the account's publishing state (suspension, App Store
+    records and market links) fails;
   - the suspension record is malformed.
+
+  `GET /entities/arkavo:<uuid>` answers a 5xx instead of a `200` without the
+  entitlement when it cannot tell: `500` when the publishing-state read fails,
+  `503 {"error":"market_unavailable"}` when a linked market purchase could not
+  be checked and no other source grants. A resolver keeps its last answer on
+  a 5xx.
 
 ### App Store membership
 
@@ -171,6 +187,80 @@ an older notification never overwrites a newer one of the same period.
   transaction after a purchase, and App Store Server Notifications keep the
   state current. See [Deploy](#deploy).
 
+### market.arkavo.com lifetime membership
+
+market.arkavo.com sells a lifetime creator membership through a Stripe Payment
+Link. The buyer gets a signed **claim** at
+`https://market.arkavo.com/claim/<checkoutSessionId>`. Identity treats the
+market the way it treats Patreon: it stores only the link and asks the market
+at every mint. It stores no purchase, price, refund or revocation, and the
+market pushes nothing. Contract: arkavo-com/market
+`docs/market-identity-interface.md`.
+
+- **The claim** is a compact JWS. Identity accepts it only when all of these
+  hold:
+  - header `alg` is `ES256`, `typ` is `JWT`, and `kid` names a key pinned in
+    `MARKET_CLAIM_KEYS_PATH`; the signature verifies under that key;
+  - `iss` is `MARKET_ISSUER` and `aud` is this identity's `OIDC_ISSUER`;
+  - `jti` is `market#<checkoutSessionId>`, the purchase the claim was fetched
+    for;
+  - `tier` is known. `lifetime` grants every paid entitlement, mapped at mint
+    and never stored: today the publish FQN;
+  - `livemode` is `true` (or `false` with `MARKET_ACCEPT_TEST_MODE=true`) and
+    agrees with the id's prefix (`cs_live_` / `cs_test_`).
+
+  There is no `exp`: identity fetches the claim fresh.
+- **Linking.** `POST /market/link` with the passkey auth CWT in
+  `X-Auth-Token` and the body `{"claim": "<jws>"}`. Identity reads the
+  purchase id from the pasted claim's `jti` without verifying it (the pasted
+  claim only shows that the caller holds the id, which is the bearer secret),
+  fetches the claim fresh, verifies that one, and writes the link: the
+  `identity_links` row `market#<id>` → the account, and the id in the
+  account's `market_links`.
+
+  | Outcome | Response |
+  |---|---|
+  | Linked, or already this account's | `200 {"tier","livemode","entitlements","token_can_publish"}` |
+  | Another live account holds it | `409 {"error":"already_linked"}` |
+  | The market answers `410` (refunded, or a dispute lost) | `409 {"error":"revoked"}` |
+  | The market answers `404`; no purchase id in the body; a test-mode id while test mode is off | `400 {"error":"invalid_claim"}` |
+  | Anything else from the market, including a claim that does not verify (fetched fresh, so an operator fault such as an unpinned key, not a bad paste); the feature is off | `503 {"error":"market_unavailable"}` |
+  | More than 5 link fetches by the account in a minute (`MARKET_LINK_FETCHES_PER_MINUTE`) | `429 {"error":"rate_limited"}` with `Retry-After` |
+  | No valid token, or the account was deleted | `401` |
+
+  The link limit exists because every link fetches fresh, on an id the
+  caller chose, and the market rate-limits identity as one client (20
+  requests a second, bursts of 60): one account must not spend the budget
+  other accounts' mints need. It is per instance.
+
+  A purchase linked to a deleted account that the sweep has not reached yet
+  moves to the caller. `entitlements` is what the tier grants; a suspension
+  can still withhold it from the next token. `token_can_publish: false`
+  tells the client to renew its token.
+- **At mint.** For each linked purchase, identity sends
+  `GET <MARKET_ISSUER>/claim/<id>` with `Accept: application/json` and no
+  credentials, and follows no redirect. It runs alongside Patreon's
+  materialization, within its own 3 s deadline
+  (`MARKET_FETCH_DEADLINE_SECONDS`), so a mint waits for the slower of the
+  two, never both in turn. A verified `200` grants; `410` and `404` grant
+  nothing; anything else grants nothing too. Answers are cached in the
+  process for 5 minutes (`MARKET_CACHE_TTL_SECONDS`), failures for 60 s
+  (`MARKET_FAILURE_CACHE_TTL_SECONDS`), including a fetch that misses the
+  deadline, so a hung market does not make every mint wait. Cached answers
+  are read first: a purchase cached as valid grants without waiting on
+  another that must be fetched. There is no last-good fallback (owner
+  decision, 2026-11-07): availability is the market's job. The market is not
+  asked while an App Store membership already grants or the account is
+  suspended.
+- **A refund** removes the entitlement at the first mint after the cached
+  answer expires: the market answers `410` once a purchase is fully refunded
+  or a dispute over it is lost (with the offer's `checkRefunds` on).
+- **Logs** never carry a checkout session id: anyone holding one can fetch
+  the claim. They name a purchase by `market_ref`, the first 12 hex digits of
+  the id's SHA-256 (`market link outcome=… market_ref=… status=…`).
+- **Deleting the account** frees the purchase: the sweep's link step removes
+  the `market#` row, and the tombstone drops `market_links`.
+
 ### Lapse timing
 
 When a membership lapses (cancelled, `declined_patron`, or moved to a tier
@@ -221,12 +311,19 @@ Every setting is an environment variable. In production they go in
 | `APP_STORE_APP_APPLE_ID` | The app's numeric Apple ID (`6738845556`); Production notifications must carry it. |
 | `APP_STORE_PUBLISH_PRODUCT_IDS` | Comma-separated product ids that grant publishing (`com.arkavo.ArkavoCreator.membership.monthly`). |
 | `APP_STORE_ENVIRONMENTS` | Optional; default `Production,Sandbox`. |
+| `MARKET_ISSUER` | The market's issuer (`https://market.arkavo.com`): the claims' `iss` and the base of `<issuer>/claim/<id>`. |
+| `MARKET_CLAIM_KEYS_PATH` | A JWK Set file of the **pinned** P-256 claim keys. Each `kid` must be the key's RFC 7638 thumbprint. |
+| `MARKET_ACCEPT_TEST_MODE` | Optional; `true` accepts Stripe test-mode claims (`cs_test_`, `livemode: false`). Default off. |
 
 - If either `PATREON_PUBLISHER_*` variable is unset or empty, Patreon never
   grants the entitlement. If any of the first three `APP_STORE_*` variables is
   unset, the App Store never grants it and the two `/app-store/*` routes answer
-  503. The sources are configured separately; with neither configured a mint
-  makes no extra DynamoDB read.
+  503. If `MARKET_ISSUER` or `MARKET_CLAIM_KEYS_PATH` is unset, the market
+  never grants it and `POST /market/link` answers 503; a value that is set
+  but unusable (a key file that does not parse, a `kid` that is not the
+  thumbprint) leaves it off with a warning. The sources are configured
+  separately; with only Patreon configured a mint makes no extra DynamoDB
+  read for an account that does not qualify.
 - Startup logs the feature state once: `Creator publishing entitlement
   ENABLED: …` or `… DISABLED: …`. It warns when only one of the two variables
   is set.
@@ -291,10 +388,11 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
 
 ## Deploy
 
-1. **No table changes.** The suspension and the App Store records are
-   attributes on the existing `credentials` table (DynamoDB is schemaless for
-   non-key attributes), the App Store links are `appstore#<id>` rows of
-   `identity_links`, and no new table, GSI or IAM grant is needed.
+1. **No table changes.** The suspension, the App Store records and the
+   market links are attributes on the existing `credentials` table (DynamoDB
+   is schemaless for non-key attributes), the App Store and market links are
+   `appstore#<id>` and `market#<id>` rows of `identity_links`, and no new
+   table, GSI or IAM grant is needed.
 2. Register a moderation service client, if you don't have one:
    - `OIDC_CLIENT_<TAG>_ID`, `_SECRET` and a dummy `_REDIRECT_URIS`, as
      described in `docs/pep-service-clients.md`;
@@ -309,11 +407,31 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
      `APP_STORE_PUBLISH_PRODUCT_IDS=com.arkavo.ArkavoCreator.membership.monthly`
      (`APP_STORE_ENVIRONMENTS` is optional; the default is
      `Production,Sandbox`).
+
+   For the market source:
+
+   - **Before enabling it, confirm the offer's `checkRefunds` is on** on the
+     market host (it defaults to off). With it off, a refunded purchase keeps
+     answering `200` and keeps the entitlement. Turning it on first needs the
+     market's Stripe restricted key to read PaymentIntents, Charges and
+     Disputes; without that every claim fetch answers `503`;
+   - fetch `https://market.arkavo.com/.well-known/jwks.json`, check the key
+     with the market's operator out of band (it is a rotation channel, not a
+     trust anchor), and save it as the file `MARKET_CLAIM_KEYS_PATH` names;
+   - `MARKET_ISSUER=https://market.arkavo.com` and
+     `MARKET_CLAIM_KEYS_PATH=<that file>`. `OIDC_ISSUER` must be
+     `https://identity.arkavo.net`, the claims' `aud`;
+   - `MARKET_ACCEPT_TEST_MODE` only if test-mode purchases should grant on
+     this server (#141, still an owner decision).
+   - **Key rotation:** pin the new key in the file first (both keys listed),
+     restart, then let the market switch. Remove the old key once the market
+     signs with the new one: identity verifies only claims it fetches.
 4. Check that the Patreon apps' authorize URLs request `identity.memberships`
    for **creator** links as well as consumer links. Creators linked before that
    change must re-link.
 5. Restart. Confirm that the startup log reports `Creator publishing
-   entitlement ENABLED` and `App Store purchases ENABLED`.
+   entitlement ENABLED`, `App Store purchases ENABLED` and `market purchases
+   ENABLED: issuer=… pinned_kids=…`.
 6. Check that the notification route is live:
 
    ```bash
@@ -345,6 +463,11 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
       with `"active":true`, logs `app_store transaction outcome=bound …
       env=Sandbox`, and the next auth CWT lists the FQN.
 
-**Rollback:** unset the two `PATREON_PUBLISHER_*` variables (Patreon) and one
-of the first three `APP_STORE_*` variables (App Store). No more tokens get the
-entitlement from that source. Stored suspensions are harmless and can stay.
+    - a market purchase linked with `POST /market/link` answers `200`, logs
+      `market link outcome=linked market_ref=…`, and the next auth CWT lists
+      the FQN.
+
+**Rollback:** unset the two `PATREON_PUBLISHER_*` variables (Patreon), one
+of the first three `APP_STORE_*` variables (App Store), or `MARKET_ISSUER`
+(market). No more tokens get the entitlement from that source. Stored
+suspensions and links are harmless and can stay.

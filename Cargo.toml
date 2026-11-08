@@ -1,6 +1,6 @@
 [package]
 name = "authnz-rs"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 license = "BSD-2"
 rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
@@ -81,3 +81,5 @@ h2 = "0.4"
 webauthn-authenticator-rs = { version = "=0.5.5", default-features = false, features = ["softpasskey"] }
 # StoreKit JWS fixture chains (app_store_tests): custom-OID extensions, ECDSA P-256/P-384.
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+# Market claims signed the way market-commerce signs them (market::tests).
+ring = "0.17"

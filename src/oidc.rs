@@ -2198,23 +2198,40 @@ pub(crate) async fn arkavo_user_claims(
     user: &AuthenticatedUser,
 ) -> crate::cwt::ArkavoUserClaims {
     let user_id = arkavo_user_uuid(user);
-    let snap = match user_id {
-        Some(id) => crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await,
-        None => None,
+    // The market check (and the publishing-state read it needs) runs
+    // alongside Patreon's materialization, so a mint waits for the slower of
+    // the two deadlines, never both in turn.
+    let (snap, sources) = tokio::join!(
+        async {
+            match user_id {
+                Some(id) => {
+                    crate::patreon::materialize_for_user_bounded(app_state, patreon, id).await
+                }
+                None => None,
+            }
+        },
+        crate::publishing::load_sources(app_state, user_id),
+    );
+    let publish = match sources {
+        Ok(sources) => crate::publishing::derive(app_state, user_id, snap.as_ref(), sources)
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
     };
-    let publish = crate::publishing::derived_entitlements(app_state, user_id, snap.as_ref()).await;
     assemble_user_claims(app_state, user, user_id, snap, publish)
 }
 
 /// [`arkavo_user_claims`] for `GET /entities`, which materializes the Patreon
 /// snapshot itself and answers a 5xx where a mint fails closed: no snapshot
-/// for a linked account (the caller's 503), or a failed publishing-state read
-/// (returned here). A resolver must not cache either as "not entitled".
+/// for a linked account (the caller's 503), a failed publishing-state read,
+/// or a market purchase that could not be checked while no other source
+/// grants (both returned here). A resolver must not cache any of them as
+/// "not entitled".
 pub(crate) async fn try_arkavo_user_claims_from(
     app_state: &AppState,
     user: &AuthenticatedUser,
     snap: Option<crate::cwt::ArkavoPatreon>,
-) -> Result<crate::cwt::ArkavoUserClaims, crate::db::DynamoDBError> {
+) -> Result<crate::cwt::ArkavoUserClaims, crate::publishing::DeriveError> {
     let user_id = arkavo_user_uuid(user);
     let publish =
         crate::publishing::try_derived_entitlements(app_state, user_id, snap.as_ref()).await?;
@@ -3224,6 +3241,7 @@ pub(crate) mod tests {
             entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
+            market: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -3350,6 +3368,7 @@ pub(crate) mod tests {
             entity_client_ids: Arc::new(Vec::new()),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
+            market: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };

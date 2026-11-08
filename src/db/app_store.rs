@@ -98,6 +98,9 @@ pub enum GraceUpdate {
 pub struct PublishingState {
     pub suspension: Option<PublishingSuspension>,
     pub app_store: Vec<AppStoreRecord>,
+    /// The account's market.arkavo.com purchases (checkout session ids,
+    /// sorted), from `market_links` (#141).
+    pub market_links: Vec<String>,
 }
 
 fn environment_str(e: Environment) -> &'static str {
@@ -630,9 +633,10 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.credentials_table)
             .key("user_id", s(&user_id.to_string()))
-            .projection_expression("user_id, #ps, #as, deleted_at")
+            .projection_expression("user_id, #ps, #as, #ml, deleted_at")
             .expression_attribute_names("#ps", publishing::ATTR)
             .expression_attribute_names("#as", ATTR)
+            .expression_attribute_names("#ml", super::market::ATTR)
             .consistent_read(true)
             .send()
             .await
@@ -661,6 +665,7 @@ impl DynamoDBStore {
         Ok(Some(PublishingState {
             suspension,
             app_store,
+            market_links: super::market::links_from_item(&item)?,
         }))
     }
 }
@@ -1158,7 +1163,8 @@ mod tests {
             store.get_publishing_state(&id).await.unwrap(),
             Some(PublishingState {
                 suspension: None,
-                app_store: vec![]
+                app_store: vec![],
+                market_links: vec![],
             })
         );
 
@@ -1176,7 +1182,8 @@ mod tests {
             store.get_publishing_state(&id).await.unwrap(),
             Some(PublishingState {
                 suspension: Some(sus),
-                app_store: vec![r]
+                app_store: vec![r],
+                market_links: vec![],
             })
         );
         assert_eq!(

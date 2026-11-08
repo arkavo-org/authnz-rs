@@ -38,6 +38,14 @@ paths:
   malleable); the JWS is not stored. Read with the suspension in one
   `consistent_read(true)` `GetItem` (`get_publishing_state`). The entitlement
   derived from it is never stored.
+- **market_links** (String Set, optional; #141): the checkout session ids of
+  the account's market.arkavo.com purchases (`cs_live_…` / `cs_test_…`),
+  the account's side of the `market#` links below (`identity_links` has no
+  `user_id` index, so a mint finds them here). Added by `ADD` under
+  `LIVE_ROW` after the link row is written (`link_market_purchase`; its
+  failure deletes the link). Read in `get_publishing_state`. Never removed
+  by a request; the tombstone drops it. Each id is the purchase's bearer
+  secret: never logged.
 - **Tombstone** (#88): a deleted account's row is replaced, in one put on
   `attribute_exists(user_id) AND attribute_not_exists(deleted_at)`, by
   `user_id`, `deleted_at` (Number; its presence makes the row a tombstone),
@@ -127,6 +135,15 @@ paths:
   meanwhile. It holds no `token_*` attribute, so the sweep's
   `delete_identity_links_of` removes it. Read with `app_store_link_owner`
   (consistent). The state lives on the `credentials` row, not here.
+- **market.arkavo.com purchase link** (#141; `db/market.rs`): `link_pk =
+  market#<checkoutSessionId>`, `provider = market`, `user_id`, `created_at`
+  (kept on a re-bind, restarted by a move). One account per purchase:
+  written by one `UpdateItem` on `attribute_not_exists(link_pk) OR user_id =
+  :uid`; a link naming a non-live account moves on `user_id = :from`. Then
+  the id is added to the account's `market_links`. No `token_*` attribute, so
+  the sweep's `delete_identity_links_of` removes it, which frees the purchase
+  for another account. Nothing about the purchase is stored here: the
+  market is asked at every mint. Read with `market_link_owner` (consistent).
 - **Passkey index** (#104; `db/passkeys.rs`): `link_pk = passkey#<base64url
   credential id>`, `provider = passkey`, `subject` = the id, `user_id`,
   `linked_at` (first attestation), `revoked_at` (Number, optional). Written by
