@@ -16,7 +16,7 @@ use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -779,6 +779,55 @@ async fn grant_gives_up_at_the_mint_deadline_and_caches_the_miss() {
     );
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(h.market.hits(), 1);
+}
+
+/// A mint whose fetch misses the deadline does not overwrite an answer
+/// another request (here: the link route's fresh fetch) cached meanwhile.
+#[tokio::test]
+async fn a_deadline_miss_keeps_an_answer_cached_meanwhile() {
+    let h = Harness::new(AUDIENCE).await;
+    let slow = h.with(Answer::Slow);
+    let slow_links = links(&[&slow]);
+    let (grant, ()) = tokio::join!(h.source.grant(&slow_links), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        h.source.remember(
+            &slow,
+            ClaimStatus::Valid(Tier::Lifetime),
+            Utc::now().timestamp(),
+        );
+    });
+    assert_eq!(grant, MarketGrant::Unavailable);
+    assert_eq!(
+        h.source.cached(&slow, Utc::now().timestamp()),
+        Some(ClaimStatus::Valid(Tier::Lifetime))
+    );
+    assert!(matches!(
+        h.source.grant(&links(&[&slow])).await,
+        MarketGrant::Granted(_)
+    ));
+}
+
+/// An answer from an earlier fetch never replaces one from a later fetch.
+#[test]
+fn a_later_fetch_wins() {
+    let source = MarketSource::new(MarketConfig::for_tests(ISSUER, AUDIENCE, &key())).unwrap();
+    let id = live_id();
+    let now = Utc::now().timestamp();
+    let (early, late) = (source.begin(), source.begin());
+    source.record(&id, ClaimStatus::Valid(Tier::Lifetime), late, now);
+    source.record(&id, ClaimStatus::Unavailable, early, now);
+    assert_eq!(
+        source.cached(&id, now),
+        Some(ClaimStatus::Valid(Tier::Lifetime))
+    );
+    // A later one replaces an earlier one, whatever it says.
+    source.record(&id, ClaimStatus::Revoked, source.begin(), now);
+    assert_eq!(source.cached(&id, now), Some(ClaimStatus::Revoked));
+    // An expired later answer does not block an earlier one.
+    let stale = source.begin();
+    source.record(&id, ClaimStatus::NotFound, source.begin(), now - 1_000);
+    source.record(&id, ClaimStatus::Unavailable, stale, now);
+    assert_eq!(source.cached(&id, now), Some(ClaimStatus::Unavailable));
 }
 
 #[tokio::test]

@@ -47,6 +47,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -488,12 +489,22 @@ pub(crate) enum MarketGrant {
     Unavailable,
 }
 
+/// A cached answer, and which fetch produced it.
+#[derive(Debug, Clone, Copy)]
+struct CacheEntry {
+    status: ClaimStatus,
+    expires_at: i64,
+    /// When the fetch began, in [`MarketSource::begin`] order.
+    fetch: u64,
+}
+
 /// The configured market source: its configuration, an HTTP client and the
 /// answer cache (in process: at most one entry per purchase, about 100).
 pub struct MarketSource {
     pub config: MarketConfig,
     http: reqwest::Client,
-    cache: Mutex<HashMap<SessionId, (ClaimStatus, i64)>>,
+    cache: Mutex<HashMap<SessionId, CacheEntry>>,
+    fetches: AtomicU64,
 }
 
 impl MarketSource {
@@ -508,6 +519,7 @@ impl MarketSource {
             config,
             http,
             cache: Mutex::new(HashMap::new()),
+            fetches: AtomicU64::new(0),
         })
     }
 
@@ -527,14 +539,41 @@ impl MarketSource {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache
             .get(id)
-            .filter(|(_, expires_at)| *expires_at > now)
-            .map(|(status, _)| *status)
+            .filter(|e| e.expires_at > now)
+            .map(|e| e.status)
     }
 
-    fn remember(&self, id: &SessionId, status: ClaimStatus, now: i64) {
+    /// Number a fetch as it begins, so its answer can be ordered against
+    /// others for the same purchase.
+    fn begin(&self) -> u64 {
+        self.fetches.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Cache the answer of the fetch numbered `fetch`, unless an unexpired
+    /// answer from a fetch that began later is cached: that one is newer.
+    /// So a mint whose fetch hung or timed out never replaces what the link
+    /// route (or a concurrent mint) learned meanwhile.
+    fn record(&self, id: &SessionId, status: ClaimStatus, fetch: u64, now: i64) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.retain(|_, (_, expires_at)| *expires_at > now);
-        cache.insert(id.clone(), (status, now + status.ttl()));
+        cache.retain(|_, e| e.expires_at > now);
+        if cache.get(id).is_some_and(|e| e.fetch > fetch) {
+            return;
+        }
+        cache.insert(
+            id.clone(),
+            CacheEntry {
+                status,
+                expires_at: now + status.ttl(),
+                fetch,
+            },
+        );
+    }
+
+    /// Cache an answer as if a fetch had just begun and ended at `now`.
+    #[cfg(test)]
+    fn remember(&self, id: &SessionId, status: ClaimStatus, now: i64) {
+        let fetch = self.begin();
+        self.record(id, status, fetch, now);
     }
 
     /// The market's answer, from the cache while it holds one. A mint reads
@@ -551,8 +590,9 @@ impl MarketSource {
     /// The market's answer, fetched now (the link asks fresh); cached for
     /// the next mint.
     pub(crate) async fn fresh_status(&self, id: &SessionId) -> ClaimStatus {
+        let fetch = self.begin();
         let status = self.fetch(id).await;
-        self.remember(id, status, Utc::now().timestamp());
+        self.record(id, status, fetch, Utc::now().timestamp());
         status
     }
 
@@ -669,20 +709,25 @@ impl MarketSource {
                 unavailable = true;
                 break;
             }
-            match tokio::time::timeout_at(deadline, self.fresh_status(&id)).await {
-                Ok(ClaimStatus::Valid(tier)) => return granted(&id, tier),
-                Ok(ClaimStatus::Revoked | ClaimStatus::NotFound) => {}
-                Ok(ClaimStatus::Invalid | ClaimStatus::Unavailable) => unavailable = true,
+            let fetch = self.begin();
+            let status = match tokio::time::timeout_at(deadline, self.fetch(&id)).await {
+                Ok(status) => status,
                 Err(_) => {
                     warn!(
                         "market check market_ref={} missed the {}s mint deadline",
                         id.log_ref(),
                         MARKET_FETCH_DEADLINE_SECONDS
                     );
-                    // The fetch was dropped before it could cache its failure.
-                    self.remember(&id, ClaimStatus::Unavailable, Utc::now().timestamp());
-                    unavailable = true;
+                    ClaimStatus::Unavailable
                 }
+            };
+            // Cached either way (a deadline miss as a failure), unless a fetch
+            // that began later has answered meanwhile.
+            self.record(&id, status, fetch, Utc::now().timestamp());
+            match status {
+                ClaimStatus::Valid(tier) => return granted(&id, tier),
+                ClaimStatus::Revoked | ClaimStatus::NotFound => {}
+                ClaimStatus::Invalid | ClaimStatus::Unavailable => unavailable = true,
             }
         }
         if unavailable {
