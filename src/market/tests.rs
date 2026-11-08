@@ -416,17 +416,21 @@ fn a_high_s_signature_verifies() {
     let k = key();
     let cfg = MarketConfig::for_tests(ISSUER, AUDIENCE, &k);
     let id = live_id();
-    let low = claim_for(&k, &cfg, &id, json!({}));
-    let (input, sig_b64) = low.rsplit_once('.').unwrap();
+    let signed = claim_for(&k, &cfg, &id, json!({}));
+    let (input, sig_b64) = signed.rsplit_once('.').unwrap();
     let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig_b64).unwrap()).unwrap();
-    let (r, s) = sig.split_scalars();
+    // p256 does not normalise S when it signs: start from the low one.
+    let low = sig.normalize_s().unwrap_or(sig);
+    let (r, s) = low.split_scalars();
     let high = Signature::from_scalars(r, -*s).unwrap();
     assert!(
         high.normalize_s().is_some(),
         "the negated S is the high one"
     );
-    let claim = format!("{input}.{}", URL_SAFE_NO_PAD.encode(high.to_bytes()));
-    assert!(verify_claim(&cfg, &claim, &id).is_ok());
+    for sig in [low, high] {
+        let claim = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+        assert!(verify_claim(&cfg, &claim, &id).is_ok());
+    }
 }
 
 /// The market signs with ring (market-commerce `keys::SigningKey`:
