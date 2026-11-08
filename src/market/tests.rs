@@ -429,6 +429,92 @@ fn a_high_s_signature_verifies() {
     assert!(verify_claim(&cfg, &claim, &id).is_ok());
 }
 
+/// The market signs with ring (market-commerce `keys::SigningKey`:
+/// `ECDSA_P256_SHA256_FIXED_SIGNING`, a random nonce, S not normalised), so
+/// about half its claims carry a high S. Sign claims the same way, with a key
+/// generated here, in the market's header and payload serialization, until
+/// there is one with a high S and one with a low S; both must verify, and
+/// only for their purchase and this identity.
+#[test]
+fn claims_signed_the_way_the_market_signs_verify_high_s_and_low_s() {
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    // Uncompressed: 0x04 || x || y.
+    let point = pair.public_key().as_ref();
+    let (x, y) = (&point[1..33], &point[33..65]);
+    let kid = thumbprint(x, y);
+    let jwks = json!({"keys": [{
+        "alg": "ES256", "crv": "P-256", "kid": kid, "kty": "EC", "use": "sig",
+        "x": URL_SAFE_NO_PAD.encode(x), "y": URL_SAFE_NO_PAD.encode(y),
+    }]})
+    .to_string();
+    let cfg = MarketConfig::parse(
+        Some("https://market.arkavo.com"),
+        Some(&jwks),
+        None,
+        "https://identity.arkavo.net",
+    )
+    .unwrap()
+    .expect("the key file pins");
+
+    let id = live_id();
+    let header = format!(r#"{{"alg":"ES256","kid":"{kid}","typ":"JWT"}}"#);
+    let payload = format!(
+        r#"{{"iss":"https://market.arkavo.com","aud":"https://identity.arkavo.net","jti":"{}","tier":"lifetime","offer":"arkavo-lifetime-creator-membership","amount":49900,"currency":"USD","livemode":true,"iat":1794000000}}"#,
+        id.jti()
+    );
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header),
+        URL_SAFE_NO_PAD.encode(payload)
+    );
+    let (mut high, mut low) = (None, None);
+    for _ in 0..200 {
+        let sig = pair.sign(&rng, input.as_bytes()).unwrap();
+        let is_high = Signature::from_slice(sig.as_ref())
+            .unwrap()
+            .normalize_s()
+            .is_some();
+        let claim = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
+        if is_high {
+            high.get_or_insert(claim);
+        } else {
+            low.get_or_insert(claim);
+        }
+        if high.is_some() && low.is_some() {
+            break;
+        }
+    }
+    for claim in [
+        high.expect("a high-S signature"),
+        low.expect("a low-S signature"),
+    ] {
+        assert_eq!(
+            verify_claim(&cfg, &claim, &id),
+            Ok(VerifiedClaim {
+                tier: Tier::Lifetime,
+                livemode: true
+            })
+        );
+        assert_eq!(pasted_session_id(&claim), Some(id.clone()));
+        assert_eq!(
+            verify_claim(&cfg, &claim, &live_id()),
+            Err(ClaimError::WrongPurchase)
+        );
+        let mut elsewhere = cfg.clone();
+        elsewhere.audience = "https://identity.example".into();
+        assert_eq!(
+            verify_claim(&elsewhere, &claim, &id),
+            Err(ClaimError::WrongAudience)
+        );
+    }
+}
+
 #[test]
 fn a_pasted_claim_names_its_purchase_unverified() {
     let k = key();
