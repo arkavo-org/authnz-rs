@@ -12,6 +12,7 @@ mod agent_state;
 mod app_store;
 mod apple_tokens;
 mod guardians;
+mod market;
 mod passkeys;
 mod patreon_campaigns;
 mod publishing;
@@ -23,8 +24,9 @@ pub use agent_state::{
     AgentState, AgentTrust, AuthorizeOver, AuthorizeWrite, EffectiveState, QuarantineOutcome,
     SwarmWrite,
 };
-pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, StateOutcome};
+pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, PublishingState, StateOutcome};
 pub use guardians::Guardian;
+pub use market::MarketLinkOutcome;
 pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 pub use session::{Session, SessionOpened};

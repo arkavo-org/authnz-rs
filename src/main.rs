@@ -73,6 +73,7 @@ mod entitlements;
 mod google_signin;
 mod guardian;
 mod identity;
+mod market;
 mod oidc;
 mod passkeys;
 #[cfg(test)]
@@ -356,6 +357,10 @@ pub struct AppState {
     /// `APP_STORE_PUBLISH_PRODUCT_IDS`, `APP_STORE_ENVIRONMENTS`). `None` ⇒
     /// the feature is off.
     pub app_store: Arc<Option<app_store::AppStoreConfig>>,
+    /// market.arkavo.com lifetime membership (`MARKET_ISSUER`,
+    /// `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE`; #141): the pinned
+    /// claim keys, an HTTP client and the claim cache. `None` ⇒ off.
+    pub market: Arc<Option<market::MarketSource>>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
     /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
     pub appraisal: agent_state::AppraisalConfig,
@@ -576,6 +581,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let publisher = publishing::PublisherConfig::from_env();
     let app_store = app_store::AppStoreConfig::from_env();
+    // The claims' audience is this identity's issuer.
+    let market = market::MarketSource::from_env(&issuer);
 
     // Create the app state
     let app_state = AppState {
@@ -600,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         moderation_client_ids: Arc::new(moderation_client_ids),
         publisher: Arc::new(publisher),
         app_store: Arc::new(app_store),
+        market: Arc::new(market),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
@@ -747,6 +755,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/app-store/notifications",
             post(app_store::notifications_handler),
         )
+        // market.arkavo.com lifetime membership (#141): link the purchase a
+        // pasted claim names to the caller. Auth CWT required.
+        .route("/market/link", post(market::link_handler))
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
         // Passkey credential attestations (#104): the IdP vouches that a
@@ -1962,6 +1973,7 @@ pub(crate) mod test_helpers {
             moderation_client_ids: Arc::new(vec!["moderation".into()]),
             publisher: Arc::new(None),
             app_store: Arc::new(None),
+            market: Arc::new(None),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }

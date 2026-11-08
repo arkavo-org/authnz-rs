@@ -474,7 +474,7 @@ appraisal, status)
   `/entities` answers 503 `market_unavailable` when the market could not
   answer and no other source grants.
 - A checkout session id is the purchase's bearer secret: never log it
-  (`market::log_ref` logs a hash prefix).
+  (`SessionId::log_ref`, a hash prefix, names it in logs).
 - Deletion: the sweep's link step removes `market#` rows (they carry
   `user_id`); the tombstone drops `market_links`. The purchase is then free
   for another account.
@@ -615,7 +615,9 @@ appraisal, status)
   never a 200 without Patreon data: the resolver treats 503 as unavailable
   (keeps its last answer) and a 200 as a fresh negative. Likewise a failed
   publishing-state read is a 500 (`publishing::try_derived_entitlements`),
-  never a 200 missing the publish value; a mint withholds it. Agents never get
+  never a 200 missing the publish value; a mint withholds it. So is a linked
+  market purchase that could not be checked while no other source grants
+  (#141): 503 `{"error":"market_unavailable"}`. Agents never get
   derived values. Contract agreed with the opentdf-platform session
   2026-10-27; change it only with them.
 

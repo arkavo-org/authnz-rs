@@ -18,9 +18,17 @@
 //!    - App Store: the feature is configured (`APP_STORE_*`) and a
 //!      subscription record bound to the account is active
 //!      ([`app_store_active`]);
+//!    - market.arkavo.com: the feature is configured (`MARKET_*`) and a
+//!      purchase linked to the account still has a claim that verifies
+//!      ([`crate::market::MarketSource::grant`], #141);
 //! 2. the account carries no publishing suspension.
 //!
-//! Every failure (Patreon down, deadline passed, DB error, malformed record)
+//! The market is asked alongside Patreon, not after it ([`load_sources`]
+//! runs while Patreon materializes), so a mint waits for the slower of the
+//! two deadlines, never both in turn.
+//!
+//! Every failure (Patreon or the market down, deadline passed, DB error,
+//! malformed record)
 //! withholds the entitlement, with one exception: while Patreon is
 //! unreachable an owner's fallback snapshot keeps its stored owned campaign,
 //! so the publisher campaign's owner still qualifies. It is never written to
@@ -37,8 +45,11 @@ use crate::constants::{
     ENTITLEMENT_CREATOR_PUBLISH, SUSPENSION_REASON_MAX_LEN, SUSPENSION_REPORT_ID_MAX_LEN,
 };
 use crate::cwt::ArkavoPatreon;
-use crate::db::{DynamoDBError, PublishingSuspension, SuspensionLift, SuspensionSet};
+use crate::db::{
+    DynamoDBError, PublishingState, PublishingSuspension, SuspensionLift, SuspensionSet,
+};
 use crate::entitlements::{EntitlementError, require_service_cwt_for};
+use crate::market::MarketGrant;
 use axum::{
     extract::{Extension, Json, Path},
     http::{HeaderMap, StatusCode},
@@ -136,20 +147,108 @@ pub(crate) fn qualifies(cfg: &PublisherConfig, snap: &ArkavoPatreon, now: i64) -
     })
 }
 
+/// Why [`try_derived_entitlements`] could not answer. A mint fails closed
+/// on either; `GET /entities` answers a 5xx, so a resolver keeps its last
+/// answer where a 200 without the entitlement would be cached as a fresh
+/// negative.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeriveError {
+    /// The publishing-state read failed.
+    #[error(transparent)]
+    Database(#[from] DynamoDBError),
+    /// A linked market purchase could not be checked and no other source
+    /// grants.
+    #[error("market_unavailable")]
+    MarketUnavailable,
+}
+
+/// What [`load_sources`] read before Patreon's answer is known.
+#[derive(Debug)]
+pub(crate) enum Sources {
+    /// Nothing read: only Patreon can grant, and the `credentials` row is
+    /// read once it does (so a Patreon-only deployment reads nothing for an
+    /// account that does not qualify).
+    Unread,
+    /// The row was read (the App Store or the market is configured). `None`:
+    /// no live row, which grants nothing.
+    Read {
+        state: Option<PublishingState>,
+        market: MarketGrant,
+    },
+}
+
+/// The sources that do not depend on Patreon: one strongly consistent read
+/// of the `credentials` row (the suspension, the App Store records and the
+/// market links), then the market check. Called alongside Patreon's
+/// materialization. The market is not asked when the account is suspended or
+/// an App Store membership already grants.
+pub(crate) async fn load_sources(
+    app_state: &AppState,
+    user_id: Option<Uuid>,
+) -> Result<Sources, DeriveError> {
+    let Some(user_id) = user_id else {
+        return Ok(Sources::Read {
+            state: None,
+            market: MarketGrant::NotGranted,
+        });
+    };
+    let app_store_cfg = app_state.app_store.as_ref().as_ref();
+    let market = app_state.market.as_ref().as_ref();
+    if app_store_cfg.is_none() && market.is_none() {
+        return Ok(Sources::Unread);
+    }
+    let Some(state) = read_state(app_state, &user_id).await? else {
+        return Ok(Sources::Read {
+            state: None,
+            market: MarketGrant::NotGranted,
+        });
+    };
+    let app_store_ok = app_store_cfg
+        .is_some_and(|cfg| app_store_active(cfg, &state.app_store, Utc::now().timestamp()));
+    let market = match market {
+        Some(source)
+            if !app_store_ok && state.suspension.is_none() && !state.market_links.is_empty() =>
+        {
+            source.grant(&state.market_links).await
+        }
+        _ => MarketGrant::NotGranted,
+    };
+    Ok(Sources::Read {
+        state: Some(state),
+        market,
+    })
+}
+
+async fn read_state(
+    app_state: &AppState,
+    user_id: &Uuid,
+) -> Result<Option<PublishingState>, DeriveError> {
+    app_state
+        .db_store
+        .get_publishing_state(user_id)
+        .await
+        .map_err(|e| {
+            warn!(
+                "Publishing state lookup failed for user {}: {} — no publishing entitlement \
+                 (a mint fails closed, /entities answers 5xx)",
+                user_id, e
+            );
+            DeriveError::Database(e)
+        })
+}
+
 /// The entitlements derived for `user_id` at this mint (today: the
 /// creator-publishing entitlement or nothing).
 ///
-/// Two sources grant it, either one enough: a qualifying Patreon membership
-/// (`patreon_ok`: the feature is configured and the already-materialized
-/// snapshot qualifies) or an active App Store Creator Membership (the feature
-/// is configured and a record bound to the account is active, see
-/// [`app_store_active`]). Neither applies ⇒ no DynamoDB read at all.
-/// Otherwise one strongly consistent read of the `credentials` row yields the
-/// suspension and the App Store records together; a suspension withholds the
-/// entitlement whichever source granted it. The read happens only when a
-/// source can grant, so feature-off and non-qualifying users cost nothing
-/// extra. Any read error withholds the entitlement (fails closed). A Sandbox
-/// grant is logged with `env=Sandbox`.
+/// Three sources grant it, any one enough: a qualifying Patreon membership
+/// (`snap`), an active App Store Creator Membership ([`app_store_active`]),
+/// or a linked market purchase whose claim verifies. A suspension withholds
+/// it whichever source granted it. Any failure withholds it (fails closed). A
+/// Sandbox grant is logged with `env=Sandbox`.
+///
+/// The sequential form, for tests: a mint calls [`load_sources`] alongside
+/// Patreon and then [`derive`] (`oidc::arkavo_user_claims`).
+#[cfg(test)]
 pub(crate) async fn derived_entitlements(
     app_state: &AppState,
     user_id: Option<Uuid>,
@@ -160,15 +259,26 @@ pub(crate) async fn derived_entitlements(
         .unwrap_or_default()
 }
 
-/// [`derived_entitlements`] with a failed publishing-state read returned, not
-/// withheld: `GET /entities` answers it with a 5xx so a resolver keeps its
-/// last answer, where a 200 without the entitlement would be cached as a
-/// fresh negative.
+/// [`derived_entitlements`] with a failure returned, not withheld:
+/// `GET /entities` answers it with a 5xx.
 pub(crate) async fn try_derived_entitlements(
     app_state: &AppState,
     user_id: Option<Uuid>,
     snap: Option<&ArkavoPatreon>,
-) -> Result<Vec<String>, DynamoDBError> {
+) -> Result<Vec<String>, DeriveError> {
+    let sources = load_sources(app_state, user_id).await?;
+    derive(app_state, user_id, snap, sources).await
+}
+
+/// Decide from Patreon's snapshot and what [`load_sources`] read. With
+/// [`Sources::Unread`] the row is read here, and only when Patreon
+/// qualifies.
+pub(crate) async fn derive(
+    app_state: &AppState,
+    user_id: Option<Uuid>,
+    snap: Option<&ArkavoPatreon>,
+    sources: Sources,
+) -> Result<Vec<String>, DeriveError> {
     let Some(user_id) = user_id else {
         return Ok(Vec::new());
     };
@@ -177,25 +287,27 @@ pub(crate) async fn try_derived_entitlements(
         (Some(cfg), Some(snap)) => qualifies(cfg, snap, now),
         _ => false,
     };
-    let app_store_cfg = app_state.app_store.as_ref().as_ref();
-    if !patreon_ok && app_store_cfg.is_none() {
-        return Ok(Vec::new());
-    }
-    let state = match app_state.db_store.get_publishing_state(&user_id).await {
-        Ok(Some(state)) => state,
-        Ok(None) => return Ok(Vec::new()),
-        Err(e) => {
-            warn!(
-                "Publishing state lookup failed for user {}: {} — no publishing entitlement \
-                 (a mint fails closed, /entities answers 5xx)",
-                user_id, e
-            );
-            return Err(e);
-        }
+    let (state, market) = match sources {
+        Sources::Read { state, market } => (state, market),
+        Sources::Unread if !patreon_ok => return Ok(Vec::new()),
+        Sources::Unread => (
+            read_state(app_state, &user_id).await?,
+            MarketGrant::NotGranted,
+        ),
     };
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    let app_store_cfg = app_state.app_store.as_ref().as_ref();
     let app_store_ok =
         app_store_cfg.is_some_and(|cfg| app_store_active(cfg, &state.app_store, now));
-    if !patreon_ok && !app_store_ok {
+    let market_ok = matches!(market, MarketGrant::Granted(_));
+    if !patreon_ok && !app_store_ok && !market_ok {
+        // Suspended accounts never reach the market check, so this is never
+        // a suspended account's 503.
+        if market == MarketGrant::Unavailable {
+            return Err(DeriveError::MarketUnavailable);
+        }
         return Ok(Vec::new());
     }
     if state.suspension.is_some() {
@@ -219,7 +331,15 @@ pub(crate) async fn try_derived_entitlements(
             );
         }
     }
-    Ok(vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()])
+    let mut out = vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()];
+    if let MarketGrant::Granted(entitlements) = market {
+        for e in entitlements {
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    Ok(out)
 }
 
 // --------- Admin: publishing suspension ---------

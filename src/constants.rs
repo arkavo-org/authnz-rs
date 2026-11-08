@@ -208,6 +208,27 @@ pub const PATREON_MATERIALIZE_DEADLINE_SECONDS: u64 = 3;
 /// every mint. Holds no memberships, so nothing derived from it qualifies.
 pub const PATREON_FAILURE_CACHE_TTL_SECONDS: i64 = 60;
 
+// market.arkavo.com lifetime membership (#141)
+
+/// How long a market claim answer (a verified `200`, a `410` or a `404`) is
+/// cached, as [`PATREON_CACHE_TTL_SECONDS`]: a refund reaches tokens within
+/// this, plus the lifetime of tokens already minted.
+pub const MARKET_CACHE_TTL_SECONDS: i64 = 300;
+
+/// How long a failed market claim fetch (unreachable, timed out, an
+/// unexpected status, or a claim that does not verify) is cached, as
+/// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]. The source grants nothing meanwhile
+/// (fail-closed, no last-good fallback).
+pub const MARKET_FAILURE_CACHE_TTL_SECONDS: i64 = 60;
+
+/// Wall-clock budget for the market check on a token mint, and the timeout
+/// of each claim fetch, as [`PATREON_MATERIALIZE_DEADLINE_SECONDS`]. The check
+/// runs alongside Patreon's, so a mint waits for the slower of the two.
+pub const MARKET_FETCH_DEADLINE_SECONDS: u64 = 3;
+
+/// Largest claim response body read. A claim is a few hundred bytes.
+pub const MARKET_CLAIM_MAX_BYTES: usize = 16 * 1024;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single

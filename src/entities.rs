@@ -7,6 +7,7 @@ use crate::AppState;
 use crate::db::DynamoDBError;
 use crate::entitlements::{EntitlementError, require_service_cwt_for};
 use crate::patreon::{Materialized, PatreonState};
+use crate::publishing::DeriveError;
 use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, Json, Path},
@@ -86,7 +87,10 @@ pub async fn get_entity(
             let user = crate::oidc::AuthenticatedUser::webauthn(u.user_id, u.entitlements);
             let claims = crate::oidc::try_arkavo_user_claims_from(&app_state, &user, snap)
                 .await
-                .map_err(|e| EntityError::Database(Box::new(e)))?;
+                .map_err(|e| match e {
+                    DeriveError::Database(e) => EntityError::Database(Box::new(e)),
+                    DeriveError::MarketUnavailable => EntityError::MarketUnavailable,
+                })?;
             let mut body = serde_json::json!({
                 "sub": user.subject,
                 "arkavo_account_id": u.user_id,
@@ -167,6 +171,10 @@ pub enum EntityError {
     /// The account is Patreon-linked and no snapshot could be produced.
     #[error("patreon_unavailable")]
     PatreonUnavailable,
+    /// A linked market purchase could not be checked and no other source
+    /// grants the creator-publishing entitlement (#141).
+    #[error("market_unavailable")]
+    MarketUnavailable,
     #[error("Database error: {0}")]
     Database(#[from] Box<DynamoDBError>),
 }
@@ -176,15 +184,17 @@ impl IntoResponse for EntityError {
         if let EntityError::Auth(e) = self {
             return e.into_response();
         }
-        if let EntityError::PatreonUnavailable = self {
+        if let EntityError::PatreonUnavailable | EntityError::MarketUnavailable = self {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "patreon_unavailable"})),
+                Json(serde_json::json!({"error": self.to_string()})),
             )
                 .into_response();
         }
         let (status, body) = match &self {
-            EntityError::Auth(_) | EntityError::PatreonUnavailable => {
+            EntityError::Auth(_)
+            | EntityError::PatreonUnavailable
+            | EntityError::MarketUnavailable => {
                 unreachable!("handled above")
             }
             EntityError::BadId(_) => (StatusCode::BAD_REQUEST, self.to_string()),
@@ -204,6 +214,18 @@ impl IntoResponse for EntityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn market_unavailable_is_a_503_with_a_stable_token() {
+        use axum::response::IntoResponse;
+        let resp = EntityError::MarketUnavailable.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "market_unavailable"})
+        );
+    }
 
     #[tokio::test]
     async fn patreon_unavailable_is_a_503_with_a_stable_token() {
