@@ -830,6 +830,37 @@ fn a_later_fetch_wins() {
     assert_eq!(source.cached(&id, now), Some(ClaimStatus::Unavailable));
 }
 
+/// A fetch the mint deadline cut short carries no answer: it never replaces
+/// one, and any real answer replaces it, however the fetches are ordered.
+#[test]
+fn a_cut_off_fetch_never_outranks_a_real_answer() {
+    let source = MarketSource::new(MarketConfig::for_tests(ISSUER, AUDIENCE, &key())).unwrap();
+    let now = Utc::now().timestamp();
+
+    // The link's fetch began first and answers after the mint's cut-off.
+    let id = live_id();
+    let (link, mint) = (source.begin(), source.begin());
+    source.record_cut_off(&id, mint, now);
+    assert_eq!(source.cached(&id, now), Some(ClaimStatus::Unavailable));
+    source.record(&id, ClaimStatus::Valid(Tier::Lifetime), link, now);
+    assert_eq!(
+        source.cached(&id, now),
+        Some(ClaimStatus::Valid(Tier::Lifetime))
+    );
+
+    // A cut-off after a real answer leaves it, even a later-begun one.
+    source.record_cut_off(&id, source.begin(), now);
+    assert_eq!(
+        source.cached(&id, now),
+        Some(ClaimStatus::Valid(Tier::Lifetime))
+    );
+
+    // With nothing cached, the cut-off is cached as a failure.
+    let fresh = live_id();
+    source.record_cut_off(&fresh, source.begin(), now);
+    assert_eq!(source.cached(&fresh, now), Some(ClaimStatus::Unavailable));
+}
+
 #[tokio::test]
 async fn a_hung_purchase_does_not_hide_a_valid_one() {
     let h = Harness::new(AUDIENCE).await;

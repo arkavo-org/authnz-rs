@@ -496,6 +496,10 @@ struct CacheEntry {
     expires_at: i64,
     /// When the fetch began, in [`MarketSource::begin`] order.
     fetch: u64,
+    /// A fetch the mint deadline cut short: cached as a failure so a hung
+    /// market is not asked by every mint, but it says nothing about the
+    /// purchase, so any real answer replaces it.
+    cut_off: bool,
 }
 
 /// The configured market source: its configuration, an HTTP client and the
@@ -550,13 +554,14 @@ impl MarketSource {
     }
 
     /// Cache the answer of the fetch numbered `fetch`, unless an unexpired
-    /// answer from a fetch that began later is cached: that one is newer.
-    /// So a mint whose fetch hung or timed out never replaces what the link
-    /// route (or a concurrent mint) learned meanwhile.
+    /// real answer from a fetch that began later is cached: that one is
+    /// newer. So a mint whose fetch failed or timed out never replaces what
+    /// the link route (or a concurrent mint) learned meanwhile. A cut-off
+    /// entry ([`Self::record_cut_off`]) is always replaced.
     fn record(&self, id: &SessionId, status: ClaimStatus, fetch: u64, now: i64) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.retain(|_, e| e.expires_at > now);
-        if cache.get(id).is_some_and(|e| e.fetch > fetch) {
+        if cache.get(id).is_some_and(|e| !e.cut_off && e.fetch > fetch) {
             return;
         }
         cache.insert(
@@ -565,8 +570,24 @@ impl MarketSource {
                 status,
                 expires_at: now + status.ttl(),
                 fetch,
+                cut_off: false,
             },
         );
+    }
+
+    /// Cache a fetch the mint deadline cut short as a failure (60 s), only
+    /// when nothing unexpired is cached: it carries no answer, so it never
+    /// replaces one, however its fetch is ordered.
+    fn record_cut_off(&self, id: &SessionId, fetch: u64, now: i64) {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, e| e.expires_at > now);
+        let status = ClaimStatus::Unavailable;
+        cache.entry(id.clone()).or_insert(CacheEntry {
+            status,
+            expires_at: now + status.ttl(),
+            fetch,
+            cut_off: true,
+        });
     }
 
     /// Cache an answer as if a fetch had just begun and ended at `now`.
@@ -711,19 +732,20 @@ impl MarketSource {
             }
             let fetch = self.begin();
             let status = match tokio::time::timeout_at(deadline, self.fetch(&id)).await {
-                Ok(status) => status,
+                Ok(status) => {
+                    self.record(&id, status, fetch, Utc::now().timestamp());
+                    status
+                }
                 Err(_) => {
                     warn!(
                         "market check market_ref={} missed the {}s mint deadline",
                         id.log_ref(),
                         MARKET_FETCH_DEADLINE_SECONDS
                     );
+                    self.record_cut_off(&id, fetch, Utc::now().timestamp());
                     ClaimStatus::Unavailable
                 }
             };
-            // Cached either way (a deadline miss as a failure), unless a fetch
-            // that began later has answered meanwhile.
-            self.record(&id, status, fetch, Utc::now().timestamp());
             match status {
                 ClaimStatus::Valid(tier) => return granted(&id, tier),
                 ClaimStatus::Revoked | ClaimStatus::NotFound => {}
