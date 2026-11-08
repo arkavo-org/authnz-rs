@@ -1889,7 +1889,7 @@ pub async fn userinfo(
     };
     let opts = crate::cwt::VerifyOptions {
         expected_iss: Some(oidc.issuer.as_str()),
-        // aud is the client_id; we don't know it here, so skip the check.
+        // aud is the client_id, which is not known here: checked below.
         expected_aud: None,
         now: chrono::Utc::now().timestamp(),
         skew_secs: crate::cwt::DEFAULT_SKEW_SECS,
@@ -1905,6 +1905,17 @@ pub async fn userinfo(
             );
         }
     };
+    // Only an access token, whose `aud` names the OIDC client it was issued
+    // to. Every other identity CWT (passkey `arkavo`, DeviceCheck, an agent
+    // token for the platform) is refused (#146).
+    if !names_registered_client(&claims.aud, &oidc) {
+        debug!("UserInfo token is not an access token for a registered client");
+        return oidc_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "Access token is invalid or expired",
+        );
+    }
 
     // A deleted account's access token still verifies until it expires (#88).
     if let Some(user_id) = claims
@@ -2081,6 +2092,15 @@ pub(crate) fn webauthn_auth_time(claims: &crate::cwt::ArkavoClaims) -> Option<i6
 }
 
 /// Whether a space-separated OAuth scope string grants `want`.
+/// Whether `aud` names a registered OIDC client: what an access token's does
+/// (`[client_id, platform audience?]`).
+fn names_registered_client(aud: &crate::cwt::Audience, oidc: &OidcConfig) -> bool {
+    match aud {
+        crate::cwt::Audience::Single(a) => oidc.clients.contains_key(a),
+        crate::cwt::Audience::Multiple(v) => v.iter().any(|a| oidc.clients.contains_key(a)),
+    }
+}
+
 pub(crate) fn has_scope(scope: &str, want: &str) -> bool {
     scope.split_whitespace().any(|s| s == want)
 }
@@ -3242,6 +3262,7 @@ pub(crate) mod tests {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
+            local_kas_mints: Arc::default(),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };
@@ -3369,6 +3390,7 @@ pub(crate) mod tests {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
+            local_kas_mints: Arc::default(),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         };

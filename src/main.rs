@@ -73,6 +73,7 @@ mod entitlements;
 mod google_signin;
 mod guardian;
 mod identity;
+mod local_kas;
 mod market;
 mod oidc;
 mod passkeys;
@@ -361,6 +362,8 @@ pub struct AppState {
     /// `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE`; #141): the pinned
     /// claim keys, an HTTP client and the claim cache. `None` ⇒ off.
     pub market: Arc<Option<market::MarketSource>>,
+    /// `POST /local-kas/token` mints per account in the current minute (#146).
+    pub local_kas_mints: Arc<local_kas::MintLimiter>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
     /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
     pub appraisal: agent_state::AppraisalConfig,
@@ -608,6 +611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         publisher: Arc::new(publisher),
         app_store: Arc::new(app_store),
         market: Arc::new(market),
+        local_kas_mints: Arc::default(),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
@@ -758,6 +762,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // market.arkavo.com lifetime membership (#141): link the purchase a
         // pasted claim names to the caller. Auth CWT required.
         .route("/market/link", post(market::link_handler))
+        // Owner-held local KAS (#146): a token for one owner route, bound to
+        // the receiver's request key, so the session token never reaches the
+        // owner's phone. Passkey auth CWT required.
+        .route("/local-kas/token", post(local_kas::token_handler))
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
         // Passkey credential attestations (#104): the IdP vouches that a
@@ -1974,6 +1982,7 @@ pub(crate) mod test_helpers {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
+            local_kas_mints: Arc::default(),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }

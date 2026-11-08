@@ -12,3 +12,4 @@ pub mod constants;
 pub mod credential_attestation;
 pub mod cwt;
 pub mod keys;
+pub mod local_kas_token;

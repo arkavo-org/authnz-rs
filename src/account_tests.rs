@@ -437,7 +437,16 @@ async fn oidc_refuses_a_deleted_accounts_tokens() {
     let Some(p) = Plane::new().await else { return };
     let app = router(&p);
     let (uid, cwt) = p.user(&[READ]).await;
-    let oidc = crate::oidc::tests::test_oidc_config();
+    let mut oidc = (*crate::oidc::tests::test_oidc_config()).clone();
+    oidc.clients.insert(
+        "test-client".into(),
+        crate::oidc::OidcClient {
+            client_id: "test-client".into(),
+            client_secret: None,
+            redirect_uris: vec!["https://rp.example/cb".into()],
+        },
+    );
+    let oidc = std::sync::Arc::new(oidc);
     let access = crate::oidc::mint_access_token(
         &p.state,
         &format!("arkavo:{uid}"),
