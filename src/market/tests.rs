@@ -755,7 +755,7 @@ async fn grant_is_unavailable_when_a_purchase_cannot_be_checked() {
 }
 
 #[tokio::test]
-async fn grant_gives_up_at_the_mint_deadline() {
+async fn grant_gives_up_at_the_mint_deadline_and_caches_the_miss() {
     let h = Harness::new(AUDIENCE).await;
     let slow = h.with(Answer::Slow);
     let started = std::time::Instant::now();
@@ -768,6 +768,45 @@ async fn grant_gives_up_at_the_mint_deadline() {
         waited < Duration::from_secs(MARKET_FETCH_DEADLINE_SECONDS + 2),
         "{waited:?}"
     );
+    assert_eq!(h.market.hits(), 1);
+
+    // The miss is cached as a failure (60 s): the next mint neither fetches
+    // nor waits.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        h.source.grant(&links(&[&slow])).await,
+        MarketGrant::Unavailable
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(h.market.hits(), 1);
+}
+
+#[tokio::test]
+async fn a_hung_purchase_does_not_hide_a_valid_one() {
+    let h = Harness::new(AUDIENCE).await;
+    let (slow, valid) = (h.with(Answer::Slow), h.valid());
+
+    // The hung purchase uses up the deadline before the valid one is
+    // fetched, so this mint cannot tell.
+    assert_eq!(
+        h.source.grant(&links(&[&slow, &valid])).await,
+        MarketGrant::Unavailable
+    );
+    // The next mint skips the cached miss and fetches the valid one.
+    assert!(matches!(
+        h.source.grant(&links(&[&slow, &valid])).await,
+        MarketGrant::Granted(_)
+    ));
+    // Once cached, a valid purchase grants at once, whatever comes first.
+    let other_slow = h.with(Answer::Slow);
+    let hits = h.market.hits();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        h.source.grant(&links(&[&other_slow, &valid])).await,
+        MarketGrant::Granted(_)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(h.market.hits(), hits, "nothing fetched");
 }
 
 // --------- POST /market/link ---------

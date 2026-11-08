@@ -239,7 +239,10 @@ market pushes nothing. Contract: arkavo-com/market
   two, never both in turn. A verified `200` grants; `410` and `404` grant
   nothing; anything else grants nothing too. Answers are cached in the
   process for 5 minutes (`MARKET_CACHE_TTL_SECONDS`), failures for 60 s
-  (`MARKET_FAILURE_CACHE_TTL_SECONDS`). There is no last-good fallback (owner
+  (`MARKET_FAILURE_CACHE_TTL_SECONDS`), including a fetch that misses the
+  deadline, so a hung market does not make every mint wait. Cached answers
+  are read first: a purchase cached as valid grants without waiting on
+  another that must be fetched. There is no last-good fallback (owner
   decision, 2026-11-07): availability is the market's job. The market is not
   asked while an App Store membership already grants or the account is
   suspended.

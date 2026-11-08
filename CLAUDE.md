@@ -470,7 +470,8 @@ appraisal, status)
   not after it (`publishing::load_sources`). 200 and verified ⇒ grants; 410
   or 404 ⇒ nothing; anything else ⇒ nothing (fails closed, no last-good
   fallback, owner decision 2026-11-07). Outcomes are cached in process 5
-  min, failures 60 s. Skipped when an App Store membership already grants.
+  min, failures 60 s, a deadline miss included (a hung market must not make
+  every mint wait); cached answers are read before any fetch. Skipped when an App Store membership already grants.
   `/entities` answers 503 `market_unavailable` when the market could not
   answer and no other source grants.
 - A checkout session id is the purchase's bearer secret: never log it

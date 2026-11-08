@@ -537,7 +537,10 @@ impl MarketSource {
         cache.insert(id.clone(), (status, now + status.ttl()));
     }
 
-    /// The market's answer, from the cache while it holds one.
+    /// The market's answer, from the cache while it holds one. A mint reads
+    /// the cache and fetches in [`Self::grant`]; this is the single-purchase
+    /// form the tests use.
+    #[cfg(test)]
     pub(crate) async fn status(&self, id: &SessionId) -> ClaimStatus {
         if let Some(status) = self.cached(id, Utc::now().timestamp()) {
             return status;
@@ -629,13 +632,22 @@ impl MarketSource {
 
     /// What the account's linked purchases (`links`, the `market_links` ids)
     /// grant at this mint, within [`MARKET_FETCH_DEADLINE_SECONDS`] in all.
-    /// The first purchase that verifies decides (a lifetime membership grants
-    /// every paid feature). A test-mode purchase while test mode is off is
-    /// skipped, not fetched: a definite "no", never "unavailable".
+    /// A purchase that verifies decides (a lifetime membership grants every
+    /// paid feature). A test-mode purchase while test mode is off is skipped,
+    /// not fetched: a definite "no", never "unavailable".
+    ///
+    /// Cached answers are read first, so a purchase cached as valid grants at
+    /// once without waiting on another that must be fetched. The rest are
+    /// fetched in turn until the deadline. One that misses it is cached as
+    /// [`ClaimStatus::Unavailable`] (60 s), so a hung market does not make
+    /// every mint wait again; one not reached before the deadline is left
+    /// uncached and counts as unavailable.
     pub(crate) async fn grant(&self, links: &[String]) -> MarketGrant {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(MARKET_FETCH_DEADLINE_SECONDS);
+        let now = Utc::now().timestamp();
         let mut unavailable = false;
+        let mut to_fetch = Vec::new();
         for link in links {
             let Some(id) = SessionId::parse(link) else {
                 warn!("unreadable market link on an account; skipped");
@@ -644,16 +656,21 @@ impl MarketSource {
             if !id.livemode() && !self.config.accept_test_mode {
                 continue;
             }
-            match tokio::time::timeout_at(deadline, self.status(&id)).await {
-                Ok(ClaimStatus::Valid(tier)) => {
-                    if !id.livemode() {
-                        info!(
-                            "market purchase market_ref={} grants from a Stripe test-mode claim",
-                            id.log_ref()
-                        );
-                    }
-                    return MarketGrant::Granted(tier.entitlements());
-                }
+            match self.cached(&id, now) {
+                Some(ClaimStatus::Valid(tier)) => return granted(&id, tier),
+                Some(ClaimStatus::Revoked | ClaimStatus::NotFound) => {}
+                Some(ClaimStatus::Invalid | ClaimStatus::Unavailable) => unavailable = true,
+                None => to_fetch.push(id),
+            }
+        }
+        for id in to_fetch {
+            if tokio::time::Instant::now() >= deadline {
+                // Not reached in time: unknown, so not cached.
+                unavailable = true;
+                break;
+            }
+            match tokio::time::timeout_at(deadline, self.fresh_status(&id)).await {
+                Ok(ClaimStatus::Valid(tier)) => return granted(&id, tier),
                 Ok(ClaimStatus::Revoked | ClaimStatus::NotFound) => {}
                 Ok(ClaimStatus::Invalid | ClaimStatus::Unavailable) => unavailable = true,
                 Err(_) => {
@@ -662,7 +679,9 @@ impl MarketSource {
                         id.log_ref(),
                         MARKET_FETCH_DEADLINE_SECONDS
                     );
-                    return MarketGrant::Unavailable;
+                    // The fetch was dropped before it could cache its failure.
+                    self.remember(&id, ClaimStatus::Unavailable, Utc::now().timestamp());
+                    unavailable = true;
                 }
             }
         }
@@ -672,6 +691,17 @@ impl MarketSource {
             MarketGrant::NotGranted
         }
     }
+}
+
+/// The grant of a purchase that verified, logging a test-mode one.
+fn granted(id: &SessionId, tier: Tier) -> MarketGrant {
+    if !id.livemode() {
+        info!(
+            "market purchase market_ref={} grants from a Stripe test-mode claim",
+            id.log_ref()
+        );
+    }
+    MarketGrant::Granted(tier.entitlements())
 }
 
 // --------- POST /market/link ---------
