@@ -232,7 +232,11 @@ pub fn verify_assertion(
     if client.challenge != URL_SAFE_NO_PAD.encode(Sha256::digest(record)) {
         return Err(Bad("challenge"));
     }
-    if client.origin != origin || client.cross_origin == Some(true) {
+    // The serialized origin, as platforms send it. A client that writes the
+    // origin as a URL adds one trailing "/" (webauthn-rs compares parsed
+    // origins, so it accepts that too); nothing else is allowed after it.
+    let same_origin = client.origin == origin || client.origin.strip_suffix('/') == Some(origin);
+    if !same_origin || client.cross_origin == Some(true) {
         return Err(Bad("origin"));
     }
 
@@ -416,6 +420,12 @@ mod tests {
         let record = encode(entries(1));
         let a = sign(&key, client_data(&record), FLAG_UP | FLAG_UV);
         assert_eq!(verify_assertion(&record, &a, RP, ORIGIN, &x, &y), Ok(()));
+
+        // The origin written as a URL, with one trailing "/", is the same origin.
+        let mut cd = client_data(&record);
+        cd["origin"] = format!("{ORIGIN}/").into();
+        let a = sign(&key, cd, FLAG_UP | FLAG_UV);
+        assert_eq!(verify_assertion(&record, &a, RP, ORIGIN, &x, &y), Ok(()));
     }
 
     #[test]
@@ -456,6 +466,16 @@ mod tests {
             ),
             "origin",
         );
+        for other in [
+            "https://identity.arkavo.net/x",
+            "https://identity.arkavo.net//",
+            "http://identity.arkavo.net",
+        ] {
+            bad(
+                &sign(&key, cd(&|v| v["origin"] = other.into()), FLAG_UP | FLAG_UV),
+                "origin",
+            );
+        }
         bad(
             &sign(
                 &key,
