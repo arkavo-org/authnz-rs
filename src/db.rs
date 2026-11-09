@@ -13,6 +13,7 @@ mod app_store;
 mod apple_tokens;
 mod guardians;
 mod market;
+mod owner_kas;
 mod passkeys;
 mod patreon_campaigns;
 mod publishing;
@@ -27,6 +28,7 @@ pub use agent_state::{
 pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, PublishingState, StateOutcome};
 pub use guardians::Guardian;
 pub use market::MarketLinkOutcome;
+pub use owner_kas::{OwnerKasRoute, RouteWrite};
 pub use passkeys::PasskeyLinked;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 pub use session::{Session, SessionOpened};

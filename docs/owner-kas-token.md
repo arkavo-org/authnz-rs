@@ -48,12 +48,14 @@ Identity does not check that the route exists, and stores nothing.
 
 | Status | Body | When |
 |---|---|---|
-| 200 | `{"token": "<base64url>", "expires_at": <unix s>}` | minted |
+| 200 | `{"token": "<base64url>", "expires_at": <unix s>, "route": <bundle>}` | minted. `route` (from 0.31.0) is the owner's route-record bundle exactly as put |
 | 401 | `{"error":"unauthorized"}` | no valid passkey auth CWT, or the account is deleted |
 | 400 | `{"error":"invalid_request"}` | the body is not `{route_id, cnf_key}` |
 | 400 | `{"error":"invalid_route_id"}` | not a canonical ULID |
 | 400 | `{"error":"invalid_cnf_key"}` | not an unpadded base64url P-256 point |
 | 429 | `{"error":"rate_limited"}`, `Retry-After` | more than 30 mints by the account in a minute |
+| 404 | `{"error":"unknown_route"}` | from 0.31.0: the route was never registered ([owner-kas-routes.md](owner-kas-routes.md)) |
+| 410 | `{"error":"route_retired"}` | from 0.31.0: the owner turned sharing off, or its account is not live |
 | 500 | `{"error":"server_error"}` | the account could not be read, or signing failed |
 
 Every response is `Cache-Control: no-store`. The 400s are decided before the

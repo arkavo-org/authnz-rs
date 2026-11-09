@@ -19,11 +19,16 @@ use uuid::Uuid;
 /// `provider` of a passkey index row.
 pub(crate) const PASSKEY_PROVIDER: &str = "passkey";
 
-/// Condition (and scan filter) that leaves passkey index rows out, with its
-/// one value. Account deletion revokes them instead of deleting them.
-pub(super) const NOT_PASSKEY: &str = "(attribute_not_exists(provider) OR provider <> :passkey)";
-pub(super) fn not_passkey_value() -> (&'static str, AttributeValue) {
-    (":passkey", s(PASSKEY_PROVIDER))
+/// Condition (and scan filter) that leaves out the link rows account
+/// deletion keeps, with its values: passkey index rows (revoked instead) and
+/// owner-KAS routes (retired instead, #148).
+pub(super) const NOT_KEPT_LINK: &str = "(attribute_not_exists(provider) OR \
+     (provider <> :passkey AND provider <> :owner_kas_route))";
+pub(super) fn not_kept_link_values() -> Vec<(&'static str, AttributeValue)> {
+    vec![
+        (":passkey", s(PASSKEY_PROVIDER)),
+        (":owner_kas_route", s(super::owner_kas::ROUTE_PROVIDER)),
+    ]
 }
 
 fn link_pk(credential_id: &str) -> String {

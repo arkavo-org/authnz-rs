@@ -167,6 +167,23 @@ paths:
   account deleted). No `token_*` attribute and not `provider = passkey`, so
   the sweep's `delete_identity_links_of` removes it. Read consistently by
   `get_session`, never by sign-in.
+- **Owner-KAS route** (#148; `db/owner_kas.rs`): `link_pk =
+  owner-kas-route#<route_id>`, `provider = owner-kas-route`, `subject` = the
+  route id. Attributes: `user_id` (the owner), `seq` (N), `bundle` (S, the
+  passkey-signed bundle as put, JSON), `apns_token` and `apns_environment`
+  (S, optional), `created_at` and `updated_at` (N), and `retired_at` (N,
+  optional).
+  - **Writes:** one conditional `UpdateItem`. A put is conditioned on
+    `attribute_not_exists(link_pk) OR (user_id = :uid AND seq < :seq AND
+    attribute_not_exists(retired_at))`. Push writes are conditioned on
+    `user_id = :uid AND attribute_not_exists(retired_at)`. The relay's push
+    removal is conditioned on `apns_token = :t`.
+  - **Never deleted.** Turning sharing off and account deletion retire the
+    row: `retired_at` is set (`if_not_exists`), `bundle` and the push token
+    are removed, and `user_id` is kept, so a route id never passes to another
+    account. The sweep's link step skips these rows (`NOT_KEPT_LINK`, like
+    passkey rows), and `retire_owner_kas_routes_of` retires them.
+  - **Reads:** `get_owner_kas_route`, consistent. No sign-in path reads it.
 - **Patreon campaign owner** (#128; `db/patreon_campaigns.rs`): `link_pk =
   patreon-campaign#<campaign id>`, `provider = patreon-campaign`, `subject` =
   the campaign id, `user_id` (the owning account), `linked_at`. One account

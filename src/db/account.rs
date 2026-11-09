@@ -385,7 +385,7 @@ impl DynamoDBStore {
     /// and that meets `also` (a condition expression), if given.
     /// `identity_links` and `device_bindings` have no index on `user_id`, so
     /// this is a paginated scan; each delete is conditional on the row still
-    /// naming the account. `skip` (a filter expression and its one value)
+    /// naming the account. `skip` (a filter expression and its values)
     /// leaves rows out of both the scan and the deletes. Returns how many
     /// rows were removed.
     async fn delete_rows_owned_by(
@@ -394,7 +394,7 @@ impl DynamoDBStore {
         key: &str,
         user_id: &Uuid,
         also: Option<&str>,
-        skip: Option<(&str, (&str, AttributeValue))>,
+        skip: Option<(&str, Vec<(&str, AttributeValue)>)>,
     ) -> Result<u32, DynamoDBError> {
         let mut filter = "user_id = :uid".to_string();
         if let Some((f, _)) = skip {
@@ -406,8 +406,10 @@ impl DynamoDBStore {
         };
         let uid = s(&user_id.to_string());
         let mut values = HashMap::from([(":uid".to_string(), uid.clone())]);
-        if let Some((_, (name, v))) = skip {
-            values.insert(name.to_string(), v);
+        if let Some((_, skip_values)) = skip {
+            for (name, v) in skip_values {
+                values.insert(name.to_string(), v);
+            }
         }
         let mut removed = 0;
         let mut start = None;
@@ -455,7 +457,8 @@ impl DynamoDBStore {
     /// except an Apple link that holds a token (`db::apple_tokens`): that one
     /// stays until Apple has revoked the token, and the sweep's last step
     /// deletes it. Passkey index rows (`db::passkeys`) are never deleted:
-    /// [`Self::revoke_passkey_links_of`] marks them revoked.
+    /// [`Self::revoke_passkey_links_of`] marks them revoked. Nor are owner-KAS
+    /// routes: [`Self::retire_owner_kas_routes_of`] retires them (#148).
     pub async fn delete_identity_links_of(&self, user_id: &Uuid) -> Result<u32, DynamoDBError> {
         let table = self.identity_links_table.clone();
         self.delete_rows_owned_by(
@@ -464,8 +467,8 @@ impl DynamoDBStore {
             user_id,
             Some(super::apple_tokens::HOLDS_NO_TOKEN),
             Some((
-                super::passkeys::NOT_PASSKEY,
-                super::passkeys::not_passkey_value(),
+                super::passkeys::NOT_KEPT_LINK,
+                super::passkeys::not_kept_link_values(),
             )),
         )
         .await
