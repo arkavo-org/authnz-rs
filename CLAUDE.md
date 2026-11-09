@@ -49,6 +49,7 @@ when unset.
 | `AGENT_STATUS_CLIENT_IDS` | client_ids whose service CWTs may call `GET /agents/:did/status` (intended for the platform entity resolver's `agent_status` client). Empty ⇒ 403, and the platform withholds every agent's entitlements. |
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
 | `MODERATION_CLIENT_IDS` | client_ids whose service CWTs may set, lift and read publishing suspensions (`PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`). Empty ⇒ 403. See `docs/creator-publishing-entitlement.md`. |
+| `OWNER_KAS_RELAY_CLIENT_IDS` | client_ids whose service CWTs may read owner-KAS routes and remove unregistered push tokens (`GET /owner-kas/routes/:id/relay`, `DELETE …/relay/push`; #148). Production: `owner-kas-relay`, the relay's (arkavo-rs) own client, never `arks-media`. Empty ⇒ 403 (startup warns). |
 | `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
 | `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. All three required; any unset ⇒ the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
@@ -507,6 +508,51 @@ appraisal, status)
   handle, lowercase, never the username), in deterministic CBOR order. No
   entitlement, Patreon data or email: it lands on another user's phone.
   Keep any new identity verifier refusing typed CWTs.
+- From 0.31.0 the mint also needs the route (#148): 404 `unknown_route`,
+  410 `route_retired` (retired, or its owner is not live), else the
+  response carries `route`, the owner's bundle exactly as put.
+
+**owner_kas_routes.rs** - Owner-KAS routes at identity (#148)
+- Identity owns account deletion, so the owner's route record and APNs push
+  token live here, not at the relay (which never learns of a deletion).
+  Contract: [docs/owner-kas-routes.md](docs/owner-kas-routes.md); format and
+  assertion check in the lib module `owner_kas_route.rs`.
+- `PUT /owner-kas/routes/:route_id` (owner, passkey auth CWT, live account),
+  body ≤ 8 KiB `{record, assertion{credentialId, authenticatorData,
+  clientDataJSON, signature}, credential}`, all unpadded base64url, unknown
+  members refused. `record` is deterministic CBOR with exactly `v` (1),
+  `route_id` (= the path), `owner_sub` (= the session's bare UUID),
+  `kas_key`, `kas_kid`, `service_key`, `seq` (1…2^53−1), `issued_at`.
+  Identity checks the WebAuthn assertion itself (webauthn-rs only verifies
+  challenges it issued):
+  - `webauthn.get`, with challenge = base64url(SHA-256(record));
+  - origin `https://identity.arkavo.net`, no `crossOrigin`;
+  - rpIdHash of `identity.arkavo.net`, with UP and UV;
+  - an ES256 DER signature under the account's stored passkey;
+  - no sign-count check.
+
+  `credential` must be identity's own attestation of that passkey for the
+  same `sub`, and the passkey index row must not be revoked. Answers:
+  - 200 `{route_id, seq}`;
+  - 400 `invalid_request` / `invalid_route_id` / `invalid_record` /
+    `invalid_assertion`;
+  - 403 `not_route_owner`;
+  - 409 `stale_seq`;
+  - 410 `route_retired`.
+- `DELETE` it (sharing off) retires it. `PUT`/`DELETE …/push`
+  `{apns_token (lowercase hex 64–200), environment: "production"}`.
+- The relay (`OWNER_KAS_RELAY_CLIENT_IDS` service CWT in `X-Auth-Token`)
+  has two routes:
+  - `GET …/relay` → `{owner_sub, apns_token?, environment?}`, 404 / 410;
+  - `DELETE …/relay/push {apns_token}`, removed only if still stored, 204.
+- **A route id is retired, never deleted** (`db/owner_kas.rs`): every
+  recipient of a shared file knows it, and a freed id could be registered by
+  one of them to receive later requests for the owner's files. `DELETE` and
+  the deletion sweep (`retire_owner_kas_routes_of`; the link step skips these
+  rows like passkey rows) set `retired_at`, remove the bundle and push token
+  and keep `user_id`. A retired row takes no write (410). Until the sweep
+  runs, the mint and the relay read treat a route whose owner is not live as
+  retired (`owner_kas_routes::in_service`).
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
@@ -543,7 +589,8 @@ appraisal, status)
   bindings, identity links (scan: no `user_id` GSI; an
   Apple link holding a token is left for the last step) and the
   Patreon token row (Patreon has no revocation endpoint), revokes (never
-  deletes) the passkey index rows (#104), invalidates the
+  deletes) the passkey index rows (#104), retires (never deletes) the
+  owner-KAS routes (#148), invalidates the
   Patreon cache, revokes agent delegations (+ chain cascade; also done in the
   request itself) and Guardians and blanks their `name` / `delegator_username`
   (rows stay: a revoked or
