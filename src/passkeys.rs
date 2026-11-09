@@ -74,7 +74,7 @@ impl From<DynamoDBError> for PasskeyError {
 /// Decode a credential id: base64url without padding, strictly (so every
 /// spelling of one id is one string), 1 to 1023 bytes. Returns the bytes and
 /// the canonical spelling the index is keyed by.
-fn decode_credential_id(id: &str) -> Result<(Vec<u8>, String), PasskeyError> {
+pub(crate) fn decode_credential_id(id: &str) -> Result<(Vec<u8>, String), PasskeyError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(id)
         .map_err(|_| PasskeyError::InvalidCredentialId)?;
@@ -89,7 +89,7 @@ fn decode_credential_id(id: &str) -> Result<(Vec<u8>, String), PasskeyError> {
 }
 
 /// The passkey's P-256 public key coordinates, as stored at registration.
-fn p256_coordinates(passkey: &Passkey) -> Result<([u8; 32], [u8; 32]), PasskeyError> {
+pub(crate) fn p256_coordinates(passkey: &Passkey) -> Result<([u8; 32], [u8; 32]), PasskeyError> {
     match &passkey.get_public_key().key {
         COSEKeyType::EC_EC2(ec2) if ec2.curve == ECDSACurve::SECP256R1 => {
             let x = <[u8; 32]>::try_from(ec2.x.as_ref())

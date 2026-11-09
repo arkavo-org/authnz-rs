@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use ecdsa::SigningKey;
 use http::Uri;
@@ -76,6 +76,7 @@ mod identity;
 mod market;
 mod oidc;
 mod owner_kas;
+mod owner_kas_routes;
 mod passkeys;
 #[cfg(test)]
 mod passkeys_tests;
@@ -364,6 +365,10 @@ pub struct AppState {
     pub market: Arc<Option<market::MarketSource>>,
     /// `POST /owner-kas/token` mints per account in the current minute (#146).
     pub owner_kas_mints: Arc<owner_kas::MintLimiter>,
+    /// client_ids whose service CWTs may read owner-KAS routes and remove
+    /// unregistered push tokens (`OWNER_KAS_RELAY_CLIENT_IDS`, #148): the
+    /// relay's `owner-kas-relay` client. Empty ⇒ 403.
+    pub owner_kas_relay_client_ids: Arc<Vec<String>>,
     /// Appraisal lifetimes (`AGENT_OWNER_APPRAISAL_TTL_SECONDS`,
     /// `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS`), validated at startup.
     pub appraisal: agent_state::AppraisalConfig,
@@ -570,6 +575,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS").ok(),
     )?;
     let agent_status_client_ids = parse_id_list(env::var("AGENT_STATUS_CLIENT_IDS").ok());
+    let owner_kas_relay_client_ids = parse_id_list(env::var("OWNER_KAS_RELAY_CLIENT_IDS").ok());
+    if owner_kas_relay_client_ids.is_empty() {
+        log::warn!("OWNER_KAS_RELAY_CLIENT_IDS is empty: the owner-KAS relay read will 403");
+    }
     if agent_status_client_ids.is_empty() {
         log::warn!(
             "AGENT_STATUS_CLIENT_IDS is empty: GET /agents/:did/status will 403 and the platform will withhold every agent's entitlements"
@@ -612,6 +621,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_store: Arc::new(app_store),
         market: Arc::new(market),
         owner_kas_mints: Arc::default(),
+        owner_kas_relay_client_ids: Arc::new(owner_kas_relay_client_ids),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
@@ -766,6 +776,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the receiver's request key, so the session token never reaches the
         // owner's phone. Passkey auth CWT required.
         .route("/owner-kas/token", post(owner_kas::token_handler))
+        // Owner-KAS routes (#148): the owner's passkey-signed route record
+        // and push token live here so account deletion reaches them; the
+        // relay reads them with its service client. Retired, never deleted.
+        .route(
+            "/owner-kas/routes/:route_id",
+            put(owner_kas_routes::put_route).delete(owner_kas_routes::delete_route),
+        )
+        .route(
+            "/owner-kas/routes/:route_id/push",
+            put(owner_kas_routes::put_push).delete(owner_kas_routes::delete_push),
+        )
+        .route(
+            "/owner-kas/routes/:route_id/relay",
+            get(owner_kas_routes::relay_read),
+        )
+        .route(
+            "/owner-kas/routes/:route_id/relay/push",
+            delete(owner_kas_routes::relay_delete_push),
+        )
         // Account deletion (#88): fresh passkey auth CWT; status by the
         // unguessable deletion id, no token (the account's tokens are dead).
         // Passkey credential attestations (#104): the IdP vouches that a
@@ -1983,6 +2012,7 @@ pub(crate) mod test_helpers {
             app_store: Arc::new(None),
             market: Arc::new(None),
             owner_kas_mints: Arc::default(),
+            owner_kas_relay_client_ids: Arc::new(vec!["owner-kas-relay".into()]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
         }

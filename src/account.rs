@@ -285,6 +285,11 @@ pub(crate) async fn sweep(
     // Kept, revoked as of the deletion: the status route already reports
     // them revoked from the tombstone on, with this same time (#104).
     let passkeys = db.revoke_passkey_links_of(uid, deletion.deleted_at).await?;
+    // Kept and retired, never deleted: a freed route id could be claimed by
+    // a recipient of the owner's files (#148).
+    let routes = db
+        .retire_owner_kas_routes_of(uid, deletion.deleted_at)
+        .await?;
     let devices = db.delete_device_bindings_of(uid).await?;
     let agents = db.revoke_and_scrub_delegations_of(uid, now).await?;
     let guardians = db.revoke_and_scrub_guardians_of(uid, now).await?;
@@ -293,7 +298,7 @@ pub(crate) async fn sweep(
     let apple_tokens = revoke_apple_tokens(db, apple, uid).await?;
     info!(
         "audit account_deletion outcome=swept user_id={uid} identity_links={links} \
-         passkeys={passkeys} device_bindings={devices} agents={agents} guardians={guardians} \
+         passkeys={passkeys} owner_kas_routes={routes} device_bindings={devices} agents={agents} guardians={guardians} \
          apple_tokens={apple_tokens}"
     );
     Ok(())

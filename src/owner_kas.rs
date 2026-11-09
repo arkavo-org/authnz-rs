@@ -60,7 +60,7 @@ struct TokenRequest {
     cnf_key: String,
 }
 
-fn refuse(status: StatusCode, error: &str) -> Response {
+pub(crate) fn refuse(status: StatusCode, error: &str) -> Response {
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
@@ -76,7 +76,9 @@ fn refuse(status: StatusCode, error: &str) -> Response {
 /// `invalid_request` (not that JSON object), `invalid_route_id` (not a
 /// canonical ULID) or `invalid_cnf_key` (not an unpadded base64url P-256
 /// point); 429 `rate_limited` with `Retry-After` past
-/// [`OWNER_KAS_MINTS_PER_MINUTE`]; 200 `{token, expires_at}`.
+/// [`OWNER_KAS_MINTS_PER_MINUTE`]; 404 `unknown_route` (never registered)
+/// or 410 `route_retired` (turned off, or its owner is not live; #148); 200
+/// `{token, expires_at, route}`, `route` the bundle as the owner put it.
 pub(crate) async fn token_handler(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -125,6 +127,50 @@ pub(crate) async fn token_handler(
         }
     };
 
+    // The route the token is for, from the same read the receiver gets its
+    // bundle from (#148).
+    let route = match app_state
+        .db_store
+        .get_owner_kas_route(&request.route_id)
+        .await
+    {
+        Ok(Some(route)) => route,
+        Ok(None) => {
+            return refuse(
+                StatusCode::NOT_FOUND,
+                crate::owner_kas_routes::ERR_UNKNOWN_ROUTE,
+            );
+        }
+        Err(e) => {
+            error!("owner-KAS token: route read failed: {e}");
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
+        }
+    };
+    match crate::owner_kas_routes::in_service(&app_state, &route).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return refuse(StatusCode::GONE, crate::owner_kas_routes::ERR_ROUTE_RETIRED);
+        }
+        Err(e) => {
+            error!("owner-KAS token: route owner lookup failed: {e}");
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
+        }
+    }
+    let bundle = match route
+        .bundle
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        Some(Ok(bundle)) => bundle,
+        _ => {
+            error!(
+                "owner-KAS token: route {} has an unreadable bundle",
+                request.route_id
+            );
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
+        }
+    };
+
     let token = OwnerKasToken {
         iss: app_state.issuer.to_string(),
         // Exactly the passkey auth CWT's `sub` (authn::mint_auth_token).
@@ -141,7 +187,7 @@ pub(crate) async fn token_handler(
     {
         Ok(b) => b,
         Err(e) => {
-            error!("Signing a owner-KAS token failed: {e}");
+            error!("Signing an owner-KAS token failed: {e}");
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
         }
     };
@@ -156,6 +202,7 @@ pub(crate) async fn token_handler(
         axum::Json(serde_json::json!({
             "token": authnz_rs::cwt::encode_for_header(&bytes),
             "expires_at": token.exp,
+            "route": bundle,
         })),
     )
         .into_response()

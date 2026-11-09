@@ -12,4 +12,5 @@ pub mod constants;
 pub mod credential_attestation;
 pub mod cwt;
 pub mod keys;
+pub mod owner_kas_route;
 pub mod owner_kas_token;

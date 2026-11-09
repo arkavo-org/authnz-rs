@@ -164,22 +164,35 @@ async fn a_live_account_gets_a_token_for_the_route_and_key() {
         .await
         .unwrap();
     let key = request_key();
+    // A route this account owns (#148), with a fresh id: CI shares one
+    // database across runs of the suite.
+    let route: String = format!(
+        "0{}",
+        &Uuid::new_v4().simple().to_string().to_uppercase()[..25]
+    );
+    let bundle = json!({ "record": "AA", "credential": "AA", "assertion": {
+        "credentialId": "AA", "authenticatorData": "AA", "clientDataJSON": "AA", "signature": "AA" } });
+    store
+        .put_owner_kas_route(&user.user_id, &route, 1, &bundle.to_string(), 1)
+        .await
+        .unwrap();
 
     let before = Utc::now().timestamp();
     let (st, h, body) = post_token(
         &state,
         Some(&auth_cwt_aged(&state, user.user_id, 0)),
-        json!({ "route_id": ROUTE, "cnf_key": key }),
+        json!({ "route_id": route, "cnf_key": key }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(h["cache-control"], "no-store");
+    assert_eq!(body["route"], bundle);
 
     let bytes = authnz_rs::cwt::decode_from_header(body["token"].as_str().unwrap()).unwrap();
     let t = authnz_rs::owner_kas_token::verify(&bytes, &state.cwt_keys, before, 60).unwrap();
     assert_eq!(t.iss, *state.issuer);
     assert_eq!(t.sub, user.user_id.to_string());
-    assert_eq!(t.route_id, ROUTE);
+    assert_eq!(t.route_id, route);
     assert_eq!(t.exp - t.iat, LIFETIME_SECONDS);
     assert_eq!(body["expires_at"], json!(t.exp));
     assert_eq!(t.handle, format!("{name}.arkavo.social"));

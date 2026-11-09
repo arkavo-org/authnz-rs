@@ -42,19 +42,21 @@ Content-Type: application/json
 - **`cnf_key`**: base64url without padding of the 65-byte SEC1 uncompressed
   point `04‖X‖Y`. It must be a valid P-256 point.
 
-Identity does not check that the route exists, and stores nothing.
+From 0.31.0 identity reads the route (#148, [owner-kas-routes.md](owner-kas-routes.md)): it must be registered and in service, that is, not retired and with a live owner. The mint itself stores nothing.
 
 ## Responses
 
 | Status | Body | When |
 |---|---|---|
-| 200 | `{"token": "<base64url>", "expires_at": <unix s>}` | minted |
+| 200 | `{"token": "<base64url>", "expires_at": <unix s>, "route": <bundle>}` | minted. `route` (from 0.31.0) is the owner's route-record bundle exactly as put |
 | 401 | `{"error":"unauthorized"}` | no valid passkey auth CWT, or the account is deleted |
 | 400 | `{"error":"invalid_request"}` | the body is not `{route_id, cnf_key}` |
 | 400 | `{"error":"invalid_route_id"}` | not a canonical ULID |
 | 400 | `{"error":"invalid_cnf_key"}` | not an unpadded base64url P-256 point |
 | 429 | `{"error":"rate_limited"}`, `Retry-After` | more than 30 mints by the account in a minute |
-| 500 | `{"error":"server_error"}` | the account could not be read, or signing failed |
+| 404 | `{"error":"unknown_route"}` | from 0.31.0: the route was never registered ([owner-kas-routes.md](owner-kas-routes.md)) |
+| 410 | `{"error":"route_retired"}` | from 0.31.0: the owner turned sharing off, or its account is not live |
+| 500 | `{"error":"server_error"}` | the account, the route or the route owner's account could not be read, the stored bundle could not be parsed, or signing failed |
 
 Every response is `Cache-Control: no-store`. The 400s are decided before the
 account is read. The rate limit is per account and in process. The app mints

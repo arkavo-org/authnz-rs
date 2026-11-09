@@ -14,13 +14,13 @@ use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{Base64UrlSafeData, PublicKeyCredential, RequestChallengeResponse, Url};
 
 /// The origin the test `Webauthn` is built for.
-const ORIGIN: &str = "https://identity.arkavo.net";
+pub(crate) const ORIGIN: &str = "https://identity.arkavo.net";
 
 /// A registered account, with the session that registered it and the
 /// software passkey that holds its credential.
 pub(crate) struct Registered {
     pub(crate) ceremony: Ceremony,
-    auth: WebauthnAuthenticator<SoftPasskey>,
+    pub(crate) auth: WebauthnAuthenticator<SoftPasskey>,
     pub(crate) user_id: Uuid,
     pub(crate) cred: Base64UrlSafeData,
     /// The `X-Auth-Token` its `POST /register` answered with.
