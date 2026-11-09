@@ -2,18 +2,24 @@
 
 authnz-rs#146. Agreed with arkavo-ios on 2026-11-08 and approved by the owner
 the same day. The design it serves is arkavo-ios's owner-KAS design, §4.1, at
-https://github.com/arkavo-org/arkavo-ios/blob/9326c382739c66cd921cd8a0dacde685a7d4d943/docs/superpowers/specs/2026-11-08-owner-kas-design.md
+https://github.com/arkavo-org/arkavo-ios/blob/7d11e02/docs/superpowers/specs/2026-11-08-owner-kas-design.md
 (arkavo-ios#78), which names this file as the source of the same contract.
 Change this contract only together with arkavo-ios and arkavo-rs.
 
 ## Why
 
-In arkavo-ios's owner KAS, the owner's iPhone, not a server,
-decides each key release. A receiver's request reaches that phone through a
-relay (arkavo-rs, platform.arkavo.net). The receiver's session token must
-never reach another user's device (arkavo-ios ADR-0072), so the request
-carries this token instead. It is bound to one owner route and to the
-receiver's per-attempt request key, and it lives 900 s.
+In arkavo-ios's owner KAS, the owner's iPhone, not a server, decides each
+key release. The owner KAS answers OpenTDF's standard Rewrap at its KAS URL on
+the relay (arkavo-rs#163, platform.arkavo.net):
+`https://platform.arkavo.net/owner-kas/v1/routes/<route_id>/kas.AccessService/Rewrap`.
+The relay forwards the request to the owner's phone.
+
+The receiver's session token must never reach another user's device
+(arkavo-ios ADR-0072), so it goes only to `POST /owner-kas/token`. This token
+is the Rewrap's bearer token (`Authorization: Bearer`). The Rewrap's
+`signed_request_token` is an ES256 JWT signed by the `cnf` key: OpenTDF's
+token-plus-signed-request (DPoP) pattern. The token is bound to one owner
+route and to the receiver's per-attempt request key, and it lives 900 s.
 
 ## Request
 
@@ -79,7 +85,7 @@ only on Open and "Try again", never while polling.
 Nothing else. There is no entitlement, Patreon data or email, because the
 token lands on another user's phone.
 
-## Verifying (the owner's phone)
+## Verifying
 
 1. Strip tag 61. Require ES256, exactly the content type above, a `kid` in
    identity's COSE key set, and a valid signature.
@@ -88,7 +94,13 @@ token lands on another user's phone.
 3. Check `exp` and `iat` against the phone's clock when it services the
    request, with 60 s of skew. The phone has no trusted submission time, so
    900 s is the owner's window to answer.
-4. Verify the OpenRequest's signature under the `cnf` key.
+4. The owner's phone verifies the Rewrap's `signed_request_token` under the
+   `cnf` key.
+
+The relay verifies the token too, on its owner-KAS receiver routes (Rewrap,
+polling, the route-record read). It applies steps 1–3, with `aud` equal to
+`owner-kas:` + the route id in the path, uses `sub` to identify the submitter,
+and decides no access.
 
 `owner_kas_token::verify` in this repository is a reference implementation
 of steps 1–3.
@@ -98,6 +110,8 @@ of steps 1–3.
 - **Identity**: `cwt::verify` refuses any protected content type, so the
   token passes no identity route. `GET /oauth/userinfo` also takes only an
   access token whose `aud` names a registered OIDC client.
-- **Every other relying party** must refuse the `owner-kas:` audience. No
-  service enforces `cnf`, so a verifier that checks neither the audience nor
-  the content type would take this token as the receiver for up to 900 s.
+- **Every relying party except the relay's owner-KAS receiver routes on
+  platform.arkavo.net** must refuse the `owner-kas:` audience. Only the
+  owner's phone checks the `cnf` signature, so a verifier that checks neither
+  the audience nor the content type would take this token as the receiver for
+  up to 900 s.
