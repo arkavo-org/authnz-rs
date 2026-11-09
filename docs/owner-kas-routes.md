@@ -2,7 +2,7 @@
 
 authnz-rs#148, approved by the owner on 2026-11-09 and built in 0.31.0. The
 design it serves is arkavo-ios's owner-KAS design, §4.1 and §4.3, at
-https://github.com/arkavo-org/arkavo-ios/blob/43bbd68/docs/superpowers/specs/2026-11-08-owner-kas-design.md
+https://github.com/arkavo-org/arkavo-ios/blob/ee391d8/docs/superpowers/specs/2026-11-08-owner-kas-design.md
 (arkavo-ios#78). The relay side is arkavo-rs#163. Change this contract only
 together with arkavo-ios and arkavo-rs. The token is in
 [owner-kas-token.md](owner-kas-token.md).
