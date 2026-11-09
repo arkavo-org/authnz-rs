@@ -2,7 +2,7 @@
 
 authnz-rs#146. Agreed with arkavo-ios on 2026-11-08 and approved by the owner
 the same day. The design it serves is arkavo-ios's owner-KAS design, §4.1, at
-https://github.com/arkavo-org/arkavo-ios/blob/7d11e02/docs/superpowers/specs/2026-11-08-owner-kas-design.md
+https://github.com/arkavo-org/arkavo-ios/blob/eb50ad8/docs/superpowers/specs/2026-11-08-owner-kas-design.md
 (arkavo-ios#78), which names this file as the source of the same contract.
 Change this contract only together with arkavo-ios and arkavo-rs.
 
@@ -99,8 +99,10 @@ token lands on another user's phone.
 
 The relay verifies the token too, on its owner-KAS receiver routes (Rewrap,
 polling, the route-record read). It applies steps 1–3, with `aud` equal to
-`owner-kas:` + the route id in the path, uses `sub` to identify the submitter,
-and decides no access.
+`owner-kas:` + the route id in the path, and uses `sub` to identify the
+submitter. On a Rewrap it also verifies the `signed_request_token` under the
+`cnf` key, with `exp` no later than the bearer's, so a token without its key
+cannot queue a request. It decides no access.
 
 `owner_kas_token::verify` in this repository is a reference implementation
 of steps 1–3.
@@ -112,6 +114,6 @@ of steps 1–3.
   access token whose `aud` names a registered OIDC client.
 - **Every relying party except the relay's owner-KAS receiver routes on
   platform.arkavo.net** must refuse the `owner-kas:` audience. Only the
-  owner's phone checks the `cnf` signature, so a verifier that checks neither
-  the audience nor the content type would take this token as the receiver for
-  up to 900 s.
+  owner's phone and the relay's Rewrap check the `cnf` signature, so a
+  verifier that checks neither the audience nor the content type would take
+  this token as the receiver for up to 900 s.
