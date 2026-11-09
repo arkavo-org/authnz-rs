@@ -235,6 +235,11 @@ pub const MARKET_CLAIM_MAX_BYTES: usize = 16 * 1024;
 /// (429 beyond it), and one account cannot spend the budget mints need.
 pub const MARKET_LINK_FETCHES_PER_MINUTE: u32 = 5;
 
+/// `POST /owner-kas/token` (#146): mints per account per minute (429 beyond
+/// it, in process). The app mints only on Open and "Try again", never while
+/// polling, so this is ample.
+pub const OWNER_KAS_MINTS_PER_MINUTE: u32 = 30;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
