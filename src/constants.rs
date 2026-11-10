@@ -240,6 +240,11 @@ pub const MARKET_LINK_FETCHES_PER_MINUTE: u32 = 5;
 /// polling, so this is ample.
 pub const OWNER_KAS_MINTS_PER_MINUTE: u32 = 30;
 
+/// `POST /peer/certificate` (#143): mints per account per minute (429 beyond
+/// it, in process). A device mints after sign-in and at most once a day
+/// after that, so this covers an account with many devices.
+pub const PEER_CERT_MINTS_PER_MINUTE: u32 = 10;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
