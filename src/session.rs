@@ -439,8 +439,15 @@ pub async fn signout_session(
                 error!("Game session {game_session_id} holds an unreadable device key");
                 SessionError::Internal
             })?;
+            // Another key ends nothing, and is answered like a session
+            // that never was: for 30 days this must not say which session
+            // ids had a game session (as `POST /game/session/end`).
             if !signature_verifies(&key, &signout_message(&req.session_id), &req.signature) {
-                return Err(SessionError::Ended(Ended::InvalidProof));
+                warn!(
+                    "Sign-out of ended session {}: invalid proof",
+                    req.session_id
+                );
+                return Ok(StatusCode::NO_CONTENT);
             }
             app_state
                 .db_store

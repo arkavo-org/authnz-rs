@@ -1061,9 +1061,9 @@ async fn signing_out_after_the_passkey_session_is_gone_still_ends_the_game_sessi
             }),
         )
     };
-    // Another key ends nothing.
+    // Another key ends nothing, and is answered like an unknown session.
     let other = Device::new().sign(&crate::session::signout_message(&f.session));
-    assert!(signout(other).await.is_err());
+    assert_eq!(signout(other).await.unwrap(), StatusCode::NO_CONTENT);
     assert!(f.store.get_game_session(&id).await.unwrap().is_some());
 
     let own = f.device.sign(&crate::session::signout_message(&f.session));

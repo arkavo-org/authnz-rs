@@ -108,7 +108,9 @@ game session right after `POST /session`.
   after that session has ended too (the usual case for a game: the session
   went idle the day before): the game session holds the same device key,
   so the same sign-out request, with the passkey session's id and the same
-  signature, ends it. A client needs only one of the two calls.
+  signature, ends it. A client needs only one of the two calls. Once the
+  passkey session is gone, a sign-out with a wrong signature answers 204
+  and ends nothing, as the end route does.
 - Deletion of the account: mints are refused at once, and the row is
   removed with the account's other rows.
 
