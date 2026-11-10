@@ -41,7 +41,7 @@ when unset.
 |---|---|
 | `SIGN_KEY_PATH`, `ENCODING_KEY_PATH`, `DECODING_KEY_PATH` | EC P-256 keys (attestation envelope; CWT/JWT sign + verify). Encode/decode must be the same key pair or boot fails. |
 | `VERIFY_ONLY_KEY_PATHS` | Comma-separated SPKI PEM paths of extra P-256 public keys that verify but never sign: the next key, published before a rotation, or a retired one, kept while its tokens and attestations must verify (#107). Published in `cose-keys` and `jwks.json` after the current key. A key equal to the current one, a duplicate, or a file that does not parse fails startup. Runbook: [docs/key-rotation.md](docs/key-rotation.md). |
-| `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). |
+| `AGENT_TOKEN_AUDIENCES` | **Required.** Comma-separated `aud` for agent CWTs from `POST /agents/token`. Use the audience your verifier checks (normally `OIDC_PLATFORM_AUDIENCE`). **Every agent token carries the whole list**: there is no per-request audience, so adding a verifier (the market's request API wants `https://market.arkavo.com`) makes every agent token valid there too. Each verifier must therefore require its own entitlement and proof of possession. |
 | `AGENT_AUTHORIZED_ACTORS`, `AGENT_TOKEN_MINUTES` | Optional `act` claim and agent CWT lifetime (clamped to 15). |
 | `ADMIN_CLIENT_IDS` | OIDC client_ids (service CWT `sub` = `client:<id>`) allowed on `PUT /admin/users/:id/entitlements` and `GET /entities/:id`. Empty ⇒ 403. |
 | `ENTITY_CLIENT_IDS` | client_ids whose service CWTs may call `GET /entities/:id` only (read-only; production: `opentdf-platform`, the platform ERS's live Patreon source). `ADMIN_CLIENT_IDS` are accepted there too. Never put a resolver on the admin list: that also grants `PUT` entitlements. |
@@ -240,6 +240,20 @@ when unset.
   recovered; 409 while another owner's delegation of the DID is live. The
   agent quota applies only when authorize adds a delegation.
   Response `{success, message, agent, state, state_version, appraised_until}`.
+- **The market request entitlement**
+  `https://arkavo.net/attr/market/value/request`
+  (`constants::ENTITLEMENT_MARKET_REQUEST`): an agent holding it may ask
+  market.arkavo.com for a purchase for its owner, who still pays. **Every
+  live account holds it without a stored copy**
+  (`constants::is_held_by_every_account`, exact match), so any account
+  holder can delegate it: `agent::holds_entitlement` is the one rule behind
+  the authorize subset check and the mint intersection. The whole
+  `https://arkavo.net/attr/market/` attribute is refused by `validate_fqns`
+  (`EntitlementError::NeverStored`), so it is never in a human's token. It
+  is **not** derived-only: `strip_derived_only` must keep it on a
+  delegation. The market's contract: arkavo-com/market
+  `docs/market-identity-interface.md`, "Requests: the tokens identity
+  issues".
 - `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
 - `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
   challenge is stored on the delegation row (no cookie session)
