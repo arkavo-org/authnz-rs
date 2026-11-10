@@ -16,12 +16,17 @@
 //!      creator pledge to its own campaign, so membership can never qualify
 //!      it. Owning any other campaign grants nothing;
 //!    - App Store: the feature is configured (`APP_STORE_*`) and a
-//!      subscription record bound to the account is active
-//!      ([`app_store_active`]);
+//!      subscription record bound to the account, of a product listed for
+//!      publishing, is active ([`app_store_active`] with [`Grant::Publish`]);
 //!    - market.arkavo.com: the feature is configured (`MARKET_*`) and a
 //!      purchase linked to the account still has a claim that verifies
 //!      ([`crate::market::MarketSource::grant`], #141);
 //! 2. the account carries no publishing suspension.
+//!
+//! [`ENTITLEMENT_ONLINE_PLAY`] is derived here too, on its own path: an
+//! active App Store record of a product listed for online play grants it,
+//! nothing that grants publishing does, and a suspension does not remove it
+//! (`docs/online-play-entitlement.md`).
 //!
 //! The market is asked alongside Patreon, not after it ([`load_sources`]
 //! runs while Patreon materializes), so a mint waits for the slower of the
@@ -40,9 +45,10 @@
 //! service CWT whose client is on `MODERATION_CLIENT_IDS`.
 
 use crate::AppState;
-use crate::app_store::{Environment, app_store_active};
+use crate::app_store::{Environment, Grant, app_store_active};
 use crate::constants::{
-    ENTITLEMENT_CREATOR_PUBLISH, SUSPENSION_REASON_MAX_LEN, SUSPENSION_REPORT_ID_MAX_LEN,
+    ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY, SUSPENSION_REASON_MAX_LEN,
+    SUSPENSION_REPORT_ID_MAX_LEN,
 };
 use crate::cwt::ArkavoPatreon;
 use crate::db::{
@@ -203,8 +209,14 @@ pub(crate) async fn load_sources(
             market: MarketGrant::NotGranted,
         });
     };
-    let app_store_ok = app_store_cfg
-        .is_some_and(|cfg| app_store_active(cfg, &state.app_store, Utc::now().timestamp()));
+    let app_store_ok = app_store_cfg.is_some_and(|cfg| {
+        app_store_active(
+            cfg,
+            Grant::Publish,
+            &state.app_store,
+            Utc::now().timestamp(),
+        )
+    });
     let market = match market {
         Some(source)
             if !app_store_ok && state.suspension.is_none() && !state.market_links.is_empty() =>
@@ -237,8 +249,9 @@ async fn read_state(
         })
 }
 
-/// The entitlements derived for `user_id` at this mint (today: the
-/// creator-publishing entitlement or nothing).
+/// The entitlements derived for `user_id` at this mint: the
+/// creator-publishing entitlement and the online-play entitlement, each or
+/// neither.
 ///
 /// Three sources grant it, any one enough: a qualifying Patreon membership
 /// (`snap`), an active App Store Creator Membership ([`app_store_active`]),
@@ -267,20 +280,48 @@ pub(crate) async fn try_derived_entitlements(
     snap: Option<&ArkavoPatreon>,
 ) -> Result<Vec<String>, DeriveError> {
     let sources = load_sources(app_state, user_id).await?;
-    derive(app_state, user_id, snap, sources).await
+    derive(app_state, user_id, snap, sources).await?.complete()
+}
+
+/// What [`derive`] decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Derived {
+    /// The entitlements granted. Each was decided on its own path, so this
+    /// is right whatever `market_unavailable` says.
+    pub entitlements: Vec<String>,
+    /// A linked market purchase could not be checked and no other source
+    /// grants publishing, so whether the account may publish is unknown.
+    /// A mint goes without it; `GET /entities` answers 503.
+    pub market_unavailable: bool,
+}
+
+impl Derived {
+    /// The answer for a caller that must not report an unknown as "not
+    /// entitled" (`GET /entities`).
+    pub(crate) fn complete(self) -> Result<Vec<String>, DeriveError> {
+        if self.market_unavailable {
+            return Err(DeriveError::MarketUnavailable);
+        }
+        Ok(self.entitlements)
+    }
 }
 
 /// Decide from Patreon's snapshot and what [`load_sources`] read. With
 /// [`Sources::Unread`] the row is read here, and only when Patreon
 /// qualifies.
+///
+/// Each entitlement has its own path, and a source grants only its own:
+/// publishing from Patreon, an App Store publish product or the market,
+/// unless suspended; online play from an App Store online-play product,
+/// whatever the suspension and whatever the market answered.
 pub(crate) async fn derive(
     app_state: &AppState,
     user_id: Option<Uuid>,
     snap: Option<&ArkavoPatreon>,
     sources: Sources,
-) -> Result<Vec<String>, DeriveError> {
+) -> Result<Derived, DeriveError> {
     let Some(user_id) = user_id else {
-        return Ok(Vec::new());
+        return Ok(Derived::default());
     };
     let now = Utc::now().timestamp();
     let patreon_ok = match (app_state.publisher.as_ref().as_ref(), snap) {
@@ -289,47 +330,77 @@ pub(crate) async fn derive(
     };
     let (state, market) = match sources {
         Sources::Read { state, market } => (state, market),
-        Sources::Unread if !patreon_ok => return Ok(Vec::new()),
+        // Unread means no App Store app is configured: nothing but Patreon
+        // can grant anything.
+        Sources::Unread if !patreon_ok => return Ok(Derived::default()),
         Sources::Unread => (
             read_state(app_state, &user_id).await?,
             MarketGrant::NotGranted,
         ),
     };
     let Some(state) = state else {
-        return Ok(Vec::new());
+        return Ok(Derived::default());
     };
     let app_store_cfg = app_state.app_store.as_ref().as_ref();
-    let app_store_ok =
-        app_store_cfg.is_some_and(|cfg| app_store_active(cfg, &state.app_store, now));
+    let mut derived = publishing(&user_id, patreon_ok, app_store_cfg, &state, market, now);
+    if online_play(&user_id, app_store_cfg, &state, now) {
+        derived
+            .entitlements
+            .push(ENTITLEMENT_ONLINE_PLAY.to_string());
+    }
+    Ok(derived)
+}
+
+/// Every Sandbox grant is visible (TestFlight and App Review buy there).
+fn log_sandbox_grant(
+    what: &str,
+    user_id: &Uuid,
+    cfg: &crate::app_store::AppStoreConfig,
+    grant: Grant,
+    state: &PublishingState,
+    now: i64,
+) {
+    let sandbox = state.app_store.iter().any(|r| {
+        r.environment == Environment::Sandbox
+            && app_store_active(cfg, grant, std::slice::from_ref(r), now)
+    });
+    if sandbox {
+        info!(
+            "{what} entitlement granted for user {user_id} from an App Store purchase env=Sandbox"
+        );
+    }
+}
+
+/// The publishing path: Patreon, an App Store publish product or the
+/// market, any one enough, and withheld by a suspension.
+fn publishing(
+    user_id: &Uuid,
+    patreon_ok: bool,
+    app_store_cfg: Option<&crate::app_store::AppStoreConfig>,
+    state: &PublishingState,
+    market: MarketGrant,
+    now: i64,
+) -> Derived {
+    let app_store_ok = app_store_cfg
+        .is_some_and(|cfg| app_store_active(cfg, Grant::Publish, &state.app_store, now));
     let market_ok = matches!(market, MarketGrant::Granted(_));
     if !patreon_ok && !app_store_ok && !market_ok {
         // Suspended accounts never reach the market check, so this is never
-        // a suspended account's 503.
-        if market == MarketGrant::Unavailable {
-            return Err(DeriveError::MarketUnavailable);
-        }
-        return Ok(Vec::new());
+        // a suspended account's unknown.
+        return Derived {
+            entitlements: Vec::new(),
+            market_unavailable: market == MarketGrant::Unavailable,
+        };
     }
     if state.suspension.is_some() {
         info!(
             "Publishing entitlement withheld for user {}: publishing is suspended",
             user_id
         );
-        return Ok(Vec::new());
+        return Derived::default();
     }
-    // Every Sandbox grant is visible (TestFlight and App Review buy there).
     if let Some(cfg) = app_store_cfg.filter(|_| app_store_ok) {
-        let sandbox = state.app_store.iter().any(|r| {
-            r.environment == Environment::Sandbox
-                && app_store_active(cfg, std::slice::from_ref(r), now)
-        });
-        if sandbox {
-            info!(
-                "Publishing entitlement granted for user {} from an App Store membership \
-                 env=Sandbox",
-                user_id
-            );
-        }
+        log_sandbox_grant("Publishing", user_id, cfg, Grant::Publish, state, now);
     }
     let mut out = vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()];
     if let MarketGrant::Granted(entitlements) = market {
@@ -339,7 +410,30 @@ pub(crate) async fn derive(
             }
         }
     }
-    Ok(out)
+    Derived {
+        entitlements: out,
+        market_unavailable: false,
+    }
+}
+
+/// The online-play path: an active App Store record of a product configured
+/// as online-play. Nothing else grants it, and a publishing suspension does
+/// not remove it: the suspension is about publishing, the pass is paid
+/// network access.
+fn online_play(
+    user_id: &Uuid,
+    app_store_cfg: Option<&crate::app_store::AppStoreConfig>,
+    state: &PublishingState,
+    now: i64,
+) -> bool {
+    let Some(cfg) = app_store_cfg else {
+        return false;
+    };
+    if !app_store_active(cfg, Grant::OnlinePlay, &state.app_store, now) {
+        return false;
+    }
+    log_sandbox_grant("Online-play", user_id, cfg, Grant::OnlinePlay, state, now);
+    true
 }
 
 // --------- Admin: publishing suspension ---------

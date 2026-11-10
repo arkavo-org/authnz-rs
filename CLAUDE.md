@@ -51,7 +51,8 @@ when unset.
 | `MODERATION_CLIENT_IDS` | client_ids whose service CWTs may set, lift and read publishing suspensions (`PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`). Empty ⇒ 403. See `docs/creator-publishing-entitlement.md`. |
 | `OWNER_KAS_RELAY_CLIENT_IDS` | client_ids whose service CWTs may read owner-KAS routes and remove unregistered push tokens (`GET /owner-kas/routes/:id/relay`, `DELETE …/relay/push`; #148). Production: `owner-kas-relay`, the relay's (arkavo-rs) own client, never `arks-media`. Empty ⇒ 403 (startup warns). |
 | `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
-| `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. All three required; any unset ⇒ the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
+| `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. This is the first (untagged) app; all three are required for it. With no usable app at all (this one or a tagged one, below) the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
+| `APP_STORE_<TAG>_BUNDLE_ID`, `_APP_APPLE_ID`, `_PUBLISH_PRODUCT_IDS`, `_ONLINE_PLAY_PRODUCT_IDS`, `_ENVIRONMENTS`; `APP_STORE_ONLINE_PLAY_PRODUCT_IDS` | Further App Store apps, one per operator-chosen `<TAG>` (never in a token), each with the untagged variables' meaning for its own bundle. **A product grants exactly one entitlement**: a `_PUBLISH_PRODUCT_IDS` product grants creator publishing, an `_ONLINE_PLAY_PRODUCT_IDS` product grants `https://arkavo.net/attr/network/value/online-play` (the Game Pass) and nothing else. An app needs its bundle id, Apple ID and at least one product. A tagged app that is incomplete, repeats a bundle id or product id of the untagged app, or lists a product in both lists is skipped (error log); two tagged apps that share a bundle id or product id are both skipped. The other apps stay on. The untagged `APP_STORE_ONLINE_PLAY_PRODUCT_IDS` adds online-play products to the untagged app. |
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
 | `MARKET_ISSUER`, `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE` | market.arkavo.com lifetime membership (#141, `market.rs`). `MARKET_ISSUER` (`https://market.arkavo.com`) is the claims' `iss` and the base of `<issuer>/claim/<checkoutSessionId>`. `MARKET_CLAIM_KEYS_PATH` is a JWK Set file of the **pinned** P-256 claim keys; each `kid` must be its RFC 7638 thumbprint. The market's `/.well-known/jwks.json` is a rotation channel to read, never a trust anchor. The expected `aud` is `OIDC_ISSUER`. `MARKET_ACCEPT_TEST_MODE=true` accepts Stripe test-mode claims (default off). The first two are required; either unset ⇒ off (startup log line) and `POST /market/link` answers 503. A set but unusable value also leaves it off (warn). |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
@@ -377,7 +378,8 @@ appraisal, status)
   fallback's stored one) *is* `PATREON_PUBLISHER_CAMPAIGN_ID` (Arkavo's own
   account: Patreon does not let a creator pledge to itself),
   **or** a bound App Store Creator Membership is active (`app_store.rs`: a
-  non-revoked record of a configured product and environment, unexpired
+  non-revoked record of a product configured for publishing, in an
+  environment its app accepts, unexpired
   counting any billing-retry grace), **or** a linked market.arkavo.com
   lifetime claim still verifies (`market.rs`), and the account has no
   publishing suspension. One `get_publishing_state` read (the `credentials`
@@ -392,6 +394,21 @@ appraisal, status)
   `MODERATION_CLIENT_IDS`; the suspension (`suspended_by`, `suspended_at`,
   `reason`, `report_id`) is a map attribute on the `credentials` row and is
   the audit record. See [docs/creator-publishing-entitlement.md](docs/creator-publishing-entitlement.md).
+- **Online play (the Game Pass)**: `https://arkavo.net/attr/network/value/online-play`
+  (`constants::ENTITLEMENT_ONLINE_PLAY`) is derived at the same place, on
+  **its own path**: an active App Store record of a product configured as
+  online-play (`app_store::Grant::OnlinePlay`) grants it and nothing else,
+  and no publish source grants it. A publishing suspension does not remove
+  it, and neither does a market outage (`publishing::Derived` carries what
+  was granted beside `market_unavailable`; a mint keeps the former). The
+  whole `https://arkavo.net/attr/network/` attribute is derived-only: never
+  stored, delegated to an agent or put in the registration token, and
+  **never in a token that lives longer than an hour** (a lapsed pass must
+  stop within the hour; so never in a peer certificate, #143). The market
+  sources (prepaid terms, the lifetime tier) and the game-server token are
+  not built yet. `POST /app-store/transactions` answers the product's
+  FQN as `entitlement`. See
+  [docs/online-play-entitlement.md](docs/online-play-entitlement.md).
 - **Patreon campaign entitlements** (`patreon::campaign_entitlements`, the
   same builder): for each `active_patron` membership with a numeric campaign
   id, `https://patreon.arkavo.com/attr/campaign/value/<campaign_id>` plus
