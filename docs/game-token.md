@@ -47,8 +47,10 @@ Content-Type: application/json
 - **`sessionId`**: the session, as `POST /session` returned it.
 - **`audience`**: the game server the token is for. It must be one of the
   values the operator lists in `GAME_TOKEN_AUDIENCES`.
-- **`issuedAt`**: the device's clock, unix seconds, as a JSON number. It
-  must be within 300 seconds of identity's clock.
+- **`issuedAt`**: unix seconds, as a JSON integer (no fraction, no
+  exponent). It must be within 60 seconds of identity's clock. A client
+  that has a `serverTime` from an earlier answer sends its own clock
+  corrected by that offset.
 - **`signature`**: base64url without padding of the raw 64-byte `r‖s` ECDSA
   P-256 SHA-256 signature (never DER) by the session's device key over the
   UTF-8 bytes of:
@@ -62,24 +64,26 @@ Content-Type: application/json
 
   Four lines joined by `\n`, with no trailing newline. `<sessionId>` is the
   lowercase hyphenated UUID, `<audience>` the request's string exactly as
-  sent, `<issuedAt>` the number in plain decimal.
+  sent, `<issuedAt>` the integer in decimal digits.
 
 No `X-Auth-Token` is needed, and none is read.
 
 The mint reads the session and never writes it. It is not a renewal: it
 does not rotate the session credential, and it does not keep an idle session
-alive. A request can be sent again; a replay within the 300 seconds only
-yields another token bound to the same device key.
+alive. A request can be sent again, and a lost answer costs nothing; a
+replay within the 60 seconds only yields another token bound to the same
+device key.
 
 ## Responses
 
 | Status | Body | When |
 |---|---|---|
-| 200 | `{"token": "<base64url>", "expiresAt": <unix s>, "onlinePlay": <bool>}` | minted. `onlinePlay` says whether the token carries the entitlement, so the app need not parse it |
+| 200 | `{"token": "<base64url>", "expiresAt": <unix s>, "onlinePlay": <bool>, "serverTime": <unix s>}` | minted. `onlinePlay` says whether the token carries the entitlement, so the app need not parse it. `serverTime` is identity's clock |
 | 503 | `{"error":"game_tokens_unavailable"}` | the operator has not set `GAME_TOKEN_AUDIENCES` |
 | 400 | `{"error":"invalid_request"}` | the body is not `{sessionId, audience, issuedAt, signature}` |
 | 400 | `{"error":"invalid_audience"}` | not a listed audience |
-| 401 | `{"error":"unauthorized"}` | no such session; the signature does not verify; `issuedAt` is more than 300 s off; the session is past its 24 h deadline or its idle limit; or its account is deleted |
+| 400 | `{"error":"invalid_issued_at", "serverTime": <unix s>}` | `issuedAt` is more than 60 s from identity's clock. Decided before the session is read: it needs no secret. Correct the clock offset from `serverTime` and send again; do **not** renew the session for it |
+| 401 | `{"error":"unauthorized"}` | no such session; the signature does not verify; the session is past its 24 h deadline or its idle limit; or its account is deleted |
 | 429 | `{"error":"rate_limited"}`, `Retry-After` | more than 30 mints by the account in a minute |
 | 500 | `{"error":"server_error"}` | a read or signing failed |
 
@@ -88,7 +92,14 @@ Every response is `Cache-Control: no-store`.
 **A 401 here never ends the session**, and the body does not say which check
 failed. On a 401 the client renews the session (`POST /session/refresh`),
 which answers with the definite reason if the session is over, and then
-tries the mint once more. A wrong device clock is the other cause.
+tries the mint once more. A 429 is answered here (unlike the session
+routes): wait `Retry-After`.
+
+**Clocks.** Every 200 and every `invalid_issued_at` carries `serverTime`.
+A client keeps the offset between it and its own clock and uses the
+corrected time for `issuedAt` and for `t` in the request proof below, so a
+device whose clock is wrong still works. A game server whose clock is kept
+right then sees `t` within its window.
 
 **The mint succeeds without a pass.** The token then has no
 `arkavo_entitlements`, and the game server can answer "Game Pass needed"
@@ -162,10 +173,15 @@ Seven lines joined by `\n`, with no trailing newline:
 
 - `<audience>`: the token's `aud`.
 - `<METHOD>`: the HTTP method in uppercase.
-- `<path>`: the request target exactly as sent: the path, and `?` plus the
-  query when there is one.
-- `<t>`: the device's clock, unix seconds, plain decimal. The server accepts
-  it within 60 seconds of its own clock.
+- `<path>`: the request target exactly as sent on the wire, still
+  percent-encoded: the path (`/` when it is empty), and `?` plus the query
+  when there is one. The game server verifies the raw target it received.
+  Anything in front of it that rewrites a target (merging slashes, decoding
+  escapes) breaks the proof, so its API should avoid paths that need
+  escaping.
+- `<t>`: unix seconds as decimal digits, from the device's clock corrected
+  by `serverTime` (above). The server accepts it within 60 seconds of its
+  own clock.
 - `<body hash>`: base64url without padding of SHA-256 of the request body
   bytes (of the empty string for no body).
 - `<token hash>`: base64url without padding of SHA-256 of the token's text,
@@ -185,7 +201,10 @@ Rules:
 - A proof can be replayed for 60 seconds against the same method, path and
   body. A server that must not act twice (starting a run, finishing a run)
   makes the operation idempotent or remembers `(cti, t)` for that long.
-- For a long-lived connection, sign its handshake, not each message.
+- For a long-lived connection, sign its handshake, not each message. The
+  server then closes the connection at the token's `exp`, or asks for a
+  fresh token and proof on it before then; otherwise the token's lifetime
+  would not bound the connection.
 - The key signs only while the device is unlocked.
 
 ## When the client mints
@@ -193,11 +212,27 @@ Rules:
 - When it is about to call the game server and holds no token, or one that
   expires within a minute. Never on a background timer.
 - After a 401 from the game server for an expired token.
-- After a purchase: mint again (not more than every 20 seconds, for about a
-  minute and a half) until `onlinePlay` is `true`. The market's payment
-  search lags a payment by a minute or more.
+- **Near the session's deadline** `exp` is capped, so a new token can expire
+  in under a minute. A client must not mint again when the token it just
+  got expires no later than the one it had: the session is ending, and the
+  person signs in again.
+- **After a purchase, poll the mint, not the session renewal.** The mint
+  asks the market again and rotates nothing, so a lost answer costs nothing.
+  Mint every 20 seconds, for about a minute and a half, until `onlinePlay`
+  is `true`. The market's payment search lags a payment by a minute or more.
 - On sign-out the session ends, and the device key with it: the token is
   then useless.
+
+**Keep the session alive while playing.** The mint is not a renewal, and it
+answers 401 once the session is idle. A person who plays for more than an
+hour and talks only to the game server must still renew the session
+(`POST /session/refresh`) within its idle limit, under the usual rule: only
+while the app is in use (frontmost with recent input; active play counts).
+Otherwise the next mint fails and the person meets a passkey prompt
+mid-game. The device key, and so `cnf`, stays the same across renewals of
+one session. A new passkey sign-in opens a new session with a new key; the
+`sub` is the same, so a game server keys what it stores by `sub`, never by
+`cnf`.
 
 ## Configuration
 

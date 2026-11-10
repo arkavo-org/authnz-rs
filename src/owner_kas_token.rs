@@ -90,7 +90,7 @@ pub fn parse_cnf_key(s: &str) -> Option<([u8; 32], [u8; 32])> {
     Some((x, y))
 }
 
-fn cnf_cbor(x: &[u8; 32], y: &[u8; 32]) -> Value {
+pub(crate) fn cnf_cbor(x: &[u8; 32], y: &[u8; 32]) -> Value {
     let key = Value::Map(vec![
         (
             Value::Integer((iana::KeyParameter::Kty as i64).into()),
@@ -245,7 +245,7 @@ fn parse_payload(bytes: &[u8]) -> Result<OwnerKasToken, CwtError> {
     })
 }
 
-fn parse_cnf(v: &Value) -> Result<([u8; 32], [u8; 32]), CwtError> {
+pub(crate) fn parse_cnf(v: &Value) -> Result<([u8; 32], [u8; 32]), CwtError> {
     let Some([(k, key)]) = v.as_map().map(Vec::as_slice) else {
         return Err(CwtError::Malformed);
     };

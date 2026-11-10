@@ -70,6 +70,7 @@ mod db;
 mod device_check;
 mod entities;
 mod entitlements;
+mod game;
 mod google_signin;
 mod guardian;
 mod identity;
@@ -363,6 +364,9 @@ pub struct AppState {
     /// `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE`; #141): the pinned
     /// claim keys, an HTTP client and the claim cache. `None` ⇒ off.
     pub market: Arc<Option<market::MarketSource>>,
+    /// Game-server tokens (`POST /game/token`, #151): the audiences, the
+    /// lifetime and the per-account mint count.
+    pub game: Arc<game::GameTokens>,
     /// `POST /owner-kas/token` mints per account in the current minute (#146).
     pub owner_kas_mints: Arc<owner_kas::MintLimiter>,
     /// client_ids whose service CWTs may read owner-KAS routes and remove
@@ -557,6 +561,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("agent token config: {e}"))?;
 
+    let platform_audience = parse_platform_audience(env::var("OIDC_PLATFORM_AUDIENCE").ok())?;
+    // A game token's audience must be no other token's: some verifiers
+    // check the audience and not the content type.
+    let game = {
+        let mut taken: Vec<&str> = vec![crate::constants::ARKAVO_CWT_AUDIENCE];
+        taken.extend(platform_audience.as_deref());
+        taken.extend(agent_tokens.audiences.iter().map(String::as_str));
+        game::GameTokens::parse(
+            env::var("GAME_TOKEN_AUDIENCES").ok().as_deref(),
+            env::var("GAME_TOKEN_SECONDS").ok().as_deref(),
+            &taken,
+        )
+        .map_err(|e| format!("game token config: {e}"))?
+    };
+    game.log_state();
+
     let admin_client_ids = parse_id_list(env::var("ADMIN_CLIENT_IDS").ok());
     if admin_client_ids.is_empty() {
         log::warn!(
@@ -607,9 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwt_keys: Arc::new(cwt_keys),
         cwt_kid: Arc::new(cwt_kid),
         issuer: Arc::new(issuer),
-        platform_audience: Arc::new(parse_platform_audience(
-            env::var("OIDC_PLATFORM_AUDIENCE").ok(),
-        )?),
+        platform_audience: Arc::new(platform_audience),
         webvh_sign_key: Arc::new(webvh_sign_key),
         agent_tokens: Arc::new(agent_tokens),
         admin_client_ids: Arc::new(admin_client_ids),
@@ -620,6 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         publisher: Arc::new(publisher),
         app_store: Arc::new(app_store),
         market: Arc::new(market),
+        game: Arc::new(game),
         owner_kas_mints: Arc::default(),
         owner_kas_relay_client_ids: Arc::new(owner_kas_relay_client_ids),
         appraisal,
@@ -655,6 +674,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OidcConfig::from_env(&app_state.cwt_keys)
             .map_err(|e| format!("Failed to load OIDC configuration: {}", e))?,
     );
+    app_state
+        .game
+        .refuse_client_ids(oidc_config.clients.keys().map(String::as_str))
+        .map_err(|e| format!("game token config: {e}"))?;
     let oidc_code_store = AuthorizationCodeStore::new(redis_client.clone());
     let oidc_refresh_store = RefreshTokenStore::new(redis_client.clone());
     let apple_jwks_cache = Arc::new(AppleJwksCache::new());
@@ -775,6 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Owner KAS (#146): a token for one owner route, bound to
         // the receiver's request key, so the session token never reaches the
         // owner's phone. Passkey auth CWT required.
+        .route("/game/token", post(game::token_handler))
         .route("/owner-kas/token", post(owner_kas::token_handler))
         // Owner-KAS routes (#148): the owner's passkey-signed route record
         // and push token live here so account deletion reaches them; the
@@ -2011,6 +2035,7 @@ pub(crate) mod test_helpers {
             publisher: Arc::new(None),
             app_store: Arc::new(None),
             market: Arc::new(None),
+            game: Arc::default(),
             owner_kas_mints: Arc::default(),
             owner_kas_relay_client_ids: Arc::new(vec!["owner-kas-relay".into()]),
             appraisal: crate::agent_state::AppraisalConfig::default(),

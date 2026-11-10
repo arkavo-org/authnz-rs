@@ -406,8 +406,8 @@ appraisal, status)
   whole `https://arkavo.net/attr/network/` attribute is derived-only: never
   stored, delegated to an agent or put in the registration token, and
   **never in a token that lives longer than an hour** (a lapsed pass must
-  stop within the hour; so never in a peer certificate, #143). The
-  game-server token is not built yet.
+  stop within the hour; so never in a peer certificate, #143). A game
+  server reads it from its own token (`game.rs`).
 - **The market's prepaid terms** (`market/subscription.rs`, #151) are the
   second online-play source. With `MARKET_LOOKUP_TOKEN` set, every human
   mint asks `GET <MARKET_ISSUER>/subscriptions/<account uuid>` (bearer
@@ -617,10 +617,12 @@ appraisal, status)
   **authenticated by the passkey session, not by a token**. `signature` is
   the session device key's raw r‖s over
   `arkavo-game-token-v1\n<sessionId>\n<audience>\n<issuedAt>` (`issuedAt`
-  unix seconds within `GAME_TOKEN_PROOF_SKEW_SECONDS`). The session must be
+  an integer, unix seconds within `GAME_TOKEN_PROOF_SKEW_SECONDS` = 60 of
+  identity's clock, else 400 `invalid_issued_at` with `serverTime`, decided
+  before the session is read so a wrong clock never costs a renewal). The session must be
   inside its 24 h deadline and its idle limit, and its account live. The
   mint reads the session and never writes it: it is not a renewal and does
-  not keep an idle session alive. 200 `{token, expiresAt, onlinePlay}`;
+  not keep an idle session alive. 200 `{token, expiresAt, onlinePlay, serverTime}`;
   401 `unauthorized` (every session or proof failure, one body; the session
   is never ended here); 400 `invalid_request` / `invalid_audience`; 429
   `rate_limited` + `Retry-After` past `GAME_TOKEN_MINTS_PER_MINUTE`; 503

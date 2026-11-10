@@ -247,6 +247,16 @@ pub const MARKET_SUBSCRIPTION_RECHECKS_PER_MINUTE: u32 = 6;
 /// polling, so this is ample.
 pub const OWNER_KAS_MINTS_PER_MINUTE: u32 = 30;
 
+/// `POST /game/token` (#151): mints per account per minute (429 beyond it,
+/// in process). A client mints when its token is about to expire and, after
+/// a purchase, every 20 s for a minute and a half, on each of its devices.
+pub const GAME_TOKEN_MINTS_PER_MINUTE: u32 = 30;
+
+/// How far `issuedAt` in a `POST /game/token` request may be from identity's
+/// clock. The same window a game server gives a request proof's `t`, so a
+/// device that can mint can also call the server.
+pub const GAME_TOKEN_PROOF_SKEW_SECONDS: i64 = 60;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
