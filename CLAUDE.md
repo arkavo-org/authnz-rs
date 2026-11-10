@@ -50,6 +50,7 @@ when unset.
 | `AGENT_OWNER_APPRAISAL_TTL_SECONDS`, `AGENT_GUARDIAN_APPRAISAL_MAX_SECONDS` | Appraisal lifetimes: owner default 43200 (12 h), at most 86400; Guardian default and maximum 900. Out of range fails startup. |
 | `MODERATION_CLIENT_IDS` | client_ids whose service CWTs may set, lift and read publishing suspensions (`PUT`/`DELETE`/`GET /admin/users/:id/publishing-suspension`). Empty ⇒ 403. See `docs/creator-publishing-entitlement.md`. |
 | `OWNER_KAS_RELAY_CLIENT_IDS` | client_ids whose service CWTs may read owner-KAS routes and remove unregistered push tokens (`GET /owner-kas/routes/:id/relay`, `DELETE …/relay/push`; #148). Production: `owner-kas-relay`, the relay's (arkavo-rs) own client, never `arks-media`. Empty ⇒ 403 (startup warns). |
+| `PEER_AUDIENCES`, `PEER_CERT_SECONDS` | Peer certificates (#143, `peer.rs`). `PEER_AUDIENCES` is the comma-separated `aud` values `POST /peer/certificate` may mint for, one per peer protocol (an app's local multiplayer); the client names one. Unset ⇒ off (startup log line) and the route answers 503. A value that is `arkavo`, `OIDC_PLATFORM_AUDIENCE`, an OIDC client id or an `AGENT_TOKEN_AUDIENCES` member, starts with `arkavo:` or `owner-kas:`, or is not 1–64 of `A-Z a-z 0-9 . _ : -` fails startup. `PEER_CERT_SECONDS` is the lifetime, default and maximum 604800 (7 days); out of range fails startup. |
 | `PATREON_PUBLISHER_CAMPAIGN_ID`, `PATREON_PUBLISHER_TIER_IDS` | Arkavo's own Patreon campaign id and the comma-separated Patreon **tier IDs** (not titles) that grant the derived creator-publishing entitlement `https://patreon.arkavo.com/attr/arkavo-creator/value/publish`. Both required; either unset/empty ⇒ never granted. State logged once at startup. |
 | `APP_STORE_BUNDLE_ID`, `APP_STORE_APP_APPLE_ID`, `APP_STORE_PUBLISH_PRODUCT_IDS` | App Store Creator Membership. Bundle id (`com.arkavo.ArkavoCreator`), the app's numeric Apple ID (required on Production notifications) and the comma-separated auto-renewable product ids that grant the derived creator-publishing entitlement. All three required; any unset ⇒ the feature is off (startup log line) and `POST /app-store/transactions` / `/app-store/notifications` answer 503. No new table. |
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
@@ -553,6 +554,37 @@ appraisal, status)
   and keep `user_id`. A retired row takes no write (410). Until the sweep
   runs, the mint and the relay read treat a route whose owner is not live as
   retired (`owner_kas_routes::in_service`).
+
+**peer.rs** - Peer certificates (#143)
+- Two devices on a local network, with no internet, must each prove which
+  account they are. A peer certificate binds the account to a key the app
+  holds (Secure Enclave P-256) for up to `PEER_CERT_SECONDS`; peers verify
+  it offline against a stored copy of `/.well-known/cose-keys`. Contract:
+  [docs/peer-certificate.md](docs/peer-certificate.md) (proposed; change it
+  only with ArkavoKit and the apps that verify it).
+- `POST /peer/certificate` (passkey auth CWT in `X-Auth-Token`, original or
+  renewed; live account), body `{audience, cnf_key, proof}`: `audience` a
+  member of `PEER_AUDIENCES`, `cnf_key` as on the owner-KAS mint, `proof` the
+  key's raw r‖s signature over
+  `arkavo-peer-certificate-v1\n<sub>\n<b64url cti>\n<audience>\n<cnf_key>`
+  (`cti` is the auth CWT's). 200 `{certificate, expires_at}`; 401
+  `unauthorized`; 400 `invalid_request` / `invalid_audience` /
+  `invalid_cnf_key` / `invalid_proof` (decided before the account read);
+  429 `rate_limited` + `Retry-After` past `PEER_CERT_MINTS_PER_MINUTE`; 503
+  `peer_certificates_unavailable` when unconfigured. Stateless: no row, so
+  the deletion sweep has nothing to remove and **a certificate cannot be
+  revoked**; its `exp` is the revocation lag.
+- Format (`authnz_rs::peer_certificate`): tag 61 + COSE_Sign1, ES256,
+  protected **content type `application/peer-certificate+cwt`**, so
+  `cwt::verify` refuses it everywhere in identity. Claims exactly `iss`,
+  `sub` (bare UUID), `aud`, `exp`, `iat`, `cti`, `cnf`, `auth_time` (the
+  passkey assertion time), `arkavo_handle`. **Never an entitlement**: it is
+  built by hand, never through `oidc::arkavo_user_claims`, and it lives far
+  longer than any token an entitlement may ride in.
+- It outlives the 24 h session by design: no online verifier accepts it, so
+  it is a dated statement, not a session. The signing key must stay in
+  `cose-keys` for `PEER_CERT_SECONDS` after it stops signing, and a new key
+  must be published that long before it signs (docs/key-rotation.md).
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
