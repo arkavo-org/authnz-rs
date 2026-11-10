@@ -416,9 +416,12 @@ appraisal, status)
   nothing; anything else is a failure and grants nothing. The body's
   `until` is unsigned and never used. Rules:
   - An answer is cached 5 min, a failure 60 s, per account, in process.
-  - **Circuit breaker:** after a failure no account is asked for 60 s
-    (`Subscription::Unavailable`, never cached as "none"); then one mint
-    probes. So an outage costs one deadline a minute, not one per sign-in.
+  - **Circuit breaker:** after an **outage** (no response, a timeout, any
+    status but 200 or 404, a body that is not the answer) no account is
+    asked for 60 s (`Subscription::Unavailable`, never cached as "none");
+    then one mint probes. A `200` whose claim does not verify is one
+    account's failure: cached for that account, and the breaker stays
+    closed, so one bad claim never stops everyone's lookups. So an outage costs one deadline a minute, not one per sign-in.
     A cached "active" still grants while the breaker is open.
   - **An outage withholds only the pass.** The mint succeeds, and so does
     `GET /entities` (200 without the value): unlike a linked membership

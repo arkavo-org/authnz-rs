@@ -122,8 +122,11 @@ How the lookup is kept from slowing sign-in or hiding a payment:
 - **Not asked when an App Store pass already grants.**
 - **Cache**, per account, in process: an answer (`200` or `404`) 5 minutes, a
   failure 60 seconds.
-- **Circuit breaker.** After a failure no account is asked for 60 seconds,
-  then one mint probes. Meanwhile the answer is unknown for accounts with
+- **Circuit breaker.** After an outage (no response, a timeout, any status
+  but 200 or 404, a body that is not the answer) no account is asked for 60
+  seconds, then one mint probes. A `200` whose claim does not verify is that
+  account's failure alone: it is cached for that account and the breaker
+  stays closed. Meanwhile the answer is unknown for accounts with
   nothing cached, and a cached "active" still grants. An outage costs one
   3-second deadline a minute, not one per sign-in.
 - **A renewal rechecks a cached "none".** `POST /session/refresh`, a passkey

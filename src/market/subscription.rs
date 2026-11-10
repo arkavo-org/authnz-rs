@@ -12,8 +12,9 @@
 //! `docs/market-identity-interface.md`, "Account lookups (subscriptions)"):
 //!
 //! - **Cache**, per account: an answer 5 min, a failure 60 s.
-//! - **Circuit breaker**: after a failure no account is asked for 60 s; then
-//!   one caller probes. Meanwhile the answer is unknown, never "none", and a
+//! - **Circuit breaker**: after an outage (no usable response) no account is
+//!   asked for 60 s; then one caller probes. A claim that does not verify is
+//!   one account's failure and leaves the breaker closed. Meanwhile the answer is unknown, never "none", and a
 //!   cached "active" still grants.
 //! - **Recheck**: a renewal may skip a cached "none" (the app refreshes right
 //!   after a payment), a few times a minute per account, never through an
@@ -94,6 +95,28 @@ impl Subscription {
     }
 }
 
+/// How one lookup ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetched {
+    /// The market answered: a verified `200`, or `404`.
+    Answer(Subscription),
+    /// A `200` whose claim does not verify. A failure for this account
+    /// only: the market is up, so the breaker stays closed.
+    Unverified,
+    /// No usable response: unreachable, timed out, any other status, or a
+    /// body that is not the answer. Opens the breaker for every account.
+    Outage,
+}
+
+impl Fetched {
+    fn status(self) -> Subscription {
+        match self {
+            Self::Answer(status) => status,
+            Self::Unverified | Self::Outage => Subscription::Unavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     status: Subscription,
@@ -167,12 +190,14 @@ impl SubscriptionLookup {
         true
     }
 
-    /// Close the breaker after an answer, or open it for the failure window.
-    fn settle(&self, status: Subscription, now: i64) {
+    /// Open the breaker for the failure window after an outage; close it
+    /// after anything the market answered, a claim that does not verify
+    /// included: that is one account's failure, and the market is up.
+    fn settle(&self, fetched: Fetched, now: i64) {
         let mut until = self.breaker_until.lock().unwrap_or_else(|e| e.into_inner());
-        *until = match status {
-            Subscription::Active | Subscription::None => 0,
-            Subscription::Unavailable => now + MARKET_FAILURE_CACHE_TTL_SECONDS,
+        *until = match fetched {
+            Fetched::Answer(_) | Fetched::Unverified => 0,
+            Fetched::Outage => now + MARKET_FAILURE_CACHE_TTL_SECONDS,
         };
     }
 
@@ -241,18 +266,15 @@ impl MarketSource {
         if !lookup.admit(now) {
             return Subscription::Unavailable;
         }
-        let status = self.fetch_subscription(lookup, account).await;
+        let fetched = self.fetch_subscription(lookup, account).await;
         let now = Utc::now().timestamp();
-        lookup.settle(status, now);
+        lookup.settle(fetched, now);
+        let status = fetched.status();
         lookup.record(account, status, now);
         status
     }
 
-    async fn fetch_subscription(
-        &self,
-        lookup: &SubscriptionLookup,
-        account: &Uuid,
-    ) -> Subscription {
+    async fn fetch_subscription(&self, lookup: &SubscriptionLookup, account: &Uuid) -> Fetched {
         let url = format!(
             "{}/subscriptions/{}",
             self.config.issuer,
@@ -272,23 +294,23 @@ impl MarketSource {
                     "market subscription lookup for {account} failed: {}",
                     e.without_url()
                 );
-                return Subscription::Unavailable;
+                return Fetched::Outage;
             }
         };
         match response.status().as_u16() {
             200 => {}
-            404 => return Subscription::None,
+            404 => return Fetched::Answer(Subscription::None),
             401 => {
                 // Identity's own fault, and every account's: alert on it.
                 error!(
                     "market subscription lookup refused (401): MARKET_LOOKUP_TOKEN does not \
                      match the market's token; no subscription is granted until it does"
                 );
-                return Subscription::Unavailable;
+                return Fetched::Outage;
             }
             other => {
                 warn!("market subscription lookup for {account} answered {other}");
-                return Subscription::Unavailable;
+                return Fetched::Outage;
             }
         }
         if response
@@ -296,20 +318,20 @@ impl MarketSource {
             .is_some_and(|n| n > MARKET_CLAIM_MAX_BYTES as u64)
         {
             warn!("market subscription answer for {account} is too large");
-            return Subscription::Unavailable;
+            return Fetched::Outage;
         }
         let body = match response.bytes().await {
             Ok(b) if b.len() <= MARKET_CLAIM_MAX_BYTES => b,
             Ok(_) => {
                 warn!("market subscription answer for {account} is too large");
-                return Subscription::Unavailable;
+                return Fetched::Outage;
             }
             Err(e) => {
                 warn!(
                     "market subscription read for {account} failed: {}",
                     e.without_url()
                 );
-                return Subscription::Unavailable;
+                return Fetched::Outage;
             }
         };
         // `until` is not signed: nothing is granted from it, so it is not
@@ -320,14 +342,15 @@ impl MarketSource {
         }
         let Ok(Answer { claim }) = serde_json::from_slice(&body) else {
             warn!("market subscription answer for {account} has no claim");
-            return Subscription::Unavailable;
+            return Fetched::Outage;
         };
         match verify_answer(&self.config, &claim, account) {
-            Ok(()) => Subscription::Active,
-            // A 200 that does not verify is a failure, never "none".
+            Ok(()) => Fetched::Answer(Subscription::Active),
+            // A 200 that does not verify is a failure, never "none": this
+            // account's alone, since the market did answer.
             Err(e) => {
                 warn!("market subscription claim for {account} does not verify: {e}");
-                Subscription::Unavailable
+                Fetched::Unverified
             }
         }
     }
