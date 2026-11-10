@@ -552,6 +552,36 @@ appraisal, status)
   `user_id`); the tombstone drops `market_links`. The purchase is then free
   for another account.
 
+**market/token.rs** - Market app token (#151)
+- The market's request API (how an app asks for a prepaid Game Pass term)
+  does not accept the passkey auth CWT, a bearer token every service takes.
+  So identity mints a dedicated one. Contract:
+  [docs/market-token.md](docs/market-token.md), built to arkavo-com/market
+  `docs/market-identity-interface.md`, "Requests: the tokens identity
+  issues"; change it only with the market. A third token of the owner-KAS
+  kind by owner decision 2026-11-09; #156 would fold the three into one
+  mint behind the same routes.
+- `POST /market/token` (passkey auth CWT in `X-Auth-Token`, original or
+  renewed; live account), body `{cnf_key}` only (unknown members refused:
+  the caller never chooses the audience). 200 `{token, expires_at,
+  audience}`; 401 `unauthorized`; 400 `invalid_request` / `invalid_cnf_key`
+  (before the account read); 429 `rate_limited` + `Retry-After` past
+  `MARKET_TOKEN_MINTS_PER_MINUTE` (10, in process, its own
+  `owner_kas::MintLimiter`); 503 `market_unavailable` while the market is
+  not configured. No variable of its own: `aud` is `MARKET_ISSUER`.
+  Stateless.
+- Format (`authnz_rs::market_token`): tag 61 + COSE_Sign1, ES256, protected
+  **content type `application/market+cwt`**, so `cwt::verify` refuses it
+  everywhere in identity. Claims exactly `iss`, `sub` (bare UUID), `aud`
+  (one string), `exp` = `iat` + 900, `iat`, `cti`, `cnf` (the app's P-256
+  key, as in the owner-KAS token), `arkavo_roles` `["user"]` (**never
+  `agent`**: that word selects the market's agent rules) and
+  `arkavo_account_id` (= `sub`; the market reads the account from it). No
+  entitlement.
+- The key is not proven at the mint; the market requires a signature by it
+  on every request. An agent uses its agent token and the market request
+  entitlement instead (agent.rs).
+
 **owner_kas.rs** - Owner KAS token (#146)
 - arkavo-ios's owner KAS (design §4.1, ADR-0072) has the owner's
   phone decide each key release. A receiver's request reaches it through a
