@@ -56,6 +56,7 @@ when unset.
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
 | `MARKET_ISSUER`, `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE` | market.arkavo.com lifetime membership (#141, `market.rs`). `MARKET_ISSUER` (`https://market.arkavo.com`) is the claims' `iss` and the base of `<issuer>/claim/<checkoutSessionId>`. `MARKET_CLAIM_KEYS_PATH` is a JWK Set file of the **pinned** P-256 claim keys; each `kid` must be its RFC 7638 thumbprint. The market's `/.well-known/jwks.json` is a rotation channel to read, never a trust anchor. The expected `aud` is `OIDC_ISSUER`. `MARKET_ACCEPT_TEST_MODE=true` accepts Stripe test-mode claims (default off). The first two are required; either unset ⇒ off (startup log line) and `POST /market/link` answers 503. A set but unusable value also leaves it off (warn). |
 | `MARKET_LOOKUP_TOKEN` | The secret identity sends the market as `Authorization: Bearer` on `GET <MARKET_ISSUER>/subscriptions/<account uuid>` (the Game Pass's prepaid terms, #151). The same value as the market's `IDENTITY_LOOKUP_TOKEN`: at least 32 printable ASCII characters, no spaces. Needs `MARKET_ISSUER` and `MARKET_CLAIM_KEYS_PATH`. Unset ⇒ no lookup (startup log line); set but unusable ⇒ no lookup (warn, the value is never logged). **Setting it turns the lookup on for every human mint.** Rotate both sides together. Never log it. |
+| `GAME_TOKEN_AUDIENCES`, `GAME_TOKEN_SECONDS` | Game-server tokens (#151, `game.rs`). `GAME_TOKEN_AUDIENCES` is the comma-separated `aud` values `POST /game/token` may mint for, one per game server (production: `https://game.arkavo.net`); the client names one. Unset ⇒ off (startup log line) and the route answers 503. A value that is `arkavo`, `OIDC_PLATFORM_AUDIENCE`, an OIDC client id or an `AGENT_TOKEN_AUDIENCES` member, starts with `arkavo:` or `owner-kas:`, or is not 1–128 printable ASCII characters without space or comma fails startup: the audience is the only thing that keeps a game token out of a verifier that ignores the content type (the OpenTDF platform's does). `GAME_TOKEN_SECONDS` is the lifetime, default 900, 60 to 3600; out of range fails startup. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
@@ -604,6 +605,42 @@ appraisal, status)
   and keep `user_id`. A retired row takes no write (410). Until the sweep
   runs, the mint and the relay read treat a route whose owner is not live as
   retired (`owner_kas_routes::in_service`).
+
+**game.rs** - Game-server token (#151)
+- A game server must be able to pin a token to itself, and the passkey auth
+  CWT (`aud` `arkavo` plus the platform audience) is accepted everywhere.
+  So identity mints a dedicated one. Contract:
+  [docs/game-token.md](docs/game-token.md), agreed in outline with Roadfall
+  and ArkavoKit 2026-11-09 and approved by the owner the same day; change it
+  only with them.
+- `POST /game/token`, body `{sessionId, audience, issuedAt, signature}`:
+  **authenticated by the passkey session, not by a token**. `signature` is
+  the session device key's raw r‖s over
+  `arkavo-game-token-v1\n<sessionId>\n<audience>\n<issuedAt>` (`issuedAt`
+  unix seconds within `GAME_TOKEN_PROOF_SKEW_SECONDS`). The session must be
+  inside its 24 h deadline and its idle limit, and its account live. The
+  mint reads the session and never writes it: it is not a renewal and does
+  not keep an idle session alive. 200 `{token, expiresAt, onlinePlay}`;
+  401 `unauthorized` (every session or proof failure, one body; the session
+  is never ended here); 400 `invalid_request` / `invalid_audience`; 429
+  `rate_limited` + `Retry-After` past `GAME_TOKEN_MINTS_PER_MINUTE`; 503
+  `game_tokens_unavailable` when unconfigured.
+- Format (`authnz_rs::game_token`): tag 61 + COSE_Sign1, ES256, protected
+  **content type `application/game+cwt`**, so `cwt::verify` refuses it
+  everywhere in identity. Claims exactly `iss`, `sub` (bare UUID), `aud`
+  (the one requested audience), `exp`, `iat`, `cti`, `cnf` (**the session's
+  stored device key, never a key the caller sends**: a stolen auth token
+  cannot mint a game token for another key), `arkavo_handle`, and
+  `arkavo_entitlements` = `[online-play]` **only while the account holds the
+  pass**. The mint succeeds without a pass, so a server can tell "Game Pass
+  needed" from "not signed in". No other entitlement, no Patreon data.
+- `exp` = `iat` + `GAME_TOKEN_SECONDS`, never past the session's deadline.
+- The pass is derived as at any mint (`publishing::load_sources` with
+  recheck, then `derive`), without Patreon: no publishing source grants it.
+- The game server requires proof of possession: each request is signed by
+  the `cnf` key over `arkavo-game-request-v1\n…` (`game_token::request_message`).
+  The device key also signs the session messages, so it must only ever sign
+  messages that start with a fixed context line.
 
 **account.rs** - Account deletion (#88, App Store guideline 5.1.1(v))
 - `DELETE /account`: passkey auth CWT (`X-Auth-Token`) minted within
