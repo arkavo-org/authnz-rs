@@ -1153,6 +1153,7 @@ mod online_play_source {
         let sources = Sources::Read {
             state,
             market: MarketGrant::Unavailable,
+            subscription: crate::market::subscription::Subscription::None,
         };
         let derived = derive(&f.state, Some(f.user_id), None, sources)
             .await

@@ -348,6 +348,8 @@ pub(crate) enum ClaimError {
     WrongAudience,
     #[error("names another purchase")]
     WrongPurchase,
+    #[error("names another account")]
+    WrongAccount,
     #[error("unknown tier")]
     UnknownTier,
     #[error("livemode disagrees with the purchase id")]
@@ -379,13 +381,11 @@ fn segments(jws: &str) -> Result<(&str, &str, &str), ClaimError> {
     }
 }
 
-/// Verify a claim the market served for `expected` (the purchase identity
-/// fetched it for).
-pub(crate) fn verify_claim(
-    cfg: &MarketConfig,
-    jws: &str,
-    expected: &SessionId,
-) -> Result<VerifiedClaim, ClaimError> {
+/// The payload of a JWS the market signed for this identity: `alg` ES256,
+/// `typ` JWT, a pinned `kid`, the signature, `iss` and `aud`. What the
+/// payload says is the caller's to check ([`verify_claim`] for a membership
+/// claim, `subscription::verify_answer` for an account lookup).
+fn verified_payload(cfg: &MarketConfig, jws: &str) -> Result<Map<String, Value>, ClaimError> {
     let (header_b64, payload_b64, signature_b64) = segments(jws)?;
     let header: Map<String, Value> = decode_json(header_b64)?;
     let text =
@@ -418,6 +418,19 @@ pub(crate) fn verify_claim(
     if !aud_ok {
         return Err(ClaimError::WrongAudience);
     }
+    Ok(payload)
+}
+
+/// Verify a claim the market served for `expected` (the purchase identity
+/// fetched it for).
+pub(crate) fn verify_claim(
+    cfg: &MarketConfig,
+    jws: &str,
+    expected: &SessionId,
+) -> Result<VerifiedClaim, ClaimError> {
+    let payload = verified_payload(cfg, jws)?;
+    let text =
+        |m: &Map<String, Value>, k: &str| m.get(k).and_then(Value::as_str).map(str::to_owned);
     if text(&payload, "jti") != Some(expected.jti()) {
         return Err(ClaimError::WrongPurchase);
     }
@@ -513,6 +526,9 @@ pub struct MarketSource {
     fetches: AtomicU64,
     /// Link fetches per account in the current minute: (window start, count).
     link_fetches: Mutex<HashMap<Uuid, (i64, u32)>>,
+    /// The account lookup for subscriptions (#151); `None` while
+    /// `MARKET_LOOKUP_TOKEN` is unset.
+    subscriptions: Option<subscription::SubscriptionLookup>,
 }
 
 impl MarketSource {
@@ -529,7 +545,14 @@ impl MarketSource {
             cache: Mutex::new(HashMap::new()),
             fetches: AtomicU64::new(0),
             link_fetches: Mutex::new(HashMap::new()),
+            subscriptions: None,
         })
+    }
+
+    /// Turn the subscription lookup on, with the market's shared secret.
+    pub fn with_lookup_token(mut self, token: subscription::LookupToken) -> Self {
+        self.subscriptions = Some(subscription::SubscriptionLookup::new(token));
+        self
     }
 
     /// Admit one `POST /market/link` fetch for `user_id`: at most
@@ -551,8 +574,25 @@ impl MarketSource {
     /// Read the configuration from the environment; `None` when it is off.
     pub fn from_env(audience: &str) -> Option<Self> {
         let config = MarketConfig::from_env(audience)?;
+        // Read and parsed here so the value never passes through a type
+        // that can be printed.
+        let token =
+            subscription::LookupToken::parse(std::env::var("MARKET_LOOKUP_TOKEN").ok().as_deref());
         match Self::new(config) {
-            Ok(source) => Some(source),
+            Ok(source) => Some(match token {
+                Ok(Some(token)) => {
+                    info!("market subscription lookups ENABLED: every human mint asks the market");
+                    source.with_lookup_token(token)
+                }
+                Ok(None) => {
+                    info!("market subscription lookups DISABLED: MARKET_LOOKUP_TOKEN unset");
+                    source
+                }
+                Err(reason) => {
+                    warn!("market subscription lookups DISABLED: {reason}");
+                    source
+                }
+            }),
             Err(e) => {
                 warn!("market purchases DISABLED: {e}");
                 None
@@ -951,6 +991,8 @@ async fn post_link(
     })
     .into_response()
 }
+
+pub(crate) mod subscription;
 
 #[cfg(test)]
 mod tests;

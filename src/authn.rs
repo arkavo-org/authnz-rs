@@ -825,7 +825,7 @@ async fn signed_in(
     record: crate::db::UserCredentials,
 ) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
     let user = crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
-    let arkavo_user = crate::oidc::arkavo_user_claims(app_state, patreon, &user).await;
+    let arkavo_user = crate::oidc::arkavo_user_claims_rechecking(app_state, patreon, &user).await;
     // Generate CWT auth token (1-hour, no cnf binding at this point;
     // cnf binding is added in Task 15 once the passkey is retrieved from DB).
     let token = mint_auth_token(app_state, &record.user_id, Some(&arkavo_user), None)?;
