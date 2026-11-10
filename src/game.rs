@@ -243,7 +243,7 @@ pub(crate) async fn open_session_handler(
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_REQUEST);
     };
     let now = Utc::now().timestamp();
-    if (now - request.issued_at).abs() > GAME_TOKEN_PROOF_SKEW_SECONDS {
+    if now.abs_diff(request.issued_at) > GAME_TOKEN_PROOF_SKEW_SECONDS.unsigned_abs() {
         return refuse_with_time(StatusCode::BAD_REQUEST, ERR_INVALID_ISSUED_AT, now);
     }
     let unauthorized = |why: &str| {
@@ -301,38 +301,48 @@ pub(crate) async fn open_session_handler(
         public_key: session.public_key,
         assertion_at: session.assertion_at,
     };
-    if let Err(e) = app_state
+    let wrote = match app_state
         .db_store
         .open_game_session(&game_session, now)
         .await
     {
-        error!("game session: write failed for {user_id}: {e}");
-        return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
-    }
-    // A sign-out that ran between the read above and this write found no
-    // game session to end, and has removed the passkey session. So look
-    // again: without it, the game session written here must not stay (the
-    // sign-out route could never reach it). A failed read takes it back
-    // too; the client opens again.
-    let still_open = app_state.db_store.get_session(&request.session_id).await;
-    if !matches!(still_open, Ok(Some(_))) {
-        if let Err(e) = app_state
-            .db_store
-            .delete_game_session(&game_session.game_session_id)
-            .await
-        {
-            error!(
-                "game session: {} outlives its ended passkey session, delete failed: {e}",
-                game_session.game_session_id
-            );
+        Ok(wrote) => wrote,
+        Err(e) => {
+            error!("game session: write failed for {user_id}: {e}");
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
         }
-        return match still_open {
-            Err(e) => {
-                error!("game session: re-check failed for {user_id}: {e}");
-                refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER)
-            }
-            _ => unauthorized("session_ended_during_open"),
+    };
+    // Only for a row this request wrote: a game session that was already
+    // open is in use, and nothing here may end it. A sign-out or an account
+    // deletion that ran between the reads above and the write found no game
+    // session to remove. So look again, and take the new row back unless
+    // the passkey session and the account are both still there (a failed
+    // read takes it back too; the client opens again).
+    if wrote {
+        let still = match app_state.db_store.get_session(&request.session_id).await {
+            Ok(Some(_)) => app_state.db_store.is_account_live(&user_id).await,
+            Ok(None) => Ok(false),
+            Err(e) => Err(e),
         };
+        if !matches!(still, Ok(true)) {
+            if let Err(e) = app_state
+                .db_store
+                .delete_game_session(&game_session.game_session_id)
+                .await
+            {
+                error!(
+                    "game session: {} must not stay, and its delete failed: {e}",
+                    game_session.game_session_id
+                );
+            }
+            return match still {
+                Err(e) => {
+                    error!("game session: re-check failed for {user_id}: {e}");
+                    refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER)
+                }
+                _ => unauthorized("ended_during_open"),
+            };
+        }
     }
     info!(
         "audit game_session_open outcome=opened user_id={user_id} game_session={}",
@@ -353,6 +363,10 @@ pub(crate) async fn open_session_handler(
 /// `POST /game/session/end`, body `{gameSessionId, issuedAt, signature}`:
 /// the device key ends its game session. 204, and 204 again for one that is
 /// already gone. A session past its deadline can still be ended.
+///
+/// **A signature that is not the device key's is 204 too, and ends
+/// nothing**: the route takes no token and no rate limit, so it must not
+/// say whether an id names a game session (the mint does not either).
 pub(crate) async fn end_session_handler(
     Extension(app_state): Extension<AppState>,
     body: Bytes,
@@ -364,7 +378,7 @@ pub(crate) async fn end_session_handler(
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_REQUEST);
     };
     let now = Utc::now().timestamp();
-    if (now - request.issued_at).abs() > GAME_TOKEN_PROOF_SKEW_SECONDS {
+    if now.abs_diff(request.issued_at) > GAME_TOKEN_PROOF_SKEW_SECONDS.unsigned_abs() {
         return refuse_with_time(StatusCode::BAD_REQUEST, ERR_INVALID_ISSUED_AT, now);
     }
     let id = request.game_session_id;
@@ -388,8 +402,8 @@ pub(crate) async fn end_session_handler(
         game_token::signature_verifies(&x, &y, &message, &request.signature)
     });
     if !verified {
-        warn!("audit game_session_end outcome=unauthorized game_session={id}");
-        return refuse(StatusCode::UNAUTHORIZED, ERR_UNAUTHORIZED);
+        warn!("audit game_session_end outcome=invalid_proof game_session={id}");
+        return ended();
     }
     if let Err(e) = app_state.db_store.delete_game_session(&id).await {
         error!("game session end: delete failed: {e}");
@@ -438,7 +452,7 @@ pub(crate) async fn token_handler(
         return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_AUDIENCE);
     }
     let now = Utc::now().timestamp();
-    if (now - request.issued_at).abs() > GAME_TOKEN_PROOF_SKEW_SECONDS {
+    if now.abs_diff(request.issued_at) > GAME_TOKEN_PROOF_SKEW_SECONDS.unsigned_abs() {
         return refuse_with_time(StatusCode::BAD_REQUEST, ERR_INVALID_ISSUED_AT, now);
     }
 
@@ -466,14 +480,16 @@ pub(crate) async fn token_handler(
         if !game_token::signature_verifies(&x, &y, &message, &request.signature) {
             return unauthorized("invalid_proof");
         }
-        // Read-only, and after the proof: only the device learns that its
-        // game session is over, and the row is left for sign-out to remove.
-        let deadline = session.assertion_at + GAME_SESSION_SECONDS;
-        if now >= deadline {
-            warn!("audit game_token outcome=game_session_ended {named}");
-            return refuse(StatusCode::UNAUTHORIZED, ERR_GAME_SESSION_ENDED);
-        }
-        (session.user_id, x, y, deadline)
+        // The deadline is decided below, after the rate limit and the
+        // account: the row of an ended game session stays, so its mints
+        // must be counted like any other, and a deleted account's is
+        // `unauthorized` whatever its age.
+        (
+            session.user_id,
+            x,
+            y,
+            session.assertion_at + GAME_SESSION_SECONDS,
+        )
     } else {
         let Some(id) = request.session_id else {
             return refuse(StatusCode::BAD_REQUEST, ERR_INVALID_REQUEST);
@@ -523,6 +539,13 @@ pub(crate) async fn token_handler(
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
         }
     };
+    // A game session past its deadline. Read-only, and after the proof:
+    // only the device learns that it is over, and the row is left for
+    // sign-out to remove. (A passkey session's deadline was decided above.)
+    if now >= deadline {
+        warn!("audit game_token outcome=game_session_ended {named}");
+        return refuse(StatusCode::UNAUTHORIZED, ERR_GAME_SESSION_ENDED);
+    }
 
     let online_play = holds_online_play(&app_state, user_id).await;
     let token = GameToken {
@@ -547,7 +570,8 @@ pub(crate) async fn token_handler(
         }
     };
     info!(
-        "audit game_token outcome=issued user_id={user_id} aud={} online_play={online_play}",
+        "audit game_token outcome=issued user_id={user_id} aud={} online_play={online_play} \
+         {named}",
         token.aud
     );
     let mut answer = serde_json::json!({

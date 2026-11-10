@@ -88,7 +88,8 @@ game session right after `POST /session`.
 - **One passkey session has one game session.** `gameSessionId` is derived
   from `sessionId`, so opening again (a lost answer, a retry) returns the
   same id and the same `expiresAt`. Nothing extends a game session; a new
-  one needs a new passkey sign-in.
+  one needs a new passkey sign-in. An open that fails or is refused never
+  ends a game session that was already open.
 - **The key.** The game session is bound to the passkey session's device
   key as identity stored it; the caller sends no key. The client must
   **keep that key for as long as it keeps the game session**, also after
@@ -103,8 +104,11 @@ game session right after `POST /session`.
 
 - Its deadline.
 - `POST /game/session/end`.
-- `POST /session/signout` of the passkey session that opened it, while that
-  session still exists.
+- `POST /session/signout` of the passkey session that opened it. This works
+  after that session has ended too (the usual case for a game: the session
+  went idle the day before): the game session holds the same device key,
+  so the same sign-out request, with the passkey session's id and the same
+  signature, ends it. A client needs only one of the two calls.
 - Deletion of the account: mints are refused at once, and the row is
   removed with the account's other rows.
 
@@ -125,14 +129,19 @@ arkavo-game-session-end-v1
 <issuedAt>
 ```
 
-204 when ended, and 204 again for one already gone (or never opened). 401
-`{"error":"unauthorized"}` when the signature is not the device key's; 400
+204 when ended, and 204 again for one already gone (or never opened). 400
 and 503 as above. A game session past its deadline can still be ended.
+
+**A signature that is not the device key's is also 204, and ends nothing.**
+The route takes no token, so it does not say whether an id names a game
+session. A client that signed with the right key has ended it; the proof,
+if it wants one, is that a mint with that id answers 401.
 
 **Signing out offline.** A client that signs out with no network deletes the
 device key and its stored ids, and need not reach identity later. The row
-then stays until its deadline, but nothing can use it: every mint needs a
-signature by the deleted key. A client that can reach identity should end
+then stays (refused once past its deadline, and removed only with the
+account, or by a DynamoDB TTL once one is enabled), but nothing can use it:
+every mint needs a signature by the deleted key. A client that can reach identity should end
 the game session before it deletes the key.
 
 ## Request
@@ -190,7 +199,7 @@ device key.
 | 400 | `{"error":"invalid_audience"}` | not a listed audience |
 | 400 | `{"error":"invalid_issued_at", "serverTime": <unix s>}` | `issuedAt` is more than 60 s from identity's clock. Decided before the session is read: it needs no secret. Correct the clock offset from `serverTime` and send again; do **not** renew the session for it |
 | 401 | `{"error":"unauthorized"}` | no such session or game session; the signature does not verify; the passkey session is past its 24 h deadline or its idle limit; or the account is deleted |
-| 401 | `{"error":"game_session_ended"}` | `gameSessionId` only: the game session is past its deadline. Told only to a caller whose signature verified. The person signs in with the passkey again |
+| 401 | `{"error":"game_session_ended"}` | `gameSessionId` only: the game session is past its deadline. Told only to a caller whose signature verified, for a live account, and counted by the rate limit like a mint. The person signs in with the passkey again |
 | 429 | `{"error":"rate_limited"}`, `Retry-After` | more than 30 mints by the account in a minute |
 | 500 | `{"error":"server_error"}` | a read or signing failed |
 

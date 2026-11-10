@@ -669,10 +669,17 @@ appraisal, status)
   a session past its deadline answers 401 `game_session_ended`, only after
   the proof verifies. Never let another route accept a game session: it
   must not renew a session or yield a passkey auth CWT. Ended by its
-  deadline, `POST /game/session/end` (device key, 204, idempotent),
-  `POST /session/signout` of its passkey session, and account deletion (the
-  mint's liveness check, then the sweep's link step); **not** by the
-  passkey session going idle, expiring or being reused. Row:
+  deadline, `POST /game/session/end` (device key; 204 for ended, unknown
+  **and a wrong signature alike**, so the route is no existence oracle),
+  `POST /session/signout` of its passkey session (also after that session's
+  row is gone: the signature is then checked against the game session's
+  key), and account deletion (the mint's liveness check, then the sweep's
+  link step); **not** by the passkey session going idle, expiring or being
+  reused. The open takes a row back only if **that request wrote it**
+  (`open_game_session` says so) and the passkey session or the account is
+  gone on a second look; sign-out deletes the game session before and
+  after the passkey session. Together these close the open/sign-out race;
+  an already-open game session is never ended by a repeated open. Row:
   `identity_links` `game-session#<id>` (`db/game_session.rs`), never
   written after the open, so the mint stays read-only. The `sessionId` mint
   is unchanged.

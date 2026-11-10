@@ -167,6 +167,18 @@ paths:
   account deleted). No `token_*` attribute and not `provider = passkey`, so
   the sweep's `delete_identity_links_of` removes it. Read consistently by
   `get_session`, never by sign-in.
+- **Game session** (#151, 0.36.0; `db/game_session.rs`): `link_pk =
+  game-session#<game session id>`, `provider = game-session`, `subject` =
+  the id (UUID v8 derived from the passkey session id), `user_id`,
+  `public_key` (B, the passkey session's device key), `assertion_at`,
+  `created_at`, `expires_at` (N, `assertion_at + GAME_SESSION_SECONDS`, for
+  a TTL that is not enabled yet). Written once by `POST /game/session` on
+  `attribute_not_exists(link_pk)` and never updated; an open takes back
+  only a row it wrote. Deleted by `POST /game/session/end`, by
+  `POST /session/signout` and by the sweep's `delete_identity_links_of`. A
+  row past its deadline stays, refused. Read consistently by
+  `get_game_session`, only by the game-token mint and the two routes that
+  end it.
 - **Owner-KAS route** (#148; `db/owner_kas.rs`): `link_pk =
   owner-kas-route#<route_id>`, `provider = owner-kas-route`, `subject` = the
   route id. Attributes: `user_id` (the owner), `seq` (N), `bundle` (S, the

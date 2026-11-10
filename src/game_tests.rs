@@ -972,10 +972,25 @@ async fn the_device_key_ends_its_game_session() {
         return;
     };
     let id = f.open_game_session().await;
-    let (st, _, body) = post_to(&f.state, "/game/session/end", Device::new().end(&id)).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED);
-    assert_eq!(body, json!({ "error": "unauthorized" }));
+    // Another key ends nothing, and is answered exactly like an unknown id:
+    // the route must not say which ids exist.
+    let wrong = post_to(&f.state, "/game/session/end", Device::new().end(&id)).await;
+    let unknown = post_to(
+        &f.state,
+        "/game/session/end",
+        Device::new().end(&Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(wrong.0, StatusCode::NO_CONTENT);
+    assert_eq!((wrong.0, &wrong.2), (unknown.0, &unknown.2));
     assert!(f.store.get_game_session(&id).await.unwrap().is_some());
+    let (st, _, _) = post_to(
+        &f.state,
+        "/game/token",
+        f.device.game_request(&id, AUDIENCE),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 
     for _ in 0..2 {
         let (st, _, body) = post_to(&f.state, "/game/session/end", f.device.end(&id)).await;
@@ -1026,4 +1041,136 @@ async fn a_deleted_accounts_game_session_cannot_mint_and_the_sweep_removes_it() 
     f.unauthorized(f.device.game_request(&id, AUDIENCE)).await;
     f.store.delete_identity_links_of(&f.user).await.unwrap();
     assert!(f.store.get_game_session(&id).await.unwrap().is_none());
+}
+
+/// The usual order for a game: the passkey session ended the day before (a
+/// refused renewal removed its row), and then the person signs out.
+#[tokio::test]
+async fn signing_out_after_the_passkey_session_is_gone_still_ends_the_game_session() {
+    let Some(f) = Fixture::fresh().await else {
+        return;
+    };
+    let id = f.open_game_session().await;
+    f.store.delete_session(&f.session).await.unwrap();
+    let signout = |signature: String| {
+        crate::session::signout_session(
+            Extension(f.state.clone()),
+            axum::Json(crate::session::SignoutRequest {
+                session_id: f.session,
+                signature,
+            }),
+        )
+    };
+    // Another key ends nothing.
+    let other = Device::new().sign(&crate::session::signout_message(&f.session));
+    assert!(signout(other).await.is_err());
+    assert!(f.store.get_game_session(&id).await.unwrap().is_some());
+
+    let own = f.device.sign(&crate::session::signout_message(&f.session));
+    assert_eq!(signout(own.clone()).await.unwrap(), StatusCode::NO_CONTENT);
+    assert!(f.store.get_game_session(&id).await.unwrap().is_none());
+    f.unauthorized(f.device.game_request(&id, AUDIENCE)).await;
+    // And again: both rows gone.
+    assert_eq!(signout(own).await.unwrap(), StatusCode::NO_CONTENT);
+}
+
+/// An open that is refused, or that finds the game session already there,
+/// never ends a game session that is in use.
+#[tokio::test]
+async fn a_repeated_or_refused_open_leaves_the_open_game_session() {
+    let Some(f) = Fixture::fresh().await else {
+        return;
+    };
+    let id = f.open_game_session().await;
+    assert_eq!(f.open_game_session().await, id);
+    assert!(f.store.get_game_session(&id).await.unwrap().is_some());
+
+    // The store says whether a call wrote the row: only that one may be
+    // taken back.
+    let row = f.store.get_game_session(&id).await.unwrap().unwrap();
+    assert!(!f.store.open_game_session(&row, 0).await.unwrap());
+
+    // The passkey session ends; an open is now refused, and the game
+    // session goes on minting.
+    f.store.delete_session(&f.session).await.unwrap();
+    let (st, _, _) = post_to(&f.state, "/game/session", f.device.open(&f.session)).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, _) = post_to(
+        &f.state,
+        "/game/token",
+        f.device.game_request(&id, AUDIENCE),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn opens_and_an_ended_game_sessions_mints_are_rate_limited() {
+    let Some(f) = Fixture::fresh().await else {
+        return;
+    };
+    for _ in 0..GAME_TOKEN_MINTS_PER_MINUTE {
+        f.open_game_session().await;
+    }
+    let (st, h, body) = post_to(&f.state, "/game/session", f.device.open(&f.session)).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body, json!({ "error": "rate_limited" }));
+    assert!(h.contains_key("retry-after"));
+
+    // The row of an ended game session stays, so its mints are counted too.
+    let f = Fixture::fresh().await.unwrap();
+    let id = f.game_session_aged(GAME_SESSION_SECONDS + 1).await;
+    for _ in 0..GAME_TOKEN_MINTS_PER_MINUTE {
+        let (st, _, body) = post_to(
+            &f.state,
+            "/game/token",
+            f.device.game_request(&id, AUDIENCE),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({ "error": "game_session_ended" }));
+    }
+    let (st, _, _) = post_to(
+        &f.state,
+        "/game/token",
+        f.device.game_request(&id, AUDIENCE),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_deleted_accounts_ended_game_session_is_unauthorized() {
+    let Some(f) = Fixture::fresh().await else {
+        return;
+    };
+    let id = f.game_session_aged(GAME_SESSION_SECONDS + 1).await;
+    f.store
+        .tombstone_account(&f.user, &format!("{}.test", f.user), None, 1_700_000_000)
+        .await
+        .unwrap();
+    f.unauthorized(f.device.game_request(&id, AUDIENCE)).await;
+}
+
+/// `issuedAt` is the caller's number: the extremes are a wrong clock, never
+/// an overflow.
+#[tokio::test]
+async fn an_extreme_issued_at_is_a_wrong_clock() {
+    let mut state = build_test_app_state().await;
+    state.game = configured(900);
+    let device = Device::new();
+    let id = Uuid::new_v4();
+    for at in [i64::MIN, i64::MAX] {
+        for (path, mut body) in [
+            ("/game/token", device.request(&id, AUDIENCE)),
+            ("/game/token", device.game_request(&id, AUDIENCE)),
+            ("/game/session", device.open(&id)),
+            ("/game/session/end", device.end(&id)),
+        ] {
+            body["issuedAt"] = json!(at);
+            let (st, _, got) = post_to(&state, path, body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{path} {at}");
+            assert_eq!(got["error"], "invalid_issued_at", "{path} {at}");
+        }
+    }
 }

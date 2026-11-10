@@ -37,12 +37,14 @@ pub struct GameSession {
 impl DynamoDBStore {
     /// Write a game session row unless one with this id exists. The id is
     /// derived from the passkey session, so an existing row is the same
-    /// game session and the open is idempotent.
+    /// game session and the open is idempotent. `true` when this call wrote
+    /// the row, `false` when it was already there: a caller that takes a
+    /// row back must only ever take back one it wrote.
     pub async fn open_game_session(
         &self,
         session: &GameSession,
         now: i64,
-    ) -> Result<(), DynamoDBError> {
+    ) -> Result<bool, DynamoDBError> {
         let table = &self.identity_links_table;
         let result = self
             .client
@@ -66,9 +68,9 @@ impl DynamoDBStore {
             .send()
             .await;
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(()),
+                DynamoDBError::ConditionalConflict => Ok(false),
                 other => Err(other),
             },
         }
