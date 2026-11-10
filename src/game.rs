@@ -309,6 +309,31 @@ pub(crate) async fn open_session_handler(
         error!("game session: write failed for {user_id}: {e}");
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
     }
+    // A sign-out that ran between the read above and this write found no
+    // game session to end, and has removed the passkey session. So look
+    // again: without it, the game session written here must not stay (the
+    // sign-out route could never reach it). A failed read takes it back
+    // too; the client opens again.
+    let still_open = app_state.db_store.get_session(&request.session_id).await;
+    if !matches!(still_open, Ok(Some(_))) {
+        if let Err(e) = app_state
+            .db_store
+            .delete_game_session(&game_session.game_session_id)
+            .await
+        {
+            error!(
+                "game session: {} outlives its ended passkey session, delete failed: {e}",
+                game_session.game_session_id
+            );
+        }
+        return match still_open {
+            Err(e) => {
+                error!("game session: re-check failed for {user_id}: {e}");
+                refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER)
+            }
+            _ => unauthorized("session_ended_during_open"),
+        };
+    }
     info!(
         "audit game_session_open outcome=opened user_id={user_id} game_session={}",
         game_session.game_session_id
