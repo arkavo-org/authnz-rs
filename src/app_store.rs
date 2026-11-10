@@ -336,14 +336,14 @@ impl AppStoreApp {
         }
         let app_apple_id: i64 = app_apple_id
             .parse()
-            .map_err(|_| "APP_STORE_APP_APPLE_ID is not an integer")?;
+            .map_err(|_| "the app's Apple ID is not an integer")?;
         let environments = match present(environments) {
             None => HashSet::from([Environment::Production, Environment::Sandbox]),
             Some(list) => list
                 .split(',')
                 .map(|e| Environment::from_apple(e.trim()))
                 .collect::<Option<HashSet<_>>>()
-                .ok_or("APP_STORE_ENVIRONMENTS accepts only Production and Sandbox")?,
+                .ok_or("only the Production and Sandbox environments are accepted")?,
         };
         Ok(Some(Self {
             bundle_id: bundle_id.to_string(),
@@ -385,9 +385,10 @@ impl AppStoreConfig {
     /// names an app that was left out and why. `None`: no app is usable, so
     /// the feature is off.
     ///
-    /// A tagged app never takes the first app down with it: an operator's
-    /// mistake in one app's variables must not end another app's
-    /// memberships.
+    /// A tagged app never takes the first app down with it, and a tagged
+    /// app that repeats another tagged app's bundle id or product id takes
+    /// that one down only together with itself: a new app's variables can
+    /// never move an existing app's purchases to the new app.
     pub(crate) fn parse_vars(vars: &HashMap<String, String>) -> (Option<Self>, Vec<String>) {
         let mut tags: Vec<&str> = vars
             .keys()
@@ -399,44 +400,71 @@ impl AppStoreConfig {
             .collect();
         tags.sort_unstable();
 
-        let mut apps: Vec<AppStoreApp> = Vec::new();
         let mut skipped = Vec::new();
-        for tag in std::iter::once(None).chain(tags.into_iter().map(Some)) {
+        let mut parse = |tag: Option<&str>| -> Option<AppStoreApp> {
             let get = |suffix: &str| vars.get(&app_var(tag, suffix)).map(String::as_str);
             let name = app_var(tag, "BUNDLE_ID");
-            let app = match AppStoreApp::parse(
+            match AppStoreApp::parse(
                 get("BUNDLE_ID"),
                 get("APP_APPLE_ID"),
                 get("PUBLISH_PRODUCT_IDS"),
                 get("ONLINE_PLAY_PRODUCT_IDS"),
                 get("ENVIRONMENTS"),
             ) {
-                Ok(Some(app)) => app,
+                Ok(Some(app)) => Some(app),
                 // The first app unset is the feature's ordinary off state.
-                Ok(None) if tag.is_none() => continue,
+                Ok(None) if tag.is_none() => None,
                 Ok(None) => {
                     skipped.push(format!(
                         "{name}: the app needs its Apple ID and at least one product"
                     ));
-                    continue;
+                    None
                 }
                 Err(reason) => {
                     skipped.push(format!("{name}: {reason}"));
-                    continue;
+                    None
                 }
-            };
-            if apps.iter().any(|a| a.bundle_id == app.bundle_id) {
-                skipped.push(format!("{name}: the bundle id is another app's"));
+            }
+        };
+        let first = parse(None);
+        let tagged: Vec<(&str, AppStoreApp)> = tags
+            .into_iter()
+            .filter_map(|tag| Some((tag, parse(Some(tag))?)))
+            .collect();
+
+        // A bundle id and a product id each belong to one app. The first app
+        // keeps its own. Two tagged apps that share one are both left out:
+        // no order of tags says which of them was working before, so
+        // neither may take the other's purchases.
+        let overlap = |a: &AppStoreApp, b: &AppStoreApp| {
+            if a.bundle_id == b.bundle_id {
+                Some("bundle id")
+            } else if a.products.keys().any(|p| b.products.contains_key(p)) {
+                Some("product id")
+            } else {
+                None
+            }
+        };
+        let mut apps: Vec<AppStoreApp> = first.into_iter().collect();
+        for (i, (tag, app)) in tagged.iter().enumerate() {
+            let name = app_var(Some(tag), "BUNDLE_ID");
+            if let Some(what) = apps.first().and_then(|first| overlap(app, first)) {
+                skipped.push(format!("{name}: its {what} is the first app's"));
                 continue;
             }
-            if apps
+            let clash = tagged
                 .iter()
-                .any(|a| app.products.keys().any(|p| a.products.contains_key(p)))
-            {
-                skipped.push(format!("{name}: a product id is another app's"));
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .find_map(|(_, (other, b))| Some((*other, overlap(app, b)?)));
+            if let Some((other, what)) = clash {
+                skipped.push(format!(
+                    "{name}: it shares a {what} with {}; both are left out",
+                    app_var(Some(other), "BUNDLE_ID")
+                ));
                 continue;
             }
-            apps.push(app);
+            apps.push(app.clone());
         }
         let cfg = (!apps.is_empty()).then_some(Self {
             apps,

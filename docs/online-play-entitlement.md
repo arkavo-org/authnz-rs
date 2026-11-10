@@ -58,8 +58,11 @@ A product grants exactly one entitlement. Which one is configuration:
   names its product, and the product names the app and the entitlement.
 - A product may not be in both lists.
 - A tagged app that breaks one of these rules is left out and logged as an
-  error at startup (`App Store app left out: …`). The other apps stay on: a
-  mistake in one app's variables never ends another app's memberships.
+  error at startup (`App Store app left out: …`). The first app always keeps
+  its bundle id and products. Two tagged apps that share a bundle id or a
+  product id are **both** left out: a new app's variables can never take over
+  an existing app's purchases, but a clash does stop both until it is fixed,
+  so read the startup log after adding an app.
 - Startup logs one `App Store purchases ENABLED` line per app, with its
   count of publish and online-play products.
 

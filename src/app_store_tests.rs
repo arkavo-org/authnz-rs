@@ -3250,7 +3250,7 @@ mod several_apps {
             all.extend_from_slice(extra);
             AppStoreConfig::parse_vars(&vars(&all))
         };
-        let cases: [(&[(&str, &str)], &str); 6] = [
+        let cases: [(&[(&str, &str)], &str); 7] = [
             // No Apple ID.
             (
                 &[
@@ -3274,7 +3274,7 @@ mod several_apps {
                     ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
                     ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
                 ],
-                "bundle id is another app's",
+                "its bundle id is the first app's",
             ),
             // The first app's product: its stored records would change
             // entitlement.
@@ -3284,7 +3284,7 @@ mod several_apps {
                     ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
                     ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", "creator.monthly"),
                 ],
-                "product id is another app's",
+                "its product id is the first app's",
             ),
             // One product, two entitlements.
             (
@@ -3296,6 +3296,15 @@ mod several_apps {
                 ],
                 "two entitlements",
             ),
+            // The message names no variable of another app.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "forty-two"),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+                ],
+                "the app's Apple ID is not an integer",
+            ),
             (
                 &[
                     ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
@@ -3303,7 +3312,7 @@ mod several_apps {
                     ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
                     ("APP_STORE_GAME_ENVIRONMENTS", "Production,Xcode"),
                 ],
-                "only Production and Sandbox",
+                "only the Production and Sandbox environments",
             ),
         ];
         for (extra, why) in cases {
@@ -3317,6 +3326,55 @@ mod several_apps {
                 "{:?} should mention {why:?}",
                 skipped[0]
             );
+            assert!(
+                !skipped[0].contains("APP_STORE_APP_APPLE_ID")
+                    && !skipped[0].contains("APP_STORE_ENVIRONMENTS"),
+                "{:?} names the first app's variable",
+                skipped[0]
+            );
+        }
+    }
+
+    /// A new tagged app that repeats a working tagged app's bundle id or
+    /// product id must not take that app's place, whichever tag sorts first.
+    #[test]
+    fn two_tagged_apps_that_clash_are_both_left_out() {
+        for (bundle, product, what) in [
+            (GAME_BUNDLE, "arcade.pass", "bundle id"),
+            ("com.example.arcade", PASS, "product id"),
+        ] {
+            let mut all = FIRST_APP.to_vec();
+            all.extend(GAME_APP);
+            all.extend([
+                ("APP_STORE_ARCADE_BUNDLE_ID", bundle),
+                ("APP_STORE_ARCADE_APP_APPLE_ID", "77"),
+                ("APP_STORE_ARCADE_ONLINE_PLAY_PRODUCT_IDS", product),
+                // An unrelated third app is unaffected.
+                ("APP_STORE_ZED_BUNDLE_ID", "com.example.zed"),
+                ("APP_STORE_ZED_APP_APPLE_ID", "88"),
+                ("APP_STORE_ZED_PUBLISH_PRODUCT_IDS", "zed.monthly"),
+            ]);
+            let (cfg, skipped) = AppStoreConfig::parse_vars(&vars(&all));
+            let bundles: Vec<String> = cfg
+                .unwrap()
+                .apps
+                .into_iter()
+                .map(|app| app.bundle_id)
+                .collect();
+            assert_eq!(
+                bundles,
+                ["com.example.creator", "com.example.zed"],
+                "{what}"
+            );
+            assert_eq!(skipped.len(), 2, "{skipped:?}");
+            for (reason, tag) in skipped.iter().zip(["ARCADE", "GAME"]) {
+                assert!(
+                    reason.starts_with(&format!("APP_STORE_{tag}_BUNDLE_ID: "))
+                        && reason.contains(what)
+                        && reason.contains("both are left out"),
+                    "{reason:?}"
+                );
+            }
         }
     }
 }
