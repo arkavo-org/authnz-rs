@@ -16,12 +16,17 @@
 //!      creator pledge to its own campaign, so membership can never qualify
 //!      it. Owning any other campaign grants nothing;
 //!    - App Store: the feature is configured (`APP_STORE_*`) and a
-//!      subscription record bound to the account is active
-//!      ([`app_store_active`]);
+//!      subscription record bound to the account, of a product listed for
+//!      publishing, is active ([`app_store_active`] with [`Grant::Publish`]);
 //!    - market.arkavo.com: the feature is configured (`MARKET_*`) and a
 //!      purchase linked to the account still has a claim that verifies
 //!      ([`crate::market::MarketSource::grant`], #141);
 //! 2. the account carries no publishing suspension.
+//!
+//! [`ENTITLEMENT_ONLINE_PLAY`] is derived here too, on its own path: an
+//! active App Store record of a product listed for online play grants it,
+//! nothing that grants publishing does, and a suspension does not remove it
+//! (`docs/online-play-entitlement.md`).
 //!
 //! The market is asked alongside Patreon, not after it ([`load_sources`]
 //! runs while Patreon materializes), so a mint waits for the slower of the

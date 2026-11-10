@@ -103,8 +103,11 @@ The entitlement is **computed when a token is minted, and never stored**.
 
 A stored subscription record is **active** when all of these hold:
 
-- its `product_id` is in `APP_STORE_PUBLISH_PRODUCT_IDS`;
-- its `environment` is in `APP_STORE_ENVIRONMENTS`;
+- its `product_id` is in `APP_STORE_PUBLISH_PRODUCT_IDS` (or a further app's
+  `APP_STORE_<TAG>_PUBLISH_PRODUCT_IDS`). A product listed for online play
+  ([online-play-entitlement.md](online-play-entitlement.md)) never grants
+  publishing;
+- its `environment` is one its app accepts (`APP_STORE_ENVIRONMENTS`);
 - it has no `revoked_at`;
 - now is before the later of its `expires_at` and its `grace_expires_at`.
 
@@ -318,8 +321,9 @@ Every setting is an environment variable. In production they go in
 
 - If either `PATREON_PUBLISHER_*` variable is unset or empty, Patreon never
   grants the entitlement. If any of the first three `APP_STORE_*` variables is
-  unset, the App Store never grants it and the two `/app-store/*` routes answer
-  503. If `MARKET_ISSUER` or `MARKET_CLAIM_KEYS_PATH` is unset, the market
+  unset, the first app's products never grant it. The two `/app-store/*`
+  routes answer 503 only when no app at all is configured (a tagged app
+  alone keeps them on). If `MARKET_ISSUER` or `MARKET_CLAIM_KEYS_PATH` is unset, the market
   never grants it and `POST /market/link` answers 503; a value that is set
   but unusable (a key file that does not parse, a `kid` that is not the
   thumbprint) leaves it off with a warning. The sources are configured
@@ -442,7 +446,8 @@ curl -sS -X DELETE "https://identity.arkavo.net/admin/users/$ACCOUNT_ID/publishi
    ```
 
    It must answer `400`. A `404` means the running binary has no such route;
-   a `503` means the `APP_STORE_*` variables are not all set.
+   a `503` means no App Store app is configured (the `APP_STORE_*` variables
+   are not all set).
 7. In App Store Connect → App Information → App Store Server Notifications,
    select Version 2 and set both the **Production** and the **Sandbox**
    Server URL to `https://identity.arkavo.net/app-store/notifications`.

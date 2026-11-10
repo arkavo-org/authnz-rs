@@ -3320,3 +3320,124 @@ mod several_apps {
         }
     }
 }
+
+// --------- Both routes with a second app ---------
+
+mod several_apps_routes {
+    use super::transactions_route::{Harness, INVALID_BODY, json_body, otid};
+    use super::*;
+    use crate::app_store::AppStoreApp;
+    use crate::constants::ENTITLEMENT_ONLINE_PLAY;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Extension, Router};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const GAME_BUNDLE: &str = "com.example.game";
+    const GAME_APPLE_ID: i64 = 4_242;
+    const PASS: &str = "com.example.game.pass.monthly";
+
+    /// The harness with a second app whose one product grants online play.
+    /// `None` unless DynamoDB Local is configured.
+    fn harness() -> Option<Harness> {
+        let mut h = Harness::new()?;
+        let mut cfg = AppStoreConfig::for_tests(h.fx.root_der.clone());
+        cfg.apps.push(AppStoreApp {
+            bundle_id: GAME_BUNDLE.into(),
+            app_apple_id: GAME_APPLE_ID,
+            products: HashMap::from([(PASS.to_string(), Grant::OnlinePlay)]),
+            environments: [Environment::Production, Environment::Sandbox].into(),
+        });
+        h.state.app_store = Arc::new(Some(cfg));
+        h.app = Router::new()
+            .route("/app-store/transactions", post(transactions_handler))
+            .route("/app-store/notifications", post(notifications_handler))
+            .layer(Extension(h.state.clone()));
+        Some(h)
+    }
+
+    fn pass_purchase(t: &str, account: &uuid::Uuid, product: &str) -> Value {
+        purchase(json!({
+            "bundleId": GAME_BUNDLE,
+            "productId": product,
+            "environment": "Production",
+            "originalTransactionId": t,
+            "appAccountToken": account.to_string(),
+        }))
+    }
+
+    async fn notify(h: &Harness, signed_payload: &str) -> StatusCode {
+        let req = Request::post("/app-store/notifications")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "signedPayload": signed_payload }).to_string(),
+            ))
+            .unwrap();
+        h.app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_pass_purchase_binds_and_grants_only_online_play() {
+        let Some(h) = harness() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let jws = sign_jws(&pass_purchase(&t, &id, PASS), &h.fx);
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let body = json_body(&body);
+        assert_eq!(body["active"], true);
+        assert_eq!(body["entitlement"], ENTITLEMENT_ONLINE_PLAY);
+        assert_eq!(body["environment"], "Production");
+
+        let records = h.records(&id).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].product_id, PASS);
+        assert_eq!(
+            crate::publishing::derived_entitlements(&h.state, Some(id), None).await,
+            vec![ENTITLEMENT_ONLINE_PLAY.to_string()]
+        );
+
+        // The first app's membership product, signed for the game's bundle,
+        // is not a purchase of anything.
+        let other = otid();
+        let jws = sign_jws(&pass_purchase(&other, &id, PRODUCT), &h.fx);
+        let (status, body) = h.post(&h.token(&id), &jws).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, INVALID_BODY);
+        assert_eq!(h.store.app_store_link_owner(&other).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_notification_for_the_second_app_applies_under_its_own_apple_id() {
+        let Some(h) = harness() else { return };
+        let id = h.user().await;
+        let t = otid();
+        let data = |app_apple_id: i64| {
+            json!({
+                "bundleId": GAME_BUNDLE,
+                "appAppleId": app_apple_id,
+                "environment": "Production",
+                "signedTransactionInfo": sign_jws(&pass_purchase(&t, &id, PASS), &h.fx),
+            })
+        };
+
+        // The first app's Apple ID does not vouch for the game's bundle.
+        let wrong = notification(&h.fx, "SUBSCRIBED", data(6_738_845_556));
+        assert_eq!(notify(&h, &wrong).await, StatusCode::BAD_REQUEST);
+        assert!(h.records(&id).await.is_empty());
+
+        let right = notification(&h.fx, "SUBSCRIBED", data(GAME_APPLE_ID));
+        assert_eq!(notify(&h, &right).await, StatusCode::OK);
+        let records = h.records(&id).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].product_id, PASS);
+        assert_eq!(h.store.app_store_link_owner(&t).await.unwrap(), Some(id));
+        assert_eq!(
+            crate::publishing::derived_entitlements(&h.state, Some(id), None).await,
+            vec![ENTITLEMENT_ONLINE_PLAY.to_string()]
+        );
+    }
+}
