@@ -43,7 +43,7 @@ Content-Type: application/json
 
 | Status | Body | When |
 |---|---|---|
-| 200 | `{"token", "expires_at", "audience"}` | minted |
+| 200 | `{"token", "expires_at", "audience", "server_time"}` | minted |
 | 400 | `{"error":"invalid_request"}` | not that JSON object |
 | 400 | `{"error":"invalid_cnf_key"}` | not such a key |
 | 401 | `{"error":"unauthorized"}` | no acceptable auth CWT, or the account is not live |
@@ -53,7 +53,11 @@ Content-Type: application/json
 
 Every answer carries `Cache-Control: no-store`. `token` is base64url without
 padding. `expires_at` is the token's `exp` (unix seconds). `audience` is the
-market the token is for; send the token nowhere else. A 400 is decided
+market the token is for; send the token nowhere else. `server_time` is
+identity's clock at the mint (unix seconds, the token's `iat`): the market
+accepts a request signed within 60 seconds of its own clock and explains no
+refusal, so a device whose clock is wrong should sign with a time corrected
+by the difference, and read `expires_at` against it. A 400 is decided
 before the account is read.
 
 ## The token

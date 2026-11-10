@@ -564,7 +564,8 @@ appraisal, status)
 - `POST /market/token` (passkey auth CWT in `X-Auth-Token`, original or
   renewed; live account), body `{cnf_key}` only (unknown members refused:
   the caller never chooses the audience). 200 `{token, expires_at,
-  audience}`; 401 `unauthorized`; 400 `invalid_request` / `invalid_cnf_key`
+  audience, server_time}` (`server_time` = `iat`, so a device with a wrong
+  clock can correct the time it signs for the market); 401 `unauthorized`; 400 `invalid_request` / `invalid_cnf_key`
   (before the account read); 429 `rate_limited` + `Retry-After` past
   `MARKET_TOKEN_MINTS_PER_MINUTE` (10, in process, its own
   `owner_kas::MintLimiter`); 503 `market_unavailable` while the market is

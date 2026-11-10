@@ -45,7 +45,7 @@ struct TokenRequest {
 /// JSON object) or `invalid_cnf_key` (not an unpadded base64url P-256
 /// point), decided before the account read; 429 `rate_limited` with
 /// `Retry-After` past [`MARKET_TOKEN_MINTS_PER_MINUTE`]; 200
-/// `{token, expires_at, audience}`.
+/// `{token, expires_at, audience, server_time}`.
 pub(crate) async fn token_handler(
     Extension(app_state): Extension<AppState>,
     headers: HeaderMap,
@@ -123,6 +123,11 @@ pub(crate) async fn token_handler(
             "token": authnz_rs::cwt::encode_for_header(&bytes),
             "expires_at": token.exp,
             "audience": token.aud,
+            // The market accepts a request signed within 60 s of its clock
+            // and explains no refusal: identity's clock, which must stay
+            // within 60 s of the market's, lets a device with a wrong one
+            // correct the time it signs.
+            "server_time": now,
         })),
     )
         .into_response()

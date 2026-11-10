@@ -177,12 +177,18 @@ async fn a_live_account_gets_a_token_for_the_market_and_key() {
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(h["cache-control"], "no-store");
     assert_eq!(body["audience"], json!(MARKET));
+    let server_time = body["server_time"].as_i64().unwrap();
+    assert!(
+        (before..=before + 5).contains(&server_time),
+        "{server_time}"
+    );
 
     let bytes = authnz_rs::cwt::decode_from_header(body["token"].as_str().unwrap()).unwrap();
     let t = market_token::verify(&bytes, &state.cwt_keys, MARKET, before, 60).unwrap();
     assert_eq!(t.iss, *state.issuer);
     assert_eq!(t.account, user.user_id.to_string());
     assert_eq!(t.exp - t.iat, LIFETIME_SECONDS);
+    assert_eq!(t.iat, server_time);
     assert_eq!(body["expires_at"], json!(t.exp));
     assert_eq!(market_token::parse_cnf_key(&key), Some((t.x, t.y)));
 
