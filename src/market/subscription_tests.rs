@@ -652,6 +652,79 @@ async fn one_failure_stops_lookups_for_every_account() {
     assert_eq!(h.hits(), asked + 1);
 }
 
+/// The market is up and answering; one account's claim does not verify (a
+/// test-mode term, another account's claim, an unknown tier, an unpinned
+/// key). That account goes without, and nobody else's lookup is stopped.
+#[tokio::test]
+async fn one_accounts_bad_claim_does_not_stop_other_lookups() {
+    let h = Harness::new().await;
+    let someone_else = Uuid::new_v4();
+    let stranger = key();
+    let unpinned = Uuid::new_v4();
+    h.answer(
+        &unpinned,
+        Answer::Active(sign(
+            &stranger,
+            &payload(&h.source.config, &unpinned, json!({})),
+        )),
+    );
+    let test_mode = Uuid::new_v4();
+    h.answer(
+        &test_mode,
+        Answer::Active(h.claim(&test_mode, json!({ "livemode": false }))),
+    );
+    let wrong_tier = Uuid::new_v4();
+    h.answer(
+        &wrong_tier,
+        Answer::Active(h.claim(&wrong_tier, json!({ "tier": "lifetime" }))),
+    );
+    let bad = [
+        test_mode,
+        wrong_tier,
+        unpinned,
+        h.with(Answer::Active(h.claim(&someone_else, json!({})))),
+    ];
+    for account in bad {
+        assert_eq!(
+            h.source.subscription(&account, true).await,
+            Subscription::Unavailable,
+            "{account}"
+        );
+        assert!(!h.breaker_open(), "{account}");
+        // Cached for that account alone: it is not asked again at once.
+        let asked = h.hits();
+        assert_eq!(
+            h.source.subscription(&account, true).await,
+            Subscription::Unavailable
+        );
+        assert_eq!(h.hits(), asked);
+        // A subscriber with nothing cached is still asked about, and held.
+        let subscriber = h.subscriber();
+        assert_eq!(
+            h.source.subscription(&subscriber, false).await,
+            Subscription::Active
+        );
+    }
+
+    // An outage, by contrast, opens it: each kind.
+    for answer in [
+        Answer::Status(401),
+        Answer::Status(429),
+        Answer::Status(503),
+        Answer::Redirect,
+        Answer::Body("not json".into()),
+        Answer::Body(r#"{"status":"active"}"#.into()),
+    ] {
+        h.close_breaker();
+        let account = h.with(answer);
+        assert_eq!(
+            h.source.subscription(&account, false).await,
+            Subscription::Unavailable
+        );
+        assert!(h.breaker_open(), "{account}");
+    }
+}
+
 #[test]
 fn when_the_breaker_window_ends_one_caller_probes() {
     let lookup = SubscriptionLookup::new(LookupToken::parse(Some(&token_text())).unwrap().unwrap());
@@ -659,7 +732,7 @@ fn when_the_breaker_window_ends_one_caller_probes() {
     assert!(lookup.admit(now), "closed: everyone is admitted");
     assert!(lookup.admit(now));
 
-    lookup.settle(Subscription::Unavailable, now);
+    lookup.settle(Fetched::Outage, now);
     assert!(!lookup.admit(now));
     assert!(!lookup.admit(now + MARKET_FAILURE_CACHE_TTL_SECONDS - 1));
 
@@ -670,17 +743,21 @@ fn when_the_breaker_window_ends_one_caller_probes() {
     assert!(!lookup.admit(later + MARKET_FETCH_DEADLINE_SECONDS as i64));
 
     // A probe that fails opens it for another window.
-    lookup.settle(Subscription::Unavailable, later + 3);
+    lookup.settle(Fetched::Outage, later + 3);
     assert!(!lookup.admit(later + 3 + MARKET_FAILURE_CACHE_TTL_SECONDS - 1));
     // One that answers closes it, whatever the answer.
-    for answer in [Subscription::None, Subscription::Active] {
-        lookup.settle(Subscription::Unavailable, now);
+    for answer in [
+        Fetched::Answer(Subscription::None),
+        Fetched::Answer(Subscription::Active),
+        Fetched::Unverified,
+    ] {
+        lookup.settle(Fetched::Outage, now);
         lookup.settle(answer, now + 1);
         assert!(lookup.admit(now + 1));
         assert!(lookup.admit(now + 1));
     }
     // A probe that never reports back does not shut the breaker for good.
-    lookup.settle(Subscription::Unavailable, now);
+    lookup.settle(Fetched::Outage, now);
     assert!(lookup.admit(later));
     assert!(lookup.admit(later + MARKET_FETCH_DEADLINE_SECONDS as i64 + 1));
 }
@@ -766,8 +843,7 @@ async fn a_recheck_never_passes_a_cached_failure_or_an_open_breaker() {
     );
     assert_eq!(h.hits(), asked);
     // Another account's recheck while the breaker is open.
-    h.lookup()
-        .settle(Subscription::Unavailable, Utc::now().timestamp());
+    h.lookup().settle(Fetched::Outage, Utc::now().timestamp());
     assert_eq!(
         h.source.subscription(&waiting, true).await,
         Subscription::Unavailable
