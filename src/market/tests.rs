@@ -5,6 +5,7 @@
 //! unless `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it).
 
 use super::*;
+use crate::constants::ENTITLEMENT_ONLINE_PLAY;
 use crate::db::{DynamoDBStore, PublishingSuspension};
 use crate::publishing::DeriveError;
 use axum::Router;
@@ -570,7 +571,10 @@ fn a_pasted_claim_names_its_purchase_unverified() {
 fn the_lifetime_tier_grants_every_paid_feature_today() {
     assert_eq!(
         Tier::Lifetime.entitlements(),
-        vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        vec![
+            ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+            ENTITLEMENT_ONLINE_PLAY.to_string()
+        ]
     );
     // Derived-only, so never stored and never delegated to an agent.
     for e in Tier::Lifetime.entitlements() {
@@ -803,7 +807,10 @@ async fn grant_takes_a_verified_purchase_and_skips_test_mode() {
     let (refunded, valid) = (h.with(Answer::Status(410)), h.valid());
     assert_eq!(
         h.source.grant(&links(&[&refunded, &valid])).await,
-        MarketGrant::Granted(vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()])
+        MarketGrant::Granted(vec![
+            ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+            ENTITLEMENT_ONLINE_PLAY.to_string()
+        ])
     );
     assert_eq!(
         h.source.grant(&links(&[&refunded, &live_id()])).await,
@@ -837,7 +844,10 @@ async fn grant_in_test_mode_takes_a_test_purchase() {
         .answer(&test, Answer::Claim(h.claim(&test, json!({}))));
     assert_eq!(
         h.source.grant(&links(&[&test])).await,
-        MarketGrant::Granted(vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()])
+        MarketGrant::Granted(vec![
+            ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+            ENTITLEMENT_ONLINE_PLAY.to_string()
+        ])
     );
 }
 
@@ -1130,7 +1140,7 @@ async fn link_binds_a_verified_purchase_once() {
         json!({
             "tier": "lifetime",
             "livemode": true,
-            "entitlements": [ENTITLEMENT_CREATOR_PUBLISH],
+            "entitlements": [ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY],
             "token_can_publish": false,
         })
     );
@@ -1295,7 +1305,10 @@ async fn a_mint_derives_publishing_from_a_linked_purchase() {
     assert_eq!(f.link(&token, &id).await.0, StatusCode::OK);
     assert_eq!(
         derived(&f.state, user).await,
-        vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        vec![
+            ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+            ENTITLEMENT_ONLINE_PLAY.to_string()
+        ]
     );
 
     // Through the one claims builder every human token uses.
@@ -1331,7 +1344,12 @@ async fn a_mint_derives_publishing_from_a_linked_purchase() {
         )
         .await
         .unwrap();
-    assert!(derived(&f.state, user).await.is_empty());
+    // The suspension withholds publishing only: the lifetime membership's
+    // online play stays (each entitlement has its own path).
+    assert_eq!(
+        derived(&f.state, user).await,
+        vec![ENTITLEMENT_ONLINE_PLAY.to_string()]
+    );
 }
 
 #[tokio::test]

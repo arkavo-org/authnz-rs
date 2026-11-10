@@ -235,6 +235,13 @@ pub const MARKET_CLAIM_MAX_BYTES: usize = 16 * 1024;
 /// (429 beyond it), and one account cannot spend the budget mints need.
 pub const MARKET_LINK_FETCHES_PER_MINUTE: u32 = 5;
 
+/// How many times a minute a renewal may ask the market again about an
+/// account whose cached subscription answer is "none" (#151). An app
+/// refreshes its token right after a payment and keeps trying for about a
+/// minute (Stripe's search lags a payment), so this allows a retry every ten
+/// seconds; beyond it the cached answer is served.
+pub const MARKET_SUBSCRIPTION_RECHECKS_PER_MINUTE: u32 = 6;
+
 /// `POST /owner-kas/token` (#146): mints per account per minute (429 beyond
 /// it, in process). The app mints only on Open and "Try again", never while
 /// polling, so this is ample.

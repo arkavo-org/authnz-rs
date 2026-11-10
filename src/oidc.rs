@@ -1711,7 +1711,7 @@ async fn handle_refresh_token_grant(
         entitlements,
         auth_time: record.auth_time,
     };
-    let arkavo_user = arkavo_user_claims(&app_state, &patreon, &refreshed_user).await;
+    let arkavo_user = arkavo_user_claims_rechecking(&app_state, &patreon, &refreshed_user).await;
 
     let id_exp = now + ID_TOKEN_LIFETIME_SECONDS;
 
@@ -2217,6 +2217,28 @@ pub(crate) async fn arkavo_user_claims(
     patreon: &crate::patreon::PatreonState,
     user: &AuthenticatedUser,
 ) -> crate::cwt::ArkavoUserClaims {
+    user_claims(app_state, patreon, user, false).await
+}
+
+/// [`arkavo_user_claims`] for a mint the user asked for to pick up a change:
+/// a session renewal, a passkey sign-in, the OIDC refresh grant. It may ask
+/// the market again about a subscription cached as "none" (within a
+/// per-account budget), so the refresh an app makes right after a payment is
+/// not answered from before it (#151).
+pub(crate) async fn arkavo_user_claims_rechecking(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    user: &AuthenticatedUser,
+) -> crate::cwt::ArkavoUserClaims {
+    user_claims(app_state, patreon, user, true).await
+}
+
+async fn user_claims(
+    app_state: &AppState,
+    patreon: &crate::patreon::PatreonState,
+    user: &AuthenticatedUser,
+    recheck: bool,
+) -> crate::cwt::ArkavoUserClaims {
     let user_id = arkavo_user_uuid(user);
     // The market check (and the publishing-state read it needs) runs
     // alongside Patreon's materialization, so a mint waits for the slower of
@@ -2230,7 +2252,7 @@ pub(crate) async fn arkavo_user_claims(
                 None => None,
             }
         },
-        crate::publishing::load_sources(app_state, user_id),
+        crate::publishing::load_sources(app_state, user_id, recheck),
     );
     let publish = match sources {
         // What was granted stands even when the market could not answer: an

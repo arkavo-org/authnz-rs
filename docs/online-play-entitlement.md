@@ -10,9 +10,9 @@ It means the account has paid for play over the operator's network between
 players who are not together. A game server checks for it in the caller's own
 token. Local play never needs it.
 
-This document covers what identity does today: the App Store source. The
-market sources (prepaid terms, the lifetime membership) and a token scoped to
-a game server are not built.
+Three sources grant it: an App Store product (0.32.0), a prepaid term bought
+at the market, and a linked market lifetime membership (both 0.33.0). A token
+scoped to a game server is not built.
 
 ## Rules
 
@@ -31,11 +31,15 @@ a game server are not built.
   peer certificate, #143): a lapsed pass must stop within the hour.
 - **A publishing suspension does not remove it.** The suspension is about
   publishing; the pass is paid network access.
-- **A market outage does not remove it.** When a linked market purchase
-  cannot be checked, a mint goes without what the market would have granted
-  and keeps the rest. `GET /entities/arkavo:<uuid>` still answers 503
-  `market_unavailable` in that case, as before: it must not report an unknown
-  as "not entitled".
+- **A market outage withholds only what the market would have granted.** A
+  mint always succeeds and keeps what the other sources grant. Two cases
+  differ for `GET /entities/arkavo:<uuid>`:
+  - a linked **membership claim** that cannot be checked, with no other
+    publishing source: 503 `market_unavailable`, as before (it must not
+    report an unknown publishing answer as "not entitled");
+  - a **subscription lookup** that fails: 200 without the online-play value.
+    No decision path reads the pass from `/entities`, and the lookup runs
+    for every account, so an outage must not fail that route for everyone.
 - `GET /entities/arkavo:<uuid>` lists it while it holds, because a person's
   entity is the live view of a fresh mint.
 
@@ -78,7 +82,83 @@ In App Store Connect, set that app's App Store Server Notifications V2 URL
 (Production and Sandbox) to `https://<identity>/app-store/notifications`, the
 same route every app uses.
 
-## What the app does
+## The market source: prepaid terms
+
+The market sells prepaid terms of the pass and records which account each is
+for. Identity stores nothing about them: at each mint it asks the market
+about the account. Contract: arkavo-com/market
+`docs/market-identity-interface.md`, "Account lookups (subscriptions)".
+
+| Variable | Purpose |
+|---|---|
+| `MARKET_ISSUER`, `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE` | As for the lifetime membership: the market's base URL, the pinned claim keys, and whether test-mode claims are accepted. |
+| `MARKET_LOOKUP_TOKEN` | The secret identity sends as `Authorization: Bearer`. The same value as `IDENTITY_LOOKUP_TOKEN` in the market's `commerce.env`: at least 32 printable ASCII characters, no spaces. Unset, or set but unusable ⇒ no lookup (startup log line; the value is never logged). |
+
+**Setting `MARKET_LOOKUP_TOKEN` turns the lookup on for every human mint.**
+
+```
+GET <MARKET_ISSUER>/subscriptions/<account uuid>
+Authorization: Bearer <MARKET_LOOKUP_TOKEN>
+Accept: application/json
+```
+
+The account id is the bare lowercase UUID, never the `arkavo:` OIDC `sub`.
+
+| The market answers | Identity |
+|---|---|
+| `200` with a claim that verifies | grants online play |
+| `404` | grants nothing: no term covers now |
+| `200` with a claim that does not verify, `401`, `429`, `5xx`, a redirect, a timeout, a network error | a failure: grants nothing, and is never taken for "none" |
+
+A claim verifies when it is signed by a pinned claim key (`alg` ES256, `typ`
+JWT), its `iss` is `MARKET_ISSUER`, its `aud` is `OIDC_ISSUER`, its `sub` is
+the account identity asked about, its `tier` is `online-play`, and its
+`livemode` is `true` (or test mode is accepted). The body's `until` is not
+signed and is not used. A membership claim never verifies as a lookup answer,
+and a lookup answer never links as a membership.
+
+How the lookup is kept from slowing sign-in or hiding a payment:
+
+- **Not asked when an App Store pass already grants.**
+- **Cache**, per account, in process: an answer (`200` or `404`) 5 minutes, a
+  failure 60 seconds.
+- **Circuit breaker.** After a failure no account is asked for 60 seconds,
+  then one mint probes. Meanwhile the answer is unknown for accounts with
+  nothing cached, and a cached "active" still grants. An outage costs one
+  3-second deadline a minute, not one per sign-in.
+- **A renewal rechecks a cached "none".** `POST /session/refresh`, a passkey
+  sign-in and the OIDC refresh grant ask the market again when the cached
+  answer is "none", at most 6 times a minute per account. So the refresh an
+  app makes after a payment is not answered from before it. The market's
+  payment search lags a payment by a minute or more, so the app should keep
+  renewing for about that long (every 10 seconds fits the budget).
+- **One deadline.** The lookup runs beside the membership claim check and
+  Patreon; a mint waits for the slowest, never for each in turn.
+- A `401` means the two tokens differ. It is logged as an error (`market
+  subscription lookup refused (401)`) and treated as an outage. To rotate,
+  change both sides and restart identity.
+
+Lapse: at most about an hour and five minutes after a term ends (the cache,
+then the token's life).
+
+## The lifetime membership
+
+A market lifetime membership linked to the account
+([creator-publishing-entitlement.md](creator-publishing-entitlement.md))
+covers every paid entitlement, so it grants online play as well as
+publishing. The two stay separate paths:
+
+- a publishing suspension withholds publishing and leaves online play;
+- the membership's claim is checked whenever it can still decide either
+  entitlement, so also for a suspended account and for one whose App Store
+  membership already grants publishing;
+- `POST /market/link` lists both values in `entitlements`.
+
+When the market cannot be reached, a lifetime member's mint goes without
+both until it answers again (60 seconds of failure cache at most between
+tries).
+
+## What the app does (App Store)
 
 Exactly what an app does for a publishing membership:
 
