@@ -52,7 +52,7 @@ fn main() {
         .unwrap_or_else(|| "https://identity.example".into());
     let audience = args.next().unwrap_or_else(|| "https://game.example".into());
     assert!(game_token::is_audience(&audience), "not a game audience");
-    let (ISSUER, AUDIENCE) = (issuer.as_str(), audience.as_str());
+    let (issuer, audience) = (issuer.as_str(), audience.as_str());
     let now = chrono::Utc::now().timestamp();
 
     // Identity's signing key and the set a verifier fetches.
@@ -75,7 +75,7 @@ fn main() {
     let (x, y): ([u8; 32], [u8; 32]) = ((*point.x().unwrap()).into(), (*point.y().unwrap()).into());
 
     let token = |online_play: bool, aud: &str, iat: i64, exp: i64| GameToken {
-        iss: ISSUER.into(),
+        iss: issuer.into(),
         sub: "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10".into(),
         aud: aud.into(),
         iat,
@@ -86,13 +86,13 @@ fn main() {
         handle: "alice.arkavo.social".into(),
         online_play,
     };
-    let verify = |bytes: &[u8]| game_token::verify(bytes, &keys, ISSUER, AUDIENCE, now, SKEW);
+    let verify = |bytes: &[u8]| game_token::verify(bytes, &keys, issuer, audience, now, SKEW);
 
     // Accepted.
     let mut accepted = Vec::new();
     let mut with_pass_text = String::new();
     for (name, online_play) in [("with_pass", true), ("without_pass", false)] {
-        let t = token(online_play, AUDIENCE, now, now + 900);
+        let t = token(online_play, audience, now, now + 900);
         let bytes = game_token::mint(&t, &identity, &kid).expect("mint");
         assert_eq!(verify(&bytes).expect(name), t);
         if online_play {
@@ -108,7 +108,7 @@ fn main() {
     }
 
     // Request proofs for the token with the pass.
-    let pass = token(true, AUDIENCE, now, now + 900);
+    let pass = token(true, audience, now, now + 900);
     let proofs: Vec<Value> = [
         (
             "GET",
@@ -133,7 +133,7 @@ fn main() {
     .into_iter()
     .map(|(method, path, body, note)| {
         let message =
-            game_token::request_message(AUDIENCE, method, path, now, body, &with_pass_text);
+            game_token::request_message(audience, method, path, now, body, &with_pass_text);
         let signature = raw_signature(&device, &message);
         assert!(game_token::request_proof_verifies(
             &pass,
@@ -159,7 +159,7 @@ fn main() {
     // Refused.
     let stranger = SigningKey::random(&mut OsRng);
     let stranger_kid = thumbprint_kid(stranger.verifying_key()).expect("kid");
-    let ok = token(true, AUDIENCE, now, now + 900);
+    let ok = token(true, audience, now, now + 900);
     let mut refused = Vec::new();
     let mut refuse = |name: &str, why: &str, bytes: Vec<u8>, expected: fn(&CwtError) -> bool| {
         let err = verify(&bytes).expect_err(name);
@@ -181,7 +181,7 @@ fn main() {
         "expired",
         "exp is more than the skew in the past",
         game_token::mint(
-            &token(true, AUDIENCE, now - 2_000, now - 1_100),
+            &token(true, audience, now - 2_000, now - 1_100),
             &identity,
             &kid,
         )
@@ -192,7 +192,7 @@ fn main() {
         "not_yet_valid",
         "iat is more than the skew in the future",
         game_token::mint(
-            &token(true, AUDIENCE, now + 600, now + 1_500),
+            &token(true, audience, now + 600, now + 1_500),
             &identity,
             &kid,
         )
@@ -202,7 +202,7 @@ fn main() {
     refuse(
         "lifetime_over_an_hour",
         "exp - iat is more than 3600",
-        game_token::mint(&token(true, AUDIENCE, now, now + 3_601), &identity, &kid).unwrap(),
+        game_token::mint(&token(true, audience, now, now + 3_601), &identity, &kid).unwrap(),
         |e| matches!(e, CwtError::Malformed),
     );
     refuse(
@@ -221,7 +221,7 @@ fn main() {
         "no_content_type",
         "an ordinary session CWT for the same audience: no protected content type",
         cwt::mint(
-            &cwt::ArkavoClaims::oidc_access(ISSUER, &ok.sub, AUDIENCE, 1),
+            &cwt::ArkavoClaims::oidc_access(issuer, &ok.sub, audience, 1),
             &identity,
             &kid,
         )
@@ -233,7 +233,7 @@ fn main() {
         "an owner-KAS token: another protected content type",
         authnz_rs::owner_kas_token::mint(
             &authnz_rs::owner_kas_token::OwnerKasToken {
-                iss: ISSUER.into(),
+                iss: issuer.into(),
                 sub: ok.sub.clone(),
                 route_id: "01JC5Z8Q4M7N2P3R6S9T0V1W2X".into(),
                 iat: now,
@@ -266,8 +266,8 @@ fn main() {
         "generated_at": now,
         "verify_at": now,
         "skew_seconds": SKEW,
-        "issuer": ISSUER,
-        "audience": AUDIENCE,
+        "issuer": issuer,
+        "audience": audience,
         "content_type": game_token::CONTENT_TYPE,
         "encoding": "tokens are base64url without padding of CBOR tag 61 around a COSE_Sign1; \
                      signatures are base64url without padding of raw r||s (64 bytes)",
