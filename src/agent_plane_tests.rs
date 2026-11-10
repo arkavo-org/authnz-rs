@@ -579,6 +579,55 @@ async fn any_account_can_delegate_the_market_request_entitlement() {
     assert_eq!(p.authorize(auth, body).await.0, StatusCode::FORBIDDEN);
 }
 
+/// "Every account" means every live one: once the owner's row is a
+/// tombstone its agent mints nothing, although the deletion has not revoked
+/// the delegation and the entitlement needs no stored copy.
+#[tokio::test]
+async fn a_deleted_owners_agent_cannot_mint_the_market_request_entitlement() {
+    let Some(p) = Plane::new().await else { return };
+    let request = crate::constants::ENTITLEMENT_MARKET_REQUEST;
+    let (owner, cwt) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let mut body = authorize_body(&a, "kit-1", false);
+    body["entitlements"] = json!([request]);
+    let (st, reply) = p.authorize(("X-Auth-Token", &cwt), body).await;
+    assert_eq!(st, StatusCode::OK, "{reply}");
+    let read = p
+        .store
+        .get_agent_delegation(&did_key(&a))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The tombstone alone: the delegation row is left as it was.
+    p.store
+        .tombstone_account(
+            &owner,
+            &format!("{owner}.{}", "a".repeat(32)),
+            None,
+            Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let after = p
+        .store
+        .get_agent_delegation(&did_key(&a))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.revoked_at.is_none());
+
+    let (st, body) = p.mint(&a).await;
+    assert_ne!(st, StatusCode::OK, "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+
+    // The mint itself refuses, whatever its caller read.
+    assert!(matches!(
+        crate::agent::mint_from_current(&p.state, &read, &[]).await,
+        Err(crate::agent::AgentError::DelegationRevoked)
+    ));
+}
+
 fn verify_passkey(p: &Plane, token: &str) -> crate::cwt::ArkavoClaims {
     let bytes = crate::cwt::decode_from_header(token).unwrap();
     crate::cwt::verify(

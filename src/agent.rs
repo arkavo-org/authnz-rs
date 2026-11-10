@@ -1017,11 +1017,17 @@ pub async fn issue_agent_token(
     // Agents keep stale entitlements for the whole delegation lifetime
     // otherwise: mint against what the delegator currently holds, not what
     // was captured at authorize time.
+    //
+    // An owner whose row is gone (#88) holds nothing, not even what every
+    // live account holds (`holds_entitlement`): refuse here, by the row
+    // itself, as well as in `active_delegation`'s liveness check.
     let held = app_state
         .db_store
-        .get_user_entitlements(&delegation.root_user_id)
+        .get_user_by_id(&delegation.root_user_id)
         .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
+        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
+        .ok_or(AgentError::DelegationRevoked)?
+        .entitlements;
     let minted = mint_from_current(&app_state, &delegation, &held).await?;
 
     info!(
@@ -1090,11 +1096,14 @@ fn intersect_entitlements(delegated: &[String], stored: &[String]) -> Vec<String
         .collect()
 }
 
-/// Whether an account whose stored entitlements are `stored` holds
+/// Whether a **live** account whose stored entitlements are `stored` holds
 /// `entitlement`: it is stored, or every live account holds it
 /// (`constants::is_held_by_every_account`, the market request entitlement).
 /// The one rule behind the authorize subset check and the mint
-/// intersection, so the two can never disagree.
+/// intersection, so the two can never disagree. Both callers establish that
+/// the account is live first: authorize authenticates a live operator, and
+/// a mint goes through `active_delegation`, which refuses a delegation
+/// whose owner's row is gone.
 fn holds_entitlement(stored: &[String], entitlement: &str) -> bool {
     crate::constants::is_held_by_every_account(entitlement)
         || stored.iter().any(|s| s == entitlement)
