@@ -21,6 +21,11 @@
 //!   nothing; anything else grants nothing too (fails closed, no last-good
 //!   fallback).
 //!
+//! The market also sells prepaid terms of the online-play subscription (the
+//! Game Pass, #151). Those have no link: [`subscription`] asks the market
+//! about the account at each mint. A lifetime membership grants online play
+//! too ([`Tier::entitlements`]).
+//!
 //! A checkout session id is the purchase's bearer secret (anyone holding it
 //! can fetch the claim), so no error, log line or `Debug` output here carries
 //! one: logs name a purchase by [`SessionId::log_ref`]. Errors are unit

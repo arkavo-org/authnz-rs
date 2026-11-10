@@ -316,7 +316,7 @@ async fn lookup_route(
 }
 
 /// A local market and a source that looks subscriptions up there.
-struct Harness {
+pub(crate) struct Harness {
     key: SigningKey,
     token: String,
     market: Market,
@@ -324,7 +324,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let token = token_text();
         Self::with_tokens(&token, &token).await
     }
@@ -360,8 +360,21 @@ impl Harness {
         self.source.subscriptions.as_ref().unwrap()
     }
 
-    fn hits(&self) -> usize {
+    pub(crate) fn hits(&self) -> usize {
         self.market.hits.load(Ordering::SeqCst)
+    }
+
+    /// Another source pointed at this market with the same token, for an
+    /// `AppState` to own.
+    pub(crate) fn source_for_state(&self) -> MarketSource {
+        MarketSource::new(self.source.config.clone())
+            .unwrap()
+            .with_lookup_token(LookupToken::parse(Some(&self.token)).unwrap().unwrap())
+    }
+
+    /// From now on the market answers that `account` holds a paid term.
+    pub(crate) fn subscribe(&self, account: &Uuid) {
+        self.answer(account, Answer::Active(self.claim(account, json!({}))));
     }
 
     fn answer(&self, account: &Uuid, answer: Answer) {
@@ -776,10 +789,7 @@ impl MintFixture {
         let mut state = crate::test_helpers::build_test_app_state_with_store(store.clone());
         let h = Harness::new().await;
         // The state owns its own source, pointed at the same market.
-        let source = MarketSource::new(h.source.config.clone())
-            .unwrap()
-            .with_lookup_token(LookupToken::parse(Some(&h.token)).unwrap().unwrap());
-        state.market = Arc::new(Some(source));
+        state.market = Arc::new(Some(h.source_for_state()));
         Some(Self {
             h: Arc::new(h),
             state,
@@ -799,8 +809,7 @@ impl MintFixture {
     }
 
     fn subscribe(&self, account: &Uuid) {
-        self.h
-            .answer(account, Answer::Active(self.h.claim(account, json!({}))));
+        self.h.subscribe(account);
     }
 
     async fn derived(&self, account: Uuid) -> Vec<String> {

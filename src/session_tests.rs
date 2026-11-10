@@ -239,7 +239,12 @@ struct Harness {
 }
 
 fn harness(r: &Registered) -> Harness {
-    let state = crate::test_helpers::build_test_app_state_with_store(r.ceremony.store.clone());
+    harness_with(crate::test_helpers::build_test_app_state_with_store(
+        r.ceremony.store.clone(),
+    ))
+}
+
+fn harness_with(state: AppState) -> Harness {
     let app = Router::new()
         .route("/session", post(crate::session::open_session))
         .route("/session/refresh", post(crate::session::refresh_session))
@@ -343,6 +348,47 @@ impl Harness {
 fn reason(body: &Value) -> Option<&str> {
     assert_eq!(body["error"], "session_ended", "{body}");
     body["reason"].as_str()
+}
+
+/// The app renews right after a payment at the market. The renewal asks the
+/// market again although the last mint cached "no term", so the new token
+/// carries the pass (#151).
+#[tokio::test]
+async fn a_renewal_carries_a_term_paid_since_the_last_one() {
+    use crate::constants::ENTITLEMENT_ONLINE_PLAY;
+    let Some(r) = registered_account(&unique_name()).await else {
+        return;
+    };
+    let market = crate::market::subscription::tests::Harness::new().await;
+    let mut state = crate::test_helpers::build_test_app_state_with_store(r.ceremony.store.clone());
+    state.market = std::sync::Arc::new(Some(market.source_for_state()));
+    let h = harness_with(state);
+    let device = Device::new();
+    let sign_in = crate::test_helpers::auth_cwt_aged(&h.state, r.user_id, 10);
+    let (st, opened) = h.open(&sign_in, &device).await;
+    assert_eq!(st, StatusCode::CREATED, "{opened}");
+    let id = opened["sessionId"].as_str().unwrap().to_string();
+    let has_pass = |body: &Value| {
+        claims_of(&h.state, body["token"].as_str().unwrap())
+            .custom
+            .arkavo_entitlements
+            .is_some_and(|e| e.contains(&ENTITLEMENT_ONLINE_PLAY.to_string()))
+    };
+
+    let (st, first) = h
+        .refresh(&device, &id, opened["credential"].as_str().unwrap())
+        .await;
+    assert_eq!(st, StatusCode::OK, "{first}");
+    assert!(!has_pass(&first), "no term yet");
+    assert_eq!(market.hits(), 1);
+
+    market.subscribe(&r.user_id);
+    let (st, second) = h
+        .refresh(&device, &id, first["credential"].as_str().unwrap())
+        .await;
+    assert_eq!(st, StatusCode::OK, "{second}");
+    assert!(has_pass(&second), "the renewal asked the market again");
+    assert_eq!(market.hits(), 2);
 }
 
 #[tokio::test]
