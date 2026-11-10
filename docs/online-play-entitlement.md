@@ -11,8 +11,9 @@ players who are not together. A game server checks for it in the caller's own
 token. Local play never needs it.
 
 Three sources grant it: an App Store product (0.32.0), a prepaid term bought
-at the market, and a linked market lifetime membership (both 0.33.0). A token
-scoped to a game server is not built.
+at the market, and a linked market lifetime membership (both 0.33.0). A game
+server reads it from a token minted for it alone
+([game-token.md](game-token.md), 0.34.0).
 
 ## Rules
 

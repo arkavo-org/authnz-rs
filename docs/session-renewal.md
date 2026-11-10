@@ -148,6 +148,16 @@ Renew before `expiresAt`, and once on a 401 from a resource server. Never
 renew on a background timer: that keeps an idle session alive and defeats
 the idle timeout.
 
+## What else the device key signs
+
+The device key also signs the request for a game-server token
+(`arkavo-game-token-v1`, [game-token.md](game-token.md)) and, with that token,
+each request to a game server (`arkavo-game-request-v1`). The session is not
+changed by either. Every message the key signs starts with a fixed context
+line. A client library must never sign caller-supplied bytes with it: the
+sign-out message is only a context line and the session id, so raw signing
+would let another party obtain one.
+
 ## Server notes
 
 - Row: `identity_links` `session#<sessionId>`, `provider = session`,
