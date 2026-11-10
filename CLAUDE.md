@@ -55,6 +55,7 @@ when unset.
 | `APP_STORE_<TAG>_BUNDLE_ID`, `_APP_APPLE_ID`, `_PUBLISH_PRODUCT_IDS`, `_ONLINE_PLAY_PRODUCT_IDS`, `_ENVIRONMENTS`; `APP_STORE_ONLINE_PLAY_PRODUCT_IDS` | Further App Store apps, one per operator-chosen `<TAG>` (never in a token), each with the untagged variables' meaning for its own bundle. **A product grants exactly one entitlement**: a `_PUBLISH_PRODUCT_IDS` product grants creator publishing, an `_ONLINE_PLAY_PRODUCT_IDS` product grants `https://arkavo.net/attr/network/value/online-play` (the Game Pass) and nothing else. An app needs its bundle id, Apple ID and at least one product. A tagged app that is incomplete, repeats a bundle id or product id of the untagged app, or lists a product in both lists is skipped (error log); two tagged apps that share a bundle id or product id are both skipped. The other apps stay on. The untagged `APP_STORE_ONLINE_PLAY_PRODUCT_IDS` adds online-play products to the untagged app. |
 | `APP_STORE_ENVIRONMENTS` | Comma-separated, default `Production,Sandbox`; only those two values are accepted. Sandbox is accepted on prod by owner decision (App Review buys there); every Sandbox grant is logged with `env=Sandbox`. `Xcode` and `LocalTesting` are always refused. |
 | `MARKET_ISSUER`, `MARKET_CLAIM_KEYS_PATH`, `MARKET_ACCEPT_TEST_MODE` | market.arkavo.com lifetime membership (#141, `market.rs`). `MARKET_ISSUER` (`https://market.arkavo.com`) is the claims' `iss` and the base of `<issuer>/claim/<checkoutSessionId>`. `MARKET_CLAIM_KEYS_PATH` is a JWK Set file of the **pinned** P-256 claim keys; each `kid` must be its RFC 7638 thumbprint. The market's `/.well-known/jwks.json` is a rotation channel to read, never a trust anchor. The expected `aud` is `OIDC_ISSUER`. `MARKET_ACCEPT_TEST_MODE=true` accepts Stripe test-mode claims (default off). The first two are required; either unset ⇒ off (startup log line) and `POST /market/link` answers 503. A set but unusable value also leaves it off (warn). |
+| `MARKET_LOOKUP_TOKEN` | The secret identity sends the market as `Authorization: Bearer` on `GET <MARKET_ISSUER>/subscriptions/<account uuid>` (the Game Pass's prepaid terms, #151). The same value as the market's `IDENTITY_LOOKUP_TOKEN`: at least 32 printable ASCII characters, no spaces. Needs `MARKET_ISSUER` and `MARKET_CLAIM_KEYS_PATH`. Unset ⇒ no lookup (startup log line); set but unusable ⇒ no lookup (warn, the value is never logged). **Setting it turns the lookup on for every human mint.** Rotate both sides together. Never log it. |
 | `USER_DEFAULT_ENTITLEMENTS` | Override the default entitlement FQNs written to new user rows. May not contain the creator-publishing FQN (derived only). |
 | `PORT`, `BIND_ADDRESS` | Defaults `8080`, `0.0.0.0`. |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | PEM chain + key. Setting either enables HTTPS. |
@@ -404,9 +405,36 @@ appraisal, status)
   whole `https://arkavo.net/attr/network/` attribute is derived-only: never
   stored, delegated to an agent or put in the registration token, and
   **never in a token that lives longer than an hour** (a lapsed pass must
-  stop within the hour; so never in a peer certificate, #143). The market
-  sources (prepaid terms, the lifetime tier) and the game-server token are
-  not built yet. `POST /app-store/transactions` answers the product's
+  stop within the hour; so never in a peer certificate, #143). The
+  game-server token is not built yet.
+- **The market's prepaid terms** (`market/subscription.rs`, #151) are the
+  second online-play source. With `MARKET_LOOKUP_TOKEN` set, every human
+  mint asks `GET <MARKET_ISSUER>/subscriptions/<account uuid>` (bearer
+  token), unless an App Store pass already grants. A `200` whose claim
+  verifies (the pinned claim keys, `iss`, `aud`, `sub` = the account asked
+  about, `tier` `online-play`, accepted `livemode`) grants; `404` grants
+  nothing; anything else is a failure and grants nothing. The body's
+  `until` is unsigned and never used. Rules:
+  - An answer is cached 5 min, a failure 60 s, per account, in process.
+  - **Circuit breaker:** after a failure no account is asked for 60 s
+    (`Subscription::Unavailable`, never cached as "none"); then one mint
+    probes. So an outage costs one deadline a minute, not one per sign-in.
+    A cached "active" still grants while the breaker is open.
+  - **An outage withholds only the pass.** The mint succeeds, and so does
+    `GET /entities` (200 without the value): unlike a linked membership
+    claim that cannot be checked, a failed lookup is never a 503. No
+    decision path reads the pass from `/entities`.
+  - **A renewal rechecks a cached "none"** (`oidc::arkavo_user_claims_rechecking`:
+    `POST /session/refresh`, a passkey sign-in, the OIDC refresh grant), at
+    most `MARKET_SUBSCRIPTION_RECHECKS_PER_MINUTE` per account, so the
+    refresh an app makes after a payment is not served the "none" cached
+    before it. It never passes an open breaker.
+  - A 401 means identity's token is wrong: logged as an error, treated as
+    an outage.
+  - The lookup runs beside the membership claim check and Patreon, inside
+    the one mint deadline.
+  Contract: arkavo-com/market `docs/market-identity-interface.md`, "Account
+  lookups (subscriptions)"; change it only with the market. `POST /app-store/transactions` answers the product's
   FQN as `entitlement`. See
   [docs/online-play-entitlement.md](docs/online-play-entitlement.md).
 - **Patreon campaign entitlements** (`patreon::campaign_entitlements`, the
