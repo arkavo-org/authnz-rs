@@ -280,6 +280,8 @@ mod tests {
             own.replacen("arkavo.net", "ARKAVO.NET", 1),
             "https://Arkavo.Net/attr/creator/value/x".to_string(),
             "https://Patreon.arkavo.com/attr/campaign/value/123".to_string(),
+            crate::constants::ENTITLEMENT_ONLINE_PLAY.to_string(),
+            "https://ARKAVO.net/attr/network/value/anything".to_string(),
         ] {
             assert!(crate::constants::is_derived_only(&derived), "{derived}");
             assert!(
@@ -294,6 +296,7 @@ mod tests {
         for stored in [
             "https://arkavo.net/attr/creators/value/x",
             "https://arkavo.net/attr/other/value/x",
+            "https://arkavo.net/attr/networks/value/online-play",
             "https://arkavo.ai/attr/tdf/value/decrypt",
         ] {
             assert!(!crate::constants::is_derived_only(stored), "{stored}");

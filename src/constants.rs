@@ -443,6 +443,21 @@ pub fn creator_entitlement(user_id: &uuid::Uuid) -> String {
     format!("{CREATOR_ATTRIBUTE}value/{}", user_id.hyphenated())
 }
 
+/// The network attribute: `<this>value/<what the account may use>`. Paid
+/// access to the operator's network, derived at mint from a purchase and
+/// never stored or delegated: a stored copy would outlive a lapsed pass.
+pub const NETWORK_ATTRIBUTE: &str = "https://arkavo.net/attr/network/";
+
+/// Attribute FQN of the online-play entitlement (the Game Pass): play over
+/// the operator's network between players who are not together.
+///
+/// Derived at mint on its own path: only a source configured to grant it
+/// does (today an App Store product listed as online-play), and nothing
+/// that grants publishing grants it. It goes only in tokens that expire
+/// within an hour, so a lapsed pass stops within the hour: never in the
+/// registration token, an agent token or a peer certificate.
+pub const ENTITLEMENT_ONLINE_PLAY: &str = "https://arkavo.net/attr/network/value/online-play";
+
 /// Whether `fqn` may only be derived at mint, never stored or delegated.
 ///
 /// ASCII case-insensitive: hosts are, and the platform lowercases FQNs, so
@@ -452,7 +467,7 @@ pub fn is_derived_only(fqn: &str) -> bool {
         fqn.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     };
-    starts(PATREON_ENTITLEMENT_NAMESPACE) || starts(CREATOR_ATTRIBUTE)
+    starts(PATREON_ENTITLEMENT_NAMESPACE) || starts(CREATOR_ATTRIBUTE) || starts(NETWORK_ATTRIBUTE)
 }
 
 /// Patreon OAuth scope a link must hold for its memberships to be readable.

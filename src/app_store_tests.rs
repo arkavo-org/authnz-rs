@@ -6,7 +6,7 @@
 //! `AUTHNZ_TEST_DYNAMODB_ENDPOINT` is set, as CI's `test` job sets it).
 
 use crate::app_store::{
-    AppStoreConfig, AppStoreError, Environment, app_store_active, apple_root_g3_der,
+    AppStoreConfig, AppStoreError, Environment, Grant, app_store_active, apple_root_g3_der,
     decode_notification, decode_renewal_info, decode_transaction, notifications_handler,
     transactions_handler, verify_jws,
 };
@@ -553,7 +553,7 @@ fn accepts_sandbox_by_default() {
 fn refuses_sandbox_when_only_production() {
     let fx = fixture(Options::default());
     let mut cfg = AppStoreConfig::for_tests(fx.root_der.clone());
-    cfg.environments = [Environment::Production].into();
+    cfg.apps[0].environments = [Environment::Production].into();
     let jws = sign_jws(&purchase(json!({ "environment": "Sandbox" })), &fx);
     assert_eq!(
         decode_transaction(&cfg, &jws),
@@ -615,7 +615,7 @@ fn refuses_a_transaction_signed_by_another_root() {
 fn production_config_trusts_only_apples_root() {
     let fx = fixture(Options::default());
     let mut cfg = AppStoreConfig::for_tests(fx.root_der.clone());
-    cfg.bundle_id = "com.arkavo.ArkavoCreator".into();
+    cfg.apps[0].bundle_id = "com.arkavo.ArkavoCreator".into();
     let parsed = AppStoreConfig::parse(
         Some("com.arkavo.ArkavoCreator"),
         Some("6738845556"),
@@ -951,11 +951,11 @@ fn config_environments_default_and_validate() {
     let both = [Environment::Production, Environment::Sandbox].into();
 
     let default = parse(None).unwrap().unwrap();
-    assert_eq!(default.environments, both);
-    assert_eq!(default.product_ids.len(), 2);
-    assert_eq!(parse(Some("")).unwrap().unwrap().environments, both);
+    assert_eq!(default.apps[0].environments, both);
+    assert_eq!(default.apps[0].products.len(), 2);
+    assert_eq!(parse(Some("")).unwrap().unwrap().apps[0].environments, both);
     assert_eq!(
-        parse(Some("Production")).unwrap().unwrap().environments,
+        parse(Some("Production")).unwrap().unwrap().apps[0].environments,
         [Environment::Production].into()
     );
     assert!(parse(Some("Production,Xcode")).is_err());
@@ -989,9 +989,9 @@ mod active_rule {
 
     #[test]
     fn a_current_unrevoked_configured_record_is_active() {
-        assert!(app_store_active(&cfg(), &[record()], NOW));
+        assert!(app_store_active(&cfg(), Grant::Publish, &[record()], NOW));
         // Not before any record exists.
-        assert!(!app_store_active(&cfg(), &[], NOW));
+        assert!(!app_store_active(&cfg(), Grant::Publish, &[], NOW));
     }
 
     #[test]
@@ -999,16 +999,19 @@ mod active_rule {
         let r = record();
         assert!(app_store_active(
             &cfg(),
+            Grant::Publish,
             std::slice::from_ref(&r),
             r.expires_at - 1
         ));
         assert!(!app_store_active(
             &cfg(),
+            Grant::Publish,
             std::slice::from_ref(&r),
             r.expires_at
         ));
         assert!(!app_store_active(
             &cfg(),
+            Grant::Publish,
             std::slice::from_ref(&r),
             r.expires_at + 1
         ));
@@ -1023,17 +1026,28 @@ mod active_rule {
         };
         assert!(app_store_active(
             &cfg(),
+            Grant::Publish,
             std::slice::from_ref(&in_grace),
             NOW
         ));
-        assert!(!app_store_active(&cfg(), &[in_grace], NOW + 10));
+        assert!(!app_store_active(
+            &cfg(),
+            Grant::Publish,
+            &[in_grace],
+            NOW + 10
+        ));
 
         // A grace date earlier than the expiry does not cut the term short.
         let early_grace = AppStoreRecord {
             grace_expires_at: Some(NOW - 50),
             ..record()
         };
-        assert!(app_store_active(&cfg(), &[early_grace], NOW));
+        assert!(app_store_active(
+            &cfg(),
+            Grant::Publish,
+            &[early_grace],
+            NOW
+        ));
     }
 
     #[test]
@@ -1043,7 +1057,7 @@ mod active_rule {
             grace_expires_at: Some(NOW + 1_000),
             ..record()
         };
-        assert!(!app_store_active(&cfg(), &[refunded], NOW));
+        assert!(!app_store_active(&cfg(), Grant::Publish, &[refunded], NOW));
     }
 
     #[test]
@@ -1052,20 +1066,26 @@ mod active_rule {
             product_id: "com.example.other".into(),
             ..record()
         };
-        assert!(!app_store_active(&cfg(), &[other_product], NOW));
+        assert!(!app_store_active(
+            &cfg(),
+            Grant::Publish,
+            &[other_product],
+            NOW
+        ));
 
         let mut production_only = cfg();
-        production_only.environments = [Environment::Production].into();
+        production_only.apps[0].environments = [Environment::Production].into();
         let sandbox = AppStoreRecord {
             environment: Environment::Sandbox,
             ..record()
         };
         assert!(!app_store_active(
             &production_only,
+            Grant::Publish,
             std::slice::from_ref(&sandbox),
             NOW
         ));
-        assert!(app_store_active(&cfg(), &[sandbox], NOW));
+        assert!(app_store_active(&cfg(), Grant::Publish, &[sandbox], NOW));
     }
 
     #[test]
@@ -1074,8 +1094,13 @@ mod active_rule {
             expires_at: NOW - 1,
             ..record()
         };
-        assert!(app_store_active(&cfg(), &[lapsed.clone(), record()], NOW));
-        assert!(!app_store_active(&cfg(), &[lapsed], NOW));
+        assert!(app_store_active(
+            &cfg(),
+            Grant::Publish,
+            &[lapsed.clone(), record()],
+            NOW
+        ));
+        assert!(!app_store_active(&cfg(), Grant::Publish, &[lapsed], NOW));
     }
 }
 
@@ -1255,6 +1280,7 @@ mod transactions_route {
                 "active": true,
                 "expires_at": secs(payload["expiresDate"].as_i64().unwrap()),
                 "environment": "Sandbox",
+                "entitlement": ENTITLEMENT_CREATOR_PUBLISH,
                 "token_can_publish": false,
             })
         );
@@ -1709,6 +1735,7 @@ mod transactions_route {
                 "active": true,
                 "expires_at": stored.expires_at,
                 "environment": "Production",
+                "entitlement": ENTITLEMENT_CREATOR_PUBLISH,
                 "token_can_publish": false,
             })
         );
@@ -1755,6 +1782,7 @@ mod transactions_route {
                 "active": true,
                 "expires_at": secs(this_month_end),
                 "environment": "Sandbox",
+                "entitlement": ENTITLEMENT_CREATOR_PUBLISH,
                 "token_can_publish": false,
             })
         );
@@ -1798,6 +1826,7 @@ mod transactions_route {
                 "active": true,
                 "expires_at": secs(this_month_end),
                 "environment": "Sandbox",
+                "entitlement": ENTITLEMENT_CREATOR_PUBLISH,
                 "token_can_publish": false,
             })
         );
@@ -2889,5 +2918,405 @@ mod notifications_route {
         let record = only_record(&h, &id).await;
         assert_eq!(record.expires_at, secs(expiry));
         assert_eq!(record.last_signed_at, secs(t0));
+    }
+}
+
+// --------- Several apps, one entitlement per product ---------
+
+mod several_apps {
+    use super::*;
+    use crate::app_store::AppStoreApp;
+    use crate::constants::{ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY};
+    use crate::db::AppStoreRecord;
+    use std::collections::HashMap;
+
+    const GAME_BUNDLE: &str = "com.example.game";
+    const GAME_APPLE_ID: i64 = 4_242;
+    const PASS: &str = "com.example.game.pass.monthly";
+    const NOW: i64 = 1_800_000_000;
+
+    /// The first app (publishing) and a second whose one product grants
+    /// online play.
+    fn two_apps(root_der: Vec<u8>) -> AppStoreConfig {
+        let mut cfg = AppStoreConfig::for_tests(root_der);
+        cfg.apps.push(AppStoreApp {
+            bundle_id: GAME_BUNDLE.into(),
+            app_apple_id: GAME_APPLE_ID,
+            products: HashMap::from([(PASS.to_string(), Grant::OnlinePlay)]),
+            environments: [Environment::Production, Environment::Sandbox].into(),
+        });
+        cfg
+    }
+
+    fn game_purchase(overrides: Value) -> Value {
+        let mut payload = purchase(json!({ "bundleId": GAME_BUNDLE, "productId": PASS }));
+        for (key, value) in overrides.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        payload
+    }
+
+    fn record(product: &str, environment: Environment) -> AppStoreRecord {
+        AppStoreRecord {
+            original_transaction_id: "1".into(),
+            transaction_id: Some("1".into()),
+            product_id: product.into(),
+            environment,
+            expires_at: NOW + 100,
+            grace_expires_at: None,
+            revoked_at: None,
+            last_signed_at: NOW - 100,
+        }
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    const FIRST_APP: [(&str, &str); 3] = [
+        ("APP_STORE_BUNDLE_ID", "com.example.creator"),
+        ("APP_STORE_APP_APPLE_ID", "11"),
+        (
+            "APP_STORE_PUBLISH_PRODUCT_IDS",
+            "creator.monthly, creator.yearly",
+        ),
+    ];
+
+    const GAME_APP: [(&str, &str); 3] = [
+        ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+        ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+        ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+    ];
+
+    #[test]
+    fn each_grant_names_its_own_entitlement() {
+        assert_eq!(Grant::Publish.fqn(), ENTITLEMENT_CREATOR_PUBLISH);
+        assert_eq!(Grant::OnlinePlay.fqn(), ENTITLEMENT_ONLINE_PLAY);
+        assert_ne!(ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY);
+    }
+
+    #[test]
+    fn a_transaction_carries_its_products_grant() {
+        let fx = fixture(Options::default());
+        let cfg = two_apps(fx.root_der.clone());
+        let pass = decode_transaction(&cfg, &sign_jws(&game_purchase(json!({})), &fx)).unwrap();
+        assert_eq!(pass.grant, Grant::OnlinePlay);
+        assert_eq!(pass.product_id, PASS);
+        let membership = decode_transaction(&cfg, &sign_jws(&purchase(json!({})), &fx)).unwrap();
+        assert_eq!(membership.grant, Grant::Publish);
+    }
+
+    #[test]
+    fn a_product_counts_only_under_its_own_bundle() {
+        let fx = fixture(Options::default());
+        let cfg = two_apps(fx.root_der.clone());
+        // The first app's publish product, signed for the game's bundle.
+        assert_eq!(
+            decode_transaction(
+                &cfg,
+                &sign_jws(&game_purchase(json!({ "productId": PRODUCT })), &fx)
+            ),
+            Err(AppStoreError::UnknownProduct)
+        );
+        // The game's pass, signed for the first app's bundle.
+        assert_eq!(
+            decode_transaction(
+                &cfg,
+                &sign_jws(&purchase(json!({ "productId": PASS })), &fx)
+            ),
+            Err(AppStoreError::UnknownProduct)
+        );
+        assert_eq!(
+            decode_transaction(
+                &cfg,
+                &sign_jws(
+                    &game_purchase(json!({ "bundleId": "com.example.other" })),
+                    &fx
+                )
+            ),
+            Err(AppStoreError::WrongApp)
+        );
+        // With only the first app configured the game's purchase is refused.
+        assert_eq!(
+            decode_transaction(
+                &AppStoreConfig::for_tests(fx.root_der.clone()),
+                &sign_jws(&game_purchase(json!({})), &fx)
+            ),
+            Err(AppStoreError::WrongApp)
+        );
+    }
+
+    #[test]
+    fn an_app_accepts_only_its_own_environments() {
+        let fx = fixture(Options::default());
+        let mut cfg = two_apps(fx.root_der.clone());
+        cfg.apps[1].environments = [Environment::Production].into();
+        assert_eq!(
+            decode_transaction(
+                &cfg,
+                &sign_jws(&game_purchase(json!({ "environment": "Sandbox" })), &fx)
+            ),
+            Err(AppStoreError::WrongEnvironment)
+        );
+        // The first app still accepts Sandbox.
+        assert!(
+            decode_transaction(
+                &cfg,
+                &sign_jws(&purchase(json!({ "environment": "Sandbox" })), &fx)
+            )
+            .is_ok()
+        );
+    }
+
+    fn game_notification_data(fx: &Fixture, app_apple_id: i64) -> Value {
+        json!({
+            "bundleId": GAME_BUNDLE,
+            "appAppleId": app_apple_id,
+            "environment": "Production",
+            "signedTransactionInfo": sign_jws(
+                &game_purchase(json!({ "environment": "Production" })),
+                fx
+            ),
+        })
+    }
+
+    #[test]
+    fn a_notification_is_checked_against_its_own_apps_apple_id() {
+        let fx = fixture(Options::default());
+        let cfg = two_apps(fx.root_der.clone());
+        let ok = decode_notification(
+            &cfg,
+            &notification(
+                &fx,
+                "SUBSCRIBED",
+                game_notification_data(&fx, GAME_APPLE_ID),
+            ),
+        )
+        .unwrap();
+        assert_eq!(ok.transaction.unwrap().grant, Grant::OnlinePlay);
+        // The first app's Apple ID does not vouch for the game's bundle.
+        assert_eq!(
+            decode_notification(
+                &cfg,
+                &notification(
+                    &fx,
+                    "SUBSCRIBED",
+                    game_notification_data(&fx, 6_738_845_556)
+                ),
+            ),
+            Err(AppStoreError::WrongApp)
+        );
+    }
+
+    #[test]
+    fn a_notification_cannot_wrap_another_apps_transaction() {
+        let fx = fixture(Options::default());
+        let cfg = two_apps(fx.root_der.clone());
+        // `data` names the first app (and passes its Apple ID check); the
+        // nested transaction is the game's.
+        let mut data = notification_data(&fx, "Production");
+        data["signedTransactionInfo"] = json!(sign_jws(
+            &game_purchase(json!({ "environment": "Production" })),
+            &fx
+        ));
+        assert_eq!(
+            decode_notification(&cfg, &notification(&fx, "SUBSCRIBED", data)),
+            Err(AppStoreError::WrongApp)
+        );
+    }
+
+    #[test]
+    fn a_record_grants_only_its_products_entitlement() {
+        let cfg = two_apps(Vec::new());
+        let pass = [record(PASS, Environment::Production)];
+        assert!(app_store_active(&cfg, Grant::OnlinePlay, &pass, NOW));
+        assert!(!app_store_active(&cfg, Grant::Publish, &pass, NOW));
+
+        let membership = [record(PRODUCT, Environment::Production)];
+        assert!(app_store_active(&cfg, Grant::Publish, &membership, NOW));
+        assert!(!app_store_active(&cfg, Grant::OnlinePlay, &membership, NOW));
+
+        // A lapsed pass grants nothing; a current membership beside it still
+        // grants only publishing.
+        let mut lapsed = record(PASS, Environment::Production);
+        lapsed.expires_at = NOW - 1;
+        let both = [lapsed, record(PRODUCT, Environment::Production)];
+        assert!(!app_store_active(&cfg, Grant::OnlinePlay, &both, NOW));
+        assert!(app_store_active(&cfg, Grant::Publish, &both, NOW));
+
+        // With the game's app not configured its stored record grants nothing.
+        let first_only = AppStoreConfig::for_tests(Vec::new());
+        assert_eq!(first_only.grant_of(&pass[0]), None);
+    }
+
+    #[test]
+    fn a_stored_record_follows_its_own_apps_environments() {
+        let mut cfg = two_apps(Vec::new());
+        cfg.apps[1].environments = [Environment::Production].into();
+        let sandbox_pass = [record(PASS, Environment::Sandbox)];
+        assert!(!app_store_active(
+            &cfg,
+            Grant::OnlinePlay,
+            &sandbox_pass,
+            NOW
+        ));
+        let sandbox_membership = [record(PRODUCT, Environment::Sandbox)];
+        assert!(app_store_active(
+            &cfg,
+            Grant::Publish,
+            &sandbox_membership,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn the_first_apps_three_variables_mean_what_they_did() {
+        let (cfg, skipped) = AppStoreConfig::parse_vars(&vars(&FIRST_APP));
+        let cfg = cfg.unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(cfg.apps.len(), 1);
+        let app = &cfg.apps[0];
+        assert_eq!(app.bundle_id, "com.example.creator");
+        assert_eq!(app.app_apple_id, 11);
+        assert_eq!(
+            app.products,
+            HashMap::from([
+                ("creator.monthly".to_string(), Grant::Publish),
+                ("creator.yearly".to_string(), Grant::Publish),
+            ])
+        );
+        assert_eq!(
+            app.environments,
+            [Environment::Production, Environment::Sandbox].into()
+        );
+
+        // Any of the three unset: off, and nothing reported.
+        for (missing, (name, _)) in FIRST_APP.iter().enumerate() {
+            let mut some = FIRST_APP.to_vec();
+            some.remove(missing);
+            let (cfg, skipped) = AppStoreConfig::parse_vars(&vars(&some));
+            assert!(cfg.is_none(), "without {name}");
+            assert!(skipped.is_empty());
+        }
+        assert!(AppStoreConfig::parse_vars(&HashMap::new()).0.is_none());
+    }
+
+    #[test]
+    fn a_tagged_app_adds_an_app_with_its_own_grants() {
+        let mut all = FIRST_APP.to_vec();
+        all.extend(GAME_APP);
+        all.push(("APP_STORE_GAME_ENVIRONMENTS", "Production"));
+        let (cfg, skipped) = AppStoreConfig::parse_vars(&vars(&all));
+        let cfg = cfg.unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(cfg.apps.len(), 2);
+        let game = &cfg.apps[1];
+        assert_eq!(game.bundle_id, GAME_BUNDLE);
+        assert_eq!(game.app_apple_id, 4_242);
+        assert_eq!(
+            game.products,
+            HashMap::from([(PASS.to_string(), Grant::OnlinePlay)])
+        );
+        assert_eq!(game.environments, [Environment::Production].into());
+        // The first app is untouched, Sandbox included.
+        assert_eq!(cfg.apps[0].products.len(), 2);
+        assert!(cfg.apps[0].environments.contains(&Environment::Sandbox));
+
+        // A tagged app alone is enough to turn the feature on.
+        let (alone, skipped) = AppStoreConfig::parse_vars(&vars(&GAME_APP));
+        assert_eq!(alone.unwrap().apps.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn the_untagged_online_play_list_extends_the_first_app() {
+        let mut all = FIRST_APP.to_vec();
+        all.push(("APP_STORE_ONLINE_PLAY_PRODUCT_IDS", "creator.pass"));
+        let (cfg, skipped) = AppStoreConfig::parse_vars(&vars(&all));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.apps.len(), 1);
+        assert_eq!(cfg.apps[0].products["creator.pass"], Grant::OnlinePlay);
+        assert_eq!(cfg.apps[0].products["creator.monthly"], Grant::Publish);
+    }
+
+    #[test]
+    fn an_unusable_tagged_app_is_left_out_and_the_others_stay() {
+        let with = |extra: &[(&str, &str)]| {
+            let mut all = FIRST_APP.to_vec();
+            all.extend_from_slice(extra);
+            AppStoreConfig::parse_vars(&vars(&all))
+        };
+        let cases: [(&[(&str, &str)], &str); 6] = [
+            // No Apple ID.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+                ],
+                "needs its Apple ID",
+            ),
+            // No product.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+                ],
+                "at least one product",
+            ),
+            // The first app's bundle again.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", "com.example.creator"),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+                ],
+                "bundle id is another app's",
+            ),
+            // The first app's product: its stored records would change
+            // entitlement.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", "creator.monthly"),
+                ],
+                "product id is another app's",
+            ),
+            // One product, two entitlements.
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+                    ("APP_STORE_GAME_PUBLISH_PRODUCT_IDS", PASS),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+                ],
+                "two entitlements",
+            ),
+            (
+                &[
+                    ("APP_STORE_GAME_BUNDLE_ID", GAME_BUNDLE),
+                    ("APP_STORE_GAME_APP_APPLE_ID", "4242"),
+                    ("APP_STORE_GAME_ONLINE_PLAY_PRODUCT_IDS", PASS),
+                    ("APP_STORE_GAME_ENVIRONMENTS", "Production,Xcode"),
+                ],
+                "only Production and Sandbox",
+            ),
+        ];
+        for (extra, why) in cases {
+            let (cfg, skipped) = with(extra);
+            let cfg = cfg.unwrap();
+            assert_eq!(cfg.apps.len(), 1, "{why}");
+            assert_eq!(cfg.apps[0].bundle_id, "com.example.creator", "{why}");
+            assert_eq!(skipped.len(), 1, "{why}");
+            assert!(
+                skipped[0].starts_with("APP_STORE_GAME_BUNDLE_ID: ") && skipped[0].contains(why),
+                "{:?} should mention {why:?}",
+                skipped[0]
+            );
+        }
     }
 }

@@ -405,7 +405,9 @@ appraisal, status)
   **never in a token that lives longer than an hour** (a lapsed pass must
   stop within the hour; so never in a peer certificate, #143). The market
   sources (prepaid terms, the lifetime tier) and the game-server token are
-  not built yet.
+  not built yet. `POST /app-store/transactions` answers the product's
+  FQN as `entitlement`. See
+  [docs/online-play-entitlement.md](docs/online-play-entitlement.md).
 - **Patreon campaign entitlements** (`patreon::campaign_entitlements`, the
   same builder): for each `active_patron` membership with a numeric campaign
   id, `https://patreon.arkavo.com/attr/campaign/value/<campaign_id>` plus

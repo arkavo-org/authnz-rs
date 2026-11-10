@@ -2233,8 +2233,11 @@ pub(crate) async fn arkavo_user_claims(
         crate::publishing::load_sources(app_state, user_id),
     );
     let publish = match sources {
+        // What was granted stands even when the market could not answer: an
+        // outage there withholds only what the market would have granted.
         Ok(sources) => crate::publishing::derive(app_state, user_id, snap.as_ref(), sources)
             .await
+            .map(|derived| derived.entitlements)
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };

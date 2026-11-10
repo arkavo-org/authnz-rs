@@ -19,6 +19,7 @@
 //! payload can reach a log line or a response body through them.
 
 use crate::AppState;
+use crate::constants::{ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY};
 use crate::db::{
     AppStoreRecord, DynamoDBError, DynamoDBStore, GraceUpdate, LinkOutcome, StateOutcome,
 };
@@ -29,13 +30,13 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ecdsa::signature::Verifier;
-use log::{error, info, warn};
+use log::{error, info};
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use thiserror::Error;
 use uuid::Uuid;
@@ -89,7 +90,7 @@ pub(crate) enum AppStoreError {
     InvalidSignature,
     #[error("signed for another app")]
     WrongApp,
-    /// A product of this app that is not configured to grant membership.
+    /// A product of this app that is not configured to grant anything.
     /// The client route answers it as it does `WrongApp`; the notification
     /// route acknowledges it (the notification never changes, so a 4xx would
     /// only make Apple retry it).
@@ -249,51 +250,93 @@ impl Environment {
     }
 }
 
-/// App Store purchases, enabled by `APP_STORE_BUNDLE_ID`,
-/// `APP_STORE_APP_APPLE_ID` and `APP_STORE_PUBLISH_PRODUCT_IDS`.
+/// The entitlement a product grants. A product grants exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Grant {
+    /// Creator publishing ([`ENTITLEMENT_CREATOR_PUBLISH`]).
+    Publish,
+    /// Play over the operator's network ([`ENTITLEMENT_ONLINE_PLAY`]).
+    OnlinePlay,
+}
+
+impl Grant {
+    /// The entitlement's attribute FQN.
+    pub fn fqn(self) -> &'static str {
+        match self {
+            Self::Publish => ENTITLEMENT_CREATOR_PUBLISH,
+            Self::OnlinePlay => ENTITLEMENT_ONLINE_PLAY,
+        }
+    }
+}
+
+/// One app whose App Store purchases are accepted.
 #[derive(Debug, Clone)]
-pub struct AppStoreConfig {
+pub struct AppStoreApp {
     pub bundle_id: String,
     pub app_apple_id: i64,
-    pub product_ids: HashSet<String>,
+    /// Each configured product and the one entitlement it grants.
+    pub products: HashMap<String, Grant>,
     pub environments: HashSet<Environment>,
+}
+
+/// App Store purchases. The first app is configured by `APP_STORE_BUNDLE_ID`,
+/// `APP_STORE_APP_APPLE_ID` and its product lists; further apps by the same
+/// names with a tag (`APP_STORE_<TAG>_BUNDLE_ID`, …).
+///
+/// A bundle id and a product id each appear in at most one app, so a stored
+/// record's product names its app and its entitlement.
+#[derive(Debug, Clone)]
+pub struct AppStoreConfig {
+    pub apps: Vec<AppStoreApp>,
     /// The trust anchor tests verify against instead of Apple's. It exists
     /// only in test builds, so no config can name another root in production.
     #[cfg(test)]
     root_der: Option<Vec<u8>>,
 }
 
-impl AppStoreConfig {
-    /// Parse the four env values. `Ok(None)`: the feature is off (one of the
-    /// first three is unset or empty). `Err`: it is set but unusable, which
-    /// also leaves the feature off.
-    pub(crate) fn parse(
+fn present(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn id_list(v: Option<&str>) -> Vec<String> {
+    v.unwrap_or_default()
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+impl AppStoreApp {
+    /// Parse one app's values. `Ok(None)`: not configured (the bundle id, the
+    /// Apple ID or every product is missing). `Err`: set but unusable.
+    fn parse(
         bundle_id: Option<&str>,
         app_apple_id: Option<&str>,
-        product_ids: Option<&str>,
+        publish_products: Option<&str>,
+        online_play_products: Option<&str>,
         environments: Option<&str>,
     ) -> Result<Option<Self>, &'static str> {
-        fn present(v: Option<&str>) -> Option<&str> {
-            v.map(str::trim).filter(|s| !s.is_empty())
-        }
-        let (Some(bundle_id), Some(app_apple_id), Some(product_ids)) = (
-            present(bundle_id),
-            present(app_apple_id),
-            present(product_ids),
-        ) else {
+        let (Some(bundle_id), Some(app_apple_id)) = (present(bundle_id), present(app_apple_id))
+        else {
             return Ok(None);
         };
+        let mut products = HashMap::new();
+        for (list, grant) in [
+            (publish_products, Grant::Publish),
+            (online_play_products, Grant::OnlinePlay),
+        ] {
+            for product in id_list(list) {
+                if products.insert(product, grant).is_some_and(|g| g != grant) {
+                    return Err("a product is listed for two entitlements");
+                }
+            }
+        }
+        if products.is_empty() {
+            return Ok(None);
+        }
         let app_apple_id: i64 = app_apple_id
             .parse()
             .map_err(|_| "APP_STORE_APP_APPLE_ID is not an integer")?;
-        let product_ids: HashSet<String> = product_ids
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect();
-        if product_ids.is_empty() {
-            return Ok(None);
-        }
         let environments = match present(environments) {
             None => HashSet::from([Environment::Production, Environment::Sandbox]),
             Some(list) => list
@@ -305,50 +348,135 @@ impl AppStoreConfig {
         Ok(Some(Self {
             bundle_id: bundle_id.to_string(),
             app_apple_id,
-            product_ids,
+            products,
             environments,
-            #[cfg(test)]
+        }))
+    }
+}
+
+/// The variable `suffix` of the app tagged `tag` (`None`: the first app).
+fn app_var(tag: Option<&str>, suffix: &str) -> String {
+    match tag {
+        Some(tag) => format!("APP_STORE_{tag}_{suffix}"),
+        None => format!("APP_STORE_{suffix}"),
+    }
+}
+
+impl AppStoreConfig {
+    /// Parse the first app's values, as before tagged apps existed. `Ok(None)`:
+    /// the feature is off (one of the first three is unset or empty). `Err`:
+    /// it is set but unusable, which also leaves the feature off.
+    #[cfg(test)]
+    pub(crate) fn parse(
+        bundle_id: Option<&str>,
+        app_apple_id: Option<&str>,
+        product_ids: Option<&str>,
+        environments: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        let app = AppStoreApp::parse(bundle_id, app_apple_id, product_ids, None, environments)?;
+        Ok(app.map(|app| Self {
+            apps: vec![app],
             root_der: None,
         }))
     }
 
+    /// Parse every app from `vars` (the environment). The first app is the
+    /// untagged one; tagged apps follow in tag order. Each returned message
+    /// names an app that was left out and why. `None`: no app is usable, so
+    /// the feature is off.
+    ///
+    /// A tagged app never takes the first app down with it: an operator's
+    /// mistake in one app's variables must not end another app's
+    /// memberships.
+    pub(crate) fn parse_vars(vars: &HashMap<String, String>) -> (Option<Self>, Vec<String>) {
+        let mut tags: Vec<&str> = vars
+            .keys()
+            .filter_map(|name| {
+                name.strip_prefix("APP_STORE_")?
+                    .strip_suffix("_BUNDLE_ID")
+                    .filter(|tag| !tag.is_empty())
+            })
+            .collect();
+        tags.sort_unstable();
+
+        let mut apps: Vec<AppStoreApp> = Vec::new();
+        let mut skipped = Vec::new();
+        for tag in std::iter::once(None).chain(tags.into_iter().map(Some)) {
+            let get = |suffix: &str| vars.get(&app_var(tag, suffix)).map(String::as_str);
+            let name = app_var(tag, "BUNDLE_ID");
+            let app = match AppStoreApp::parse(
+                get("BUNDLE_ID"),
+                get("APP_APPLE_ID"),
+                get("PUBLISH_PRODUCT_IDS"),
+                get("ONLINE_PLAY_PRODUCT_IDS"),
+                get("ENVIRONMENTS"),
+            ) {
+                Ok(Some(app)) => app,
+                // The first app unset is the feature's ordinary off state.
+                Ok(None) if tag.is_none() => continue,
+                Ok(None) => {
+                    skipped.push(format!(
+                        "{name}: the app needs its Apple ID and at least one product"
+                    ));
+                    continue;
+                }
+                Err(reason) => {
+                    skipped.push(format!("{name}: {reason}"));
+                    continue;
+                }
+            };
+            if apps.iter().any(|a| a.bundle_id == app.bundle_id) {
+                skipped.push(format!("{name}: the bundle id is another app's"));
+                continue;
+            }
+            if apps
+                .iter()
+                .any(|a| app.products.keys().any(|p| a.products.contains_key(p)))
+            {
+                skipped.push(format!("{name}: a product id is another app's"));
+                continue;
+            }
+            apps.push(app);
+        }
+        let cfg = (!apps.is_empty()).then_some(Self {
+            apps,
+            #[cfg(test)]
+            root_der: None,
+        });
+        (cfg, skipped)
+    }
+
     /// Read the env vars and log, once, which state the feature is in.
     pub fn from_env() -> Option<Self> {
-        let var = |name: &str| std::env::var(name).ok();
-        let (bundle, app_id) = (var("APP_STORE_BUNDLE_ID"), var("APP_STORE_APP_APPLE_ID"));
-        let (products, envs) = (
-            var("APP_STORE_PUBLISH_PRODUCT_IDS"),
-            var("APP_STORE_ENVIRONMENTS"),
-        );
-        match Self::parse(
-            bundle.as_deref(),
-            app_id.as_deref(),
-            products.as_deref(),
-            envs.as_deref(),
-        ) {
-            Ok(Some(cfg)) => {
-                info!(
-                    "App Store purchases ENABLED: bundle_id={} app_apple_id={} products={} \
-                     environments={}",
-                    cfg.bundle_id,
-                    cfg.app_apple_id,
-                    cfg.product_ids.len(),
-                    cfg.environments.len()
-                );
-                Some(cfg)
-            }
-            Ok(None) => {
-                info!(
-                    "App Store purchases DISABLED: APP_STORE_BUNDLE_ID / APP_STORE_APP_APPLE_ID / \
-                     APP_STORE_PUBLISH_PRODUCT_IDS not all set"
-                );
-                None
-            }
-            Err(reason) => {
-                warn!("App Store purchases DISABLED: {reason}");
-                None
-            }
+        let vars: HashMap<String, String> = std::env::vars()
+            .filter(|(name, _)| name.starts_with("APP_STORE_"))
+            .collect();
+        let (cfg, skipped) = Self::parse_vars(&vars);
+        for reason in &skipped {
+            error!("App Store app left out: {reason}");
         }
+        match &cfg {
+            Some(cfg) => {
+                for app in &cfg.apps {
+                    let count = |grant| app.products.values().filter(|g| **g == grant).count();
+                    info!(
+                        "App Store purchases ENABLED: bundle_id={} app_apple_id={} \
+                         publish_products={} online_play_products={} environments={}",
+                        app.bundle_id,
+                        app.app_apple_id,
+                        count(Grant::Publish),
+                        count(Grant::OnlinePlay),
+                        app.environments.len()
+                    );
+                }
+            }
+            None => info!(
+                "App Store purchases DISABLED: no app has its bundle id, Apple ID and a \
+                 product list set (APP_STORE_BUNDLE_ID / APP_STORE_APP_APPLE_ID / \
+                 APP_STORE_PUBLISH_PRODUCT_IDS)"
+            ),
+        }
+        cfg
     }
 
     /// A config for the production app, verifying against `root_der` instead
@@ -356,12 +484,37 @@ impl AppStoreConfig {
     #[cfg(test)]
     pub(crate) fn for_tests(root_der: Vec<u8>) -> Self {
         Self {
-            bundle_id: "com.arkavo.ArkavoCreator".to_string(),
-            app_apple_id: 6_738_845_556,
-            product_ids: HashSet::from(["com.arkavo.ArkavoCreator.membership.monthly".to_string()]),
-            environments: HashSet::from([Environment::Production, Environment::Sandbox]),
+            apps: vec![AppStoreApp {
+                bundle_id: "com.arkavo.ArkavoCreator".to_string(),
+                app_apple_id: 6_738_845_556,
+                products: HashMap::from([(
+                    "com.arkavo.ArkavoCreator.membership.monthly".to_string(),
+                    Grant::Publish,
+                )]),
+                environments: HashSet::from([Environment::Production, Environment::Sandbox]),
+            }],
             root_der: Some(root_der),
         }
+    }
+
+    /// The app a signed payload's `bundleId` names.
+    fn app(&self, bundle_id: &str) -> Result<&AppStoreApp, AppStoreError> {
+        self.apps
+            .iter()
+            .find(|app| app.bundle_id == bundle_id)
+            .ok_or(AppStoreError::WrongApp)
+    }
+
+    /// The entitlement a stored record counts toward: its product's, while
+    /// the product is configured and its app accepts the record's
+    /// environment. A product id belongs to one app.
+    pub(crate) fn grant_of(&self, record: &AppStoreRecord) -> Option<Grant> {
+        self.apps.iter().find_map(|app| {
+            let grant = app.products.get(&record.product_id)?;
+            app.environments
+                .contains(&record.environment)
+                .then_some(*grant)
+        })
     }
 
     #[cfg(not(test))]
@@ -388,6 +541,8 @@ pub struct VerifiedTransaction {
     /// This transaction (one billing period) of the subscription.
     pub transaction_id: String,
     pub product_id: String,
+    /// The one entitlement the product grants.
+    pub grant: Grant,
     pub environment: Environment,
     pub app_account_token: Option<Uuid>,
     pub expires_at: i64,
@@ -447,9 +602,9 @@ fn verify_signed(cfg: &AppStoreConfig, jws: &str) -> Result<Map<String, Value>, 
     }
 }
 
-fn accepted_environment(cfg: &AppStoreConfig, value: &str) -> Result<Environment, AppStoreError> {
+fn accepted_environment(app: &AppStoreApp, value: &str) -> Result<Environment, AppStoreError> {
     Environment::from_apple(value)
-        .filter(|env| cfg.environments.contains(env))
+        .filter(|env| app.environments.contains(env))
         .ok_or(AppStoreError::WrongEnvironment)
 }
 
@@ -483,14 +638,15 @@ pub(crate) fn decode_transaction(
 ) -> Result<VerifiedTransaction, AppStoreError> {
     let payload = verify_signed(cfg, jws)?;
 
-    if string_field(&payload, "bundleId")? != cfg.bundle_id {
-        return Err(AppStoreError::WrongApp);
-    }
-    let environment = accepted_environment(cfg, string_field(&payload, "environment")?)?;
+    // The product must be one of the transaction's own app: another
+    // configured app's product id under this bundle grants nothing.
+    let app = cfg.app(string_field(&payload, "bundleId")?)?;
+    let environment = accepted_environment(app, string_field(&payload, "environment")?)?;
     let product_id = string_field(&payload, "productId")?;
-    if !cfg.product_ids.contains(product_id) {
-        return Err(AppStoreError::UnknownProduct);
-    }
+    let grant = *app
+        .products
+        .get(product_id)
+        .ok_or(AppStoreError::UnknownProduct)?;
     if payload.get("inAppOwnershipType").and_then(Value::as_str) != Some("PURCHASED") {
         return Err(AppStoreError::NotPurchased);
     }
@@ -507,6 +663,7 @@ pub(crate) fn decode_transaction(
         original_transaction_id: string_field(&payload, "originalTransactionId")?.to_string(),
         transaction_id: string_field(&payload, "transactionId")?.to_string(),
         product_id: product_id.to_string(),
+        grant,
         environment,
         app_account_token,
         expires_at: required_seconds(&payload, "expiresDate")?,
@@ -531,10 +688,16 @@ pub(crate) fn decode_renewal_info(
 ) -> Result<RenewalInfo, AppStoreError> {
     let payload = verify_signed(cfg, jws)?;
     // The signature is already trusted; the environment is checked when the
-    // payload states one.
+    // payload states one. Renewal info names no app: a notification holds it
+    // to its transaction's environment, which that app accepted.
     let environment = payload
         .get("environment")
-        .map(|v| accepted_environment(cfg, v.as_str().ok_or(AppStoreError::Malformed)?))
+        .map(|v| {
+            let value = v.as_str().ok_or(AppStoreError::Malformed)?;
+            Environment::from_apple(value)
+                .filter(|env| cfg.apps.iter().any(|app| app.environments.contains(env)))
+                .ok_or(AppStoreError::WrongEnvironment)
+        })
         .transpose()?;
     let original_transaction_id = payload
         .get("originalTransactionId")
@@ -576,7 +739,7 @@ pub(crate) fn decode_notification(
                 .get(key)
                 .and_then(Value::as_object)
                 .and_then(|o| o.get("bundleId"))
-                && bundle.as_str() != Some(cfg.bundle_id.as_str())
+                && !bundle.as_str().is_some_and(|b| cfg.app(b).is_ok())
             {
                 return Err(AppStoreError::WrongApp);
             }
@@ -589,12 +752,10 @@ pub(crate) fn decode_notification(
         });
     };
 
-    if string_field(data, "bundleId")? != cfg.bundle_id {
-        return Err(AppStoreError::WrongApp);
-    }
-    let environment = accepted_environment(cfg, string_field(data, "environment")?)?;
+    let app = cfg.app(string_field(data, "bundleId")?)?;
+    let environment = accepted_environment(app, string_field(data, "environment")?)?;
     if environment == Environment::Production
-        && data.get("appAppleId").and_then(Value::as_i64) != Some(cfg.app_apple_id)
+        && data.get("appAppleId").and_then(Value::as_i64) != Some(app.app_apple_id)
     {
         return Err(AppStoreError::WrongApp);
     }
@@ -607,6 +768,13 @@ pub(crate) fn decode_notification(
         && tx.environment != environment
     {
         return Err(AppStoreError::WrongEnvironment);
+    }
+    // `data` decided which app's Apple ID was checked, so the nested
+    // transaction must be that app's.
+    if let Some(tx) = &transaction
+        && !app.products.contains_key(&tx.product_id)
+    {
+        return Err(AppStoreError::WrongApp);
     }
     // Renewal info only qualifies a transaction; without one there is
     // nothing to apply it to. Only renewal info speaks about the grace
@@ -638,16 +806,22 @@ pub(crate) fn decode_notification(
 
 // --------- The Active rule ---------
 
-/// Whether an account holds an active membership, given its stored records.
+/// Whether an account's stored records grant `grant`.
 ///
-/// A record is active iff its product and environment are both in `cfg`, it
-/// has no `revoked_at`, and `now` is before the later of its `expires_at` and
-/// its `grace_expires_at` (a billing-retry grace the notifications recorded).
-/// One active record is enough. Times are unix seconds.
-pub(crate) fn app_store_active(cfg: &AppStoreConfig, records: &[AppStoreRecord], now: i64) -> bool {
+/// A record counts iff its product is configured for `grant` and its app
+/// accepts its environment ([`AppStoreConfig::grant_of`]), it has no
+/// `revoked_at`, and `now` is before the later of its `expires_at` and its
+/// `grace_expires_at` (a billing-retry grace the notifications recorded).
+/// One such record is enough, and a record never counts toward another
+/// entitlement than its product's. Times are unix seconds.
+pub(crate) fn app_store_active(
+    cfg: &AppStoreConfig,
+    grant: Grant,
+    records: &[AppStoreRecord],
+    now: i64,
+) -> bool {
     records.iter().any(|r| {
-        cfg.product_ids.contains(&r.product_id)
-            && cfg.environments.contains(&r.environment)
+        cfg.grant_of(r) == Some(grant)
             && r.revoked_at.is_none()
             && now < r.expires_at.max(r.grace_expires_at.unwrap_or(i64::MIN))
     })
@@ -730,6 +904,8 @@ struct TransactionResponse {
     active: bool,
     expires_at: i64,
     environment: Environment,
+    /// The entitlement the purchased product grants (its attribute FQN).
+    entitlement: &'static str,
     token_can_publish: bool,
 }
 
@@ -888,11 +1064,13 @@ async fn post_transaction(
     Json(TransactionResponse {
         active: app_store_active(
             cfg,
+            tx.grant,
             std::slice::from_ref(&stored),
             chrono::Utc::now().timestamp(),
         ),
         expires_at: stored.expires_at,
         environment: stored.environment,
+        entitlement: tx.grant.fqn(),
         token_can_publish: caller.token_can_publish,
     })
     .into_response()

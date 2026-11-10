@@ -311,6 +311,7 @@ Every setting is an environment variable. In production they go in
 | `APP_STORE_APP_APPLE_ID` | The app's numeric Apple ID (`6738845556`); Production notifications must carry it. |
 | `APP_STORE_PUBLISH_PRODUCT_IDS` | Comma-separated product ids that grant publishing (`com.arkavo.ArkavoCreator.membership.monthly`). |
 | `APP_STORE_ENVIRONMENTS` | Optional; default `Production,Sandbox`. |
+| `APP_STORE_<TAG>_…`, `APP_STORE_ONLINE_PLAY_PRODUCT_IDS` | Further apps, and products that grant online play instead of publishing: [online-play-entitlement.md](online-play-entitlement.md). A product grants one entitlement; an online-play product never grants publishing. |
 | `MARKET_ISSUER` | The market's issuer (`https://market.arkavo.com`): the claims' `iss` and the base of `<issuer>/claim/<id>`. |
 | `MARKET_CLAIM_KEYS_PATH` | A JWK Set file of the **pinned** P-256 claim keys. Each `kid` must be the key's RFC 7638 thumbprint. |
 | `MARKET_ACCEPT_TEST_MODE` | Optional; `true` accepts Stripe test-mode claims (`cs_test_`, `livemode: false`). Default off. |

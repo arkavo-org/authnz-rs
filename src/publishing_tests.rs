@@ -550,7 +550,7 @@ mod app_store_source {
         assert_eq!(f.derived().await.len(), 1);
 
         let mut cfg = AppStoreConfig::for_tests(Vec::new());
-        cfg.environments = [Environment::Production].into_iter().collect();
+        cfg.apps[0].environments = [Environment::Production].into_iter().collect();
         f.state.app_store = Arc::new(Some(cfg));
         assert!(f.derived().await.is_empty());
     }
@@ -1031,4 +1031,214 @@ async fn a_failed_publishing_read_is_an_error_for_entities_not_a_negative() {
             .await
             .is_err()
     );
+}
+
+// ---- Online play (the Game Pass): its own path ----
+
+mod online_play_source {
+    use super::*;
+    use crate::app_store::{AppStoreApp, AppStoreConfig, Environment, Grant};
+    use crate::constants::ENTITLEMENT_ONLINE_PLAY;
+    use crate::db::{AppStoreRecord, GraceUpdate, StateOutcome};
+    use std::collections::HashMap;
+
+    const MEMBERSHIP: &str = "com.arkavo.ArkavoCreator.membership.monthly";
+    const PASS: &str = "com.example.game.pass.monthly";
+
+    fn two_apps() -> AppStoreConfig {
+        let mut cfg = AppStoreConfig::for_tests(Vec::new());
+        cfg.apps.push(AppStoreApp {
+            bundle_id: "com.example.game".into(),
+            app_apple_id: 4_242,
+            products: HashMap::from([(PASS.to_string(), Grant::OnlinePlay)]),
+            environments: [Environment::Production, Environment::Sandbox].into(),
+        });
+        cfg
+    }
+
+    /// A fresh user with both apps configured and Patreon off.
+    async fn fixture() -> Option<Fixture> {
+        let mut f = Fixture::new().await?;
+        f.state.publisher = Arc::new(None);
+        f.state.app_store = Arc::new(Some(two_apps()));
+        f.patreon = PatreonState::new(
+            None,
+            None,
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None),
+        );
+        Some(f)
+    }
+
+    async fn put(f: &Fixture, product: &str, expires_at: i64) {
+        let otid = Uuid::new_v4().as_u128().to_string();
+        let record = AppStoreRecord {
+            original_transaction_id: otid.clone(),
+            transaction_id: Some(otid),
+            product_id: product.into(),
+            environment: Environment::Production,
+            expires_at,
+            grace_expires_at: None,
+            revoked_at: None,
+            last_signed_at: Utc::now().timestamp(),
+        };
+        let out = f
+            .store
+            .put_app_store_state(&f.user_id, &record, GraceUpdate::Keep)
+            .await
+            .unwrap();
+        assert_eq!(out, StateOutcome::Applied);
+    }
+
+    #[tokio::test]
+    async fn a_pass_grants_online_play_and_never_publishing() {
+        let Some(f) = fixture().await else { return };
+        assert!(f.derived().await.is_empty());
+        put(&f, PASS, Utc::now().timestamp() + 3600).await;
+        assert_eq!(f.derived().await, vec![ENTITLEMENT_ONLINE_PLAY.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_membership_grants_publishing_and_never_online_play() {
+        let Some(f) = fixture().await else { return };
+        put(&f, MEMBERSHIP, Utc::now().timestamp() + 3600).await;
+        assert_eq!(
+            f.derived().await,
+            vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn both_purchases_grant_both_and_a_lapsed_pass_only_publishing() {
+        let Some(f) = fixture().await else { return };
+        let now = Utc::now().timestamp();
+        put(&f, MEMBERSHIP, now + 3600).await;
+        put(&f, PASS, now + 3600).await;
+        assert_eq!(
+            f.derived().await,
+            vec![
+                ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+                ENTITLEMENT_ONLINE_PLAY.to_string()
+            ]
+        );
+
+        let Some(g) = fixture().await else { return };
+        put(&g, MEMBERSHIP, now + 3600).await;
+        put(&g, PASS, now - 10).await;
+        assert_eq!(
+            g.derived().await,
+            vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publishing_suspension_keeps_the_pass() {
+        let Some(f) = fixture().await else { return };
+        let now = Utc::now().timestamp();
+        put(&f, MEMBERSHIP, now + 3600).await;
+        put(&f, PASS, now + 3600).await;
+        f.suspend().await;
+        assert_eq!(f.derived().await, vec![ENTITLEMENT_ONLINE_PLAY.to_string()]);
+    }
+
+    /// A linked market purchase that cannot be checked leaves publishing
+    /// unknown. The pass was decided on its own path, so a mint keeps it,
+    /// while `GET /entities` still answers 503 for the unknown.
+    #[tokio::test]
+    async fn a_market_outage_keeps_the_pass() {
+        use crate::market::MarketGrant;
+        use crate::publishing::{DeriveError, Sources, derive};
+        let Some(f) = fixture().await else { return };
+        put(&f, PASS, Utc::now().timestamp() + 3600).await;
+        let state = f.store.get_publishing_state(&f.user_id).await.unwrap();
+        let sources = Sources::Read {
+            state,
+            market: MarketGrant::Unavailable,
+        };
+        let derived = derive(&f.state, Some(f.user_id), None, sources)
+            .await
+            .unwrap();
+        assert_eq!(derived.entitlements, [ENTITLEMENT_ONLINE_PLAY]);
+        assert!(derived.market_unavailable);
+        assert!(matches!(
+            derived.complete(),
+            Err(DeriveError::MarketUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_pass_needs_its_app_configured() {
+        let Some(mut f) = fixture().await else { return };
+        put(&f, PASS, Utc::now().timestamp() + 3600).await;
+        f.state.app_store = Arc::new(Some(AppStoreConfig::for_tests(Vec::new())));
+        assert!(f.derived().await.is_empty());
+        f.state.app_store = Arc::new(None);
+        assert!(f.derived().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_pass_is_derived_only_and_never_in_the_registration_token() {
+        let Some(f) = fixture().await else { return };
+        put(&f, PASS, Utc::now().timestamp() + 3600).await;
+        let user = f.claims().await;
+        assert!(
+            user.derived_entitlements
+                .contains(&ENTITLEMENT_ONLINE_PLAY.to_string())
+        );
+        assert!(
+            !user
+                .entitlements
+                .contains(&ENTITLEMENT_ONLINE_PLAY.to_string())
+        );
+        let has_pass = |claims: &ArkavoClaims| {
+            claims
+                .custom
+                .arkavo_entitlements
+                .as_ref()
+                .is_some_and(|e| e.contains(&ENTITLEMENT_ONLINE_PLAY.to_string()))
+        };
+
+        // The 1 h passkey auth CWT carries it.
+        let auth = decode(
+            &crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap(),
+        );
+        assert!(has_pass(&auth));
+        assert!(auth.exp - auth.iat <= 3600);
+
+        // The ~99-year registration token never does.
+        let cnf = crate::cwt::cnf_from_ed25519(&[5u8; 32], b"kid");
+        let reg = decode(
+            &crate::authn::mint_registration_token(&f.state, &f.user_id, Some(&user), cnf).unwrap(),
+        );
+        assert!(!has_pass(&reg));
+
+        // Never stored, so never delegable to an agent.
+        let stored = f.store.get_user_entitlements(&f.user_id).await.unwrap();
+        assert!(!stored.contains(&ENTITLEMENT_ONLINE_PLAY.to_string()));
+        assert!(matches!(
+            crate::entitlements::validate_fqns(&[ENTITLEMENT_ONLINE_PLAY.to_string()]),
+            Err(crate::entitlements::EntitlementError::DerivedOnly(_))
+        ));
+    }
+}
+
+/// A market outage withholds only what the market would have granted: what
+/// was granted stands at a mint, while `GET /entities` still answers 503.
+#[test]
+fn an_unknown_publish_answer_keeps_what_was_granted() {
+    use crate::constants::ENTITLEMENT_ONLINE_PLAY;
+    use crate::publishing::{DeriveError, Derived};
+    let derived = Derived {
+        entitlements: vec![ENTITLEMENT_ONLINE_PLAY.to_string()],
+        market_unavailable: true,
+    };
+    assert_eq!(derived.entitlements, [ENTITLEMENT_ONLINE_PLAY]);
+    assert!(matches!(
+        derived.complete(),
+        Err(DeriveError::MarketUnavailable)
+    ));
+    let known = Derived {
+        entitlements: vec![ENTITLEMENT_ONLINE_PLAY.to_string()],
+        market_unavailable: false,
+    };
+    assert_eq!(known.complete().unwrap(), [ENTITLEMENT_ONLINE_PLAY]);
 }
