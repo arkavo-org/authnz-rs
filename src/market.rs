@@ -28,8 +28,8 @@
 
 use crate::AppState;
 use crate::constants::{
-    ENTITLEMENT_CREATOR_PUBLISH, MARKET_CACHE_TTL_SECONDS, MARKET_CLAIM_MAX_BYTES,
-    MARKET_FAILURE_CACHE_TTL_SECONDS, MARKET_FETCH_DEADLINE_SECONDS,
+    ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY, MARKET_CACHE_TTL_SECONDS,
+    MARKET_CLAIM_MAX_BYTES, MARKET_FAILURE_CACHE_TTL_SECONDS, MARKET_FETCH_DEADLINE_SECONDS,
     MARKET_LINK_FETCHES_PER_MINUTE,
 };
 use crate::db::{DynamoDBError, MarketLinkOutcome};
@@ -138,11 +138,17 @@ impl Tier {
 
     /// The entitlements the tier grants at mint. Mapped here, never stored,
     /// so a paid feature added later reaches every lifetime member with no
-    /// data migration. Today every paid feature gates on the
-    /// creator-publishing FQN.
+    /// data migration. Today the paid features are creator publishing and
+    /// online play (the market contract: lifetime covers every paid
+    /// entitlement). Each is still decided on its own path
+    /// (`publishing::derive`): a publishing suspension withholds the first
+    /// and leaves the second.
     pub(crate) fn entitlements(self) -> Vec<String> {
         match self {
-            Self::Lifetime => vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()],
+            Self::Lifetime => vec![
+                ENTITLEMENT_CREATOR_PUBLISH.to_string(),
+                ENTITLEMENT_ONLINE_PLAY.to_string(),
+            ],
         }
     }
 }

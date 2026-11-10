@@ -252,9 +252,14 @@ market pushes nothing. Contract: arkavo-com/market
   deadline, so a hung market does not make every mint wait. Cached answers
   are read first: a purchase cached as valid grants without waiting on
   another that must be fetched. There is no last-good fallback (owner
-  decision, 2026-11-07): availability is the market's job. The market is not
-  asked while an App Store membership already grants or the account is
-  suspended.
+  decision, 2026-11-07): availability is the market's job. From 0.33.0 a
+  lifetime membership also grants online play
+  ([online-play-entitlement.md](online-play-entitlement.md)), so the market
+  is asked while the claim can still decide either entitlement: not only
+  when publishing is open, but also for a suspended account or one whose
+  App Store membership already grants publishing, unless an App Store pass
+  already grants online play. A suspension still withholds publishing
+  whatever the market answers.
 - **A refund** removes the entitlement at the first mint after the cached
   answer expires: the market answers `410` once a purchase is fully refunded
   or a dispute over it is lost (with the offer's `checkRefunds` on).

@@ -10,8 +10,9 @@ It means the account has paid for play over the operator's network between
 players who are not together. A game server checks for it in the caller's own
 token. Local play never needs it.
 
-Two sources grant it: an App Store product (0.32.0) and a prepaid term bought
-at the market (0.33.0). A token scoped to a game server is not built.
+Three sources grant it: an App Store product (0.32.0), a prepaid term bought
+at the market, and a linked market lifetime membership (both 0.33.0). A token
+scoped to a game server is not built.
 
 ## Rules
 
@@ -139,6 +140,23 @@ How the lookup is kept from slowing sign-in or hiding a payment:
 
 Lapse: at most about an hour and five minutes after a term ends (the cache,
 then the token's life).
+
+## The lifetime membership
+
+A market lifetime membership linked to the account
+([creator-publishing-entitlement.md](creator-publishing-entitlement.md))
+covers every paid entitlement, so it grants online play as well as
+publishing. The two stay separate paths:
+
+- a publishing suspension withholds publishing and leaves online play;
+- the membership's claim is checked whenever it can still decide either
+  entitlement, so also for a suspended account and for one whose App Store
+  membership already grants publishing;
+- `POST /market/link` lists both values in `entitlements`.
+
+When the market cannot be reached, a lifetime member's mint goes without
+both until it answers again (60 seconds of failure cache at most between
+tries).
 
 ## What the app does (App Store)
 

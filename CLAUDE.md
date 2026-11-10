@@ -433,6 +433,8 @@ appraisal, status)
     an outage.
   - The lookup runs beside the membership claim check and Patreon, inside
     the one mint deadline.
+  - **A linked lifetime membership also grants online play**
+    (`market::Tier::entitlements`), whatever the suspension.
   Contract: arkavo-com/market `docs/market-identity-interface.md`, "Account
   lookups (subscriptions)"; change it only with the market. `POST /app-store/transactions` answers the product's
   FQN as `entitlement`. See
@@ -513,7 +515,8 @@ appraisal, status)
 - Claim checks (`verify_claim`): compact JWS, `alg` ES256, `typ` JWT, a
   pinned `kid`, the signature, `iss` = `MARKET_ISSUER`, `aud` =
   `OIDC_ISSUER`, `jti` = the link key, a known `tier` (`lifetime` ⇒ every
-  paid entitlement: today the publish FQN), `livemode` accepted and agreeing
+  paid entitlement: today the publish FQN and online play, each on its own
+  path, so a publishing suspension leaves the second), `livemode` accepted and agreeing
   with the `jti` prefix. No `exp`: the claim is fetched fresh.
 - At mint: each `market_links` id is fetched (`GET <issuer>/claim/<id>`,
   `Accept: application/json`, no credentials, redirects not followed,
@@ -522,7 +525,7 @@ appraisal, status)
   or 404 ⇒ nothing; anything else ⇒ nothing (fails closed, no last-good
   fallback, owner decision 2026-11-07). Outcomes are cached in process 5
   min, failures 60 s, a deadline miss included (a hung market must not make
-  every mint wait); cached answers are read before any fetch. Skipped when an App Store membership already grants.
+  every mint wait); cached answers are read before any fetch. Asked while it can still decide publishing (no App Store membership grants it, not suspended) or online play (no App Store pass grants it): so a suspended account's links are fetched too, and `publishing::publishing` decides the suspension first, so that account's unreachable market is never a 503.
   `/entities` answers 503 `market_unavailable` when the market could not
   answer and no other source grants.
 - A checkout session id is the purchase's bearer secret: never log it

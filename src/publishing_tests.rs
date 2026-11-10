@@ -1243,3 +1243,140 @@ fn an_unknown_publish_answer_keeps_what_was_granted() {
     };
     assert_eq!(known.complete().unwrap(), [ENTITLEMENT_ONLINE_PLAY]);
 }
+
+// ---- The two paths, decided from what was read (no database) ----
+
+mod paths {
+    use crate::app_store::{AppStoreApp, AppStoreConfig, Environment, Grant};
+    use crate::constants::{ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY};
+    use crate::db::{AppStoreRecord, PublishingState, PublishingSuspension};
+    use crate::market::subscription::Subscription;
+    use crate::market::{MarketGrant, Tier};
+    use crate::publishing::{Derived, Sources, derive};
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const PASS: &str = "com.example.game.pass.monthly";
+
+    fn lifetime() -> MarketGrant {
+        MarketGrant::Granted(Tier::Lifetime.entitlements())
+    }
+
+    fn account(suspended: bool, pass: bool) -> PublishingState {
+        let now = Utc::now().timestamp();
+        PublishingState {
+            suspension: suspended.then(|| PublishingSuspension {
+                reason: "test".into(),
+                report_id: None,
+                suspended_by: "client:moderation".into(),
+                suspended_at: now,
+            }),
+            app_store: pass
+                .then(|| AppStoreRecord {
+                    original_transaction_id: "1".into(),
+                    transaction_id: Some("1".into()),
+                    product_id: PASS.into(),
+                    environment: Environment::Production,
+                    expires_at: now + 3600,
+                    grace_expires_at: None,
+                    revoked_at: None,
+                    last_signed_at: now,
+                })
+                .into_iter()
+                .collect(),
+            market_links: Vec::new(),
+        }
+    }
+
+    async fn decide(
+        state: PublishingState,
+        market: MarketGrant,
+        subscription: Subscription,
+    ) -> Derived {
+        let mut app_state = crate::test_helpers::build_test_app_state().await;
+        let mut cfg = AppStoreConfig::for_tests(Vec::new());
+        cfg.apps.push(AppStoreApp {
+            bundle_id: "com.example.game".into(),
+            app_apple_id: 4_242,
+            products: HashMap::from([(PASS.to_string(), Grant::OnlinePlay)]),
+            environments: [Environment::Production].into(),
+        });
+        app_state.app_store = Arc::new(Some(cfg));
+        let sources = Sources::Read {
+            state: Some(state),
+            market,
+            subscription,
+        };
+        derive(&app_state, Some(Uuid::new_v4()), None, sources)
+            .await
+            .unwrap()
+    }
+
+    fn fqns(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_membership_grants_both_and_a_suspension_only_removes_publishing() {
+        let both = decide(account(false, false), lifetime(), Subscription::None).await;
+        assert_eq!(
+            both.entitlements,
+            fqns(&[ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY])
+        );
+        assert!(!both.market_unavailable);
+
+        let suspended = decide(account(true, false), lifetime(), Subscription::None).await;
+        assert_eq!(suspended.entitlements, fqns(&[ENTITLEMENT_ONLINE_PLAY]));
+        assert!(!suspended.market_unavailable);
+    }
+
+    #[tokio::test]
+    async fn every_online_play_source_at_once_grants_it_once() {
+        let all = decide(account(false, true), lifetime(), Subscription::Active).await;
+        assert_eq!(
+            all.entitlements,
+            fqns(&[ENTITLEMENT_CREATOR_PUBLISH, ENTITLEMENT_ONLINE_PLAY])
+        );
+    }
+
+    #[tokio::test]
+    async fn each_online_play_source_alone_grants_only_online_play() {
+        for (pass, subscription) in [(true, Subscription::None), (false, Subscription::Active)] {
+            let derived = decide(account(false, pass), MarketGrant::NotGranted, subscription).await;
+            assert_eq!(derived.entitlements, fqns(&[ENTITLEMENT_ONLINE_PLAY]));
+            assert!(!derived.market_unavailable);
+        }
+        for subscription in [Subscription::None, Subscription::Unavailable] {
+            let derived =
+                decide(account(false, false), MarketGrant::NotGranted, subscription).await;
+            assert_eq!(derived, Derived::default(), "{subscription:?}");
+        }
+    }
+
+    /// A suspended account now reaches the market (its membership may grant
+    /// online play). When the market cannot answer, publishing is still a
+    /// definite "no", so `GET /entities` answers 200, not 503.
+    #[tokio::test]
+    async fn a_suspended_accounts_unreachable_market_is_not_an_unknown() {
+        let derived = decide(
+            account(true, false),
+            MarketGrant::Unavailable,
+            Subscription::Unavailable,
+        )
+        .await;
+        assert_eq!(derived, Derived::default());
+        assert_eq!(derived.complete().unwrap(), Vec::<String>::new());
+
+        // Not suspended: publishing is unknown, as before.
+        let unknown = decide(
+            account(false, true),
+            MarketGrant::Unavailable,
+            Subscription::None,
+        )
+        .await;
+        assert_eq!(unknown.entitlements, fqns(&[ENTITLEMENT_ONLINE_PLAY]));
+        assert!(unknown.market_unavailable);
+    }
+}

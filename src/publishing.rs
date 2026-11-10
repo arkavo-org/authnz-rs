@@ -189,10 +189,11 @@ pub(crate) enum Sources {
 /// The sources that do not depend on Patreon: one strongly consistent read
 /// of the `credentials` row (the suspension, the App Store records and the
 /// market links), then the market's two questions. Called alongside
-/// Patreon's materialization. The membership claims are not asked for when
-/// the account is suspended or an App Store membership already grants
-/// publishing; the subscription lookup is not made when an App Store pass
-/// already grants online play. `recheck`: this mint is a renewal, which may
+/// Patreon's materialization. The membership claims are asked for while they
+/// can still decide publishing (no App Store membership grants it and the
+/// account is not suspended) or online play (no App Store pass grants it);
+/// the subscription lookup is not made when an App Store pass already grants
+/// online play. `recheck`: this mint is a renewal, which may
 /// ask again about a subscription cached as "none".
 pub(crate) async fn load_sources(
     app_state: &AppState,
@@ -222,13 +223,14 @@ pub(crate) async fn load_sources(
     let (publish_granted, pass_granted) = (granted(Grant::Publish), granted(Grant::OnlinePlay));
     // Each market question is asked only while its answer can change the
     // mint, and both at once, so a mint waits for one deadline.
+    // A linked membership can decide publishing (unless an App Store
+    // membership already grants it, or a suspension withholds it whatever
+    // the market says) and online play (unless an App Store pass already
+    // grants it): the lifetime tier grants both.
+    let publish_open = !publish_granted && state.suspension.is_none();
     let claims = async {
         match market {
-            Some(source)
-                if !publish_granted
-                    && state.suspension.is_none()
-                    && !state.market_links.is_empty() =>
-            {
+            Some(source) if (publish_open || !pass_granted) && !state.market_links.is_empty() => {
                 source.grant(&state.market_links).await
             }
             _ => MarketGrant::NotGranted,
@@ -364,8 +366,8 @@ pub(crate) async fn derive(
         return Ok(Derived::default());
     };
     let app_store_cfg = app_state.app_store.as_ref().as_ref();
-    let mut derived = publishing(&user_id, patreon_ok, app_store_cfg, &state, market, now);
-    if online_play(&user_id, app_store_cfg, &state, subscription, now) {
+    let mut derived = publishing(&user_id, patreon_ok, app_store_cfg, &state, &market, now);
+    if online_play(&user_id, app_store_cfg, &state, &market, subscription, now) {
         derived
             .entitlements
             .push(ENTITLEMENT_ONLINE_PLAY.to_string());
@@ -393,6 +395,11 @@ fn log_sandbox_grant(
     }
 }
 
+/// Whether a membership claim that verified grants `fqn`.
+fn market_grants(market: &MarketGrant, fqn: &str) -> bool {
+    matches!(market, MarketGrant::Granted(entitlements) if entitlements.iter().any(|e| e == fqn))
+}
+
 /// The publishing path: Patreon, an App Store publish product or the
 /// market, any one enough, and withheld by a suspension.
 fn publishing(
@@ -400,57 +407,55 @@ fn publishing(
     patreon_ok: bool,
     app_store_cfg: Option<&crate::app_store::AppStoreConfig>,
     state: &PublishingState,
-    market: MarketGrant,
+    market: &MarketGrant,
     now: i64,
 ) -> Derived {
     let app_store_ok = app_store_cfg
         .is_some_and(|cfg| app_store_active(cfg, Grant::Publish, &state.app_store, now));
-    let market_ok = matches!(market, MarketGrant::Granted(_));
+    let market_ok = market_grants(market, ENTITLEMENT_CREATOR_PUBLISH);
+    // A suspension decides first: the answer is "no" whatever the sources
+    // say, so a market that could not be checked (it may have been asked
+    // for the account's online play) is never a suspended account's unknown.
+    if state.suspension.is_some() {
+        if patreon_ok || app_store_ok || market_ok {
+            info!(
+                "Publishing entitlement withheld for user {}: publishing is suspended",
+                user_id
+            );
+        }
+        return Derived::default();
+    }
     if !patreon_ok && !app_store_ok && !market_ok {
-        // Suspended accounts never reach the market check, so this is never
-        // a suspended account's unknown.
         return Derived {
             entitlements: Vec::new(),
-            market_unavailable: market == MarketGrant::Unavailable,
+            market_unavailable: *market == MarketGrant::Unavailable,
         };
-    }
-    if state.suspension.is_some() {
-        info!(
-            "Publishing entitlement withheld for user {}: publishing is suspended",
-            user_id
-        );
-        return Derived::default();
     }
     if let Some(cfg) = app_store_cfg.filter(|_| app_store_ok) {
         log_sandbox_grant("Publishing", user_id, cfg, Grant::Publish, state, now);
     }
-    let mut out = vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()];
-    if let MarketGrant::Granted(entitlements) = market {
-        for e in entitlements {
-            if !out.contains(&e) {
-                out.push(e);
-            }
-        }
-    }
+    // Only publishing: whatever else a membership grants is decided on its
+    // own path.
     Derived {
-        entitlements: out,
+        entitlements: vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()],
         market_unavailable: false,
     }
 }
 
 /// The online-play path: an active App Store record of a product configured
-/// as online-play, or a prepaid term the market vouches for
-/// ([`Subscription::Active`]). Nothing that grants publishing grants it, and
-/// a publishing suspension does not remove it: the suspension is about
-/// publishing, the pass is paid network access.
+/// as online-play, a prepaid term the market vouches for
+/// ([`Subscription::Active`]), or a linked lifetime membership (the tier
+/// covers every paid entitlement). A publishing-only source never grants
+/// it, and a publishing suspension does not remove it: the suspension is
+/// about publishing, the pass is paid network access.
 ///
-/// A market that could not answer ([`Subscription::Unavailable`]) grants
-/// nothing and is not an error: an outage withholds only the pass, at a
-/// mint and in `GET /entities` alike.
+/// A market that could not answer grants nothing and is not an error: an
+/// outage withholds only the pass, at a mint and in `GET /entities` alike.
 fn online_play(
     user_id: &Uuid,
     app_store_cfg: Option<&crate::app_store::AppStoreConfig>,
     state: &PublishingState,
+    market: &MarketGrant,
     subscription: Subscription,
     now: i64,
 ) -> bool {
@@ -460,7 +465,7 @@ fn online_play(
         log_sandbox_grant("Online-play", user_id, cfg, Grant::OnlinePlay, state, now);
         return true;
     }
-    subscription == Subscription::Active
+    subscription == Subscription::Active || market_grants(market, ENTITLEMENT_ONLINE_PLAY)
 }
 
 // --------- Admin: publishing suspension ---------
