@@ -1,9 +1,8 @@
 # Game-server token (`POST /game/token`)
 
-authnz-rs#151. The design was agreed in outline with the Roadfall and
-ArkavoKit sessions on 2026-11-09 and approved by the owner the same day.
-**This text is the first written contract: both should review it before
-building against it.** After that, change it only together with them.
+authnz-rs#151. Approved by the owner on 2026-11-09 and reviewed the same day
+by the Roadfall session (the game server and app) and the ArkavoKit session
+(the client library). Change it only together with them.
 
 ## Why
 
@@ -132,7 +131,10 @@ Nothing else: no other entitlement, Patreon data or email.
 The pass is worked out at the mint, as for any token: an App Store pass, a
 prepaid market term, or a lifetime membership. A mint asks the market again
 when its cached answer is "none" (as a renewal does), so a token minted
-right after a payment is not answered from before it.
+right after a payment is not answered from before it. That recheck is
+limited to 6 a minute per account; past it the cached answer is used. So
+every mint for an account without the pass can reach the market, not only
+one that follows a payment.
 
 ## Verifying (the game server)
 

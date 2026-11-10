@@ -558,9 +558,9 @@ async fn a_mint_carries_the_pass_once_it_is_paid() {
 }
 
 /// Publishing is no part of a game token, even for an account that may
-/// publish.
+/// publish: one that holds both an App Store membership and a pass.
 #[tokio::test]
-async fn a_lifetime_member_gets_the_pass_and_no_other_entitlement() {
+async fn an_account_that_may_publish_gets_the_pass_and_no_other_entitlement() {
     use crate::app_store::{AppStoreApp, AppStoreConfig, Environment, Grant};
     use crate::db::{AppStoreRecord, GraceUpdate};
     const MEMBERSHIP: &str = "com.arkavo.ArkavoCreator.membership.monthly";

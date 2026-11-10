@@ -25,6 +25,7 @@ is not part of the set.
 |---|---|---|
 | Passkey auth CWT, OIDC access token, `id_token`, DeviceCheck CWT | 1 h | Holders sign in again |
 | Agent CWT | ≤ 15 min | The agent re-runs challenge/token |
+| Game-server token ([game-token.md](game-token.md)) | ≤ 1 h (15 min by default) | The app mints again |
 | Registration CWT | ~99 years | Every holder's token stops verifying: they sign in with a passkey again |
 | Passkey credential attestation (catalog v2) | **no expiry** | See below |
 
@@ -38,7 +39,7 @@ that creator's next publish with 422 `invalid bundle: credential signed by an
 unknown key`; the creator recovers by publishing again.
 See [passkey-credential-attestation.md](passkey-credential-attestation.md).
 
-Consumers that read the set: the OpenTDF platform's CWT verifier, the
+Consumers that read the set: a game server (game tokens), the OpenTDF platform's CWT verifier, the
 tdf-iroh-s3 node (catalog v2), the Arkavo app (`IdentityKeySet`, selects by
 `kid`), and OIDC relying parties (`jwks.json`). Creator only consumes
 attestations.
