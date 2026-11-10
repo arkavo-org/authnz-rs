@@ -1004,6 +1004,7 @@ async fn post_link(
 }
 
 pub(crate) mod subscription;
+pub(crate) mod token;
 
 #[cfg(test)]
 mod tests;

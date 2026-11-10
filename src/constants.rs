@@ -247,6 +247,11 @@ pub const MARKET_SUBSCRIPTION_RECHECKS_PER_MINUTE: u32 = 6;
 /// polling, so this is ample.
 pub const OWNER_KAS_MINTS_PER_MINUTE: u32 = 30;
 
+/// `POST /market/token` (#151): mints per account per minute (429 beyond it,
+/// in process). An app mints when it is about to ask the market for a
+/// purchase, and a token lasts 15 minutes.
+pub const MARKET_TOKEN_MINTS_PER_MINUTE: u32 = 10;
+
 /// `POST /game/token` (#151): mints per account per minute (429 beyond it,
 /// in process). A client mints when its token is about to expire and, after
 /// a purchase, every 20 s for a minute and a half, on each of its devices.

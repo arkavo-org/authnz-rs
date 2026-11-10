@@ -42,11 +42,17 @@ impl MintLimiter {
     /// Count a mint for `user_id` at `now`, or the seconds until it may
     /// mint again.
     fn admit(&self, user_id: &Uuid, now: i64) -> Result<(), u64> {
+        self.admit_within(user_id, now, OWNER_KAS_MINTS_PER_MINUTE)
+    }
+
+    /// The same count against `limit` mints a minute, for another token's
+    /// own limiter (`POST /market/token`).
+    pub(crate) fn admit_within(&self, user_id: &Uuid, now: i64, limit: u32) -> Result<(), u64> {
         const WINDOW: i64 = 60;
         let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, (start, _)| now - *start < WINDOW);
         let (start, count) = map.entry(*user_id).or_insert((now, 0));
-        if *count >= OWNER_KAS_MINTS_PER_MINUTE {
+        if *count >= limit {
             return Err((*start + WINDOW - now).max(1) as u64);
         }
         *count += 1;

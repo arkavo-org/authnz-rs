@@ -13,5 +13,6 @@ pub mod credential_attestation;
 pub mod cwt;
 pub mod game_token;
 pub mod keys;
+pub mod market_token;
 pub mod owner_kas_route;
 pub mod owner_kas_token;
