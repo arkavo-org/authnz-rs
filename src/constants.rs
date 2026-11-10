@@ -475,6 +475,37 @@ pub const NETWORK_ATTRIBUTE: &str = "https://arkavo.net/attr/network/";
 /// registration token, an agent token or a peer certificate.
 pub const ENTITLEMENT_ONLINE_PLAY: &str = "https://arkavo.net/attr/network/value/online-play";
 
+/// The market attribute: `<this>value/<what an agent may do at the market>`.
+/// Reserved: no value of it is ever stored on an account.
+pub const MARKET_ATTRIBUTE: &str = "https://arkavo.net/attr/market/";
+
+/// Attribute FQN of the market request entitlement: an agent holding it may
+/// ask the market for a purchase on its owner's behalf (the owner still pays;
+/// arkavo-com/market `docs/market-identity-interface.md`, "Requests").
+///
+/// **Every live account holds it without storing it**, so any account holder
+/// can delegate it to an agent ([`is_held_by_every_account`]). It is never in
+/// a human's token: the market takes a person's own app token as the
+/// account, and the platform has no such attribute.
+pub const ENTITLEMENT_MARKET_REQUEST: &str = "https://arkavo.net/attr/market/value/request";
+
+/// Whether every live account holds `fqn` without a stored copy, so its
+/// owner may delegate it to an agent and an agent mint keeps it.
+///
+/// Exact match: the market compares the name byte for byte, so no other
+/// spelling is worth delegating.
+pub fn is_held_by_every_account(fqn: &str) -> bool {
+    fqn == ENTITLEMENT_MARKET_REQUEST
+}
+
+/// Whether `fqn` is a value of an attribute no account may store although
+/// it is not derived at mint ([`MARKET_ATTRIBUTE`]). ASCII case-insensitive,
+/// like [`is_derived_only`].
+pub fn is_never_stored(fqn: &str) -> bool {
+    fqn.get(..MARKET_ATTRIBUTE.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(MARKET_ATTRIBUTE))
+}
+
 /// Whether `fqn` may only be derived at mint, never stored or delegated.
 ///
 /// ASCII case-insensitive: hosts are, and the platform lowercases FQNs, so

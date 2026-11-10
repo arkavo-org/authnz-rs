@@ -57,7 +57,7 @@ The challenge signature is verified with strict Ed25519 verification against the
 | `act` | `"act"` | `[{"sub": <each AGENT_AUTHORIZED_ACTORS entry>}]`, omitted when empty |
 | `arkavo_account_id` | text | the owner's account UUID |
 | `arkavo_roles` | text | `["agent"]` |
-| `arkavo_entitlements` | text | delegated FQNs ∩ what the owner holds now |
+| `arkavo_entitlements` | text | delegated FQNs ∩ what the owner holds now (see "Entitlements every account holds") |
 | `arkavo_npe` | text | `{type: "agent", delegation_id: <DID>, depth: 0, chain: []}` |
 | `arkavo_state_version` | text | **new in v2:** unsigned integer, the identity's `state_version` when the token was minted |
 | `arkavo_swarm` | text | the SwarmKit `kit_id` of the delegation. **Omitted** while the agent has no swarm (an agent onboarded by trust QR before specialization); the platform then withholds its entitlements. |
@@ -71,6 +71,18 @@ Informative 4xx answers of the issuance endpoints (not pinned; clients retry):
 - `/agents/token` answers 400 `Challenge mismatch` when the delegation changed owner between the challenge and the token request; request a new challenge.
 
 The token is minted from a strongly consistent read of the identity taken after every other lookup the request makes, so a quarantine, revocation, expiry, appraisal change or re-authorize that lands while the request is in flight applies to it: it carries the entitlements, lifetime (`short_lived`), swarm and `state_version` of that read, and its `exp` is bounded by that read's `appraised_until`. A token whose `exp` would not be after its `iat` is never minted: the request is refused with `Forbidden: agent appraisal expired; it needs a fresh appraisal` when the appraisal has ended, or `Delegation expired` when the delegation has.
+
+### Entitlements every account holds
+
+One entitlement is held by every live account without being stored on it, so any account holder can delegate it and a mint keeps it whatever the owner stores:
+
+| FQN | Meaning |
+|---|---|
+| `https://arkavo.net/attr/market/value/request` | The agent may ask the market (`https://market.arkavo.com`) for a purchase on its owner's behalf. The owner still pays. |
+
+- The name is matched exactly. No other value of `https://arkavo.net/attr/market/` is held by anyone, and none can be stored on an account (`PUT /admin/users/{id}/entitlements` answers 400).
+- It appears only in agent tokens whose owner delegated it, never in a person's own token.
+- **Audience.** An agent token's `aud` is the whole `AGENT_TOKEN_AUDIENCES` list; there is no per-request audience. Once that list includes the market, every agent token names both the platform and the market. A verifier must therefore not rely on `aud` alone: the market requires this entitlement and a per-request signature by the `cnf` key (arkavo-com/market `docs/market-identity-interface.md`, "Requests: the tokens identity issues"), and the platform ignores an entitlement it does not define.
 
 ## Refusal bodies (part of v2)
 
@@ -101,7 +113,7 @@ Request (JSON):
 |---|---|---|
 | `agent_did` | string | `did:key:z6Mk…` (Ed25519): the identity. The key must be a valid Ed25519 point that is not small-order (weak); any other key is 400. |
 | `name` | string | a label for people; not an identifier. 1–64 characters, no control characters; anything else is 400. |
-| `entitlements` | string[] | each held by the owner now; empty is refused (403) |
+| `entitlements` | string[] | each held by the owner now (see "Entitlements every account holds"); empty is refused (403) |
 | `swarm` | string | optional, 1–128 chars when present: the SwarmKit `kit_id`. Omit it (or send `null`) before the agent has a kit; an empty string is 400. |
 | `short_lived` | bool | optional, default `false`: tokens for this delegation live ≤ 300 s |
 
