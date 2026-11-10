@@ -685,6 +685,22 @@ mod tests {
             mint_message(&id, "https://game.example", 1_794_268_800),
             "arkavo-game-token-v1\n0f0e0d0c-0b0a-8908-8706-050403020100\nhttps://game.example\n1794268800"
         );
+        // The game session messages, and the id a passkey session's game
+        // session gets (UUID v8 of SHA-256(context || the id's 16 bytes)).
+        assert_eq!(
+            session_open_message(&id, 1_794_268_800),
+            "arkavo-game-session-open-v1\n0f0e0d0c-0b0a-8908-8706-050403020100\n1794268800"
+        );
+        let game = game_session_id_for(&id);
+        assert_eq!(game.to_string(), "35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2");
+        assert_eq!(
+            session_mint_message(&game, "https://game.example", 1_794_268_800),
+            "arkavo-game-session-token-v1\n35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2\nhttps://game.example\n1794268800"
+        );
+        assert_eq!(
+            session_end_message(&game, 1_794_268_800),
+            "arkavo-game-session-end-v1\n35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2\n1794268800"
+        );
         // SHA-256 of the empty string, and of "abc".
         assert_eq!(
             request_message(

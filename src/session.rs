@@ -447,6 +447,16 @@ pub async fn signout_session(
         .db_store
         .delete_session(&session.session_id)
         .await?;
+    // And again, now that the session is gone: an open that wrote its game
+    // session between the first delete and this point passed its own
+    // re-check. One that writes after this finds no session and takes its
+    // row back (`game::open_session_handler`).
+    app_state
+        .db_store
+        .delete_game_session(&authnz_rs::game_token::game_session_id_for(
+            &session.session_id,
+        ))
+        .await?;
     info!(
         "Session {} of {} signed out",
         session.session_id, session.user_id
