@@ -50,6 +50,19 @@ pub const MINT_CONTEXT: &str = "arkavo-game-token-v1";
 /// game server.
 pub const REQUEST_CONTEXT: &str = "arkavo-game-request-v1";
 
+/// First line of the message the device key signs to open a game session.
+pub const SESSION_OPEN_CONTEXT: &str = "arkavo-game-session-open-v1";
+
+/// First line of the message the device key signs to get a token from a
+/// game session.
+pub const SESSION_MINT_CONTEXT: &str = "arkavo-game-session-token-v1";
+
+/// First line of the message the device key signs to end a game session.
+pub const SESSION_END_CONTEXT: &str = "arkavo-game-session-end-v1";
+
+/// Domain separator of the game session id's hash of the passkey session id.
+const GAME_SESSION_ID_CONTEXT: &[u8] = b"arkavo-game-session-id-v1";
+
 /// Longest game audience.
 pub const MAX_AUDIENCE_LEN: usize = 128;
 
@@ -88,6 +101,40 @@ pub fn is_audience(s: &str) -> bool {
 /// bounds how long a captured request can be replayed.
 pub fn mint_message(session_id: &uuid::Uuid, audience: &str, issued_at: i64) -> String {
     format!("{MINT_CONTEXT}\n{session_id}\n{audience}\n{issued_at}")
+}
+
+/// The game session a passkey session opens: a UUID (version 8) from
+/// SHA-256 of the passkey session's id. One passkey session has one game
+/// session, so opening it again answers the same one.
+pub fn game_session_id_for(session_id: &uuid::Uuid) -> uuid::Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(GAME_SESSION_ID_CONTEXT);
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+/// The message a passkey session's device key signs to open its game
+/// session.
+pub fn session_open_message(session_id: &uuid::Uuid, issued_at: i64) -> String {
+    format!("{SESSION_OPEN_CONTEXT}\n{session_id}\n{issued_at}")
+}
+
+/// The message a game session's device key signs to get a token: as
+/// [`mint_message`], under its own context and naming the game session.
+pub fn session_mint_message(
+    game_session_id: &uuid::Uuid,
+    audience: &str,
+    issued_at: i64,
+) -> String {
+    format!("{SESSION_MINT_CONTEXT}\n{game_session_id}\n{audience}\n{issued_at}")
+}
+
+/// The message a game session's device key signs to end it.
+pub fn session_end_message(game_session_id: &uuid::Uuid, issued_at: i64) -> String {
+    format!("{SESSION_END_CONTEXT}\n{game_session_id}\n{issued_at}")
 }
 
 /// The message the `cnf` key signs for one request to the game server:

@@ -799,6 +799,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the receiver's request key, so the session token never reaches the
         // owner's phone. Passkey auth CWT required.
         .route("/game/token", post(game::token_handler))
+        // A game session: the passkey session's device key, good for 30
+        // days for the game-token mint and nothing else.
+        .route("/game/session", post(game::open_session_handler))
+        .route("/game/session/end", post(game::end_session_handler))
         .route("/owner-kas/token", post(owner_kas::token_handler))
         // Owner-KAS routes (#148): the owner's passkey-signed route record
         // and push token live here so account deletion reaches them; the

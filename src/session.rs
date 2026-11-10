@@ -435,6 +435,14 @@ pub async fn signout_session(
     ) {
         return Err(SessionError::Ended(Ended::InvalidProof));
     }
+    // Signing out ends the session's game session too (`game.rs`). First:
+    // if this fails, the session row is still there for the retry.
+    app_state
+        .db_store
+        .delete_game_session(&authnz_rs::game_token::game_session_id_for(
+            &session.session_id,
+        ))
+        .await?;
     app_state
         .db_store
         .delete_session(&session.session_id)

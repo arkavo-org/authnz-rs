@@ -11,6 +11,7 @@ mod account;
 mod agent_state;
 mod app_store;
 mod apple_tokens;
+mod game_session;
 mod guardians;
 mod market;
 mod owner_kas;
@@ -26,6 +27,7 @@ pub use agent_state::{
     SwarmWrite,
 };
 pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, PublishingState, StateOutcome};
+pub use game_session::GameSession;
 pub use guardians::Guardian;
 pub use market::MarketLinkOutcome;
 pub use owner_kas::{OwnerKasRoute, RouteWrite};
