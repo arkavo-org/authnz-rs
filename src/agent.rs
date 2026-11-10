@@ -547,7 +547,7 @@ pub async fn authorize_agent(
         .await
         .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
     for entitlement in &request.entitlements {
-        if !delegable.contains(entitlement) {
+        if !holds_entitlement(&delegable, entitlement) {
             return Err(AgentError::InsufficientEntitlements(format!(
                 "Entitlement '{}' is not held by the delegator",
                 entitlement
@@ -1085,9 +1085,19 @@ pub(crate) async fn mint_from_current(
 fn intersect_entitlements(delegated: &[String], stored: &[String]) -> Vec<String> {
     delegated
         .iter()
-        .filter(|e| stored.contains(e))
+        .filter(|e| holds_entitlement(stored, e))
         .cloned()
         .collect()
+}
+
+/// Whether an account whose stored entitlements are `stored` holds
+/// `entitlement`: it is stored, or every live account holds it
+/// (`constants::is_held_by_every_account`, the market request entitlement).
+/// The one rule behind the authorize subset check and the mint
+/// intersection, so the two can never disagree.
+fn holds_entitlement(stored: &[String], entitlement: &str) -> bool {
+    crate::constants::is_held_by_every_account(entitlement)
+        || stored.iter().any(|s| s == entitlement)
 }
 
 // ============================================================================
@@ -2175,6 +2185,29 @@ mod tests {
         assert!(intersect_entitlements(&delegated, &[]).is_empty());
         assert_eq!(intersect_entitlements(&[], &stored), Vec::<String>::new());
         assert_eq!(intersect_entitlements(&delegated, &delegated), delegated);
+    }
+
+    /// The market request entitlement is held by every account: a mint keeps
+    /// it whatever the owner stores, and no other spelling passes.
+    #[test]
+    fn every_account_holds_the_market_request_entitlement() {
+        let request = crate::constants::ENTITLEMENT_MARKET_REQUEST.to_string();
+        let other = "https://arkavo.net/attr/market/value/other".to_string();
+        let delegated = vec!["a".to_string(), request.clone(), other.clone()];
+        assert_eq!(
+            intersect_entitlements(&delegated, &["a".to_string()]),
+            vec!["a".to_string(), request.clone()]
+        );
+        assert_eq!(
+            intersect_entitlements(&delegated, &[]),
+            vec![request.clone()]
+        );
+        assert!(holds_entitlement(&[], &request));
+        assert!(!holds_entitlement(&[], &other));
+        assert!(!holds_entitlement(
+            &[],
+            &request.replacen("arkavo.net", "Arkavo.net", 1)
+        ));
     }
 
     #[test]

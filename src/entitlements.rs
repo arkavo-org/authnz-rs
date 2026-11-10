@@ -98,6 +98,12 @@ pub(crate) fn validate_fqns(list: &[String]) -> Result<(), EntitlementError> {
         if crate::constants::is_derived_only(f) {
             return Err(EntitlementError::DerivedOnly(f.clone()));
         }
+        // Held by every account without a stored copy (the market request
+        // entitlement): a stored copy would put it in the account's own
+        // tokens, which the platform reads.
+        if crate::constants::is_never_stored(f) {
+            return Err(EntitlementError::NeverStored(f.clone()));
+        }
     }
     Ok(())
 }
@@ -186,6 +192,8 @@ pub enum EntitlementError {
     InvalidFqn(String),
     #[error("Entitlement is derived at token mint and cannot be stored: {0}")]
     DerivedOnly(String),
+    #[error("Entitlement is held by every account and cannot be stored: {0}")]
+    NeverStored(String),
     #[error("User not found")]
     UserNotFound,
     #[error("Database error: {0}")]
@@ -201,7 +209,8 @@ impl IntoResponse for EntitlementError {
             EntitlementError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
             EntitlementError::Empty
             | EntitlementError::InvalidFqn(_)
-            | EntitlementError::DerivedOnly(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            | EntitlementError::DerivedOnly(_)
+            | EntitlementError::NeverStored(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EntitlementError::UserNotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EntitlementError::Database(e) => match e.as_ref() {
                 DynamoDBError::TableNotExists(table) => (
@@ -267,6 +276,55 @@ mod tests {
             Err(EntitlementError::DerivedOnly(_))
         ));
         assert!(parse_user_default_entitlements(Some(&campaign)).is_err());
+    }
+
+    /// The market request entitlement is held by every account and never
+    /// stored, in any letter case of the host; it is not derived-only, so a
+    /// delegation keeps it.
+    #[test]
+    fn market_request_entitlement_can_never_be_stored() {
+        let request = crate::constants::ENTITLEMENT_MARKET_REQUEST.to_string();
+        assert!(crate::constants::is_held_by_every_account(&request));
+        for refused in [
+            request.clone(),
+            request.replacen("arkavo.net", "Arkavo.NET", 1),
+            "https://arkavo.net/attr/market/value/anything".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    validate_fqns(&[ENTITLEMENT_READ.into(), refused.clone()]),
+                    Err(EntitlementError::NeverStored(_))
+                ),
+                "{refused}"
+            );
+            assert!(parse_user_default_entitlements(Some(&refused)).is_err());
+            assert!(!crate::constants::is_derived_only(&refused), "{refused}");
+        }
+        assert_eq!(
+            EntitlementError::NeverStored(request.clone())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // Only the exact name is delegable.
+        for other in [
+            request.replacen("arkavo.net", "Arkavo.NET", 1),
+            "https://arkavo.net/attr/market/value/anything".to_string(),
+            "https://arkavo.net/attr/markets/value/request".to_string(),
+        ] {
+            assert!(
+                !crate::constants::is_held_by_every_account(&other),
+                "{other}"
+            );
+        }
+        assert!(!crate::constants::is_never_stored(
+            "https://arkavo.net/attr/markets/value/request"
+        ));
+        // A delegation row holding it is shown as it is.
+        assert_eq!(
+            crate::db::strip_derived_only(vec![request.clone()], &"test"),
+            vec![request]
+        );
     }
 
     /// #117: the creator attribute is derived-only whatever the host's letter
