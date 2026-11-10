@@ -152,8 +152,13 @@ the idle timeout.
 
 The device key also signs the request for a game-server token
 (`arkavo-game-token-v1`, [game-token.md](game-token.md)) and, with that token,
-each request to a game server (`arkavo-game-request-v1`). The session is not
-changed by either. Every message the key signs starts with a fixed context
+each request to a game server (`arkavo-game-request-v1`). It opens, mints
+with and ends a game session (`arkavo-game-session-open-v1`,
+`arkavo-game-session-token-v1`, `arkavo-game-session-end-v1`): 30 days of
+game-token mints for this device, which outlives the session, so a client
+that holds a game session keeps the device key after the session has ended.
+Signing out ends the session's game session too. The session is not
+changed by any of these. Every message the key signs starts with a fixed context
 line. A client library must never sign caller-supplied bytes with it: the
 sign-out message is only a context line and the session id, so raw signing
 would let another party obtain one.

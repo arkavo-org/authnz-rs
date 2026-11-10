@@ -425,7 +425,39 @@ pub async fn signout_session(
     Extension(app_state): Extension<AppState>,
     Json(req): Json<SignoutRequest>,
 ) -> Result<StatusCode, SessionError> {
+    let game_session_id = authnz_rs::game_token::game_session_id_for(&req.session_id);
     let Some(session) = app_state.db_store.get_session(&req.session_id).await? else {
+        // The session is gone (a refused renewal removed it, usually the
+        // day before), but its game session lasts 30 days and holds the
+        // same device key: the same signature ends it.
+        if let Some(game) = app_state
+            .db_store
+            .get_game_session(&game_session_id)
+            .await?
+        {
+            let key = VerifyingKey::from_sec1_bytes(&game.public_key).map_err(|_| {
+                error!("Game session {game_session_id} holds an unreadable device key");
+                SessionError::Internal
+            })?;
+            // Another key ends nothing, and is answered like a session
+            // that never was: for 30 days this must not say which session
+            // ids had a game session (as `POST /game/session/end`).
+            if !signature_verifies(&key, &signout_message(&req.session_id), &req.signature) {
+                warn!(
+                    "Sign-out of ended session {}: invalid proof",
+                    req.session_id
+                );
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            app_state
+                .db_store
+                .delete_game_session(&game_session_id)
+                .await?;
+            info!(
+                "Game session {game_session_id} of {} signed out after its session ended",
+                game.user_id
+            );
+        }
         return Ok(StatusCode::NO_CONTENT);
     };
     if !signature_verifies(
@@ -435,9 +467,23 @@ pub async fn signout_session(
     ) {
         return Err(SessionError::Ended(Ended::InvalidProof));
     }
+    // Signing out ends the session's game session too (`game.rs`). First:
+    // if this fails, the session row is still there for the retry.
+    app_state
+        .db_store
+        .delete_game_session(&game_session_id)
+        .await?;
     app_state
         .db_store
         .delete_session(&session.session_id)
+        .await?;
+    // And again, now that the session is gone: an open that wrote its game
+    // session between the first delete and this point passed its own
+    // re-check. One that writes after this finds no session and takes its
+    // row back (`game::open_session_handler`).
+    app_state
+        .db_store
+        .delete_game_session(&game_session_id)
         .await?;
     info!(
         "Session {} of {} signed out",

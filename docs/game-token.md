@@ -33,6 +33,119 @@ a game token ends with the session whose key it is bound to.
 A client without an open session signs in with the passkey and opens one
 first.
 
+A passkey session goes idle after about an hour without a renewal and ends
+24 hours after the sign-in, which would put a passkey prompt before most
+play. So the mint also takes a **game session** (below): opened from a
+passkey session, bound to the same device key, good for 30 days, and
+accepted by this mint only.
+
+## Game sessions
+
+A game session lets one device mint game tokens for **30 days after the
+passkey sign-in, with no idle limit** (owner decision 2026-11-10). It is
+outside the limits the passkey session keeps, on purpose, and so it does
+exactly one thing: `POST /game/token` accepts it. It renews no session,
+yields no passkey auth token, and no other route reads it. Account changes,
+deletion and purchases keep needing the passkey session or a fresh passkey
+sign-in.
+
+### Open: `POST /game/session`
+
+```
+POST /game/session
+Content-Type: application/json
+
+{ "sessionId": "<uuid>", "issuedAt": 1794268800, "signature": "<base64url>" }
+```
+
+`sessionId` is the passkey session. `signature` is its device key's
+signature (raw `r‖s`, as for the mint) over:
+
+```
+arkavo-game-session-open-v1
+<sessionId>
+<issuedAt>
+```
+
+The passkey session must be in service, exactly as for a mint with it:
+inside its 24 h deadline and its idle limit, its account live. So open the
+game session right after `POST /session`.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"gameSessionId": "<uuid>", "sub": "<account uuid>", "expiresAt": <unix s>, "serverTime": <unix s>}` | opened, or already open |
+| 400 | `{"error":"invalid_request"}` / `{"error":"invalid_issued_at", "serverTime": …}` | as for the mint |
+| 401 | `{"error":"unauthorized"}` | no such passkey session, the signature does not verify, the session is over or idle, or its account is deleted |
+| 429 | `{"error":"rate_limited"}`, `Retry-After` | counted with the account's mints |
+| 503 | `{"error":"game_tokens_unavailable"}` | `GAME_TOKEN_AUDIENCES` unset |
+
+- **`sub`** is the account, the same bare UUID the token carries. The
+  client stores `gameSessionId`, `sub` and `expiresAt` together, so it
+  knows whose game session it holds, and when it ends, without a request
+  and after the passkey session and its token are gone.
+- **`expiresAt`** is the passkey assertion's time + 2592000 s (30 days). It
+  counts from the sign-in, never from the open.
+- **One passkey session has one game session.** `gameSessionId` is derived
+  from `sessionId`, so opening again (a lost answer, a retry) returns the
+  same id and the same `expiresAt`. Nothing extends a game session; a new
+  one needs a new passkey sign-in. An open that fails or is refused never
+  ends a game session that was already open.
+- **The key.** The game session is bound to the passkey session's device
+  key as identity stored it; the caller sends no key. The client must
+  **keep that key for as long as it keeps the game session**, also after
+  the passkey session has ended (idle, expired, a refused renewal).
+- **A new passkey sign-in on the same device** opens a new passkey session,
+  with a new device key, and so a new game session. Identity cannot tell
+  that the two are one device. The client opens the new game session, ends
+  the old one (below) and then discards the old key, so that it holds one
+  game session.
+
+### What ends a game session
+
+- Its deadline.
+- `POST /game/session/end`.
+- `POST /session/signout` of the passkey session that opened it. This works
+  after that session has ended too (the usual case for a game: the session
+  went idle the day before): the game session holds the same device key,
+  so the same sign-out request, with the passkey session's id and the same
+  signature, ends it. A client needs only one of the two calls. Once the
+  passkey session is gone, a sign-out with a wrong signature answers 204
+  and ends nothing, as the end route does.
+- Deletion of the account: mints are refused at once, and the row is
+  removed with the account's other rows.
+
+The passkey session going idle, expiring or being ended for credential
+reuse does **not** end it: that is its purpose.
+
+### End: `POST /game/session/end`
+
+```
+{ "gameSessionId": "<uuid>", "issuedAt": 1794268800, "signature": "<base64url>" }
+```
+
+signed by the device key over:
+
+```
+arkavo-game-session-end-v1
+<gameSessionId>
+<issuedAt>
+```
+
+204 when ended, and 204 again for one already gone (or never opened). 400
+and 503 as above. A game session past its deadline can still be ended.
+
+**A signature that is not the device key's is also 204, and ends nothing.**
+The route takes no token, so it does not say whether an id names a game
+session. A client that signed with the right key has ended it; the proof,
+if it wants one, is that a mint with that id answers 401.
+
+**Signing out offline.** A client that signs out with no network deletes the
+device key and its stored ids, and need not reach identity later. The row
+then stays (refused once past its deadline, and removed only with the
+account, or by a DynamoDB TTL once one is enabled), but nothing can use it:
+every mint needs a signature by the deleted key. A client that can reach identity should end
+the game session before it deletes the key.
+
 ## Request
 
 ```
@@ -43,7 +156,11 @@ Content-Type: application/json
   "issuedAt": 1794268800, "signature": "<base64url>" }
 ```
 
-- **`sessionId`**: the session, as `POST /session` returned it.
+- **`sessionId`**: the session, as `POST /session` returned it. **Or
+  `gameSessionId`**, as `POST /game/session` returned it: exactly one of
+  the two. With `gameSessionId` the first line of the signed message is
+  `arkavo-game-session-token-v1` and its second line is the game session
+  id; everything else is the same.
 - **`audience`**: the game server the token is for. It must be one of the
   values the operator lists in `GAME_TOKEN_AUDIENCES`.
 - **`issuedAt`**: unix seconds, as a JSON integer (no fraction, no
@@ -79,10 +196,12 @@ device key.
 |---|---|---|
 | 200 | `{"token": "<base64url>", "expiresAt": <unix s>, "onlinePlay": <bool>, "serverTime": <unix s>}` | minted. `onlinePlay` says whether the token carries the entitlement, so the app need not parse it. `serverTime` is identity's clock |
 | 503 | `{"error":"game_tokens_unavailable"}` | the operator has not set `GAME_TOKEN_AUDIENCES` |
-| 400 | `{"error":"invalid_request"}` | the body is not `{sessionId, audience, issuedAt, signature}` |
+| 200 | the same, plus `"gameSessionExpiresAt": <unix s>` | minted with a `gameSessionId`: the game session's deadline, as `POST /game/session` returned it |
+| 400 | `{"error":"invalid_request"}` | the body is not `{sessionId, audience, issuedAt, signature}`, or it names both sessions or neither |
 | 400 | `{"error":"invalid_audience"}` | not a listed audience |
 | 400 | `{"error":"invalid_issued_at", "serverTime": <unix s>}` | `issuedAt` is more than 60 s from identity's clock. Decided before the session is read: it needs no secret. Correct the clock offset from `serverTime` and send again; do **not** renew the session for it |
-| 401 | `{"error":"unauthorized"}` | no such session; the signature does not verify; the session is past its 24 h deadline or its idle limit; or its account is deleted |
+| 401 | `{"error":"unauthorized"}` | no such session or game session; the signature does not verify; the passkey session is past its 24 h deadline or its idle limit; or the account is deleted |
+| 401 | `{"error":"game_session_ended"}` | `gameSessionId` only: the game session is past its deadline. Told only to a caller whose signature verified, for a live account, and counted by the rate limit like a mint. The person signs in with the passkey again |
 | 429 | `{"error":"rate_limited"}`, `Retry-After` | more than 30 mints by the account in a minute |
 | 500 | `{"error":"server_error"}` | a read or signing failed |
 
@@ -93,6 +212,14 @@ failed. On a 401 the client renews the session (`POST /session/refresh`),
 which answers with the definite reason if the session is over, and then
 tries the mint once more. A 429 is answered here (unlike the session
 routes): wait `Retry-After`.
+
+**With a `gameSessionId`, do not renew the passkey session on a 401.** It is
+usually over by then, and the renewal has nothing to do with the game
+session. `game_session_ended` means sign in again; `unauthorized` means the
+game session is gone (ended, signed out, the account deleted) or the key is
+not its key, and the answer is the same: sign in again. The mint never
+removes the row, so `game_session_ended` is answered every time until the
+client ends the game session or signs in again.
 
 **Clocks.** Every 200 and every `invalid_issued_at` carries `serverTime`.
 A client keeps the offset between it and its own clock and uses the
@@ -119,10 +246,10 @@ apart from "not signed in".
 | 1 | `iss` | the issuer (`OIDC_ISSUER`, `https://identity.arkavo.net`) |
 | 2 | `sub` | the account's bare lowercase UUID, as in the passkey CWT |
 | 3 | `aud` | the requested audience, one text string |
-| 4 | `exp` | `iat` + `GAME_TOKEN_SECONDS` (default 900), and never later than the session's deadline (24 h after its passkey assertion) |
+| 4 | `exp` | `iat` + `GAME_TOKEN_SECONDS` (default 900), and never later than the deadline of the session it was minted with (a passkey session: 24 h after its passkey assertion; a game session: 30 days after it) |
 | 6 | `iat` | mint time, unix seconds |
 | 7 | `cti` | 16 random bytes |
-| 8 | `cnf` | `{1: {1: 2, -1: 1, -2: x, -3: y}}`: the session's device key as a COSE_Key (kty EC2, crv P-256), no `kid`, no `alg` |
+| 8 | `cnf` | `{1: {1: 2, -1: 1, -2: x, -3: y}}`: the session's device key as a COSE_Key (kty EC2, crv P-256), no `kid`, no `alg`. A game session's key is its passkey session's |
 | `"arkavo_handle"` | | the account's permanent handle, full and lowercase (`alice.arkavo.social`). Always present |
 | `"arkavo_entitlements"` | | **present only while the account holds the pass**: an array of exactly one text string, `https://arkavo.net/attr/network/value/online-play`. Absent otherwise |
 
@@ -242,8 +369,14 @@ Rules:
 - On sign-out the session ends, and the device key with it: the token is
   then useless.
 
-**Keep the session alive while playing.** The mint is not a renewal, and it
-answers 401 once the session is idle. A person who plays for more than an
+**A game server sees no difference.** A token minted with a game session
+has the same claims, content type, lifetime bound and proof as one minted
+with a passkey session. Its `cnf` key stays the same for the whole game
+session, up to 30 days.
+
+**Without a game session, keep the passkey session alive while playing.**
+The mint is not a renewal, and with a `sessionId` it answers 401 once the
+session is idle. A person who plays for more than an
 hour and talks only to the game server must still renew the session
 (`POST /session/refresh`) within its idle limit, under the usual rule: only
 while the app is in use (frontmost with recent input; active play counts).
@@ -259,6 +392,16 @@ one session. A new passkey sign-in opens a new session with a new key; the
 |---|---|
 | `GAME_TOKEN_AUDIENCES` | Comma-separated audiences `POST /game/token` may mint for, one per game server. Unset ⇒ the route answers 503. |
 | `GAME_TOKEN_SECONDS` | Token lifetime. Default 900; 60 to 3600. Out of range fails startup. |
+
+The game session's 30 days is a constant (`GAME_SESSION_SECONDS`), not
+configuration. Its row is `identity_links` `game-session#<gameSessionId>`,
+`provider = game-session`, with `user_id`, `public_key`, `assertion_at`,
+`created_at` and `expires_at` (for a future DynamoDB TTL, which is not
+enabled today: a row past its deadline stays, refused, until it is ended or
+the account is deleted). `gameSessionId` = UUID v8 from the first 16 bytes
+of SHA-256(`arkavo-game-session-id-v1` || the passkey session id's 16
+bytes). The game session routes answer 503 while `GAME_TOKEN_AUDIENCES` is
+unset.
 
 Identity refuses to start if an audience is the passkey audience (`arkavo`),
 the platform audience, an OIDC client id or an agent token audience, or

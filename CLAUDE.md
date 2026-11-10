@@ -653,6 +653,36 @@ appraisal, status)
 - `exp` = `iat` + `GAME_TOKEN_SECONDS`, never past the session's deadline.
 - The pass is derived as at any mint (`publishing::load_sources` with
   recheck, then `derive`), without Patreon: no publishing source grants it.
+- **Game sessions** (0.36.0, owner decision 2026-11-10): a passkey session
+  goes idle in about an hour and ends in a day, which would put a passkey
+  prompt before most play. `POST /game/session` `{sessionId, issuedAt,
+  signature}` (the passkey session's device key over
+  `arkavo-game-session-open-v1\n<sessionId>\n<issuedAt>`; the session in
+  service as for a mint) opens that session's game session: the same
+  account and stored device key, good until the passkey assertion +
+  `GAME_SESSION_SECONDS` (30 days, **no idle limit**; outside AAL2 on
+  purpose). 200 `{gameSessionId, sub, expiresAt, serverTime}`; the id is
+  derived from the passkey session id, so the open is idempotent and never
+  extends. **Only `POST /game/token` accepts it**: `gameSessionId` in place
+  of `sessionId` (exactly one), signed under
+  `arkavo-game-session-token-v1`; the 200 adds `gameSessionExpiresAt`, and
+  a session past its deadline answers 401 `game_session_ended`, only after
+  the proof verifies. Never let another route accept a game session: it
+  must not renew a session or yield a passkey auth CWT. Ended by its
+  deadline, `POST /game/session/end` (device key; 204 for ended, unknown
+  **and a wrong signature alike**, so the route is no existence oracle),
+  `POST /session/signout` of its passkey session (also after that session's
+  row is gone: the signature is then checked against the game session's
+  key), and account deletion (the mint's liveness check, then the sweep's
+  link step); **not** by the passkey session going idle, expiring or being
+  reused. The open takes a row back only if **that request wrote it**
+  (`open_game_session` says so) and the passkey session or the account is
+  gone on a second look; sign-out deletes the game session before and
+  after the passkey session. Together these close the open/sign-out race;
+  an already-open game session is never ended by a repeated open. Row:
+  `identity_links` `game-session#<id>` (`db/game_session.rs`), never
+  written after the open, so the mint stays read-only. The `sessionId` mint
+  is unchanged.
 - The game server requires proof of possession: each request is signed by
   the `cnf` key over `arkavo-game-request-v1\n…` (`game_token::request_message`).
   The device key also signs the session messages, so it must only ever sign
@@ -994,6 +1024,8 @@ When modifying token lifetimes, update these in authn.rs:
   `PASSKEY_SESSION_TOKEN_SECONDS` + skew + `SESSION_RENEWAL_GRACE_SECONDS`
   (asserted at compile time), or the renewal an expired token's 401
   prompts is refused as idle.
+- Game session: `GAME_SESSION_SECONDS` (2592000, 30 days from the passkey
+  assertion, no idle limit). Only the game-token mint may read it.
 - Session timeout: `Duration::seconds(600)` (10 minutes)
 - Passkey enrollment freshness: `ENROLLMENT_TOKEN_MAX_AGE_SECONDS` (300s).
   Must stay below the auth token lifetime — asserted at compile time in

@@ -50,6 +50,19 @@ pub const MINT_CONTEXT: &str = "arkavo-game-token-v1";
 /// game server.
 pub const REQUEST_CONTEXT: &str = "arkavo-game-request-v1";
 
+/// First line of the message the device key signs to open a game session.
+pub const SESSION_OPEN_CONTEXT: &str = "arkavo-game-session-open-v1";
+
+/// First line of the message the device key signs to get a token from a
+/// game session.
+pub const SESSION_MINT_CONTEXT: &str = "arkavo-game-session-token-v1";
+
+/// First line of the message the device key signs to end a game session.
+pub const SESSION_END_CONTEXT: &str = "arkavo-game-session-end-v1";
+
+/// Domain separator of the game session id's hash of the passkey session id.
+const GAME_SESSION_ID_CONTEXT: &[u8] = b"arkavo-game-session-id-v1";
+
 /// Longest game audience.
 pub const MAX_AUDIENCE_LEN: usize = 128;
 
@@ -88,6 +101,40 @@ pub fn is_audience(s: &str) -> bool {
 /// bounds how long a captured request can be replayed.
 pub fn mint_message(session_id: &uuid::Uuid, audience: &str, issued_at: i64) -> String {
     format!("{MINT_CONTEXT}\n{session_id}\n{audience}\n{issued_at}")
+}
+
+/// The game session a passkey session opens: a UUID (version 8) from
+/// SHA-256 of the passkey session's id. One passkey session has one game
+/// session, so opening it again answers the same one.
+pub fn game_session_id_for(session_id: &uuid::Uuid) -> uuid::Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(GAME_SESSION_ID_CONTEXT);
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+/// The message a passkey session's device key signs to open its game
+/// session.
+pub fn session_open_message(session_id: &uuid::Uuid, issued_at: i64) -> String {
+    format!("{SESSION_OPEN_CONTEXT}\n{session_id}\n{issued_at}")
+}
+
+/// The message a game session's device key signs to get a token: as
+/// [`mint_message`], under its own context and naming the game session.
+pub fn session_mint_message(
+    game_session_id: &uuid::Uuid,
+    audience: &str,
+    issued_at: i64,
+) -> String {
+    format!("{SESSION_MINT_CONTEXT}\n{game_session_id}\n{audience}\n{issued_at}")
+}
+
+/// The message a game session's device key signs to end it.
+pub fn session_end_message(game_session_id: &uuid::Uuid, issued_at: i64) -> String {
+    format!("{SESSION_END_CONTEXT}\n{game_session_id}\n{issued_at}")
 }
 
 /// The message the `cnf` key signs for one request to the game server:
@@ -637,6 +684,22 @@ mod tests {
         assert_eq!(
             mint_message(&id, "https://game.example", 1_794_268_800),
             "arkavo-game-token-v1\n0f0e0d0c-0b0a-8908-8706-050403020100\nhttps://game.example\n1794268800"
+        );
+        // The game session messages, and the id a passkey session's game
+        // session gets (UUID v8 of SHA-256(context || the id's 16 bytes)).
+        assert_eq!(
+            session_open_message(&id, 1_794_268_800),
+            "arkavo-game-session-open-v1\n0f0e0d0c-0b0a-8908-8706-050403020100\n1794268800"
+        );
+        let game = game_session_id_for(&id);
+        assert_eq!(game.to_string(), "35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2");
+        assert_eq!(
+            session_mint_message(&game, "https://game.example", 1_794_268_800),
+            "arkavo-game-session-token-v1\n35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2\nhttps://game.example\n1794268800"
+        );
+        assert_eq!(
+            session_end_message(&game, 1_794_268_800),
+            "arkavo-game-session-end-v1\n35729ecb-43ef-8b98-8dc6-0e8c64dfd0d2\n1794268800"
         );
         // SHA-256 of the empty string, and of "abc".
         assert_eq!(

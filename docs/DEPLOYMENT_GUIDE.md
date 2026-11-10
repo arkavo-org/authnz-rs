@@ -367,6 +367,19 @@ aws dynamodb update-time-to-live --table-name prod-identity-links \
   --time-to-live-specification "Enabled=true, AttributeName=expires_at"
 ```
 
+#### Game sessions (0.36.0)
+
+No new table, IAM grant or environment variable. `POST /game/session`
+writes an `identity_links` row `game-session#<id>` (`PutItem`, `GetItem`,
+`DeleteItem`). Its `expires_at` is the game session's 30-day deadline, so
+the TTL above, once enabled, also removes game sessions at their deadline.
+Without it a game session nobody ends stays (refused) until its account is
+deleted. The TTL also removes a passkey session's row at 24 h; sign-out
+still ends that session's game session afterwards, because it then checks
+the signature against the game session's own row.
+
+The routes answer 503 while `GAME_TOKEN_AUDIENCES` is unset.
+
 The auth CWT stays 1 h in this release (`PASSKEY_SESSION_TOKEN_SECONDS`).
 It shortens to 15 min only after ArkavoKit, Creator and the iOS app renew
 (docs/session-renewal.md).

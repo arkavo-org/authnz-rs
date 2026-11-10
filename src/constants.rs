@@ -257,6 +257,16 @@ pub const GAME_TOKEN_MINTS_PER_MINUTE: u32 = 30;
 /// device that can mint can also call the server.
 pub const GAME_TOKEN_PROOF_SKEW_SECONDS: i64 = 60;
 
+/// How long after its passkey assertion a game session (`POST /game/session`)
+/// can still mint game tokens: 30 days, with no idle limit. Counted from the
+/// assertion, never from the open, so opening again cannot extend it.
+///
+/// This is outside the AAL2 limits the passkey session keeps
+/// ([`SESSION_IDLE_SECONDS`], [`SESSION_MAX_SECONDS`]) by owner decision
+/// (2026-11-10): a game session can only mint a game token, which carries
+/// online play and nothing else.
+pub const GAME_SESSION_SECONDS: i64 = 30 * 86_400;
+
 // Agent delegation (PE → agent NPE) constants
 
 /// Lifetime of a delegation record in days. A delegation outlives any single
