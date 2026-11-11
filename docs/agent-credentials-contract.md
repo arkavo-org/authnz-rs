@@ -74,15 +74,16 @@ The token is minted from a strongly consistent read of the identity taken after 
 
 ### Entitlements every account holds
 
-One entitlement is held by every live account without being stored on it, so any account holder can delegate it and a mint keeps it whatever the owner stores:
+Two entitlements are held by every live account without being stored on it, so any account holder can delegate them and a mint keeps them whatever the owner stores:
 
 | FQN | Meaning |
 |---|---|
 | `https://arkavo.net/attr/market/value/request` | The agent may ask the market (`https://market.arkavo.com`) for a purchase on its owner's behalf. The owner still pays. |
+| `https://arkavo.net/attr/market/value/pay` | The agent may attempt a purchase at the market by itself (0.37.0). Identity only entitles the attempt: what it may buy, for how much and how often is the market's purchase authority, which identity neither stores nor signs into the token. Separate from `request`, so an agent that may ask cannot spend. |
 
-- The name is matched exactly. No other value of `https://arkavo.net/attr/market/` is held by anyone, and none can be stored on an account (`PUT /admin/users/{id}/entitlements` answers 400).
-- It appears only in agent tokens whose owner delegated it, never in a person's own token.
-- **Audience.** An agent token's `aud` is the whole `AGENT_TOKEN_AUDIENCES` list; there is no per-request audience. Once that list includes the market, every agent token names both the platform and the market. A verifier must therefore not rely on `aud` alone: the market requires this entitlement and a per-request signature by the `cnf` key (arkavo-com/market `docs/market-identity-interface.md`, "Requests: the tokens identity issues"), and the platform ignores an entitlement it does not define.
+- Each name is matched exactly, and each is delegated by itself: holding one never implies the other. No other value of `https://arkavo.net/attr/market/` is held by anyone, and none can be stored on an account (`PUT /admin/users/{id}/entitlements` answers 400).
+- They appear only in agent tokens whose owner delegated them, never in a person's own token.
+- **Audience.** An agent token's `aud` is the whole `AGENT_TOKEN_AUDIENCES` list; there is no per-request audience. Once that list includes the market, every agent token names both the platform and the market. A verifier must therefore not rely on `aud` alone: the market requires its entitlement and a per-request signature by the `cnf` key (arkavo-com/market `docs/market-identity-interface.md`, "Requests: the tokens identity issues"), and the platform ignores an entitlement it does not define.
 
 ## Refusal bodies (part of v2)
 
@@ -206,7 +207,7 @@ Response 200: the status body. Errors: 400 malformed or empty JSON body, bad DID
 
 ## Revocation
 
-`DELETE /agents/delegations/{did}` (the owner, `X-Auth-Token` passkey auth CWT; unchanged from v1 apart from this) sets `revoked_at` and increases `state_version` by 1, in one write conditioned on the owner and the version the server read, so no concurrent renewal or appraisal can clear the revocation and keep its version. Response 204, also for an already revoked delegation (which moves the version again). The cascade to child delegations (none while every delegation is depth 0) moves each child's version too.
+`DELETE /agents/delegations/{did}` (the owner: `X-Auth-Token` passkey auth CWT, or from 0.37.0 an `agents:delegate` `Authorization: Bearer` token of an allowlisted client whose `auth_time` is at most 3600 s old, as for quarantine; `X-Auth-Token` wins when both are sent; a Guardian is refused) sets `revoked_at` and increases `state_version` by 1, in one write conditioned on the owner and the version the server read, so no concurrent renewal or appraisal can clear the revocation and keep its version. Response 204, also for an already revoked delegation (which moves the version again). The cascade to child delegations (none while every delegation is depth 0) moves each child's version too.
 
 ## Agent status
 

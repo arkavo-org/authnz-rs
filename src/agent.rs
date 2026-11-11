@@ -778,7 +778,11 @@ pub async fn revoke_delegation(
     Path(agent_did): Path<String>,
 ) -> Result<impl IntoResponse, AgentError> {
     refuse_guardian(&headers)?;
-    let human = authenticate_human(&app_state, &headers).await?;
+    // The owner's passkey auth CWT, or an `agents:delegate` Bearer token
+    // under the rule quarantine uses: revoking only removes power, so the
+    // owner can do it from the client the agent was authorized with.
+    let human =
+        authenticate_operator(&app_state, &headers, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS).await?;
     let now = Utc::now().timestamp();
 
     let mut revoked = None;
@@ -2217,6 +2221,31 @@ mod tests {
             &[],
             &request.replacen("arkavo.net", "Arkavo.net", 1)
         ));
+    }
+
+    /// The pay entitlement is held the same way, and by itself: delegating
+    /// one of the two never yields the other.
+    #[test]
+    fn the_market_pay_entitlement_is_held_separately_from_request() {
+        let request = crate::constants::ENTITLEMENT_MARKET_REQUEST.to_string();
+        let pay = crate::constants::ENTITLEMENT_MARKET_PAY.to_string();
+        assert_eq!(pay, "https://arkavo.net/attr/market/value/pay");
+        assert!(holds_entitlement(&[], &pay));
+        assert!(!holds_entitlement(&[], &pay.replacen("/pay", "/Pay", 1)));
+        assert_eq!(
+            intersect_entitlements(std::slice::from_ref(&request), &[]),
+            vec![request.clone()]
+        );
+        assert_eq!(
+            intersect_entitlements(std::slice::from_ref(&pay), &[]),
+            vec![pay.clone()]
+        );
+        // Never stored, and not derived-only: a delegation keeps it.
+        assert!(matches!(
+            crate::entitlements::validate_fqns(std::slice::from_ref(&pay)),
+            Err(crate::entitlements::EntitlementError::NeverStored(_))
+        ));
+        assert!(!crate::constants::is_derived_only(&pay));
     }
 
     #[test]
