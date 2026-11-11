@@ -254,7 +254,21 @@ when unset.
   delegation. The market's contract: arkavo-com/market
   `docs/market-identity-interface.md`, "Requests: the tokens identity
   issues".
-- `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade)
+- `GET /agents/delegations`, `DELETE /agents/delegations/:did` (cascade).
+  The DELETE takes the owner's passkey auth CWT or, from 0.37.0, an
+  `agents:delegate` Bearer token under quarantine's rule (allowlisted
+  client, `auth_time` within 3600 s): revoking only removes power, so an
+  owner can end an agent's authority from Edge or Creator.
+- **The market pay entitlement**
+  `https://arkavo.net/attr/market/value/pay`
+  (`constants::ENTITLEMENT_MARKET_PAY`, 0.37.0): an agent holding it may
+  *attempt* a purchase at the market by itself. Held by every live account
+  without a stored copy, exactly like the request entitlement below, and
+  separate from it so an agent that may ask for payment links cannot
+  spend. **Identity only entitles the attempt** (owner decision
+  2026-11-10): what may be bought, for how much and how often is the
+  market's purchase authority, never stored, signed into a token or
+  enforced here.
 - `GET /agents/challenge?did=…` → `{challenge: b64(32 bytes), nonce}`; the
   challenge is stored on the delegation row (no cookie session)
 - `POST /agents/token` `{did, challenge, signature, nonce}` → verifies the
