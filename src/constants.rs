@@ -499,13 +499,25 @@ pub const MARKET_ATTRIBUTE: &str = "https://arkavo.net/attr/market/";
 /// account, and the platform has no such attribute.
 pub const ENTITLEMENT_MARKET_REQUEST: &str = "https://arkavo.net/attr/market/value/request";
 
+/// Attribute FQN of the market pay entitlement: an agent holding it may
+/// *attempt* a purchase at the market by itself, where
+/// [`ENTITLEMENT_MARKET_REQUEST`] only lets it ask for a link a person pays.
+/// Two names, so an agent that may ask cannot spend.
+///
+/// Held by every live account without a stored copy, like the request
+/// entitlement. **Identity only entitles the attempt** (owner decision
+/// 2026-11-10): what may be bought, for how much and how often is the
+/// market's purchase authority. None of that is stored, signed into a token
+/// or enforced by identity.
+pub const ENTITLEMENT_MARKET_PAY: &str = "https://arkavo.net/attr/market/value/pay";
+
 /// Whether every live account holds `fqn` without a stored copy, so its
 /// owner may delegate it to an agent and an agent mint keeps it.
 ///
 /// Exact match: the market compares the name byte for byte, so no other
 /// spelling is worth delegating.
 pub fn is_held_by_every_account(fqn: &str) -> bool {
-    fqn == ENTITLEMENT_MARKET_REQUEST
+    fqn == ENTITLEMENT_MARKET_REQUEST || fqn == ENTITLEMENT_MARKET_PAY
 }
 
 /// Whether `fqn` is a value of an attribute no account may store although

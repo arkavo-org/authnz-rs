@@ -3503,3 +3503,106 @@ async fn an_owner_appraisal_runs_from_the_assertion_and_is_clamped_to_it() {
     );
     assert_eq!(p.trust(&did).await.appraised_until, Some(sooner));
 }
+
+/// An agent holds the pay entitlement only when its owner delegated that
+/// name: asking for links (`request`) is not spending (`pay`).
+#[tokio::test]
+async fn the_market_pay_entitlement_is_delegated_by_itself() {
+    let Some(p) = Plane::new().await else { return };
+    let request = crate::constants::ENTITLEMENT_MARKET_REQUEST;
+    let pay = crate::constants::ENTITLEMENT_MARKET_PAY;
+    let (_, cwt) = p.user(&[READ]).await;
+    let auth = ("X-Auth-Token", cwt.as_str());
+
+    let asker = fresh_agent();
+    let mut body = authorize_body(&asker, "kit-1", false);
+    body["entitlements"] = json!([request]);
+    assert_eq!(p.authorize(auth, body).await.0, StatusCode::OK);
+    let (st, body) = p.mint(&asker).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["entitlements"], json!([request]));
+
+    let buyer = fresh_agent();
+    let mut body = authorize_body(&buyer, "kit-1", false);
+    body["entitlements"] = json!([request, pay]);
+    assert_eq!(p.authorize(auth, body).await.0, StatusCode::OK);
+    let (st, body) = p.mint(&buyer).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let claims = verify_token(&p, body["token"].as_str().unwrap());
+    let held = claims.custom.arkavo_entitlements.unwrap_or_default();
+    assert!(held.iter().any(|e| e == pay) && held.iter().any(|e| e == request));
+
+    // The owner's own token never carries it.
+    let own = verify_passkey(&p, &cwt);
+    assert!(
+        !own.custom
+            .arkavo_entitlements
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e == pay)
+    );
+}
+
+/// The owner revokes with the sign-in the agent was authorized with: an
+/// `agents:delegate` Bearer token, under quarantine's rule.
+#[tokio::test]
+async fn the_owner_revokes_with_an_agents_delegate_bearer_token() {
+    let Some(p) = Plane::new().await else { return };
+    let (owner, cwt) = p.user(&[READ]).await;
+    let (stranger, _) = p.user(&[READ]).await;
+    let a = fresh_agent();
+    let did = did_key(&a);
+    let (st, reply) = p
+        .authorize(("X-Auth-Token", &cwt), authorize_body(&a, "kit-1", false))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{reply}");
+
+    let now = Utc::now().timestamp();
+    let revoke = |token: String| {
+        let did = did.clone();
+        let p = &p;
+        async move {
+            p.send(
+                Request::delete(format!("/agents/delegations/{did}"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .0
+        }
+    };
+    let token = |who: Uuid, client: &str, scope: &str, idp: &str, age: i64| {
+        p.delegate_token(who, client, scope, idp, Some(now - age))
+    };
+    let scope = "openid agents:delegate";
+
+    // Refused, and the delegation stays: a tap over an hour old, no
+    // delegate scope, a client off the allowlist, a federated sign-in,
+    // another account.
+    for refused in [
+        token(owner, DELEGATE_CLIENT, scope, "webauthn", 3_700),
+        token(owner, DELEGATE_CLIENT, "openid", "webauthn", 60),
+        token(owner, "some-other-client", scope, "webauthn", 60),
+        token(owner, DELEGATE_CLIENT, scope, "google", 60),
+        token(stranger, DELEGATE_CLIENT, scope, "webauthn", 60),
+    ] {
+        let st = revoke(refused).await;
+        assert!(
+            st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN,
+            "{st}"
+        );
+    }
+    assert_eq!(p.mint(&a).await.0, StatusCode::OK);
+
+    let before = p.state_version(&did).await;
+    assert_eq!(
+        revoke(token(owner, DELEGATE_CLIENT, scope, "webauthn", 600)).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(p.state_version(&did).await, before + 1);
+    assert_eq!(
+        p.mint(&a).await,
+        (StatusCode::FORBIDDEN, json!("Delegation revoked"))
+    );
+}
