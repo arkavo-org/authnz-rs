@@ -2,6 +2,8 @@
 
 Authentication and Entitlement WebAuthn and Smart Contract
 
+Public identity resolution and verification: [DID and handle binding](docs/did-handle-binding.md).
+
 ## Deployment
 
 ### Environment Variables

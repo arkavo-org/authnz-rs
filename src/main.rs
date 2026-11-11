@@ -912,11 +912,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // did:webvh passport resolution. did.json is a legacy did:web view
         // (resolvable today); did.jsonl is the signed verifiable-history log
         // (populated when the `webvh` feature signs one).
-        .route("/dids/:username/did.json", get(webvh::well_known_did_json))
-        .route(
-            "/dids/:username/did.jsonl",
-            get(webvh::well_known_did_jsonl),
-        )
+        .route("/handles/:label/did.json", get(webvh::handle_did_json))
+        .route("/dids/:id/did.json", get(webvh::well_known_did_json))
+        .route("/dids/:id/did.jsonl", get(webvh::well_known_did_jsonl))
         .layer(Extension(app_state))
         .layer(Extension(oidc_config))
         .layer(Extension(oidc_code_store))

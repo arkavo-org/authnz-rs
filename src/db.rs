@@ -614,6 +614,68 @@ impl DynamoDBStore {
         }
     }
 
+    /// Public resolution uses only an owned, active mapping. Legacy seeds and
+    /// retired reservations never identify an account.
+    pub async fn get_handle_owner(
+        &self,
+        handle: &str,
+    ) -> Result<Option<(Uuid, String)>, DynamoDBError> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.handles_table)
+            .key("handle", AttributeValue::S(handle.to_lowercase()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;
+        let Some(item) = out.item else {
+            return Ok(None);
+        };
+        if item.contains_key("retired_at") {
+            return Ok(None);
+        }
+        let uid = item
+            .get("user_id")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let did = item.get("did").and_then(|v| v.as_s().ok());
+        Ok(uid.zip(did.cloned()))
+    }
+
+    /// Compare-and-swap the entire append-only log. Concurrent initial mints
+    /// and updates must not replace a published DID or lose a signed entry.
+    #[cfg(feature = "webvh")]
+    pub async fn compare_and_swap_webvh_log(
+        &self,
+        user_id: &Uuid,
+        previous: Option<&str>,
+        log: &str,
+    ) -> Result<(), DynamoDBError> {
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .update_expression("SET webvh_log = :log")
+            .expression_attribute_values(":log", AttributeValue::S(log.to_string()));
+        request = if let Some(previous) = previous {
+            request
+                .condition_expression(format!("{} AND webvh_log = :previous", account::LIVE_ROW))
+                .expression_attribute_values(":previous", AttributeValue::S(previous.to_string()))
+        } else {
+            request.condition_expression(format!(
+                "{} AND attribute_not_exists(webvh_log)",
+                account::LIVE_ROW
+            ))
+        };
+        request
+            .send()
+            .await
+            .map_err(|e| agent_state::classify(e, &self.credentials_table))?;
+        Ok(())
+    }
+
     /// Whether `handle` has a row in the handles table, of any kind: an
     /// account's, one retired by a deletion, or a legacy seed. A handle is
     /// issued once (#132), so registration refuses a new account whose handle
@@ -1142,6 +1204,7 @@ impl DynamoDBStore {
     /// `webvh_log` attribute on the credentials row. (A future iteration may
     /// move the log to its own table; the credentials-row attribute is the
     /// current home for the resolution endpoint.)
+    #[cfg(test)]
     pub async fn put_webvh_log(&self, user_id: &Uuid, log: &str) -> Result<(), DynamoDBError> {
         self.client
             .update_item()
@@ -1166,6 +1229,7 @@ impl DynamoDBStore {
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
             .projection_expression("webvh_log")
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| DynamoDBError::SdkError(e.to_string()))?;

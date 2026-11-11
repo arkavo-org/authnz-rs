@@ -4,7 +4,7 @@
 //! as the canonical, resolvable, verifiable-history DID method — implemented
 //! against the DIF reference crate (`didwebvh-rs`). At registration the handle
 //! store (prod-handles) is written `handle -> did:webvh`, and the signed log
-//! (did.jsonl) is served from `/dids/:username/did.jsonl`.
+//! (did.jsonl) is served from `/dids/:id/did.jsonl`.
 //!
 //! ## The key architectural point this module encodes
 //!
@@ -60,10 +60,6 @@ pub enum WebvhError {
     #[error("key format: {0}")]
     KeyFormat(String),
     #[error("webvh log error: {0}")]
-    /// Only constructed on the `webvh` feature path; without it the DID
-    /// document is still built, so the variant stays in the enum rather than
-    /// splitting the error type per feature.
-    #[cfg_attr(not(feature = "webvh"), allow(dead_code))]
     Log(String),
 }
 
@@ -181,8 +177,7 @@ pub fn passkey_to_did_key(passkey: &Passkey) -> Result<String, WebvhError> {
 /// `did_id` is `"{DID}"` when handed to `create_did` (the crate substitutes the
 /// SCID-bearing identifier), or a concrete id when serving a legacy did:web
 /// view. `vm_multibase` is the passkey public key; `also_known_as` carries the
-/// ATProto handle (`at://<handle>`) so this identity and the ATProto identity
-/// are cross-declared — see the module/PR notes on the two-DID-scheme reality.
+/// permanent HTTPS handle binding and the optional ATProto bridge alias.
 pub fn build_did_document(
     did_id: &str,
     vm_multibase: &str,
@@ -287,7 +282,7 @@ pub async fn on_passkey_registered(
     // username may change, the handle does not (#132). ATProto handles are
     // lowercase; keep alsoKnownAs and the handle key consistent.
     let handle = handle.to_lowercase();
-    let also_known_as = vec![format!("at://{handle}")];
+    let also_known_as = vec![format!("https://{handle}"), format!("at://{handle}")];
     let did_document = build_did_document("{DID}", &multibase, &also_known_as);
     info!(
         "webvh: passport document ready for {username} (auth key {did_key}, aka {:?})",
@@ -306,7 +301,7 @@ pub async fn on_passkey_registered(
         // follow-up.)
         match app_state.db_store.get_webvh_log(user_id).await {
             Ok(Some(_)) => {
-                log::debug!("webvh: {username} already provisioned; skipping re-mint");
+                refresh_handle_binding(app_state, user_id, &handle).await;
                 return;
             }
             Ok(None) => {}
@@ -315,7 +310,7 @@ pub async fn on_passkey_registered(
                 return;
             }
         }
-        let address = format!("https://identity.arkavo.net/dids/{username}");
+        let address = format!("https://identity.arkavo.net/dids/{user_id}");
         match log_emit::create_passport_log(sign_key, &address, did_document).await {
             Ok((did, log)) => {
                 // Persist the log FIRST and treat a persist failure as
@@ -323,7 +318,11 @@ pub async fn on_passkey_registered(
                 // failed to persist would (a) make did.jsonl 404 for that DID and
                 // (b) let a later re-mint (get_webvh_log == None) repoint the
                 // handle to a brand-new DID — breaking did:webvh's stability.
-                if let Err(e) = app_state.db_store.put_webvh_log(user_id, &log).await {
+                if let Err(e) = app_state
+                    .db_store
+                    .compare_and_swap_webvh_log(user_id, None, &log)
+                    .await
+                {
                     warn!(
                         "webvh: failed to persist log for {username}; NOT publishing handle: {e}"
                     );
@@ -354,79 +353,228 @@ pub async fn on_passkey_registered(
 // Resolution endpoints
 // ---------------------------------------------------------------------------
 
-/// `GET /dids/:username/did.json` — legacy **did:web** view, built live from the
-/// user's passkey. Resolvable today by any did:web resolver; did:webvh consumes
-/// the same origin in "legacy mode" until a verifier upgrades to the log.
+/// Parse the stored snapshot, not a document rebuilt from a passkey. The log
+/// is server-authored; verifiers independently validate its proofs. Malformed
+/// stored data is an error, never a fallback to another identity.
+fn latest_document(log: &str) -> Result<serde_json::Value, WebvhError> {
+    let line = log
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .ok_or_else(|| WebvhError::Log("empty log".into()))?;
+    let entry: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| WebvhError::Log(e.to_string()))?;
+    let doc = &entry["state"];
+    if !doc["id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("did:webvh:"))
+    {
+        return Err(WebvhError::Log("missing did:webvh state".into()));
+    }
+    Ok(doc.clone())
+}
+
+fn did_path(doc: &serde_json::Value) -> Option<&str> {
+    let rest = doc["id"].as_str()?.strip_prefix("did:webvh:")?;
+    let (_, location) = rest.split_once(':')?;
+    let path = location.strip_prefix("identity.arkavo.net:dids:")?;
+    valid_label(path).then_some(path)
+}
+
+fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A permanent handle row doubles as the reserved-name map for legacy DID
+/// paths. Never look up a legacy path by the current username. Check the log's
+/// actual path too: new UUID DIDs must not acquire a username-path alias.
+async fn log_for_path(
+    store: &crate::db::DynamoDBStore,
+    id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if !valid_label(id) {
+        return Ok(None);
+    }
+    if let Ok(uid) = Uuid::parse_str(id)
+        && store.get_user_by_id(&uid).await?.is_some()
+        && let Some(log) = store.get_webvh_log(&uid).await?
+        && did_path(&latest_document(&log)?) == Some(id)
+    {
+        return Ok(Some(log));
+    }
+    let handle = format!("{id}.arkavo.social");
+    if let Some((uid, did)) = store.get_handle_owner(&handle).await?
+        && store.get_user_by_id(&uid).await?.is_some()
+        && let Some(log) = store.get_webvh_log(&uid).await?
+    {
+        let doc = latest_document(&log)?;
+        if doc["id"].as_str() == Some(&did) && did_path(&doc) == Some(id) {
+            return Ok(Some(log));
+        }
+    }
+    Ok(None)
+}
+
+/// Rewrite DID URLs belonging to this document, preserving other identities
+/// and arbitrary strings (e.g. service endpoints containing the DID).
+fn web_document(mut doc: serde_json::Value, id: &str) -> serde_json::Value {
+    fn rewrite(value: &mut serde_json::Value, from: &str, to: &str) {
+        match value {
+            serde_json::Value::String(s) if s == from => *s = to.to_string(),
+            serde_json::Value::String(s)
+                if s.strip_prefix(from)
+                    .is_some_and(|suffix| suffix.starts_with('#')) =>
+            {
+                *s = format!("{to}{}", &s[from.len()..]);
+            }
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(|v| rewrite(v, from, to))
+            }
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|v| rewrite(v, from, to))
+            }
+            _ => {}
+        }
+    }
+    let canonical = doc["id"].as_str().unwrap().to_string();
+    rewrite(
+        &mut doc,
+        &canonical,
+        &format!("did:web:identity.arkavo.net:dids:{id}"),
+    );
+    doc
+}
+
+fn json_document(doc: serde_json::Value) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/did+json")],
+        doc.to_string(),
+    )
+        .into_response()
+}
+
+/// `GET /dids/:id/did.json` — parallel did:web view of the latest log state.
 pub async fn well_known_did_json(
     Extension(app_state): Extension<crate::AppState>,
-    Path(username): Path<String>,
-) -> impl IntoResponse {
-    match app_state.db_store.get_user_by_name(&username).await {
-        Ok(Some(user)) => {
-            let Some(passkey) = user.credentials.first() else {
-                return (StatusCode::NOT_FOUND, "no credential for user").into_response();
-            };
-            match passkey_to_multibase(passkey) {
-                Ok(multibase) => {
-                    // did:web id encodes the path segments after the host.
-                    // Lowercase to stay consistent with the (lowercased) handle
-                    // key and the ATProto handle convention.
-                    let uname = username.to_lowercase();
-                    let did_web = format!("did:web:identity.arkavo.net:dids:{uname}");
-                    let aka = vec![format!("at://{}", user.handle.to_lowercase())];
-                    let doc = build_did_document(&did_web, &multibase, &aka);
-                    (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/did+json")],
-                        doc.to_string(),
-                    )
-                        .into_response()
-                }
-                Err(_) => {
-                    (StatusCode::UNPROCESSABLE_ENTITY, "credential is not P-256").into_response()
-                }
-            }
-        }
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match log_for_path(&app_state.db_store, &id).await {
+        Ok(Some(log)) => match latest_document(&log) {
+            Ok(doc) => json_document(web_document(doc, &id)),
+            Err(e) => resolution_error(e),
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "unknown identity").into_response(),
-        Err(e) => {
-            error!("webvh: did.json lookup failed for {username}: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "resolution error").into_response()
-        }
+        Err(e) => resolution_error(e),
     }
 }
 
-/// `GET /dids/:username/did.jsonl` — the did:webvh append-only log. Served from
-/// the persisted log written by [`on_passkey_registered`] (requires the `webvh`
-/// feature to have produced one). 404 until then.
+/// `GET /dids/:id/did.jsonl` — the exact persisted append-only log.
 pub async fn well_known_did_jsonl(
     Extension(app_state): Extension<crate::AppState>,
-    Path(username): Path<String>,
-) -> impl IntoResponse {
-    match app_state.db_store.get_user_by_name(&username).await {
-        Ok(Some(user)) => match app_state.db_store.get_webvh_log(&user.user_id).await {
-            Ok(Some(log)) => (
-                StatusCode::OK,
-                // did:webvh logs are served as JSON Lines.
-                [(header::CONTENT_TYPE, "application/jsonl")],
-                log,
-            )
-                .into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                "no did:webvh log yet (enable the `webvh` feature to sign one)",
-            )
-                .into_response(),
-            Err(e) => {
-                error!("webvh: did.jsonl lookup failed for {username}: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "resolution error").into_response()
-            }
-        },
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match log_for_path(&app_state.db_store, &id).await {
+        Ok(Some(log)) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/jsonl")], log).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "unknown identity").into_response(),
-        Err(e) => {
-            error!("webvh: user lookup failed for {username}: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "resolution error").into_response()
+        Err(e) => resolution_error(e),
+    }
+}
+
+fn resolution_error(e: impl std::fmt::Display) -> axum::response::Response {
+    error!("webvh: resolution failed: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "resolution error").into_response()
+}
+
+/// Origin for https://<label>.arkavo.social/.well-known/did.json.
+/// This alias has no verification methods: signatures name the canonical DID.
+pub async fn handle_did_json(
+    Extension(app_state): Extension<crate::AppState>,
+    Path(label): Path<String>,
+) -> axum::response::Response {
+    async fn resolve(
+        store: &crate::db::DynamoDBStore,
+        label: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        if !valid_label(label) {
+            return Ok(None);
+        }
+        let handle = format!("{label}.arkavo.social");
+        let Some((uid, did)) = store.get_handle_owner(&handle).await? else {
+            return Ok(None);
+        };
+        if store.get_user_by_id(&uid).await?.is_none() {
+            return Ok(None);
+        }
+        let Some(log) = store.get_webvh_log(&uid).await? else {
+            return Ok(None);
+        };
+        let doc = latest_document(&log)?;
+        // The permanent mapping and signed state must agree. Older logs have
+        // only the ATProto alias until their authenticated binding update.
+        let aliases = doc["alsoKnownAs"].as_array();
+        let has_binding = aliases.is_some_and(|aliases| {
+            aliases.contains(&json!(format!("https://{handle}")))
+                || aliases.contains(&json!(format!("at://{handle}")))
+        });
+        if doc["id"].as_str() != Some(&did) || !has_binding {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": format!("did:web:{handle}"),
+            "alsoKnownAs": [did]
+        })))
+    }
+    match resolve(&app_state.db_store, &label).await {
+        Ok(Some(doc)) => json_document(doc),
+        Ok(None) => (StatusCode::NOT_FOUND, "unknown identity").into_response(),
+        Err(e) => resolution_error(e),
+    }
+}
+
+/// Authenticated login/device enrollment backfills the HTTPS binding once.
+/// Failure is non-fatal to authentication; no read-only resolver signs logs.
+pub async fn refresh_handle_binding(app: &crate::AppState, uid: &Uuid, handle: &str) {
+    #[cfg(feature = "webvh")]
+    {
+        async fn refresh(
+            app: &crate::AppState,
+            uid: &Uuid,
+            handle: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let Some(log) = app.db_store.get_webvh_log(uid).await? else {
+                return Ok(());
+            };
+            let mut current = log.clone();
+            if let Some(key) = app.webvh_sign_key.as_ref().as_ref()
+                && let Some(updated) = log_emit::add_handle_binding(key, &log, handle).await?
+            {
+                app.db_store
+                    .compare_and_swap_webvh_log(uid, Some(&log), &updated)
+                    .await?;
+                current = updated;
+            }
+            // Repair a failed handle write after initial mint without re-minting.
+            let doc = latest_document(&current)?;
+            app.db_store
+                .put_handle(handle, doc["id"].as_str().unwrap(), uid)
+                .await?;
+            Ok(())
+        }
+        if let Err(e) = refresh(app, uid, handle).await {
+            warn!("webvh: handle binding refresh failed for {uid}: {e}");
         }
     }
+    #[cfg(not(feature = "webvh"))]
+    let _ = (app, uid, handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +589,82 @@ mod log_emit {
     use super::WebvhError;
     use didwebvh_rs::prelude::*;
     use std::sync::Arc;
+
+    /// Verify the existing chain, then append only the missing aliases. Keep
+    /// the DID, keys, services, and every prior byte of history unchanged.
+    pub async fn add_handle_binding(
+        key: &str,
+        log: &str,
+        handle: &str,
+    ) -> Result<Option<String>, WebvhError> {
+        let mut doc = super::latest_document(log)?;
+        let did = doc["id"].as_str().unwrap().to_string();
+        let mut state = DIDWebVHState::default();
+        state
+            .resolve_log(&did, log, None)
+            .await
+            .map_err(|e| WebvhError::Log(format!("resolve log: {e}")))?;
+        let aliases = doc
+            .as_object_mut()
+            .unwrap()
+            .entry("alsoKnownAs")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| WebvhError::Log("alsoKnownAs is not an array".into()))?;
+        let mut changed = false;
+        for alias in [format!("https://{handle}"), format!("at://{handle}")] {
+            if !aliases.iter().any(|v| v.as_str() == Some(&alias)) {
+                aliases.push(serde_json::Value::String(alias));
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let secret: Secret = serde_json::from_str(key)
+            .map_err(|e| WebvhError::Log(format!("parse update key: {e}")))?;
+        // The library serializes versionTime at second precision but stamps
+        // updates with `now`. Two updates in one second otherwise produce a
+        // chain its own resolver rejects. Wait at most one second; a log dated
+        // further in the future needs a clock correction, not a forged time.
+        let last_entry: serde_json::Value =
+            serde_json::from_str(log.lines().rfind(|line| !line.trim().is_empty()).unwrap())
+                .map_err(|e| WebvhError::Log(e.to_string()))?;
+        let last_time = chrono::DateTime::parse_from_rfc3339(
+            last_entry["versionTime"]
+                .as_str()
+                .ok_or_else(|| WebvhError::Log("missing versionTime".into()))?,
+        )
+        .map_err(|e| WebvhError::Log(e.to_string()))?;
+        let delay = last_time.with_timezone(&chrono::Utc) + chrono::Duration::seconds(1)
+            - chrono::Utc::now();
+        if delay > chrono::Duration::seconds(1) {
+            return Err(WebvhError::Log(
+                "log versionTime is ahead of the server clock".into(),
+            ));
+        }
+        if let Ok(delay) = delay.to_std() {
+            tokio::time::sleep(delay).await;
+        }
+        let config = UpdateDIDConfig::builder()
+            .state(state)
+            .signing_key(secret)
+            .document(doc)
+            .build()
+            .map_err(|e| WebvhError::Log(e.to_string()))?;
+        let result = update_did(config)
+            .await
+            .map_err(|e| WebvhError::Log(e.to_string()))?;
+        let entry = serde_json::to_string(result.log_entry())
+            .map_err(|e| WebvhError::Log(e.to_string()))?;
+        let separator = if log.ends_with('\n') { "" } else { "\n" };
+        let updated = format!("{log}{separator}{entry}\n");
+        DIDWebVHState::default()
+            .resolve_log(&did, &updated, None)
+            .await
+            .map_err(|e| WebvhError::Log(format!("validate updated log: {e}")))?;
+        Ok(Some(updated))
+    }
 
     /// Create the first `did.jsonl` log entry for a passport DID, signed by the
     /// Ed25519 update key (parsed from its crate-`Secret` JSON), with the passkey
@@ -654,3 +878,7 @@ mod tests {
         bytes
     }
 }
+
+#[cfg(test)]
+#[path = "webvh_tests.rs"]
+mod resolution_tests;
