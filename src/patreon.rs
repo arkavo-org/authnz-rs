@@ -30,6 +30,12 @@
 //!      arkavo `user_id`, plus the discovered `patreon_user_id` and (creator
 //!      only) `campaign_id`.
 //!
+//! - **Unlinking** (`DELETE /oauth/patreon/link`, #97): removes both rows
+//!   (and a creator's `patreon-campaign#<cid>` row), the `patreon_tokens`
+//!   row last, since it is the only pointer to the others. A relink to a
+//!   different Patreon account releases the replaced link's rows the same
+//!   way before it writes the new token row.
+//!
 //! - **Token sealing**: KMS envelope encryption. Tokens are AES-256-GCM
 //!   encrypted under a fresh per-row 256-bit DEK; the DEK itself is wrapped
 //!   by an operator-configured KMS key. This means a DynamoDB compromise
@@ -55,7 +61,8 @@
 //! # No new endpoint surface beyond linking
 //!
 //! The deliberate design constraint here is that the *only* new external
-//! endpoint is `POST /oauth/patreon/link` (mirroring `POST /oauth/apple/link`).
+//! endpoints are `POST /oauth/patreon/link` (mirroring `POST
+//! /oauth/apple/link`) and its `DELETE`.
 //! Status, entitlement, and membership-check endpoints are intentionally
 //! omitted — relying parties read everything they need from the
 //! access_token CWT.
@@ -666,7 +673,7 @@ pub async fn patreon_link_handler(
     let sub_prefix = subject_prefix(&patreon_user_id);
     match app_state
         .db_store
-        .link_identity(user_id, "patreon", &patreon_user_id)
+        .link_identity(user_id, crate::db::PATREON_PROVIDER, &patreon_user_id)
         .await
     {
         Ok(()) => info!(
@@ -723,13 +730,29 @@ pub async fn patreon_link_handler(
         owned_tiers: OwnedCampaignTiers::default(),
     };
 
+    // Give up what the link being replaced points to (#97): its row is
+    // the only pointer to them. Last before the put, so a failure (500)
+    // leaves the old link whole and the next link retries it.
+    if let Err(e) = app_state
+        .db_store
+        .release_replaced_patreon_link(&user_id, &link.patreon_user_id, link.campaign_id.as_deref())
+        .await
+    {
+        error!(
+            "Failed to release the replaced Patreon link of user {}: {}",
+            user_id, e
+        );
+        return PatreonError::Db("replaced_link_release_failed".into()).into_response();
+    }
+
     if let Err(e) = app_state.db_store.put_patreon_link(&link).await {
         error!("Failed to persist patreon_tokens row: {}", e);
         return PatreonError::Db("patreon_tokens_write_failed".into()).into_response();
     }
 
-    // The campaign it owns, for its patrons' `creator_sub` (#128).
-    record_campaign_owner(&app_state, &link, link.campaign_id.as_deref()).await;
+    // The campaign it owns, for its patrons' `creator_sub` (#128). A
+    // campaign the replaced link owned was given up above.
+    record_campaign_owner(&app_state, user_id, None, link.campaign_id.as_deref()).await;
 
     // Invalidate any cached materialization so the next access-token mint
     // picks up the freshly-linked memberships.
@@ -741,6 +764,67 @@ pub async fn patreon_link_handler(
         campaign_id,
     })
     .into_response()
+}
+
+/// `DELETE /oauth/patreon/link` (#97)
+///
+/// Auth-required, no body. Removes the caller's Patreon link: the
+/// `patreon#<sub>` row, a creator's `patreon-campaign#<cid>` row, then the
+/// `patreon_tokens` row holding the sealed tokens (Patreon has no
+/// revocation endpoint, so this is the server's whole copy). The token row
+/// goes last because it is the only pointer to the others: a failure is a
+/// 500 that a retry finishes, and until then the link still materializes.
+/// - 204 when removed, and when nothing was linked.
+/// - 401 for a missing or invalid token, or a deleted account.
+/// - 503 if Patreon support is not configured on this deployment.
+/// - 500 on a storage failure.
+///
+/// A creator may unlink: its patrons' tokens lose `creator_sub` for that
+/// campaign as their cached snapshots expire.
+pub async fn patreon_unlink_handler(
+    Extension(app_state): Extension<AppState>,
+    Extension(state): Extension<PatreonState>,
+    headers: HeaderMap,
+) -> Response {
+    let client_ip = client_ip_from_headers(&headers);
+
+    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    // The CWT outlives a deleted account; the deletion sweep removes its
+    // link (#88).
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return PatreonError::MissingAuth.into_response(),
+        Err(e) => return PatreonError::Db(e.to_string()).into_response(),
+    }
+
+    if !state.is_enabled() {
+        return PatreonError::NotConfigured.into_response();
+    }
+
+    match app_state.db_store.unlink_patreon(&user_id).await {
+        Ok(Some(link)) => info!(
+            "audit identity_link outcome=unlinked user_id={} provider=patreon role={} subject_prefix={} client_ip={}",
+            user_id,
+            link.role,
+            subject_prefix(&link.patreon_user_id),
+            client_ip
+        ),
+        Ok(None) => info!(
+            "audit identity_link outcome=not_linked user_id={} provider=patreon client_ip={}",
+            user_id, client_ip
+        ),
+        Err(e) => {
+            error!("Failed to unlink Patreon for user {}: {}", user_id, e);
+            return PatreonError::Db("patreon_unlink_failed".into()).into_response();
+        }
+    }
+
+    // The next mint finds no link and omits `arkavo_patreon`.
+    state.cache.invalidate(user_id).await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Seal a second plaintext under the same DEK as a previously-sealed token.
@@ -1676,15 +1760,21 @@ pub async fn materialize_for_user_resolved(
 /// a persist failure doesn't fail the mint, but it does mean the DB still
 /// holds the already-consumed refresh token — the next refresh attempt will
 /// be rejected by Patreon and the user fails closed until they re-link, so
-/// the failure is logged loudly.
+/// the failure is logged loudly. Written only while the row is still the
+/// link that was refreshed (#97): a rotation of a link unlinked or
+/// replaced meanwhile is dropped.
 async fn persist_rotated_tokens(
     app_state: &AppState,
     user_id: Uuid,
     refreshed: Option<PatreonLink>,
 ) {
     let Some(new_link) = refreshed else { return };
-    match app_state.db_store.put_patreon_link(&new_link).await {
-        Ok(()) => debug!("Persisted refreshed Patreon tokens for user {}", user_id),
+    match app_state.db_store.put_rotated_patreon_link(&new_link).await {
+        Ok(true) => debug!("Persisted refreshed Patreon tokens for user {}", user_id),
+        Ok(false) => debug!(
+            "Patreon link of user {} was unlinked or replaced meanwhile; refreshed tokens dropped",
+            user_id
+        ),
         Err(e) => warn!(
             "Failed to persist refreshed Patreon tokens for user {}: {} — stored refresh token is \
              already consumed; subsequent refreshes will fail until the user re-links",
@@ -1699,7 +1789,13 @@ async fn persist_rotated_tokens(
 /// whole-row put carries the old copy. Best-effort: a failed write only means
 /// the fallback uses an older copy until the next materialization.
 async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) {
-    record_campaign_owner(app_state, link, snap.campaign_id.as_deref()).await;
+    record_campaign_owner(
+        app_state,
+        link.user_id,
+        link.campaign_id.as_deref(),
+        snap.campaign_id.as_deref(),
+    )
+    .await;
     if snap.campaign_id == link.campaign_id && snap.owned_tiers == link.owned_tiers {
         return;
     }
@@ -1735,31 +1831,36 @@ async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &Arka
 /// Patreon said: give up a campaign the account no longer owns, and claim the
 /// one it owns (idempotent, so every live read covers links made before the
 /// row existed). Best-effort: it only feeds patrons' `creator_sub`.
-async fn record_campaign_owner(app_state: &AppState, link: &PatreonLink, owned: Option<&str>) {
+async fn record_campaign_owner(
+    app_state: &AppState,
+    user_id: Uuid,
+    old: Option<&str>,
+    owned: Option<&str>,
+) {
     let db = &app_state.db_store;
-    if let Some(old) = link.campaign_id.as_deref()
+    if let Some(old) = old
         && owned != Some(old)
-        && let Err(e) = db.delete_patreon_campaign_owner(old, &link.user_id).await
+        && let Err(e) = db.delete_patreon_campaign_owner(old, &user_id).await
     {
         warn!(
             "Failed to give up Patreon campaign {} for user {}: {}",
-            old, link.user_id, e
+            old, user_id, e
         );
     }
     let Some(cid) = owned else { return };
     match db
-        .put_patreon_campaign_owner(cid, &link.user_id, Utc::now().timestamp())
+        .put_patreon_campaign_owner(cid, &user_id, Utc::now().timestamp())
         .await
     {
         Ok(true) => {}
         Ok(false) => warn!(
             "Patreon campaign {} is recorded for another account; user {}'s patrons get no \
              creator_sub for it",
-            cid, link.user_id
+            cid, user_id
         ),
         Err(e) => warn!(
             "Failed to record Patreon campaign {} for user {}: {}",
-            cid, link.user_id, e
+            cid, user_id, e
         ),
     }
 }
@@ -4687,6 +4788,136 @@ mod tests {
                 ("PATREON_CLIENT_A_REDIRECT_URIS", "https://a/cb"),
             ]))
             .is_none()
+        );
+    }
+
+    /// `DELETE /oauth/patreon/link` through the real handler (#97).
+    async fn unlink_request(
+        app_state: &AppState,
+        state: &PatreonState,
+        token: Option<&str>,
+    ) -> StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/oauth/patreon/link",
+                axum::routing::delete(patreon_unlink_handler),
+            )
+            .layer(Extension(app_state.clone()))
+            .layer(Extension(state.clone()));
+        let mut req = Request::delete("/oauth/patreon/link");
+        if let Some(t) = token {
+            req = req.header("X-Auth-Token", t);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn unreachable_state() -> PatreonState {
+        enabled_state(
+            &TokenSealer::Plaintext,
+            unreachable_patreon_http(),
+            PATREON_TOKEN_URL.into(),
+            PATREON_IDENTITY_URL.into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unlink_needs_an_account_token() {
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let state = unreachable_state();
+        assert_eq!(
+            unlink_request(&app_state, &state, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            unlink_request(&app_state, &state, Some("not-a-cwt")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// A consumer unlinks: 204, the rows are gone, the next mint finds no
+    /// link, and a repeat is 204 too. With Patreon off it is 503 and nothing
+    /// is removed.
+    #[tokio::test]
+    async fn unlink_removes_the_link_and_is_idempotent() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let name = format!("pu-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let user = store
+            .create_user(&name, "did:key:z6Mkpatreonunlink")
+            .await
+            .unwrap();
+        let token = crate::test_helpers::auth_cwt_aged(&app_state, user.user_id, 0);
+        let mut link = consumer_link_with_token(&TokenSealer::Plaintext, b"access").await;
+        link.user_id = user.user_id;
+        link.patreon_user_id = format!("7{}", &Uuid::new_v4().as_u128().to_string()[..9]);
+        store
+            .link_identity(
+                user.user_id,
+                crate::db::PATREON_PROVIDER,
+                &link.patreon_user_id,
+            )
+            .await
+            .unwrap();
+        store.put_patreon_link(&link).await.unwrap();
+
+        let state = unreachable_state();
+        // Linked, Patreon unreachable: the read fails, which is not "no link".
+        assert!(matches!(
+            materialize_for_user_resolved(&app_state, &state, user.user_id).await,
+            Materialized::Unavailable
+        ));
+
+        let off = PatreonState {
+            oauth: None,
+            ..unreachable_state()
+        };
+        assert_eq!(
+            unlink_request(&app_state, &off, Some(&token)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            store
+                .get_patreon_link(user.user_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            unlink_request(&app_state, &state, Some(&token)).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            store
+                .get_patreon_link(user.user_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_identity_link(crate::db::PATREON_PROVIDER, &link.patreon_user_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            materialize_for_user_resolved(&app_state, &state, user.user_id).await,
+            Materialized::NotLinked
+        ));
+
+        assert_eq!(
+            unlink_request(&app_state, &state, Some(&token)).await,
+            StatusCode::NO_CONTENT
         );
     }
 }
