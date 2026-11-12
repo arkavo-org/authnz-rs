@@ -34,6 +34,7 @@ pub use market::MarketLinkOutcome;
 pub use owner_kas::{OwnerKasRoute, RouteWrite};
 pub use passkeys::PasskeyLinked;
 pub(crate) use patreon_links::PATREON_PROVIDER;
+pub use patreon_links::PatreonLinkRef;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 pub use session::{Session, SessionOpened};
 

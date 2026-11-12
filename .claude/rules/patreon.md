@@ -30,11 +30,15 @@ paths:
     4. Conditional put on `identity_links` for per-Patreon-account
        uniqueness — HTTP 409 if the Patreon account is already linked to a
        *different* arkavo user; idempotent re-link to the same user.
-    5. **Gives up what the previous link held** (#97), read consistently
-       from `patreon_tokens`: the `patreon#<old sub>` row when the Patreon
-       account changed, and `patreon-campaign#<old cid>` when the owned
-       campaign changed (each deleted on `user_id = :uid`). A failure is a
-       500 before any token is written; the next link retries it.
+    5. **Gives up what the replaced link held** (#97), from its
+       `patreon_tokens` row, read consistently before step 4:
+       `patreon-campaign#<old cid>` when the owned campaign changed, then
+       `patreon#<old sub>` when the Patreon account changed (each deleted
+       on `user_id = :uid`). If sealing, this release or the put fails
+       (500), the request gives back what it took (`abandon_link`, best
+       effort): it deletes the new `patreon#<sub>` row and restores the old
+       one, unless both are the same Patreon account. A campaign row given
+       up is claimed again by the next live materialization.
     6. Persists the encrypted token bundle (access + refresh) in
        `patreon_tokens` keyed by arkavo `user_id`.
     7. Invalidates the membership materialization cache for the user.

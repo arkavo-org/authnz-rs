@@ -666,6 +666,16 @@ pub async fn patreon_link_handler(
 
     let role = role_for(&campaign_id).to_string();
 
+    // The link this one replaces (#97), read before anything is claimed: its
+    // row is the only pointer to the `patreon#` and campaign rows it holds.
+    let previous = match app_state.db_store.get_patreon_link_ref(&user_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to read the Patreon link of user {}: {}", user_id, e);
+            return PatreonError::Db("patreon_tokens_read_failed".into()).into_response();
+        }
+    };
+
     // 3. Persist the link. identity_links first (uniqueness check), then
     //    patreon_tokens. Order matters: identity_links is the per-Patreon-
     //    account guard; only after we know we own the binding do we encrypt
@@ -693,62 +703,75 @@ pub async fn patreon_link_handler(
         }
     }
 
-    // Encrypt both tokens. Per the design note above, the access and refresh
-    // ciphertexts get their own nonces but share a DEK to keep storage small.
-    let now = Utc::now().timestamp();
-    let token_expires_at = now + tokens.expires_in;
+    // From here a failure gives back what this request took (#97), so it
+    // never leaves a `patreon#` row that no token row points to.
+    let stored: Result<PatreonLink, PatreonError> = async {
+        // Encrypt both tokens. Per the design note above, the access and
+        // refresh ciphertexts get their own nonces but share a DEK to keep
+        // storage small.
+        let now = Utc::now().timestamp();
+        let sealed_access = sealer.seal(tokens.access_token.as_bytes()).await?;
+        let sealed_refresh = seal_under_existing_dek(
+            sealer,
+            &sealed_access.wrapped_dek,
+            tokens.refresh_token.as_bytes(),
+        )
+        .await?;
+        let link = PatreonLink {
+            user_id,
+            role: role.clone(),
+            client_id: client.client_id.clone(),
+            patreon_user_id: patreon_user_id.clone(),
+            campaign_id: campaign_id.clone(),
+            scopes: tokens.scope.clone(),
+            access_token_ct: sealed_access.ciphertext,
+            access_token_nonce: sealed_access.nonce,
+            refresh_token_ct: sealed_refresh.ciphertext,
+            refresh_token_nonce: sealed_refresh.nonce,
+            wrapped_dek: sealed_access.wrapped_dek,
+            token_expires_at: now + tokens.expires_in,
+            linked_at: now,
+            owned_tiers: OwnedCampaignTiers::default(),
+        };
 
-    let sealed_access = match sealer.seal(tokens.access_token.as_bytes()).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let sealed_refresh = match seal_under_existing_dek(
-        sealer,
-        &sealed_access.wrapped_dek,
-        tokens.refresh_token.as_bytes(),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-
-    let link = PatreonLink {
-        user_id,
-        role: role.clone(),
-        client_id: client.client_id.clone(),
-        patreon_user_id: patreon_user_id.clone(),
-        campaign_id: campaign_id.clone(),
-        scopes: tokens.scope.clone(),
-        access_token_ct: sealed_access.ciphertext,
-        access_token_nonce: sealed_access.nonce,
-        refresh_token_ct: sealed_refresh.ciphertext,
-        refresh_token_nonce: sealed_refresh.nonce,
-        wrapped_dek: sealed_access.wrapped_dek,
-        token_expires_at,
-        linked_at: now,
-        owned_tiers: OwnedCampaignTiers::default(),
-    };
-
-    // Give up what the link being replaced points to (#97): its row is
-    // the only pointer to them. Last before the put, so a failure (500)
-    // leaves the old link whole and the next link retries it.
-    if let Err(e) = app_state
-        .db_store
-        .release_replaced_patreon_link(&user_id, &link.patreon_user_id, link.campaign_id.as_deref())
-        .await
-    {
-        error!(
-            "Failed to release the replaced Patreon link of user {}: {}",
-            user_id, e
-        );
-        return PatreonError::Db("replaced_link_release_failed".into()).into_response();
+        // Give up what the link being replaced points to: its row is the
+        // only pointer to them, and the put below overwrites it.
+        if let Some(previous) = &previous {
+            app_state
+                .db_store
+                .release_replaced_patreon_link(
+                    &user_id,
+                    previous,
+                    &link.patreon_user_id,
+                    link.campaign_id.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "Failed to release the replaced Patreon link of user {}: {}",
+                        user_id, e
+                    );
+                    PatreonError::Db("replaced_link_release_failed".into())
+                })?;
+        }
+        app_state
+            .db_store
+            .put_patreon_link(&link)
+            .await
+            .map_err(|e| {
+                error!("Failed to persist patreon_tokens row: {}", e);
+                PatreonError::Db("patreon_tokens_write_failed".into())
+            })?;
+        Ok(link)
     }
-
-    if let Err(e) = app_state.db_store.put_patreon_link(&link).await {
-        error!("Failed to persist patreon_tokens row: {}", e);
-        return PatreonError::Db("patreon_tokens_write_failed".into()).into_response();
-    }
+    .await;
+    let link = match stored {
+        Ok(link) => link,
+        Err(e) => {
+            abandon_link(&app_state, user_id, &patreon_user_id, previous.as_ref()).await;
+            return e.into_response();
+        }
+    };
 
     // The campaign it owns, for its patrons' `creator_sub` (#128). A
     // campaign the replaced link owned was given up above.
@@ -764,6 +787,54 @@ pub async fn patreon_link_handler(
         campaign_id,
     })
     .into_response()
+}
+
+/// Give back what a link that failed after claiming `patreon#<sub>` took
+/// (#97), best effort: that row, which no token row points to, and the
+/// replaced link's own row, which the release may have deleted while the
+/// replaced link's token row stays. Nothing when the replaced link was the
+/// same Patreon account (it held the row already, and kept it). A
+/// campaign row the release gave up is claimed again by the next live
+/// materialization.
+async fn abandon_link(
+    app_state: &AppState,
+    user_id: Uuid,
+    patreon_user_id: &str,
+    previous: Option<&crate::db::PatreonLinkRef>,
+) {
+    if previous.is_some_and(|p| p.patreon_user_id == patreon_user_id) {
+        return;
+    }
+    let db = &app_state.db_store;
+    if let Err(e) = db
+        .delete_identity_link_if_owned(crate::db::PATREON_PROVIDER, patreon_user_id, &user_id)
+        .await
+    {
+        error!(
+            "Failed to give back Patreon subject_prefix={} after a failed link of user {}: {} — \
+             it 409s other accounts until this one links it again",
+            subject_prefix(patreon_user_id),
+            user_id,
+            e
+        );
+    }
+    if let Some(previous) = previous
+        && let Err(e) = db
+            .link_identity(
+                user_id,
+                crate::db::PATREON_PROVIDER,
+                &previous.patreon_user_id,
+            )
+            .await
+    {
+        error!(
+            "Failed to restore Patreon subject_prefix={} for user {} after a failed relink: {} — \
+             its token row has no account link until it relinks or unlinks",
+            subject_prefix(&previous.patreon_user_id),
+            user_id,
+            e
+        );
+    }
 }
 
 /// `DELETE /oauth/patreon/link` (#97)
@@ -4983,6 +5054,58 @@ mod tests {
         });
         let base = format!("http://{addr}");
         (format!("{base}/token"), format!("{base}/v2/identity"))
+    }
+
+    /// A relink that fails after claiming the new `patreon#` row gives it
+    /// back and restores the replaced link's row; one of the same Patreon
+    /// account touches nothing.
+    #[tokio::test]
+    async fn a_failed_relink_gives_back_what_it_took() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let me = Uuid::new_v4();
+        let pid = || format!("7{}", &Uuid::new_v4().as_u128().to_string()[..9]);
+        let (old, new) = (pid(), pid());
+        let row = |sub: String| {
+            let store = store.clone();
+            async move {
+                store
+                    .get_identity_link(crate::db::PATREON_PROVIDER, &sub)
+                    .await
+                    .unwrap()
+            }
+        };
+        let previous = crate::db::PatreonLinkRef {
+            patreon_user_id: old.clone(),
+            campaign_id: None,
+            role: "consumer".into(),
+            linked_at: 1,
+        };
+
+        // Claimed the new row, released the old one, then the put failed.
+        store
+            .link_identity(me, crate::db::PATREON_PROVIDER, &new)
+            .await
+            .unwrap();
+        abandon_link(&app_state, me, &new, Some(&previous)).await;
+        assert_eq!(row(new.clone()).await, None);
+        assert_eq!(row(old.clone()).await, Some(me));
+
+        // A first link (nothing replaced) gives back only its own claim.
+        let first = pid();
+        store
+            .link_identity(me, crate::db::PATREON_PROVIDER, &first)
+            .await
+            .unwrap();
+        abandon_link(&app_state, me, &first, None).await;
+        assert_eq!(row(first).await, None);
+
+        // The same Patreon account again: its row stays.
+        abandon_link(&app_state, me, &old, Some(&previous)).await;
+        assert_eq!(row(old).await, Some(me));
     }
 
     /// The link mock answers each code with its own Patreon user (so the

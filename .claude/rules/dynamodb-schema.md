@@ -112,7 +112,8 @@ paths:
   by `DELETE /oauth/patreon/link` and by a relink to a different Patreon
   account (#97; `delete_identity_link_if_owned`), both before the
   `patreon_tokens` row changes: that row's `patreon_user_id` is the only
-  pointer to it. Rows orphaned by relinks before #97 remain until the
+  pointer to it. A link that fails after claiming its row deletes it again
+  and restores the replaced one (best effort). Rows orphaned by relinks before #97 remain until the
   account is deleted.
 - **Sign in with Apple token** (optional, Apple rows only; `db/apple_tokens.rs`):
   token_client_id (String, the bundle id / Service ID the token was issued

@@ -158,20 +158,26 @@ impl DynamoDBStore {
         Err(DynamoDBError::ConditionalConflict)
     }
 
-    /// Before a link replaces the account's `patreon_tokens` row, give up
-    /// what the row it replaces points to (#97): its `patreon#<sub>` row when
-    /// the Patreon account changed, and its campaign row when the campaign
-    /// owned changed. Otherwise both outlive the row, the only pointer to
-    /// them, and the old Patreon account 409s on every other account.
+    /// Before a link replaces the account's `patreon_tokens` row
+    /// (`previous`), give up what that row points to (#97): its campaign row
+    /// when the campaign owned changed, then its `patreon#<sub>` row when the
+    /// Patreon account changed. Otherwise both outlive the row, the only
+    /// pointer to them, and the old Patreon account 409s on every other
+    /// account. The campaign row goes first: a failure after it leaves the
+    /// old link whole bar that row, which its next live materialization
+    /// claims again.
     pub async fn release_replaced_patreon_link(
         &self,
         user_id: &Uuid,
+        previous: &PatreonLinkRef,
         patreon_user_id: &str,
         campaign_id: Option<&str>,
     ) -> Result<(), DynamoDBError> {
-        let Some(previous) = self.get_patreon_link_ref(user_id).await? else {
-            return Ok(());
-        };
+        if let Some(old) = previous.campaign_id.as_deref()
+            && Some(old) != campaign_id
+        {
+            self.delete_patreon_campaign_owner(old, user_id).await?;
+        }
         if previous.patreon_user_id != patreon_user_id {
             self.delete_identity_link_if_owned(
                 PATREON_PROVIDER,
@@ -179,11 +185,6 @@ impl DynamoDBStore {
                 user_id,
             )
             .await?;
-        }
-        if let Some(old) = previous.campaign_id.as_deref()
-            && Some(old) != campaign_id
-        {
-            self.delete_patreon_campaign_owner(old, user_id).await?;
         }
         Ok(())
     }
@@ -378,9 +379,11 @@ mod tests {
             .await
             .unwrap();
 
+        let previous = store.get_patreon_link_ref(&me).await.unwrap().unwrap();
+
         // Same Patreon account, same campaign: nothing released.
         store
-            .release_replaced_patreon_link(&me, &old_pid, Some(&old_cid))
+            .release_replaced_patreon_link(&me, &previous, &old_pid, Some(&old_cid))
             .await
             .unwrap();
         assert_eq!(
@@ -398,7 +401,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .release_replaced_patreon_link(&me, &new_pid, None)
+            .release_replaced_patreon_link(&me, &previous, &new_pid, None)
             .await
             .unwrap();
         assert_eq!(
