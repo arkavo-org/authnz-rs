@@ -108,6 +108,12 @@ paths:
 - **Uniqueness**: Conditional put on `link_pk` enforces per-(provider, subject) uniqueness.
   Re-linking the same identity to the same user is idempotent; binding to a
   different user returns `DynamoDBError::LinkConflict` (HTTP 409 upstream).
+- **Patreon link** (`patreon#<patreon_user_id>`): deleted on `user_id = :uid`
+  by `DELETE /oauth/patreon/link` and by a relink to a different Patreon
+  account (#97; `delete_identity_link_if_owned`), both before the
+  `patreon_tokens` row changes: that row's `patreon_user_id` is the only
+  pointer to it. Rows orphaned by relinks before #97 remain until the
+  account is deleted.
 - **Sign in with Apple token** (optional, Apple rows only; `db/apple_tokens.rs`):
   token_client_id (String, the bundle id / Service ID the token was issued
   to; revocation presents it), token_wrapped_dek (Binary, DEK wrapped by
@@ -201,7 +207,8 @@ paths:
   the campaign id, `user_id` (the owning account), `linked_at`. One account
   per campaign: written by a conditional `UpdateItem` on
   `attribute_not_exists(link_pk) OR user_id = :uid`, deleted on `user_id =
-  :uid` when Patreon says the account no longer owns it. Read in batches of
+  :uid` when Patreon says the account no longer owns it, when a relink
+  owns another campaign or none, and on unlink (#97). Read in batches of
   100 (`BatchGetItem`, eventually consistent) for patrons' `creator_sub`.
   The deletion sweep's `delete_identity_links_of` removes it. No sign-in
   path reads it.
@@ -272,7 +279,11 @@ paths:
 
 ### patreon_tokens table
 - **Primary Key**: user_id (String/UUID) - One row per arkavo user; re-link
-  overwrites in place.
+  overwrites in place. Deleted by `DELETE /oauth/patreon/link` (#97; on the
+  same `patreon_user_id` and `linked_at`, after the link rows it points to)
+  and by account deletion. A token rotation's whole-row put is conditional
+  on the same `patreon_user_id` and `linked_at`, so it never recreates an
+  unlinked row or overwrites a relink.
 - **Attributes**:
   - role (String) - `creator` or `consumer`: whether Patreon last reported
     an owned campaign (#99), never the client's word. Rewritten with
