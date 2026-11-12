@@ -4920,4 +4920,187 @@ mod tests {
             StatusCode::NO_CONTENT
         );
     }
+
+    /// A Patreon stand-in for the link flow: the token endpoint answers a
+    /// code `<pid>` with access token `access-<pid>`, and `/identity` with
+    /// that token names Patreon user `<pid>`. Returns `(token_url,
+    /// identity_url)`.
+    async fn spawn_link_mock() -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the whole request: the form body may arrive in a
+                    // later read than the headers.
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            if n == 0 {
+                                break;
+                            }
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if n == 0 || body.len() >= length {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).to_string();
+                    let after = |marker: &str, stop: &[char]| {
+                        req.split_once(marker)
+                            .map(|(_, rest)| rest.split(stop).next().unwrap_or("").to_string())
+                    };
+                    let body = if req.starts_with("POST") {
+                        let pid = after("code=", &['&', '\r', '\n']).unwrap_or_default();
+                        format!(
+                            r#"{{"access_token":"access-{pid}","refresh_token":"refresh-{pid}","expires_in":2592000,"scope":"identity","token_type":"Bearer"}}"#
+                        )
+                    } else {
+                        let pid = after("Bearer access-", &['\r', '\n']).unwrap_or_default();
+                        format!(r#"{{"data":{{"id":"{pid}"}}}}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        (format!("{base}/token"), format!("{base}/v2/identity"))
+    }
+
+    /// The link mock answers each code with its own Patreon user (so the
+    /// DB-backed relink test below exercises what it means to).
+    #[tokio::test]
+    async fn link_mock_names_the_patreon_user_of_each_code() {
+        let (token_url, identity_url) = spawn_link_mock().await;
+        let http = reqwest::Client::new();
+        let client = PatreonClient {
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            redirect_uris: vec!["https://x/cb".into()],
+        };
+        for pid in ["7123", "7456"] {
+            let tokens = exchange_code_for_tokens(&http, &client, pid, "https://x/cb", &token_url)
+                .await
+                .unwrap();
+            let (got, campaign) = fetch_identity(&http, &tokens.access_token, false, &identity_url)
+                .await
+                .unwrap();
+            assert_eq!(got, pid);
+            assert_eq!(campaign, None);
+        }
+    }
+
+    /// A relink to another Patreon account through the real handler frees
+    /// the old one (#97): its `patreon#` row is gone, so another Arkavo
+    /// account can link it.
+    #[tokio::test]
+    async fn a_relink_through_the_handler_frees_the_old_patreon_account() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = std::sync::Arc::new(store);
+        let app_state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let (token_url, identity_url) = spawn_link_mock().await;
+        let state = enabled_state(
+            &TokenSealer::Plaintext,
+            reqwest::Client::new(),
+            token_url,
+            identity_url,
+        );
+        let link = |user: Uuid, pid: String| {
+            use axum::body::Body;
+            use axum::http::Request;
+            use tower::ServiceExt;
+            let app = axum::Router::new()
+                .route(
+                    "/oauth/patreon/link",
+                    axum::routing::post(patreon_link_handler),
+                )
+                .layer(Extension(app_state.clone()))
+                .layer(Extension(state.clone()));
+            let token = crate::test_helpers::auth_cwt_aged(&app_state, user, 0);
+            async move {
+                let req = Request::post("/oauth/patreon/link")
+                    .header("content-type", "application/json")
+                    .header("X-Auth-Token", token)
+                    .body(Body::from(
+                        serde_json::json!({ "code": pid, "redirect_uri": "https://x/cb" })
+                            .to_string(),
+                    ))
+                    .unwrap();
+                app.oneshot(req).await.unwrap().status()
+            }
+        };
+        let mut users = Vec::new();
+        for _ in 0..2 {
+            let name = format!("pr-{}", &Uuid::new_v4().simple().to_string()[..12]);
+            users.push(
+                store
+                    .create_user(&name, "did:key:z6Mkpatreonrelink")
+                    .await
+                    .unwrap()
+                    .user_id,
+            );
+        }
+        let (me, other) = (users[0], users[1]);
+        let pid = || format!("7{}", &Uuid::new_v4().as_u128().to_string()[..9]);
+        let (old, new) = (pid(), pid());
+
+        assert_eq!(link(me, old.clone()).await, StatusCode::OK);
+        // Same account again: idempotent, the row stays.
+        assert_eq!(link(me, old.clone()).await, StatusCode::OK);
+        assert_eq!(
+            store
+                .get_identity_link(crate::db::PATREON_PROVIDER, &old)
+                .await
+                .unwrap(),
+            Some(me)
+        );
+        assert_eq!(link(other, old.clone()).await, StatusCode::CONFLICT);
+
+        assert_eq!(link(me, new.clone()).await, StatusCode::OK);
+        assert_eq!(
+            store
+                .get_identity_link(crate::db::PATREON_PROVIDER, &old)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_identity_link(crate::db::PATREON_PROVIDER, &new)
+                .await
+                .unwrap(),
+            Some(me)
+        );
+        assert_eq!(
+            store
+                .get_patreon_link(me)
+                .await
+                .unwrap()
+                .unwrap()
+                .patreon_user_id,
+            new
+        );
+        // The old Patreon account is free for another Arkavo account.
+        assert_eq!(link(other, old.clone()).await, StatusCode::OK);
+    }
 }

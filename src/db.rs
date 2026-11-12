@@ -2774,7 +2774,7 @@ pub(crate) mod tests {
         assert_eq!(stored.owned_tiers, tiers);
 
         // A token rotation rewrites the row from the link it read.
-        store.put_patreon_link(&stored).await.unwrap();
+        assert!(store.put_rotated_patreon_link(&stored).await.unwrap());
         let rotated = store.get_patreon_link(user_id).await.unwrap().unwrap();
         assert_eq!(rotated.owned_tiers, tiers);
         assert_eq!(rotated.campaign_id.as_deref(), Some("42"));
