@@ -46,7 +46,10 @@ use crate::oidc::{
     cose_keys as oidc_cose_keys, discovery as oidc_discovery, jwks as oidc_jwks,
     token as oidc_token, userinfo as oidc_userinfo,
 };
-use crate::patreon::{PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler};
+use crate::patreon::{
+    PatreonOAuthConfig, PatreonState, build_kms_sealer, patreon_link_handler,
+    patreon_unlink_handler,
+};
 use authnz_rs::{constants, cwt, keys};
 
 mod account;
@@ -766,7 +769,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // identity_links-write contract). Membership + tier are surfaced
         // only on the resulting OIDC access_token CWT; there is deliberately
         // no /me/patreon or /entitlements endpoint surface.
-        .route("/oauth/patreon/link", post(patreon_link_handler))
+        .route(
+            "/oauth/patreon/link",
+            post(patreon_link_handler).delete(patreon_unlink_handler),
+        )
         // Admin: per-user entitlement FQNs (service CWT required). Spec §2.3.
         .route(
             "/admin/users/:id/entitlements",

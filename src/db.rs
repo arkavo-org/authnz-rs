@@ -17,6 +17,7 @@ mod market;
 mod owner_kas;
 mod passkeys;
 mod patreon_campaigns;
+mod patreon_links;
 mod publishing;
 mod session;
 pub use account::{AccountDeletion, DeletionState, Tombstoned};
@@ -32,6 +33,8 @@ pub use guardians::Guardian;
 pub use market::MarketLinkOutcome;
 pub use owner_kas::{OwnerKasRoute, RouteWrite};
 pub use passkeys::PasskeyLinked;
+pub(crate) use patreon_links::PATREON_PROVIDER;
+pub use patreon_links::PatreonLinkRef;
 pub use publishing::{PublishingSuspension, SuspensionLift, SuspensionSet};
 pub use session::{Session, SessionOpened};
 
@@ -350,6 +353,63 @@ impl DynamoDBStore {
             self.patreon_tokens_table, link.user_id, link.role
         );
 
+        match self.patreon_link_put(link).send().await {
+            Ok(_) => Ok(()),
+            Err(err) => match err {
+                SdkError::ServiceError(ref service_error) => {
+                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                        error!(
+                            "patreon_tokens table {} does not exist",
+                            self.patreon_tokens_table
+                        );
+                        return Err(DynamoDBError::TableNotExists(
+                            self.patreon_tokens_table.clone(),
+                        ));
+                    }
+                    error!("Failed to write to patreon_tokens table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+                _ => {
+                    error!("Unknown error writing to patreon_tokens table: {:?}", err);
+                    Err(DynamoDBError::SdkError(err.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Persist a token rotation of `link`: the same whole-row put as
+    /// [`Self::put_patreon_link`], but only while the row is still that link
+    /// (same Patreon user, same `linked_at`). A mint in flight across an
+    /// unlink would otherwise recreate the row with no `patreon#` link
+    /// beside it, and one across a relink would put the old account back
+    /// (#97). `Ok(false)` when the condition fails.
+    pub async fn put_rotated_patreon_link(
+        &self,
+        link: &crate::patreon::PatreonLink,
+    ) -> Result<bool, DynamoDBError> {
+        let result = self
+            .patreon_link_put(link)
+            .condition_expression(
+                "attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at = :la",
+            )
+            .expression_attribute_values(":pid", AttributeValue::S(link.patreon_user_id.clone()))
+            .expression_attribute_values(":la", AttributeValue::N(link.linked_at.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => match agent_state::classify(e, &self.patreon_tokens_table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// The whole-row put of a Patreon link, without a condition.
+    fn patreon_link_put(
+        &self,
+        link: &crate::patreon::PatreonLink,
+    ) -> aws_sdk_dynamodb::operation::put_item::builders::PutItemFluentBuilder {
         let mut item_builder = self
             .client
             .put_item()
@@ -414,29 +474,7 @@ impl DynamoDBStore {
         if let Some(name) = &link.owned_tiers.name {
             item_builder = item_builder.item(OWNED_CAMPAIGN_NAME, AttributeValue::S(name.clone()));
         }
-
-        match item_builder.send().await {
-            Ok(_) => Ok(()),
-            Err(err) => match err {
-                SdkError::ServiceError(ref service_error) => {
-                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
-                        error!(
-                            "patreon_tokens table {} does not exist",
-                            self.patreon_tokens_table
-                        );
-                        return Err(DynamoDBError::TableNotExists(
-                            self.patreon_tokens_table.clone(),
-                        ));
-                    }
-                    error!("Failed to write to patreon_tokens table: {:?}", err);
-                    Err(DynamoDBError::SdkError(err.to_string()))
-                }
-                _ => {
-                    error!("Unknown error writing to patreon_tokens table: {:?}", err);
-                    Err(DynamoDBError::SdkError(err.to_string()))
-                }
-            },
-        }
+        item_builder
     }
 
     /// Record what Patreon says a link owns (#99): its campaign and that
@@ -2737,7 +2775,7 @@ pub(crate) mod tests {
         assert_eq!(stored.owned_tiers, tiers);
 
         // A token rotation rewrites the row from the link it read.
-        store.put_patreon_link(&stored).await.unwrap();
+        assert!(store.put_rotated_patreon_link(&stored).await.unwrap());
         let rotated = store.get_patreon_link(user_id).await.unwrap().unwrap();
         assert_eq!(rotated.owned_tiers, tiers);
         assert_eq!(rotated.campaign_id.as_deref(), Some("42"));

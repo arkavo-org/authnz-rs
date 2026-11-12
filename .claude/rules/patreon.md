@@ -9,9 +9,10 @@ paths:
   (`patreon#<patreon_user_id> → arkavo_user_id`, conditional put for
   cross-account uniqueness) plus encrypted token bundle in
   `patreon_tokens`.
-- `POST /oauth/patreon/link`: **Auth-required** link path (the *only* new
-  endpoint surface for Patreon — there is deliberately no `/me/patreon`,
-  `/entitlements/...`, or status endpoint). Body:
+- `POST /oauth/patreon/link`: **Auth-required** link path (with its
+  `DELETE` below, the *only* endpoint surface for Patreon — there is
+  deliberately no `/me/patreon`, `/entitlements/...`, or status endpoint).
+  Body:
   `{ "code": "<oauth-code>", "redirect_uri": "<a registered redirect URI>" }`.
   A `role` field is accepted and **ignored** (#99): whether a link is a
   creator's is whether Patreon says the account owns a campaign. The
@@ -29,9 +30,40 @@ paths:
     4. Conditional put on `identity_links` for per-Patreon-account
        uniqueness — HTTP 409 if the Patreon account is already linked to a
        *different* arkavo user; idempotent re-link to the same user.
-    5. Persists the encrypted token bundle (access + refresh) in
+    5. **Gives up what the replaced link held** (#97), from its
+       `patreon_tokens` row, read consistently before step 4:
+       `patreon-campaign#<old cid>` when the owned campaign changed, then
+       `patreon#<old sub>` when the Patreon account changed (each deleted
+       on `user_id = :uid`). If sealing, this release or the put fails
+       (500), the request gives back what it took (`abandon_link`, best
+       effort): it deletes the new `patreon#<sub>` row and restores the old
+       one, unless both are the same Patreon account. A campaign row given
+       up is claimed again by the next live materialization.
+    6. Persists the encrypted token bundle (access + refresh) in
        `patreon_tokens` keyed by arkavo `user_id`.
-    6. Invalidates the membership materialization cache for the user.
+    7. Invalidates the membership materialization cache for the user.
+- `DELETE /oauth/patreon/link` (#97): unlink. Same auth and liveness check
+  as the link, no body, 503 when Patreon is not configured. Reads the
+  `patreon_tokens` row (consistent), then deletes `patreon#<sub>` and
+  `patreon-campaign#<cid>` (each on `user_id = :uid`; a missing row or
+  another account's is not an error), then the `patreon_tokens` row on the
+  same Patreon user and `linked_at` (a relink that lands meanwhile is
+  re-read and removed too, up to 3 times), then invalidates the cache.
+  - **The `patreon_tokens` row goes last** because it is the only record of
+    which link rows the account holds (`identity_links` has no `user_id`
+    index). Any failure is a 500, and a retry finishes the job; until then
+    the link still materializes.
+  - 204 on success and when nothing was linked (idempotent); 401 bad token
+    or deleted account; 500 storage failure.
+  - Creators may unlink: their patrons' tokens lose `creator_sub` for that
+    campaign as their snapshots expire (5 min).
+  - Patreon has no revocation endpoint, so deleting the tokens is all the
+    server can do (#90).
+  - Audit line `outcome=unlinked` (role, subject prefix) or `not_linked`.
+- **A token rotation never recreates or overwrites a link**: the whole-row
+  put that persists refreshed tokens (`put_rotated_patreon_link`) is
+  conditional on the same `patreon_user_id` and `linked_at`, so a mint in
+  flight across an unlink or relink is dropped (debug log).
 - **`state` is the client's to verify, never the server's.** The link
   endpoint takes no `state`, and the scheme bounce
   (`GET /oauth/:client/patreon`, `main.rs`) holds none: it forwards
