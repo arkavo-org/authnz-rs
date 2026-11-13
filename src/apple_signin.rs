@@ -54,6 +54,7 @@ use crate::AppState;
 use crate::apple_tokens::{AppleTokens, apple_link_key};
 use crate::constants::{
     APPLE_ISSUER, APPLE_JWKS_CACHE_TTL_SECONDS, APPLE_JWKS_HTTP_TIMEOUT_SECS, APPLE_JWKS_URL,
+    APPLE_UNLINKS_PER_MINUTE,
 };
 use crate::oidc::AuthenticatedUser;
 use axum::Json;
@@ -171,6 +172,14 @@ pub enum AppleSigninError {
     /// The refresh token could not be sealed or stored.
     #[error("apple_token_store_failed")]
     TokenStoreFailed,
+    /// Apple did not revoke a stored token, or could not be reached; the link
+    /// holding it stays, and a retry finishes the unlink.
+    #[error("apple_token_revoke_failed")]
+    TokenRevokeFailed,
+    /// Too many unlinks for this account this minute; retry after the
+    /// given number of seconds.
+    #[error("rate_limited")]
+    RateLimited(u64),
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -182,7 +191,9 @@ impl AppleSigninError {
             AppleSigninError::JwksFetch(_)
             | AppleSigninError::JwksParse(_)
             | AppleSigninError::TokenExchangeFailed
-            | AppleSigninError::TokenStoreFailed => StatusCode::BAD_GATEWAY,
+            | AppleSigninError::TokenStoreFailed
+            | AppleSigninError::TokenRevokeFailed => StatusCode::BAD_GATEWAY,
+            AppleSigninError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             AppleSigninError::MissingClientId
             | AppleSigninError::SessionError(_)
             | AppleSigninError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -201,7 +212,37 @@ impl AppleSigninError {
 
 impl IntoResponse for AppleSigninError {
     fn into_response(self) -> Response {
-        (self.status(), self.to_string()).into_response()
+        let mut response = (self.status(), self.to_string()).into_response();
+        if let AppleSigninError::RateLimited(after) = self {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(after),
+            );
+        }
+        response
+    }
+}
+
+/// Unlinks per account in the current minute, in process
+/// ([`APPLE_UNLINKS_PER_MINUTE`]): each one scans `identity_links`.
+#[derive(Default)]
+pub struct UnlinkLimiter {
+    windows: std::sync::Mutex<std::collections::HashMap<Uuid, (i64, u32)>>,
+}
+
+impl UnlinkLimiter {
+    /// Count an unlink for `user_id` at `now`, or the seconds until it may
+    /// unlink again.
+    pub(crate) fn admit(&self, user_id: &Uuid, now: i64) -> Result<(), u64> {
+        const WINDOW: i64 = 60;
+        let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (start, _)| now - *start < WINDOW);
+        let (start, count) = map.entry(*user_id).or_insert((now, 0));
+        if *count >= APPLE_UNLINKS_PER_MINUTE {
+            return Err((*start + WINDOW - now).max(1) as u64);
+        }
+        *count += 1;
+        Ok(())
     }
 }
 
@@ -561,6 +602,7 @@ pub async fn resolve_apple_user(
         roles: vec!["user".to_string()],
         entitlements: account.entitlements.clone(),
         auth_time: None,
+        upstream_subject: Some(claims.sub.clone()),
     })
 }
 
@@ -1082,6 +1124,145 @@ fn subject_prefix(sub: &str) -> &str {
 
 /// Extract the originating client IP for audit logs.
 ///
+/// `DELETE /oauth/apple/link`: unlink every Apple ID from the signed-in
+/// account, without deleting the account.
+///
+/// Same authentication as the link: a passkey CWT in `X-Auth-Token` for a
+/// live account. No body: an account may have linked several Apple IDs, and
+/// all of them go. In order:
+///  1. the account's Apple links are found by a consistent scan (no `user_id`
+///     index; [`APPLE_UNLINKS_PER_MINUTE`] bounds it per account);
+///  2. `apple_unlinked_at` is recorded on the account, before anything is
+///     removed, so a refresh token issued before refresh tokens named their
+///     Apple ID ends too (`oidc::upstream_link_ended`);
+///  3. each link holding no token is deleted, only while it is still the
+///     account's and still holds none;
+///  4. each stored token is revoked with Apple (TN3194), then its link is
+///     deleted. A token Apple did not revoke keeps its link.
+///
+/// After it, the Apple IDs sign in nowhere, and every refresh token from an
+/// Apple sign-in fails; access tokens already issued run out (1 hour).
+///
+/// Responses (plain-text bodies, like the link):
+///  - `204`: unlinked, or no Apple ID was linked (idempotent);
+///  - `401`: missing or invalid `X-Auth-Token`, or a deleted account;
+///  - `429 rate_limited` with `Retry-After`;
+///  - `502 apple_token_revoke_failed`: Apple did not revoke a stored token
+///    or could not be reached; that link stays, the rest are gone, retry;
+///  - `500`: a storage failure, a stored token that cannot be read, or
+///    stored tokens while revocation is not configured. Safe to retry.
+pub async fn apple_unlink_handler(
+    Extension(app_state): Extension<AppState>,
+    Extension(apple_tokens): Extension<AppleTokens>,
+    headers: HeaderMap,
+) -> Response {
+    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    match app_state.db_store.is_account_live(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => return AppleSigninError::InvalidAuth.into_response(),
+        Err(e) => {
+            error!("Account lookup for Apple unlink failed: {}", e);
+            return AppleSigninError::Internal("account_lookup_failed".to_string()).into_response();
+        }
+    }
+    let now = Utc::now().timestamp();
+    if let Err(after) = app_state.apple_unlinks.admit(&user_id, now) {
+        warn!("audit identity_unlink outcome=rate_limited user_id={user_id} provider=apple");
+        return AppleSigninError::RateLimited(after).into_response();
+    }
+    match unlink_apple(&app_state.db_store, &apple_tokens, &user_id, now).await {
+        Ok(0) => {
+            info!("audit identity_unlink outcome=not_linked user_id={user_id} provider=apple");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(links) => {
+            // A count only: a link key holds the full Apple `sub`.
+            info!(
+                "audit identity_unlink outcome=unlinked user_id={user_id} provider=apple links={links}"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            error!("audit identity_unlink outcome=failed user_id={user_id} provider=apple: {e}");
+            e.into_response()
+        }
+    }
+}
+
+/// Remove every Apple link of `user_id` (see [`apple_unlink_handler`]), and
+/// how many there were. A link another account took meanwhile, or one that
+/// gained a token after the scan, is left alone.
+async fn unlink_apple(
+    db: &crate::db::DynamoDBStore,
+    apple: &AppleTokens,
+    user_id: &Uuid,
+    now: i64,
+) -> Result<usize, AppleSigninError> {
+    let storage = |what: &'static str| {
+        move |e: crate::db::DynamoDBError| {
+            error!("Apple unlink: {what} failed: {e}");
+            AppleSigninError::Internal(format!("apple_unlink_{what}_failed"))
+        }
+    };
+    let found = db.apple_tokens_of(user_id).await.map_err(storage("scan"))?;
+    if found.is_empty() {
+        return Ok(0);
+    }
+    db.mark_apple_unlinked(user_id, now)
+        .await
+        .map_err(storage("mark"))?;
+    for key in &found.without_token {
+        db.delete_apple_link_without_token(key, user_id)
+            .await
+            .map_err(storage("delete"))?;
+    }
+    // Whether any revocation failed, and whether any failure was permanent:
+    // a permanent one is reported ahead of a transient one, since retrying
+    // cannot fix it (as the deletion sweep's `revoke_apple_tokens` does).
+    let (mut transient, mut permanent) = (false, false);
+    for row in &found.rows {
+        match apple.revoke_stored(row).await {
+            Ok(()) => db
+                .delete_apple_link(&row.link_key, user_id)
+                .await
+                .map_err(storage("delete"))?,
+            // Status and Apple's error code only (AppleTokenError's Display).
+            Err(e) => {
+                error!("Apple unlink: revocation failed for {user_id}: {e}");
+                if e.is_permanent() {
+                    permanent = true;
+                } else {
+                    transient = true;
+                }
+            }
+        }
+    }
+    if !found.unreadable.is_empty() {
+        // The count only: the link keys contain the Apple sub.
+        error!(
+            "Apple unlink: {} unreadable Apple token row(s) of {user_id} kept",
+            found.unreadable.len()
+        );
+        return Err(AppleSigninError::Internal(
+            "apple_token_unreadable".to_string(),
+        ));
+    }
+    if permanent {
+        // Not configured, or Apple refused the client: retrying cannot help
+        // until the configuration is fixed.
+        return Err(AppleSigninError::Internal(
+            "apple_token_revocation_unavailable".to_string(),
+        ));
+    }
+    if transient {
+        return Err(AppleSigninError::TokenRevokeFailed);
+    }
+    Ok(found.rows.len() + found.without_token.len())
+}
+
 /// Behind HAProxy / nginx we expect `X-Forwarded-For`; first comma-separated
 /// value is the original client. Falls back to `"unknown"` when no proxy
 /// header is present (e.g. local dev hitting the server directly). We do

@@ -33,7 +33,12 @@ paths:
   authorize (`invalid_request` on the redirect URI), not just at the token
   exchange, so an upstream (Google) login is never wasted.
 - Refresh tokens carry `idp`/`email`/`email_verified`/`name` from issuance so
-  refreshed access tokens and id_tokens keep the same identity claims.
+  refreshed access tokens and id_tokens keep the same identity claims. They
+  live 30 days (`REFRESH_TOKEN_LIFETIME_SECONDS`) in Redis, with that email.
+- A refresh fails `invalid_grant` once the account is deleted, and, for an
+  Apple or Google session, once the IdP identity it was signed in with no
+  longer links to the account (`upstream_link_ended`; see
+  `federated-signin.md`, `DELETE /oauth/apple/link`).
 
 ## OIDC Provider Flow (for OpenTDF and other RPs)
 

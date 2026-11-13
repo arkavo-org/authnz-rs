@@ -33,7 +33,7 @@ use webauthn_rs::prelude::*;
 
 use crate::apple_signin::{
     AppleJwksCache, apple_callback_handler, apple_idtoken_handler, apple_link_handler,
-    apple_nonce_handler,
+    apple_nonce_handler, apple_unlink_handler,
 };
 use crate::authn::{finish_authentication, finish_register, start_authentication, start_register};
 use crate::constants::SESSION_TIMEOUT_SECONDS;
@@ -372,6 +372,8 @@ pub struct AppState {
     pub game: Arc<game::GameTokens>,
     /// `POST /owner-kas/token` mints per account in the current minute (#146).
     pub owner_kas_mints: Arc<owner_kas::MintLimiter>,
+    /// `DELETE /oauth/apple/link` per account per minute (each one scans).
+    pub apple_unlinks: Arc<apple_signin::UnlinkLimiter>,
     /// client_ids whose service CWTs may read owner-KAS routes and remove
     /// unregistered push tokens (`OWNER_KAS_RELAY_CLIENT_IDS`, #148): the
     /// relay's `owner-kas-relay` client. Empty ⇒ 403.
@@ -643,6 +645,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         market: Arc::new(market),
         game: Arc::new(game),
         owner_kas_mints: Arc::default(),
+        apple_unlinks: Arc::default(),
         owner_kas_relay_client_ids: Arc::new(owner_kas_relay_client_ids),
         appraisal,
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
@@ -746,7 +749,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Sign in with Apple
         .route("/oauth/apple/nonce", get(apple_nonce_handler))
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
-        .route("/oauth/apple/link", post(apple_link_handler))
+        .route(
+            "/oauth/apple/link",
+            post(apple_link_handler).delete(apple_unlink_handler),
+        )
         // Google linking — the Apple pair's counterpart. Link-only identity
         // resolution means this is the ONLY way a Google account becomes able
         // to sign in; see google_signin.rs and src/identity.rs.
@@ -2045,6 +2051,7 @@ pub(crate) mod test_helpers {
             market: Arc::new(None),
             game: Arc::default(),
             owner_kas_mints: Arc::default(),
+            apple_unlinks: Arc::default(),
             owner_kas_relay_client_ids: Arc::new(vec!["owner-kas-relay".into()]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),

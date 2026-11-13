@@ -721,11 +721,14 @@ impl DynamoDBStore {
     ) -> Result<Option<Uuid>, DynamoDBError> {
         let link_pk = format!("{}#{}", provider, subject);
 
+        // Consistent: a sign-in or refresh just after an unlink must not see
+        // the deleted row.
         let result = self
             .client
             .get_item()
             .table_name(&self.identity_links_table)
             .key("link_pk", AttributeValue::S(link_pk))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| self.map_get_item_err(&self.identity_links_table, e))?;

@@ -151,6 +151,12 @@ pub struct AuthenticatedUser {
     /// `default` so codes parked in Redis across a deploy still decode.
     #[serde(default)]
     pub auth_time: Option<i64>,
+    /// The upstream IdP's own subject (the Apple or Google `sub`) when the
+    /// user signed in through one. Recorded on the refresh token, so a refresh
+    /// ends once that identity is unlinked. Never put in a token. `default`
+    /// so codes parked in Redis across a deploy still decode.
+    #[serde(default)]
+    pub upstream_subject: Option<String>,
 }
 
 impl AuthenticatedUser {
@@ -170,6 +176,7 @@ impl AuthenticatedUser {
             roles: vec!["user".to_string()],
             entitlements,
             auth_time: None,
+            upstream_subject: None,
         }
     }
 
@@ -228,6 +235,12 @@ pub struct RefreshTokenRecord {
     /// from the passkey ceremony, not from the refresh.
     #[serde(default)]
     pub auth_time: Option<i64>,
+    /// The Apple or Google `sub` the session was signed in with
+    /// (`AuthenticatedUser::upstream_subject`), carried through rotation. A
+    /// refresh fails once that identity no longer links to the account.
+    /// Absent on records issued before it was kept.
+    #[serde(default)]
+    pub upstream_subject: Option<String>,
 }
 
 /// The relying-party-facing parameters of a validated authorize request —
@@ -1322,6 +1335,7 @@ async fn handle_authorization_code_grant(
             email_verified: record.user.email_verified,
             name: record.user.name.clone(),
             auth_time: record.user.auth_time,
+            upstream_subject: record.user.upstream_subject.clone(),
         };
         if let Err(err) = refresh_store.insert(&r_token, refresh_record).await {
             error!("Failed to store refresh token: {}", err);
@@ -1508,6 +1522,27 @@ async fn handle_client_credentials_grant(
     response
 }
 
+/// Whether a refresh token's Apple or Google session has lost its link, so
+/// the refresh must fail. A record naming its `sub` needs that exact
+/// `identity_links` row to still point at the account. An Apple record from
+/// before records named it cannot be checked that way: it ends once the
+/// account has unlinked Apple at all (`apple_unlinked_at`). Passkey and
+/// service sessions have no upstream link.
+async fn upstream_link_ended(
+    db: &crate::db::DynamoDBStore,
+    idp: &str,
+    record: &RefreshTokenRecord,
+    user_id: &Uuid,
+) -> Result<bool, crate::db::DynamoDBError> {
+    match (idp, record.upstream_subject.as_deref()) {
+        ("apple" | "google", Some(sub)) => {
+            Ok(db.get_identity_link(idp, sub).await? != Some(*user_id))
+        }
+        ("apple", None) => Ok(db.apple_unlinked_at(user_id).await?.is_some()),
+        _ => Ok(false),
+    }
+}
+
 async fn handle_refresh_token_grant(
     app_state: AppState,
     oidc: Arc<OidcConfig>,
@@ -1636,7 +1671,40 @@ async fn handle_refresh_token_grant(
             // to. Surface it as retryable, the same way the authorize path
             // does, and let the client retry the refresh.
             Ok(user_id) => match app_state.db_store.get_user_by_id(&user_id).await {
-                Ok(Some(user)) => user.entitlements,
+                Ok(Some(user)) => {
+                    // An Apple or Google session ends with its link: a refresh
+                    // must not outlive `DELETE /oauth/apple/link`.
+                    match upstream_link_ended(&app_state.db_store, &auth_idp, &record, &user_id)
+                        .await
+                    {
+                        Ok(false) => user.entitlements,
+                        // Like a deleted account: the token stays consumed.
+                        Ok(true) => {
+                            return oidc_error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "identity no longer linked",
+                            );
+                        }
+                        Err(e) => {
+                            error!("refresh_token grant: identity link lookup failed: {}", e);
+                            if let Err(restore) =
+                                refresh_store.insert(r_token, record.clone()).await
+                            {
+                                error!(
+                                    "refresh_token grant: could not restore the rotated refresh token: {}; \
+                                     the client must re-authenticate",
+                                    restore
+                                );
+                            }
+                            return oidc_error_response(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "temporarily_unavailable",
+                                "identity link lookup failed",
+                            );
+                        }
+                    }
+                }
                 // Deleted (#88): the consumed refresh token stays consumed.
                 Ok(None) => {
                     return oidc_error_response(
@@ -1710,6 +1778,7 @@ async fn handle_refresh_token_grant(
         roles,
         entitlements,
         auth_time: record.auth_time,
+        upstream_subject: record.upstream_subject.clone(),
     };
     let arkavo_user = arkavo_user_claims_rechecking(&app_state, &patreon, &refreshed_user).await;
 
@@ -1787,6 +1856,7 @@ async fn handle_refresh_token_grant(
         email_verified: record.email_verified,
         name: record.name.clone(),
         auth_time: record.auth_time,
+        upstream_subject: record.upstream_subject.clone(),
     };
     if let Err(err) = refresh_store
         .insert(&new_refresh_token, new_refresh_record)
@@ -2839,6 +2909,7 @@ pub(crate) mod tests {
             roles: vec!["service-account".into()],
             entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
             auth_time: None,
+            upstream_subject: None,
         };
         let claims = arkavo_user_claims(&app_state, &test_patreon_state(), &service).await;
         assert!(claims.derived_entitlements.is_empty());
@@ -2858,6 +2929,7 @@ pub(crate) mod tests {
             roles: vec!["user".into()],
             entitlements: vec![ENTITLEMENT_TDF_CREATE.to_string()],
             auth_time: None,
+            upstream_subject: None,
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2889,6 +2961,7 @@ pub(crate) mod tests {
             roles: vec![],
             entitlements: vec![],
             auth_time: None,
+            upstream_subject: None,
         };
         let record = AuthorizationCodeRecord {
             client_id: "opentdf".into(),
@@ -2918,6 +2991,7 @@ pub(crate) mod tests {
             email_verified: Some(true),
             name: None,
             auth_time: None,
+            upstream_subject: None,
             expires_at: Utc::now().timestamp() + 600,
             created_at: Utc::now().timestamp(),
         };
@@ -3289,6 +3363,7 @@ pub(crate) mod tests {
             market: Arc::new(None),
             game: Arc::default(),
             owner_kas_mints: Arc::default(),
+            apple_unlinks: Arc::default(),
             owner_kas_relay_client_ids: Arc::new(vec![]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
@@ -3328,6 +3403,129 @@ pub(crate) mod tests {
         assert!(!body["access_token"].as_str().unwrap().is_empty());
         assert!(!body["id_token"].as_str().unwrap().is_empty());
         assert_eq!(body["scope"].as_str().unwrap(), "openid");
+    }
+
+    /// A refresh of an Apple session ends with its link (`DELETE
+    /// /oauth/apple/link`). A record naming its Apple ID fails once that link
+    /// is gone. One from before records named it fails once the account has
+    /// unlinked Apple. A passkey session is unaffected. DynamoDB Local only.
+    #[tokio::test]
+    async fn a_refresh_ends_with_the_apple_link() {
+        let Some(store) = crate::db::tests::local_store() else {
+            return;
+        };
+        let store = Arc::new(store);
+        let state = crate::test_helpers::build_test_app_state_with_store(store.clone());
+        let uid = store
+            .create_user(
+                &format!("rf-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                "did:key:z6Mkrefreshlink",
+            )
+            .await
+            .unwrap()
+            .user_id;
+        let sub = format!("001234.{}", Uuid::new_v4().simple());
+        store.link_identity(uid, "apple", &sub).await.unwrap();
+
+        let mut oidc = (*test_oidc_config()).clone();
+        oidc.clients.insert(
+            "test-client".to_string(),
+            OidcClient {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                redirect_uris: vec![],
+            },
+        );
+        let oidc = Arc::new(oidc);
+        let refresh_store = RefreshTokenStore::new(test_redis());
+        // A fresh refresh token for a session of `idp`, naming `upstream`.
+        let issue = |idp: &str, upstream: Option<&str>| {
+            let now = Utc::now().timestamp();
+            let token = format!("rt-{}", Uuid::new_v4().simple());
+            let record = RefreshTokenRecord {
+                subject: format!("arkavo:{uid}"),
+                arkavo_account_id: uid.to_string(),
+                client_id: "test-client".into(),
+                scopes: "openid offline_access".into(),
+                idp: Some(idp.into()),
+                email: None,
+                email_verified: None,
+                name: None,
+                auth_time: None,
+                upstream_subject: upstream.map(Into::into),
+                expires_at: now + 3600,
+                created_at: now,
+            };
+            let store = refresh_store.clone();
+            async move {
+                store.insert(&token, record).await.unwrap();
+                token
+            }
+        };
+        let refresh = |token: String| {
+            let (state, oidc, store) = (state.clone(), oidc.clone(), refresh_store.clone());
+            async move {
+                let form = TokenForm {
+                    grant_type: "refresh_token".to_string(),
+                    code: None,
+                    redirect_uri: None,
+                    client_id: Some("test-client".to_string()),
+                    client_secret: Some("test-secret".to_string()),
+                    code_verifier: None,
+                    refresh_token: Some(token),
+                    scope: None,
+                    resource: None,
+                };
+                let patreon = crate::account_tests::patreon_off();
+                let resp =
+                    handle_refresh_token_grant(state, oidc, store, patreon, HeaderMap::new(), form)
+                        .await;
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        // Linked: every kind of session refreshes.
+        for (idp, upstream) in [
+            ("apple", Some(sub.as_str())),
+            ("apple", None),
+            ("webauthn", None),
+        ] {
+            let (status, body) = refresh(issue(idp, upstream).await).await;
+            assert_eq!(status, StatusCode::OK, "{idp} {upstream:?}: {body}");
+        }
+
+        // The link goes (another path, so `apple_unlinked_at` is not set yet):
+        // the session naming it ends; a pre-field record cannot tell yet.
+        store
+            .delete_apple_link(&crate::apple_tokens::apple_link_key(&sub), &uid)
+            .await
+            .unwrap();
+        let (status, body) = refresh(issue("apple", Some(&sub)).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_grant"), "{body}");
+        let (status, body) = refresh(issue("apple", None).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Once the account has unlinked Apple, a pre-field Apple record ends
+        // too; a passkey session does not.
+        store
+            .mark_apple_unlinked(&uid, Utc::now().timestamp())
+            .await
+            .unwrap();
+        let (status, body) = refresh(issue("apple", None).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_grant"), "{body}");
+        let (status, body) = refresh(issue("webauthn", None).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Linking the same Apple ID again revives a session that names it.
+        store.link_identity(uid, "apple", &sub).await.unwrap();
+        let (status, body) = refresh(issue("apple", Some(&sub)).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]
@@ -3419,6 +3617,7 @@ pub(crate) mod tests {
             market: Arc::new(None),
             game: Arc::default(),
             owner_kas_mints: Arc::default(),
+            apple_unlinks: Arc::default(),
             owner_kas_relay_client_ids: Arc::new(vec![]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
@@ -3453,6 +3652,7 @@ pub(crate) mod tests {
             email_verified: Some(true),
             name: None,
             auth_time: Some(1_790_000_000),
+            upstream_subject: None,
             expires_at: Utc::now().timestamp() + 3600,
             created_at: Utc::now().timestamp(),
         };
@@ -3796,6 +3996,7 @@ pub(crate) mod tests {
                     email_verified: None,
                     name: None,
                     auth_time: None,
+                    upstream_subject: None,
                     expires_at: Utc::now().timestamp() + 3600,
                     created_at: Utc::now().timestamp(),
                 },

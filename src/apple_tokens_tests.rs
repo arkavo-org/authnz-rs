@@ -6,7 +6,9 @@
 use crate::AppState;
 use crate::account::{run_once, schedule_sweep};
 use crate::account_tests::patreon_off;
-use crate::apple_signin::{AppleJwksCache, apple_link_handler, apple_nonce_handler};
+use crate::apple_signin::{
+    AppleJwksCache, apple_link_handler, apple_nonce_handler, apple_unlink_handler,
+};
 use crate::apple_tokens::test_support::{self as ts, StubApple};
 use crate::apple_tokens::{AppleTokens, apple_link_key};
 use crate::db::{DeletionState, DynamoDBStore};
@@ -73,7 +75,10 @@ impl Harness {
         };
         let app = Router::new()
             .route("/oauth/apple/nonce", get(apple_nonce_handler))
-            .route("/oauth/apple/link", post(apple_link_handler))
+            .route(
+                "/oauth/apple/link",
+                post(apple_link_handler).delete(apple_unlink_handler),
+            )
             .layer(Extension(state.clone()))
             .layer(Extension(cache))
             .layer(Extension(tokens))
@@ -175,6 +180,27 @@ impl Harness {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `DELETE /oauth/apple/link` → (status, body, `Retry-After`).
+    pub(crate) async fn unlink(&self, cwt: Option<&str>) -> (StatusCode, String, Option<String>) {
+        let mut req = Request::delete("/oauth/apple/link");
+        if let Some(c) = cwt {
+            req = req.header("X-Auth-Token", c);
+        }
+        let resp = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned(), retry)
     }
 
     /// The whole ceremony: a nonce, Apple returning `refresh_token` for
@@ -928,4 +954,276 @@ async fn an_unreadable_apple_token_row_fails_the_deletion_at_once() {
         .expect("an unreadable row must not be retried on the schedule")
         .unwrap();
     assert_eq!(state_of(&h, &uid).await.0, DeletionState::Failed);
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /oauth/apple/link
+// ---------------------------------------------------------------------------
+
+/// Every Apple ID the account linked goes, and is then free for another
+/// account; other accounts' links and the account's other links stay.
+#[tokio::test]
+async fn unlinking_removes_every_apple_id_of_the_account() {
+    let Some(h) = Harness::new(false).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let (other, other_cwt) = h.user().await;
+    let (a, b, c) = (new_sub(), new_sub(), new_sub());
+    for sub in [&a, &b] {
+        assert_eq!(h.link(&cwt, sub, None, "unused").await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        h.link(&other_cwt, &c, None, "unused").await.0,
+        StatusCode::OK
+    );
+    let google = format!("g-{}", Uuid::new_v4().simple());
+    h.store.link_identity(uid, "google", &google).await.unwrap();
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(body.is_empty());
+    for sub in [&a, &b] {
+        assert_eq!(h.store.get_identity_link("apple", sub).await.unwrap(), None);
+    }
+    assert_eq!(
+        h.store.get_identity_link("apple", &c).await.unwrap(),
+        Some(other)
+    );
+    assert_eq!(
+        h.store.get_identity_link("google", &google).await.unwrap(),
+        Some(uid)
+    );
+    assert!(h.store.apple_unlinked_at(&uid).await.unwrap().is_some());
+    assert!(h.store.apple_unlinked_at(&other).await.unwrap().is_none());
+
+    // Freed: another account may link it now, no 409.
+    assert_eq!(
+        h.link(&other_cwt, &a, None, "unused").await.0,
+        StatusCode::OK
+    );
+    // Nothing left to unlink: still 204.
+    assert_eq!(h.unlink(Some(&cwt)).await.0, StatusCode::NO_CONTENT);
+}
+
+/// With revocation configured, a stored token is revoked with Apple before
+/// its link goes.
+#[tokio::test]
+async fn unlinking_revokes_a_stored_token() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+    assert_eq!(
+        h.link(&cwt, &sub, Some("code"), "rt-unlink").await.0,
+        StatusCode::OK
+    );
+    h.stub.reply_revoke(200, json!(null));
+
+    assert_eq!(h.unlink(Some(&cwt)).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(h.stub.revoked(), vec!["rt-unlink".to_string()]);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&sub))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        None
+    );
+    assert!(h.store.apple_unlinked_at(&uid).await.unwrap().is_some());
+}
+
+/// A token Apple does not revoke keeps its link (502); the account's other
+/// links go anyway, and a retry finishes.
+#[tokio::test]
+async fn a_failed_revocation_keeps_its_link_and_a_retry_finishes() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let held = new_sub();
+    assert_eq!(
+        h.link(&cwt, &held, Some("code"), "rt-held").await.0,
+        StatusCode::OK
+    );
+    let plain = new_sub();
+    h.store.link_identity(uid, "apple", &plain).await.unwrap();
+    h.stub.reply_revoke(503, json!({}));
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "apple_token_revoke_failed");
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&held))
+            .await
+            .is_some()
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &plain).await.unwrap(),
+        None
+    );
+
+    h.stub.reply_revoke(200, json!(null));
+    assert_eq!(h.unlink(Some(&cwt)).await.0, StatusCode::NO_CONTENT);
+    assert!(
+        h.store
+            .get_apple_token(&apple_link_key(&held))
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &held).await.unwrap(),
+        None
+    );
+}
+
+/// A stored token while revocation is not configured cannot be revoked: its
+/// link stays and the unlink fails, rather than dropping it unrevoked.
+#[tokio::test]
+async fn a_stored_token_without_revocation_configured_is_kept() {
+    let Some(on) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = on.user().await;
+    let sub = new_sub();
+    assert_eq!(
+        on.link(&cwt, &sub, Some("code"), "rt-kept").await.0,
+        StatusCode::OK
+    );
+    let off = Harness::build_with(crate::db::tests::local_store().unwrap(), Tokens::Off).await;
+    let cwt_off = crate::authn::mint_auth_token(&off.state, &uid, None, None).unwrap();
+
+    let (status, body, _) = off.unlink(Some(&cwt_off)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        on.store
+            .get_apple_token(&apple_link_key(&sub))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn unlinking_needs_a_live_account() {
+    let Some(h) = Harness::new(false).await else {
+        return;
+    };
+    assert_eq!(h.unlink(None).await.0, StatusCode::UNAUTHORIZED);
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+    assert_eq!(h.link(&cwt, &sub, None, "unused").await.0, StatusCode::OK);
+    tombstone(&h, &uid).await;
+    assert_eq!(h.unlink(Some(&cwt)).await.0, StatusCode::UNAUTHORIZED);
+    // A deleted account's link is the sweep's to remove, not this route's.
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        Some(uid)
+    );
+}
+
+#[tokio::test]
+async fn unlinks_are_rate_limited_per_account() {
+    let Some(h) = Harness::new(false).await else {
+        return;
+    };
+    let (_, cwt) = h.user().await;
+    for _ in 0..crate::constants::APPLE_UNLINKS_PER_MINUTE {
+        assert_eq!(h.unlink(Some(&cwt)).await.0, StatusCode::NO_CONTENT);
+    }
+    let (status, body, retry) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body, "rate_limited");
+    let after: u64 = retry.expect("Retry-After").parse().unwrap();
+    assert!((1..=60).contains(&after), "{after}");
+    // Another account is not limited by it.
+    let (_, other) = h.user().await;
+    assert_eq!(h.unlink(Some(&other)).await.0, StatusCode::NO_CONTENT);
+}
+
+/// A row of the account whose token cannot be read is kept (its token cannot
+/// be revoked) and fails the unlink; the account's other links still go, and
+/// the answer names no link key.
+#[tokio::test]
+async fn an_unreadable_token_row_is_kept_and_fails_the_unlink() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let plain = new_sub();
+    h.store.link_identity(uid, "apple", &plain).await.unwrap();
+    let bad_sub = new_sub();
+    let bad_key = apple_link_key(&bad_sub);
+    h.store
+        .raw_identity_link_put(
+            [
+                ("link_pk", AttributeValue::S(bad_key.clone())),
+                ("user_id", AttributeValue::S(uid.to_string())),
+                ("provider", AttributeValue::S("apple".into())),
+                ("subject", AttributeValue::S(bad_sub.clone())),
+                ("token_client_id", AttributeValue::S(ts::CLIENT_ID.into())),
+                ("token_wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("apple_token_unreadable"), "{body}");
+    assert!(
+        !body.contains(&bad_sub),
+        "the answer must not carry the sub"
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &plain).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        h.store.apple_tokens_of(&uid).await.unwrap().unreadable,
+        vec![bad_key]
+    );
+    assert!(h.stub.revoked().is_empty());
+}
+
+/// One revocation that fails for now and another Apple refuses for good: the
+/// unlink reports the permanent one (500), never the retryable 502, whichever
+/// row came first. Both links stay.
+#[tokio::test]
+async fn a_permanent_revocation_failure_is_reported_ahead_of_a_transient_one() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let apple = ts::tokens(&h.stub);
+    let subs = [new_sub(), new_sub()];
+    for (sub, rt) in subs.iter().zip(["rt-x", "rt-y"]) {
+        h.store
+            .link_apple_with_token(uid, sub, ts::CLIENT_ID, &apple.seal(rt).await.unwrap(), 1)
+            .await
+            .unwrap();
+    }
+    h.stub.script_revokes(vec![
+        (503, json!({})),
+        (400, json!({"error": "invalid_client"})),
+    ]);
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("apple_token_revocation_unavailable"),
+        "{body}"
+    );
+    for sub in &subs {
+        assert!(
+            h.store
+                .get_apple_token(&apple_link_key(sub))
+                .await
+                .is_some()
+        );
+    }
 }
