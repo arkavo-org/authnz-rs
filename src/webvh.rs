@@ -553,20 +553,25 @@ pub async fn refresh_handle_binding(app: &crate::AppState, uid: &Uuid, handle: &
             let Some(log) = app.db_store.get_webvh_log(uid).await? else {
                 return Ok(());
             };
-            let mut current = log.clone();
-            if let Some(key) = app.webvh_sign_key.as_ref().as_ref()
+            // Every sign-in runs this before its token is minted. Once the
+            // log names both aliases and the handle row maps them, it reads
+            // two rows and does nothing else: no chain verification, no write.
+            let mut doc = latest_document(&log)?;
+            if !log_emit::has_handle_aliases(&doc, handle)
+                && let Some(key) = app.webvh_sign_key.as_ref().as_ref()
                 && let Some(updated) = log_emit::add_handle_binding(key, &log, handle).await?
             {
                 app.db_store
                     .compare_and_swap_webvh_log(uid, Some(&log), &updated)
                     .await?;
-                current = updated;
+                doc = latest_document(&updated)?;
             }
             // Repair a failed handle write after initial mint without re-minting.
-            let doc = latest_document(&current)?;
-            app.db_store
-                .put_handle(handle, doc["id"].as_str().unwrap(), uid)
-                .await?;
+            let did = doc["id"].as_str().unwrap();
+            let published = app.db_store.get_handle_owner(handle).await?;
+            if !matches!(published, Some((owner, ref mapped)) if owner == *uid && mapped == did) {
+                app.db_store.put_handle(handle, did, uid).await?;
+            }
             Ok(())
         }
         if let Err(e) = refresh(app, uid, handle).await {
@@ -589,6 +594,17 @@ mod log_emit {
     use super::WebvhError;
     use didwebvh_rs::prelude::*;
     use std::sync::Arc;
+
+    /// Whether the document already names `handle` under both aliases, the
+    /// HTTPS one and the ATProto one.
+    pub fn has_handle_aliases(doc: &serde_json::Value, handle: &str) -> bool {
+        let Some(aliases) = doc["alsoKnownAs"].as_array() else {
+            return false;
+        };
+        [format!("https://{handle}"), format!("at://{handle}")]
+            .iter()
+            .all(|alias| aliases.iter().any(|v| v.as_str() == Some(alias)))
+    }
 
     /// Verify the existing chain, then append only the missing aliases. Keep
     /// the DID, keys, services, and every prior byte of history unchanged.

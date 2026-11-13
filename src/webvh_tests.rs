@@ -327,6 +327,40 @@ async fn log_compare_and_swap_rejects_races_and_deleted_accounts() {
     );
 }
 
+/// A sign-in skips the chain check only when the log already names both.
+#[cfg(feature = "webvh")]
+#[test]
+fn a_binding_needs_both_aliases() {
+    let h = "alice.arkavo.social";
+    let doc = |aliases: Value| json!({ "id": "did:webvh:x", "alsoKnownAs": aliases });
+    let both = doc(json!([
+        "at://alice.arkavo.social",
+        "https://alice.arkavo.social"
+    ]));
+    assert!(log_emit::has_handle_aliases(&both, h));
+    assert!(!log_emit::has_handle_aliases(
+        &doc(json!(["at://alice.arkavo.social"])),
+        h
+    ));
+    assert!(!log_emit::has_handle_aliases(
+        &doc(json!(["https://alice.arkavo.social"])),
+        h
+    ));
+    let other = doc(json!([
+        "at://bob.arkavo.social",
+        "https://bob.arkavo.social"
+    ]));
+    assert!(!log_emit::has_handle_aliases(&other, h));
+    assert!(!log_emit::has_handle_aliases(
+        &doc(json!("https://alice.arkavo.social")),
+        h
+    ));
+    assert!(!log_emit::has_handle_aliases(
+        &json!({ "id": "did:webvh:x" }),
+        h
+    ));
+}
+
 #[cfg(feature = "webvh")]
 #[tokio::test]
 async fn refresh_backfills_once_and_repairs_missing_handle_publication() {

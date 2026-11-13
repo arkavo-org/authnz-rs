@@ -48,7 +48,9 @@ the DID, SCID, all prior log bytes, verification methods, and other aliases.
 The update validates the old and resulting chains and uses a conditional write
 against the exact old log. Concurrent initial mints cannot replace a DID, and
 concurrent updates cannot lose history. A subsequent login repairs a failed
-handle publication without minting another DID.
+handle publication without minting another DID. Once the log names both
+aliases and the handle row maps the handle to the DID, a sign-in only reads
+the two rows: it neither verifies the chain nor writes.
 
 Deploy the server, then sign in as `arkavo` to publish its forward binding.
 Dormant accounts retain their previous log until their next passkey sign-in or
