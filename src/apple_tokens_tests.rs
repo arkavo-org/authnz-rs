@@ -1143,3 +1143,49 @@ async fn unlinks_are_rate_limited_per_account() {
     let (_, other) = h.user().await;
     assert_eq!(h.unlink(Some(&other)).await.0, StatusCode::NO_CONTENT);
 }
+
+/// A row of the account whose token cannot be read is kept (its token cannot
+/// be revoked) and fails the unlink; the account's other links still go, and
+/// the answer names no link key.
+#[tokio::test]
+async fn an_unreadable_token_row_is_kept_and_fails_the_unlink() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let plain = new_sub();
+    h.store.link_identity(uid, "apple", &plain).await.unwrap();
+    let bad_sub = new_sub();
+    let bad_key = apple_link_key(&bad_sub);
+    h.store
+        .raw_identity_link_put(
+            [
+                ("link_pk", AttributeValue::S(bad_key.clone())),
+                ("user_id", AttributeValue::S(uid.to_string())),
+                ("provider", AttributeValue::S("apple".into())),
+                ("subject", AttributeValue::S(bad_sub.clone())),
+                ("token_client_id", AttributeValue::S(ts::CLIENT_ID.into())),
+                ("token_wrapped_dek", AttributeValue::B(Blob::new(vec![1u8]))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("apple_token_unreadable"), "{body}");
+    assert!(
+        !body.contains(&bad_sub),
+        "the answer must not carry the sub"
+    );
+    assert_eq!(
+        h.store.get_identity_link("apple", &plain).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        h.store.apple_tokens_of(&uid).await.unwrap().unreadable,
+        vec![bad_key]
+    );
+    assert!(h.stub.revoked().is_empty());
+}
