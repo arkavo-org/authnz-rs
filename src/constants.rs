@@ -247,6 +247,11 @@ pub const MARKET_SUBSCRIPTION_RECHECKS_PER_MINUTE: u32 = 6;
 /// polling, so this is ample.
 pub const OWNER_KAS_MINTS_PER_MINUTE: u32 = 30;
 
+/// `DELETE /oauth/apple/link` calls per account per minute, in process. Each
+/// one scans `identity_links` (no `user_id` index), so an account must not be
+/// able to make identity scan without bound. A person unlinks once.
+pub const APPLE_UNLINKS_PER_MINUTE: u32 = 5;
+
 /// `POST /game/token` (#151): mints per account per minute (429 beyond it,
 /// in process). A client mints when its token is about to expire and, after
 /// a purchase, every 20 s for a minute and a half, on each of its devices.

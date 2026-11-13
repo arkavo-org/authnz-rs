@@ -62,14 +62,25 @@ fn parse_row(item: &HashMap<String, AttributeValue>) -> Option<AppleTokenRow> {
     })
 }
 
-/// An account's stored Apple tokens, as `apple_tokens_of` found them.
+/// An account's Apple identity links, as `apple_tokens_of` found them.
 pub struct AppleTokensOfUser {
-    /// The rows that could be read.
+    /// The rows holding a token that could be read.
     pub rows: Vec<AppleTokenRow>,
     /// The `link_pk` of each row that matched the account and holds token
     /// attributes that cannot be read. Its token cannot be revoked, so a
     /// caller must not treat the account as holding none.
     pub unreadable: Vec<String>,
+    /// The `link_pk` of each of the account's Apple links that holds no
+    /// token at all (every link made without revocation configured). The
+    /// sweep's link step deletes these; `DELETE /oauth/apple/link` does too.
+    pub without_token: Vec<String>,
+}
+
+impl AppleTokensOfUser {
+    /// Whether the account has no Apple link of any kind.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.unreadable.is_empty() && self.without_token.is_empty()
+    }
 }
 
 impl fmt::Debug for AppleTokensOfUser {
@@ -78,9 +89,16 @@ impl fmt::Debug for AppleTokensOfUser {
         f.debug_struct("AppleTokensOfUser")
             .field("rows", &self.rows)
             .field("unreadable", &self.unreadable.len())
+            .field("without_token", &self.without_token.len())
             .finish()
     }
 }
+
+/// The `credentials` attribute set when the account last unlinked Apple
+/// (`DELETE /oauth/apple/link`). A refresh token issued before refresh
+/// tokens recorded their Apple ID cannot name it, so the refresh grant ends
+/// such a session once this is set.
+const APPLE_UNLINKED_AT: &str = "apple_unlinked_at";
 
 impl DynamoDBStore {
     /// Link an Apple identity to `user_id` and store its sealed refresh token
@@ -142,12 +160,13 @@ impl DynamoDBStore {
         }
     }
 
-    /// Every stored Apple token of the account: its Apple identity links that
-    /// hold one. A paginated, consistent scan (no `user_id` index; deletions
-    /// are rare). A link without token attributes is skipped (the sweep's link
-    /// step deletes it). A row with some but not all of them is logged, left
-    /// in place and named in `unreadable`, so the caller can tell it from "no
-    /// rows" and fail rather than finish without revoking its token.
+    /// Every Apple identity link of the account, and the tokens they hold. A
+    /// paginated, consistent scan (no `user_id` index; deletions and unlinks
+    /// are rare, and the unlink route is rate limited). A link without token
+    /// attributes is named in `without_token`. A row with some but not all of
+    /// them is logged, left in place and named in `unreadable`, so the caller
+    /// can tell it from "no rows" and fail rather than finish without revoking
+    /// its token.
     pub async fn apple_tokens_of(
         &self,
         user_id: &Uuid,
@@ -157,6 +176,7 @@ impl DynamoDBStore {
         let mut found = AppleTokensOfUser {
             rows: Vec::new(),
             unreadable: Vec::new(),
+            without_token: Vec::new(),
         };
         let mut start = None;
         loop {
@@ -172,7 +192,13 @@ impl DynamoDBStore {
                 .send()
                 .await
                 .map_err(|e| classify(e, table))?;
-            for item in page.items().iter().filter(|i| holds_token(i)) {
+            for item in page.items() {
+                if !holds_token(item) {
+                    if let Some(key) = item.get("link_pk").and_then(|v| v.as_s().ok()) {
+                        found.without_token.push(key.clone());
+                    }
+                    continue;
+                }
                 match parse_row(item) {
                     Some(row) => found.rows.push(row),
                     None => {
@@ -222,6 +248,74 @@ impl DynamoDBStore {
                 other => Err(other),
             },
         }
+    }
+
+    /// Delete an Apple identity link that holds no token, only while it still
+    /// belongs to `user_id` and still holds none: a link that gained a token
+    /// meanwhile must be revoked before it goes, so it stays. `false` when
+    /// the row was not deleted (gone, another account's, or now holding a
+    /// token).
+    pub async fn delete_apple_link_without_token(
+        &self,
+        link_key: &str,
+        user_id: &Uuid,
+    ) -> Result<bool, DynamoDBError> {
+        let table = &self.identity_links_table;
+        let result = self
+            .client
+            .delete_item()
+            .table_name(table)
+            .key("link_pk", s(link_key))
+            .condition_expression(format!("user_id = :uid AND {HOLDS_NO_TOKEN}"))
+            .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Record on the live `credentials` row that the account unlinked Apple
+    /// at `now`. Written before any link is removed, so a retried unlink that
+    /// finds nothing left has already recorded it.
+    pub async fn mark_apple_unlinked(&self, user_id: &Uuid, now: i64) -> Result<(), DynamoDBError> {
+        let table = &self.credentials_table;
+        self.client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("SET #at = :now")
+            .condition_expression(super::account::LIVE_ROW)
+            .expression_attribute_names("#at", APPLE_UNLINKED_AT)
+            .expression_attribute_values(":now", n(now))
+            .send()
+            .await
+            .map_err(|e| classify(e, table))?;
+        Ok(())
+    }
+
+    /// When the account last unlinked Apple, if ever (consistent read).
+    pub async fn apple_unlinked_at(&self, user_id: &Uuid) -> Result<Option<i64>, DynamoDBError> {
+        let table = &self.credentials_table;
+        let out = self
+            .client
+            .get_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .projection_expression("#at")
+            .expression_attribute_names("#at", APPLE_UNLINKED_AT)
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| classify(e, table))?;
+        Ok(out
+            .item
+            .and_then(|item| item.get(APPLE_UNLINKED_AT).cloned())
+            .and_then(|v| v.as_n().ok().and_then(|n| n.parse().ok())))
     }
 
     /// Write an arbitrary identity link item, to plant a malformed row.

@@ -766,6 +766,7 @@ pub async fn resolve_google_user(
         roles: vec!["user".to_string()],
         entitlements: account.entitlements.clone(),
         auth_time: None,
+        upstream_subject: Some(claims.sub.clone()),
     })
 }
 
