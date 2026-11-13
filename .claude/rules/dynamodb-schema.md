@@ -56,6 +56,12 @@ paths:
   `get_user_by_id` / `get_user_by_name` read a tombstone as absent. **Every
   write to this table is conditional on `LIVE_ROW`** (same expression), so
   nothing lands on a tombstone or recreates a deleted row.
+- **apple_unlinked_at** (Number, optional; 0.40.0): when the account last
+  called `DELETE /oauth/apple/link` with an Apple link to remove. Set under
+  `LIVE_ROW` before any link is deleted (`mark_apple_unlinked`); read only
+  by the refresh grant, for an Apple refresh token that names no Apple `sub`
+  (issued before 0.40.0), which it then refuses. Never removed by a request;
+  the tombstone drops it.
 - **GSI**: username-index (partition key: username)
 
 ### handles table
@@ -134,6 +140,13 @@ paths:
     tombstone, and it 409s a new account linking the same Apple ID until
     revoked. A row with some but not all `token_*` attributes is unreadable
     and keeps the deletion `failed` (permanent).
+- **Apple link unlink** (0.40.0): `DELETE /oauth/apple/link` deletes every
+  `apple#` row of the account: one holding no token on `user_id = :uid AND`
+  no `token_*` attribute, one holding a token after Apple revoked it
+  (`delete_apple_link`, on `user_id`). It finds them with the same scan as
+  the sweep, at most 5 times a minute per account. This is the endpoint the
+  `user_id-index` GSI below was earmarked for; the scan stays until the table
+  is large enough to matter.
 - **App Store subscription link** (`appstore#<original_transaction_id>`; no
   Apple token): attributes `user_id` and `created_at` (Number, unix seconds;
   kept on a re-bind). Written by `bind_app_store_link` as one `UpdateItem` on

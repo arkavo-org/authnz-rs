@@ -273,6 +273,7 @@ other relying parties.
 | `GET /oauth/userinfo`                   | UserInfo endpoint                           |
 | `GET /oauth/apple/nonce`                | Issue server-side nonce for Apple native flow |
 | `POST /oauth/apple/idtoken`             | Native Sign in with Apple (id_token + nonce)|
+| `DELETE /oauth/apple/link`              | Unlink every Apple ID from the signed-in account (`X-Auth-Token`); revokes any stored Apple token first; 204 also when nothing is linked |
 | `POST /oauth/apple/link`                | Link Sign in with Apple to the signed-in account (`X-Auth-Token`); with revocation configured, also exchanges `authorization_code` and keeps the refresh token so account deletion can revoke it |
 | `POST /oauth/apple/callback`            | Web-flow Apple callback — **disabled (501)** until full code-exchange + state-bound nonce land |
 

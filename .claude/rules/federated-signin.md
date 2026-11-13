@@ -80,6 +80,34 @@ paths:
   keeps a link in flight from outliving a deletion's sweep: the request can
   take longer than `ACCOUNT_DELETION_GRACE_SECONDS` (untimed DynamoDB and
   KMS calls).
+- `DELETE /oauth/apple/link` (0.40.0): unlink **every** Apple ID of the
+  signed-in account without deleting it. Same auth as the link (passkey CWT,
+  live account), no body, at most `APPLE_UNLINKS_PER_MINUTE` (5) per account
+  (each one scans `identity_links`: no `user_id` index). In order: the scan
+  (`apple_tokens_of`, which also lists token-less links); `apple_unlinked_at`
+  on the `credentials` row, **before** anything is removed; each token-less
+  link deleted on `user_id = :uid AND HOLDS_NO_TOKEN` (one that gained a
+  token meanwhile stays); each stored token revoked with Apple, then its
+  link deleted (`delete_apple_link`). Answers:
+  - 204 unlinked, or nothing linked;
+  - 401 bad token or deleted account (the sweep removes a deleted
+    account's links);
+  - 429 `rate_limited` + `Retry-After`;
+  - 502 `apple_token_revoke_failed` (Apple did not revoke or was
+    unreachable; that link stays, the rest are gone; retry);
+  - 500 storage failure, an unreadable token, or stored tokens while
+    revocation is not configured (`apple_token_revocation_unavailable`).
+  Audit `identity_unlink outcome=unlinked|not_linked|rate_limited|failed`,
+  with a link count, never a subject.
+- **An Apple or Google session ends with its link.** Sign-in records the
+  IdP's `sub` as `AuthenticatedUser::upstream_subject` (never in a token),
+  the refresh token keeps it, and the refresh grant
+  (`oidc::upstream_link_ended`) fails with `invalid_grant` once
+  `<idp>#<sub>` no longer names the account. An Apple refresh record from
+  before 0.40.0 names no `sub`; it ends once the account has
+  `apple_unlinked_at`. Access tokens already issued run out (1 h).
+  `get_identity_link` is a consistent read, so nothing signs in through a
+  link just deleted.
 - `POST /oauth/apple/callback`: **explicitly disabled** (HTTP 501). Apple web
   callback requires both code-exchange (signed client-secret JWT against
   Apple's token endpoint) *and* state-bound nonce verification. Until both
