@@ -96,6 +96,7 @@ contract changes only with the teams that build against it.
 | Account deletion | `account.rs`, `db/account.rs` | `account-deletion.md` | `docs/account-deletion.md` |
 | DynamoDB tables and rows | `db.rs`, `db/` | `dynamodb-schema.md` | |
 | Operator home page and icons | `site.rs` | `site.md` | |
+| Server edge: connection, time, size and rate limits, response headers | `edge.rs`, `main.rs` | | |
 | did:webvh passports, handle bindings | `webvh.rs` | `webvh.md` | `docs/did-handle-binding.md` |
 
 Before changing a module, read its rule file even if the tool did not load
@@ -138,6 +139,10 @@ holds only what applies across modules.
   handles, passkey index rows, owner-KAS routes, agent delegations,
   Guardians.
 - **No new DynamoDB table for 1:1 data**: it goes on the existing row.
+- **Edge limits live in `edge.rs`.** A new unauthenticated route that
+  makes the server hold state or sign joins a per-peer rate-limit group; a
+  route that needs a body over 64 KiB sets its own `DefaultBodyLimit`. The
+  peer is the socket address, never `X-Forwarded-For`.
 - **Never log a bearer secret**: a market checkout session id
   (`SessionId::log_ref`), `MARKET_LOOKUP_TOKEN`, tokens.
 - **authnz-rs carries no branding.** Any organization can deploy it; logos

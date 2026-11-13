@@ -1,0 +1,19 @@
+# cargo-deny: `cargo deny check advisories sources` (CI, rust.yaml). Every
+# RustSec advisory against the dependency graph fails CI unless it is
+# ignored below with why it does not reach identity and what retires it.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained crates fail only when identity depends on them directly.
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa, via jsonwebtoken's rust_crypto backend: the Marvin attack times RSA private-key operations. Identity holds no RSA private key; it only verifies Apple and Google RS256 id_tokens with their public keys. No fixed rsa release exists." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5, under p256/ecdsa 0.13 (the CWT and JWT signing key): compiler- and CPU-dependent timing variability. Fixed only in 0.7, which needs the p256 0.14 line. Retire with that upgrade, or by signing in KMS." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (not vulnerable). It parses the operator's PEM files once at boot. Replace it with rustls-pki-types' PemObject." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

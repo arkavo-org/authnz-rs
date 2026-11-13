@@ -6,7 +6,7 @@ use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
@@ -71,6 +71,7 @@ mod authentication_tests;
 mod authn;
 mod db;
 mod device_check;
+mod edge;
 mod entities;
 mod entitlements;
 mod game;
@@ -117,6 +118,17 @@ async fn run_h3_server(
         private_key(&mut key_reader)?.ok_or("No private key found")?
     };
 
+    serve_h3(std::net::UdpSocket::bind(addr)?, app, certs, key).await
+}
+
+/// Serve HTTP/3 on `socket` until the endpoint closes.
+#[cfg(feature = "http3")]
+async fn serve_h3(
+    socket: std::net::UdpSocket,
+    app: Router,
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Build rustls ServerConfig for QUIC
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -135,12 +147,16 @@ async fn run_h3_server(
     let mut quinn_server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_config)?));
 
+    // Connections still in their handshake: bounded, so a flood of
+    // Initial packets cannot grow memory without limit.
+    quinn_server_config.max_incoming(edge::MAX_CONNECTIONS);
     let transport_config = Arc::get_mut(&mut quinn_server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(100_u8.into());
-    transport_config.max_concurrent_bidi_streams(100_u8.into());
+    // HTTP/3 needs 3 unidirectional streams per side (control, QPACK
+    // encoder and decoder); the rest is room for grease.
+    transport_config.max_concurrent_uni_streams(10_u8.into());
+    transport_config.max_concurrent_bidi_streams(edge::MAX_CONCURRENT_STREAMS.into());
+    transport_config.max_idle_timeout(Some(edge::QUIC_IDLE_TIMEOUT.try_into()?));
 
-    // Bind UDP socket
-    let socket = std::net::UdpSocket::bind(addr)?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(quinn_server_config),
@@ -148,17 +164,32 @@ async fn run_h3_server(
         Arc::new(quinn::TokioRuntime),
     )?;
 
-    // Accept connections
-    while let Some(connecting) = endpoint.accept().await {
+    // Accept connections. A peer is counted once its handshake completes
+    // (the handshake validates its address), so a spoofed source cannot use
+    // up a real peer's share.
+    let limits = edge::ConnectionLimits::new(
+        edge::MAX_CONNECTIONS,
+        edge::peer_share(edge::MAX_CONNECTIONS),
+    );
+    while let Some(incoming) = endpoint.accept().await {
         let app = app.clone();
+        let limits = limits.clone();
         tokio::spawn(async move {
-            match connecting.await {
+            match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle_h3_connection(conn, app).await {
-                        eprintln!("HTTP/3 connection error: {}", e);
+                    let peer = conn.remote_address();
+                    let Some(_guard) = limits
+                        .try_place()
+                        .and_then(|place| limits.admit(peer.ip(), place))
+                    else {
+                        conn.close(0u32.into(), b"busy");
+                        return;
+                    };
+                    if let Err(e) = handle_h3_connection(conn, peer, app).await {
+                        debug!("HTTP/3 connection error: {}", e);
                     }
                 }
-                Err(e) => eprintln!("HTTP/3 connection failed: {}", e),
+                Err(e) => debug!("HTTP/3 connection failed: {}", e),
             }
         });
     }
@@ -169,9 +200,14 @@ async fn run_h3_server(
 #[cfg(feature = "http3")]
 async fn handle_h3_connection(
     conn: quinn::Connection,
+    peer: std::net::SocketAddr,
     app: Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+    // The same request header cap as HTTP/2 (h3's default is unbounded).
+    let mut h3_conn = h3::server::builder()
+        .max_field_section_size(u64::from(MAX_REQUEST_HEADER_LIST_BYTES))
+        .build(h3_quinn::Connection::new(conn))
+        .await?;
 
     loop {
         match h3_conn.accept().await {
@@ -182,11 +218,21 @@ async fn handle_h3_connection(
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(req, stream, app).await {
-                                eprintln!("HTTP/3 request error: {}", e);
+                            // The router's timeout does not cover reading
+                            // the body, which happens before it here.
+                            let deadline = edge::REQUEST_TIMEOUT * 2;
+                            match tokio::time::timeout(
+                                deadline,
+                                handle_h3_request(req, stream, peer, app),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => debug!("HTTP/3 request error: {}", e),
+                                Err(_) => debug!("HTTP/3 request from {peer} timed out"),
                             }
                         }
-                        Err(e) => eprintln!("HTTP/3 request resolve error: {}", e),
+                        Err(e) => debug!("HTTP/3 request resolve error: {}", e),
                     }
                 });
             }
@@ -210,14 +256,16 @@ async fn handle_h3_connection(
 async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+    peer: std::net::SocketAddr,
     app: Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Buf;
 
     // 1. Collect the H3 request body into an axum Body (bounded — auth/OIDC
     //    payloads are tiny; refuse anything larger rather than buffering
-    //    unbounded memory from an untrusted peer).
-    const MAX_H3_BODY: usize = 2 * 1024 * 1024; // 2 MiB
+    //    unbounded memory from an untrusted peer). The routes' own body
+    //    limits then apply as on TCP.
+    const MAX_H3_BODY: usize = edge::MAX_BUFFERED_BODY_BYTES;
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await? {
         let remaining = chunk.remaining();
@@ -243,6 +291,7 @@ async fn handle_h3_request(
     // authoritative. Normalize Content-Length so the router never sees a
     // client-supplied value that disagrees with the real body length.
     let (mut parts, _) = req.into_parts();
+    parts.extensions.insert(ConnectInfo(peer));
     parts.headers.remove(http::header::CONTENT_LENGTH);
     if !body_bytes.is_empty() {
         parts.headers.insert(
@@ -729,6 +778,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))),
     );
 
+    // Per-peer rate limits (edge.rs), one bucket per group of routes.
+    let ceremony_limit = axum::middleware::from_fn_with_state(
+        edge::PeerRateLimiter::new("ceremony", edge::CEREMONY_LIMIT),
+        edge::limit_peer,
+    );
+    let oauth_limit = axum::middleware::from_fn_with_state(
+        edge::PeerRateLimiter::new("oauth", edge::OAUTH_LIMIT),
+        edge::limit_peer,
+    );
+    let mint_limit = axum::middleware::from_fn_with_state(
+        edge::PeerRateLimiter::new("mint", edge::MINT_LIMIT),
+        edge::limit_peer,
+    );
+
     // build our application with routes
     let app = Router::<()>::new()
         // The operator's home page and site icons (#138); see site.rs.
@@ -743,11 +806,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/.well-known/jwks.json", get(oidc_jwks))
         .route("/.well-known/cose-keys", get(oidc_cose_keys))
         // OIDC endpoints
-        .route("/oauth/authorize", get(oidc_authorize))
-        .route("/oauth/token", post(oidc_token))
+        .route(
+            "/oauth/authorize",
+            get(oidc_authorize).layer(oauth_limit.clone()),
+        )
+        .route("/oauth/token", post(oidc_token).layer(oauth_limit))
         .route("/oauth/userinfo", get(oidc_userinfo))
         // Sign in with Apple
-        .route("/oauth/apple/nonce", get(apple_nonce_handler))
+        .route(
+            "/oauth/apple/nonce",
+            get(apple_nonce_handler).layer(ceremony_limit.clone()),
+        )
         .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
         .route(
             "/oauth/apple/link",
@@ -758,7 +827,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // to sign in; see google_signin.rs and src/identity.rs.
         .route(
             "/oauth/google/nonce",
-            get(google_signin::google_nonce_handler),
+            get(google_signin::google_nonce_handler).layer(ceremony_limit.clone()),
         )
         .route(
             "/oauth/google/link",
@@ -802,7 +871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // grace. No auth header; the Apple-signed payload is the only trust.
         .route(
             "/app-store/notifications",
-            post(app_store::notifications_handler),
+            post(app_store::notifications_handler).layer(DefaultBodyLimit::max(
+                edge::MAX_APP_STORE_NOTIFICATION_BYTES,
+            )),
         )
         // market.arkavo.com lifetime membership (#141): link the purchase a
         // pasted claim names to the caller. Auth CWT required.
@@ -810,7 +881,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Owner KAS (#146): a token for one owner route, bound to
         // the receiver's request key, so the session token never reaches the
         // owner's phone. Passkey auth CWT required.
-        .route("/game/token", post(game::token_handler))
+        .route(
+            "/game/token",
+            post(game::token_handler).layer(mint_limit.clone()),
+        )
         // A game session: the passkey session's device key, good for 30
         // days for the game-token mint and nothing else.
         .route("/game/session", post(game::open_session_handler))
@@ -859,11 +933,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
         .route("/oauth/:client/:provider", get(handle_oauth_callback))
-        .route("/register/:username", get(start_register))
-        .route("/register", post(finish_register))
+        .route(
+            "/register/:username",
+            get(start_register).layer(ceremony_limit.clone()),
+        )
+        .route(
+            "/register",
+            post(finish_register).layer(ceremony_limit.clone()),
+        )
         .route(
             "/authenticate",
-            get(start_authentication).post(finish_authentication),
+            get(start_authentication)
+                .post(finish_authentication)
+                .layer(ceremony_limit.clone()),
         )
         // Apple DeviceCheck / App Attest endpoints
         // Unauthenticated registration preflight (Task 5). These issue a
@@ -871,17 +953,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // register-attest is not evidence that registration is protected.
         .route(
             "/device-check/register-challenge",
-            get(device_check::register_challenge),
+            get(device_check::register_challenge).layer(ceremony_limit.clone()),
         )
         .route(
             "/device-check/register-attest",
-            post(device_check::register_attest),
+            post(device_check::register_attest).layer(ceremony_limit.clone()),
         )
-        .route("/device-check/challenge/:username", get(generate_challenge))
+        .route(
+            "/device-check/challenge/:username",
+            get(generate_challenge).layer(ceremony_limit.clone()),
+        )
         .route("/device-check/attest", post(finish_attestation))
         .route(
             "/device-check/assert-challenge/:username",
-            get(generate_assertion_challenge),
+            get(generate_assertion_challenge).layer(ceremony_limit.clone()),
         )
         .route("/device-check/assert", post(finish_assertion))
         // Agent delegation: a human (PE) delegates to an agent NPE (did:key).
@@ -896,8 +981,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/agents/delegations/:did",
             axum::routing::delete(agent::revoke_delegation),
         )
-        .route("/agents/challenge", get(agent::generate_agent_challenge))
-        .route("/agents/token", post(agent::issue_agent_token))
+        .route(
+            "/agents/challenge",
+            get(agent::generate_agent_challenge).layer(ceremony_limit),
+        )
+        .route(
+            "/agents/token",
+            post(agent::issue_agent_token).layer(mint_limit),
+        )
         // Agent identity quarantine (owner or enrolled Guardian). Contract v2.
         .route(
             "/agents/:did/quarantine",
@@ -931,7 +1022,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(patreon_state))
         .layer(session_service)
         .layer(Extension(apple_app_site_association))
-        .fallback(handler_fallback);
+        .fallback(handler_fallback)
+        // The edge (edge.rs), after the fallback so a 404 has it too, and
+        // before the HTTP/3 copy below so both transports do. Outermost
+        // last: response headers go on every response, the timeout's too.
+        .layer(DefaultBodyLimit::max(edge::MAX_REQUEST_BODY_BYTES))
+        .layer(axum::middleware::from_fn(edge::request_timeout))
+        .layer(axum::middleware::from_fn_with_state(
+            settings.tls_enabled,
+            edge::response_headers,
+        ));
 
     // The H3 server serves the base router (without the Alt-Svc layer added
     // below), so HTTP/3 responses don't redundantly advertise h3 to themselves —
@@ -995,58 +1095,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
-
-        let make_service = app.into_make_service();
-
-        loop {
-            let (stream, remote_addr) = listener
-                .accept()
-                .await
-                .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-            let tls_acceptor = tls_acceptor.clone();
-            let mut make_service = make_service.clone();
-
-            tokio::spawn(async move {
-                match tls_acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        let tower_service = match make_service.call(remote_addr).await {
-                            Ok(service) => service,
-                            Err(_) => {
-                                eprintln!("Failed to create service for {}", remote_addr);
-                                return;
-                            }
-                        };
-
-                        let hyper_service = hyper::service::service_fn(
-                            move |request: hyper::Request<hyper::body::Incoming>| {
-                                tower_service.clone().call(request)
-                            },
-                        );
-
-                        if let Err(err) = connection_builder()
-                            .serve_connection(
-                                hyper_util::rt::TokioIo::new(tls_stream),
-                                hyper_service,
-                            )
-                            .await
-                        {
-                            eprintln!("Error serving connection: {:?}", err);
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("TLS handshake error: {:?}", err);
-                    }
-                }
-            });
-        }
+        serve_tcp(listener, app, Some(tls_acceptor), tcp_limits()).await;
     } else {
         // HTTP mode without TLS
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
-
-        serve_plain(listener, app).await?;
+        serve_tcp(listener, app, None, tcp_limits()).await;
     }
 
     Ok(())
@@ -1059,38 +1114,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// buffer) and HTTP/3 (h3, unbounded) already accept more.
 const MAX_REQUEST_HEADER_LIST_BYTES: u32 = 64 * 1024;
 
-/// The HTTP/1.1 + HTTP/2 connection builder for both TCP listeners.
+/// The HTTP/1.1 + HTTP/2 connection builder for both TCP listeners. hyper
+/// applies its timeouts only with a timer.
 fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    use hyper_util::rt::TokioTimer;
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(edge::HEADER_READ_TIMEOUT);
+    builder
         .http2()
-        .max_header_list_size(MAX_REQUEST_HEADER_LIST_BYTES);
+        .timer(TokioTimer::new())
+        .max_header_list_size(MAX_REQUEST_HEADER_LIST_BYTES)
+        .max_concurrent_streams(edge::MAX_CONCURRENT_STREAMS)
+        .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+        .keep_alive_timeout(std::time::Duration::from_secs(20));
     builder
 }
 
-/// The plain-HTTP listener (no TLS: development). `axum::serve` cannot set
-/// HTTP/2 limits, so connections go through [`connection_builder`] here too.
-async fn serve_plain(listener: tokio::net::TcpListener, app: Router) -> Result<(), String> {
+/// The TCP connection limits, sized to the open-file limit (edge.rs).
+fn tcp_limits() -> Arc<edge::ConnectionLimits> {
+    let (cap, share, open_files) = edge::tcp_connection_cap();
+    match open_files {
+        Some(open_files) => println!(
+            "TCP connections: at most {cap} ({share} per peer; open-file limit {open_files})"
+        ),
+        None => println!("TCP connections: at most {cap} ({share} per peer)"),
+    }
+    edge::ConnectionLimits::new(cap, share)
+}
+
+/// Serve TCP connections (TLS when `tls` is set; plain HTTP is for
+/// development) until the process ends. A connection waits for a place
+/// under the total before `accept`, is dropped at once when its peer holds
+/// its share, and gets [`edge::TLS_HANDSHAKE_TIMEOUT`] for the handshake.
+/// An `accept` error never stops the loop. Every request carries its peer
+/// as `ConnectInfo<SocketAddr>` for the rate limits. `axum::serve` cannot
+/// set these limits, so both listeners come here.
+async fn serve_tcp(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: Option<TlsAcceptor>,
+    limits: Arc<edge::ConnectionLimits>,
+) {
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("Failed to accept connection: {}", e))?;
-        let tower_service = app.clone();
+        let place = limits.place().await;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                edge::accept_failed(&err).await;
+                continue;
+            }
+        };
+        let Some(guard) = limits.admit(peer.ip(), place) else {
+            debug!("connection from {peer} refused: its peer holds its share");
+            continue;
+        };
+        let app = app.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let hyper_service = hyper::service::service_fn(
-                move |request: hyper::Request<hyper::body::Incoming>| {
-                    tower_service.clone().call(request)
-                },
-            );
-            if let Err(err) = connection_builder()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_service)
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
+            let _guard = guard;
+            match tls {
+                Some(tls) => {
+                    match tokio::time::timeout(edge::TLS_HANDSHAKE_TIMEOUT, tls.accept(stream))
+                        .await
+                    {
+                        Ok(Ok(stream)) => serve_connection(stream, peer, app).await,
+                        Ok(Err(err)) => debug!("TLS handshake with {peer} failed: {err}"),
+                        Err(_) => debug!("TLS handshake with {peer} timed out"),
+                    }
+                }
+                None => serve_connection(stream, peer, app).await,
             }
         });
+    }
+}
+
+/// Serve one connection's requests, each carrying `peer`.
+async fn serve_connection<I>(io: I, peer: std::net::SocketAddr, app: Router)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let hyper_service =
+        hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+            request.extensions_mut().insert(ConnectInfo(peer));
+            app.clone().call(request)
+        });
+    if let Err(err) = connection_builder()
+        .serve_connection(hyper_util::rt::TokioIo::new(io), hyper_service)
+        .await
+    {
+        debug!("connection from {peer} ended: {err:?}");
     }
 }
 
@@ -1670,7 +1786,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().route("/health", get(|| async { "ok" }));
-        tokio::spawn(serve_plain(listener, app));
+        tokio::spawn(serve_tcp(
+            listener,
+            app,
+            None,
+            edge::ConnectionLimits::new(16, 16),
+        ));
 
         let status = |header_bytes: usize| async move {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1688,6 +1809,174 @@ mod tests {
         };
         assert_eq!(status(48 * 1024).await, Some(StatusCode::OK));
         assert_ne!(status(65 * 1024).await, Some(StatusCode::OK));
+    }
+
+    /// Send one HTTP/1.1 request on a fresh connection and read the reply
+    /// to the end (empty when the server drops the connection).
+    async fn http1_exchange(stream: &mut tokio::net::TcpStream, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            return String::new();
+        }
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply).await;
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    /// The listener records each request's peer for the rate limits.
+    #[tokio::test]
+    async fn the_tcp_listener_records_each_requests_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/peer",
+            get(
+                |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| async move {
+                    peer.ip().to_string()
+                },
+            ),
+        );
+        tokio::spawn(serve_tcp(
+            listener,
+            app,
+            None,
+            edge::ConnectionLimits::new(16, 16),
+        ));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let reply = http1_exchange(&mut stream, "/peer").await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.ends_with("127.0.0.1"), "{reply}");
+    }
+
+    /// A peer that holds its share of connections has the next one closed
+    /// unanswered; its open one, and other peers, are served.
+    #[tokio::test]
+    async fn a_connection_past_the_peers_share_is_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/health", get(|| async { "ok" }));
+        tokio::spawn(serve_tcp(
+            listener,
+            app,
+            None,
+            edge::ConnectionLimits::new(16, 1),
+        ));
+        let mut held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Let the server admit the held connection before the second one.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert_eq!(http1_exchange(&mut refused, "/health").await, "");
+        let reply = http1_exchange(&mut held, "/health").await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    /// Over HTTP/3, a request carries its peer (so the rate limits apply)
+    /// and the response has the edge headers.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_requests_carry_their_peer_and_the_edge_headers() {
+        use bytes::Buf;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let limit = axum::middleware::from_fn_with_state(
+            edge::PeerRateLimiter::new(
+                "test",
+                edge::RateLimit {
+                    burst: 1,
+                    refill: std::time::Duration::from_secs(60),
+                },
+            ),
+            edge::limit_peer,
+        );
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/peer",
+                get(
+                    |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| async move {
+                        peer.ip().to_string()
+                    },
+                )
+                .layer(limit),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                true,
+                edge::response_headers,
+            ));
+        let server_cert = cert.clone();
+        tokio::spawn(async move {
+            serve_h3(socket, app, vec![server_cert], key).await.unwrap();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let request = http::Request::get("https://localhost/peer")
+                .body(())
+                .unwrap();
+            let mut stream = send_request.send_request(request).await.unwrap();
+            stream.finish().await.unwrap();
+            let response = stream.recv_response().await.unwrap();
+            let mut body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            replies.push((response, String::from_utf8(body).unwrap()));
+        }
+        let (first, body) = &replies[0];
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(body, "127.0.0.1");
+        assert_eq!(first.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            first.headers()["strict-transport-security"],
+            "max-age=31536000"
+        );
+        let (second, body) = &replies[1];
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body.contains("rate_limited"), "{body}");
+
+        // The request header cap matches HTTP/2's (#135): 48 KiB is
+        // served, past 64 KiB is not.
+        for (header_bytes, served) in [(48 * 1024, true), (65 * 1024, false)] {
+            let request = http::Request::get("https://localhost/health")
+                .header("x-auth-token", "a".repeat(header_bytes))
+                .body(())
+                .unwrap();
+            let status = async {
+                let mut stream = send_request.send_request(request).await.ok()?;
+                stream.finish().await.ok()?;
+                Some(stream.recv_response().await.ok()?.status())
+            }
+            .await;
+            assert_eq!(
+                status == Some(StatusCode::OK),
+                served,
+                "{header_bytes}: {status:?}"
+            );
+        }
     }
 
     #[tokio::test]

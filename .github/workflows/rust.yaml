@@ -39,6 +39,29 @@ jobs:
           source $HOME/.cargo/env
           cargo test --verbose
           cargo test --features webvh --bin authnz-rs webvh::
+          # Production builds with http3; this is its listener's test.
+          cargo test --features http3 --bin authnz-rs http3_
+  # RustSec advisories and crate sources (deny.toml). Every advisory fails
+  # the build unless deny.toml ignores it with a reason. cargo-deny is the
+  # release binary, pinned by SHA-256: the cargo-deny action's image ships a
+  # Rust older than this crate's MSRV.
+  advisories:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: |
+          tarball="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${tarball}"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" --strip-components=1
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: cargo deny --locked check advisories sources
   build:
     runs-on: ${{ matrix.os }}
     strategy:
