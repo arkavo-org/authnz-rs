@@ -688,6 +688,9 @@ pub(crate) mod test_support {
         calls: Calls,
         token_reply: Reply,
         revoke_reply: Reply,
+        /// Replies for the next revoke calls, in order, ahead of
+        /// `revoke_reply` ([`StubApple::script_revokes`]).
+        revoke_script: Arc<Mutex<std::collections::VecDeque<(u16, Value)>>>,
         /// When set, the token / revoke endpoint answers 307 to this path
         /// instead of its scripted reply.
         token_redirect: Arc<Mutex<Option<String>>>,
@@ -762,7 +765,8 @@ pub(crate) mod test_support {
         if let Some(to) = s.revoke_redirect.lock().unwrap().clone() {
             return temporary_redirect(&to);
         }
-        let (status, body) = s.revoke_reply.lock().unwrap().clone();
+        let scripted = s.revoke_script.lock().unwrap().pop_front();
+        let (status, body) = scripted.unwrap_or_else(|| s.revoke_reply.lock().unwrap().clone());
         (
             axum::http::StatusCode::from_u16(status).unwrap(),
             axum::Json(body),
@@ -786,6 +790,7 @@ pub(crate) mod test_support {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 token_reply: Arc::new(Mutex::new((500, json!({"error": "server_error"})))),
                 revoke_reply: Arc::new(Mutex::new((200, Value::Null))),
+                revoke_script: Arc::default(),
                 token_redirect: Arc::new(Mutex::new(None)),
                 revoke_redirect: Arc::new(Mutex::new(None)),
                 keys_budget: Arc::new(Mutex::new(None)),
@@ -821,6 +826,12 @@ pub(crate) mod test_support {
 
         pub(crate) fn reply_revoke(&self, status: u16, body: Value) {
             *self.state.revoke_reply.lock().unwrap() = (status, body);
+        }
+
+        /// Answer the next revoke calls with `replies`, in order; then
+        /// [`Self::reply_revoke`]'s reply again.
+        pub(crate) fn script_revokes(&self, replies: Vec<(u16, Value)>) {
+            *self.state.revoke_script.lock().unwrap() = replies.into();
         }
 
         /// Answer the token endpoint with a 307 to `/auth/elsewhere`.

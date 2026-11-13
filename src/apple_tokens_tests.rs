@@ -1189,3 +1189,41 @@ async fn an_unreadable_token_row_is_kept_and_fails_the_unlink() {
     );
     assert!(h.stub.revoked().is_empty());
 }
+
+/// One revocation that fails for now and another Apple refuses for good: the
+/// unlink reports the permanent one (500), never the retryable 502, whichever
+/// row came first. Both links stay.
+#[tokio::test]
+async fn a_permanent_revocation_failure_is_reported_ahead_of_a_transient_one() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let apple = ts::tokens(&h.stub);
+    let subs = [new_sub(), new_sub()];
+    for (sub, rt) in subs.iter().zip(["rt-x", "rt-y"]) {
+        h.store
+            .link_apple_with_token(uid, sub, ts::CLIENT_ID, &apple.seal(rt).await.unwrap(), 1)
+            .await
+            .unwrap();
+    }
+    h.stub.script_revokes(vec![
+        (503, json!({})),
+        (400, json!({"error": "invalid_client"})),
+    ]);
+
+    let (status, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.contains("apple_token_revocation_unavailable"),
+        "{body}"
+    );
+    for sub in &subs {
+        assert!(
+            h.store
+                .get_apple_token(&apple_link_key(sub))
+                .await
+                .is_some()
+        );
+    }
+}

@@ -1219,7 +1219,10 @@ async fn unlink_apple(
             .await
             .map_err(storage("delete"))?;
     }
-    let mut revoke_failed = None;
+    // Whether any revocation failed, and whether any failure was permanent:
+    // a permanent one is reported ahead of a transient one, since retrying
+    // cannot fix it (as the deletion sweep's `revoke_apple_tokens` does).
+    let (mut transient, mut permanent) = (false, false);
     for row in &found.rows {
         match apple.revoke_stored(row).await {
             Ok(()) => db
@@ -1229,7 +1232,11 @@ async fn unlink_apple(
             // Status and Apple's error code only (AppleTokenError's Display).
             Err(e) => {
                 error!("Apple unlink: revocation failed for {user_id}: {e}");
-                revoke_failed.get_or_insert(e);
+                if e.is_permanent() {
+                    permanent = true;
+                } else {
+                    transient = true;
+                }
             }
         }
     }
@@ -1243,15 +1250,17 @@ async fn unlink_apple(
             "apple_token_unreadable".to_string(),
         ));
     }
-    match revoke_failed {
+    if permanent {
         // Not configured, or Apple refused the client: retrying cannot help
         // until the configuration is fixed.
-        Some(e) if e.is_permanent() => Err(AppleSigninError::Internal(
+        return Err(AppleSigninError::Internal(
             "apple_token_revocation_unavailable".to_string(),
-        )),
-        Some(_) => Err(AppleSigninError::TokenRevokeFailed),
-        None => Ok(found.rows.len() + found.without_token.len()),
+        ));
     }
+    if transient {
+        return Err(AppleSigninError::TokenRevokeFailed);
+    }
+    Ok(found.rows.len() + found.without_token.len())
 }
 
 /// Behind HAProxy / nginx we expect `X-Forwarded-For`; first comma-separated
