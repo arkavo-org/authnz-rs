@@ -824,6 +824,7 @@ async fn signed_in(
     patreon: &crate::patreon::PatreonState,
     record: crate::db::UserCredentials,
 ) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
+    crate::webvh::refresh_handle_binding(app_state, &record.user_id, &record.handle).await;
     let user = crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
     let arkavo_user = crate::oidc::arkavo_user_claims_rechecking(app_state, patreon, &user).await;
     // Generate CWT auth token (1-hour, no cnf binding at this point;
