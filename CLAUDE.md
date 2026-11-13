@@ -96,6 +96,7 @@ contract changes only with the teams that build against it.
 | Account deletion | `account.rs`, `db/account.rs` | `account-deletion.md` | `docs/account-deletion.md` |
 | DynamoDB tables and rows | `db.rs`, `db/` | `dynamodb-schema.md` | |
 | Operator home page and icons | `site.rs` | `site.md` | |
+| did:webvh passports, handle bindings | `webvh.rs` | `webvh.md` | `docs/did-handle-binding.md` |
 
 Before changing a module, read its rule file even if the tool did not load
 it. When a change adds a rule, put it in that file, not here; this file

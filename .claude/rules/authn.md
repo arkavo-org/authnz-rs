@@ -39,9 +39,13 @@ paths:
   refused registrant leaves no row. So a deleted account's username is not
   registrable again until registration can issue a handle different from
   the username
-- Legacy DIDs embed the username (`dids:<username>`) and
-  `/dids/:username/…` looks the user up by current username, so **no rename
-  may ship** before those routes resolve by the permanent path (#132)
+- Legacy DIDs embed the username (`dids:<username>`). Since 0.39.0
+  `/dids/:id/…` resolves a legacy name path through the permanent handle
+  row, never the current username (`.claude/rules/webvh.md`). A rename
+  must still first persist `handle` on rows from before 0.27.1, whose
+  `handle` is otherwise read back from the username
+- A passkey sign-in calls `webvh::refresh_handle_binding` before minting
+  its token (non-fatal; `.claude/rules/webvh.md`)
 - Rejects the `apple-` / `google-` username namespace (HTTP 403): those rows
   are IdP-provisioned with zero credentials, and the zero-credential
   exemption below would otherwise let anyone knowing the IdP `sub` enroll a
