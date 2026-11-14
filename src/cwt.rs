@@ -96,6 +96,10 @@ pub struct CustomClaims {
     pub scope: Option<String>,
     /// Unix time of the WebAuthn assertion behind an OIDC access token.
     pub auth_time: Option<i64>,
+    /// Passkey auth tokens only: whether the account has a linked Apple ID
+    /// (`UserCredentials::apple_linked`). Always present on them, `true` or
+    /// `false`: Creator shows "Unlink Apple" from it on every Mac.
+    pub arkavo_apple_linked: Option<bool>,
 }
 
 /// The Arkavo custom claims derived from one user record, shared by every
@@ -413,6 +417,11 @@ impl ArkavoClaims {
         self
     }
 
+    pub fn with_arkavo_apple_linked(mut self, linked: bool) -> Self {
+        self.custom.arkavo_apple_linked = Some(linked);
+        self
+    }
+
     /// Apply the per-user Arkavo custom claims in one step, so every token
     /// minted for a human user carries the same set.
     pub fn with_arkavo_user(mut self, user: &ArkavoUserClaims) -> Self {
@@ -693,6 +702,9 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
     }
     if let Some(v) = &c.custom.arkavo_swarm {
         entries.push((Value::Text("arkavo_swarm".into()), Value::Text(v.clone())));
+    }
+    if let Some(v) = c.custom.arkavo_apple_linked {
+        entries.push((Value::Text("arkavo_apple_linked".into()), Value::Bool(v)));
     }
     if let Some(v) = &c.custom.scope {
         entries.push((Value::Text("scope".into()), Value::Text(v.clone())));
@@ -1121,6 +1133,9 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
             (Value::Text(s), Value::Text(t)) if s == "email" => custom.email = Some(t),
             (Value::Text(s), Value::Bool(b)) if s == "email_verified" => {
                 custom.email_verified = Some(b)
+            }
+            (Value::Text(s), Value::Bool(b)) if s == "arkavo_apple_linked" => {
+                custom.arkavo_apple_linked = Some(b)
             }
             (Value::Text(s), Value::Text(t)) if s == "arkavo_account_id" => {
                 custom.arkavo_account_id = Some(t)

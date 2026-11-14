@@ -374,9 +374,10 @@ pub async fn refresh_session(
     // Mint before rotating: a failure here leaves the credential unspent.
     let user = crate::oidc::AuthenticatedUser::webauthn(record.user_id, record.entitlements);
     let arkavo_user = crate::oidc::arkavo_user_claims_rechecking(&app_state, &patreon, &user).await;
-    let mut claims = crate::authn::passkey_auth_claims(&app_state, &session.user_id)
-        .with_arkavo_user(&arkavo_user)
-        .with_auth_time(session.assertion_at);
+    let mut claims =
+        crate::authn::passkey_auth_claims(&app_state, &session.user_id, record.apple_linked)
+            .with_arkavo_user(&arkavo_user)
+            .with_auth_time(session.assertion_at);
     claims.exp = claims.exp.min(deadline);
     let token =
         crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).map_err(|e| {

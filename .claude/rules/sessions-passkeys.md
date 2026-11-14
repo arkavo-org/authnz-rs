@@ -36,6 +36,9 @@ paths:
   end the session. Every refusal is 401 `{"error":"session_ended","reason"}`.
 - `POST /session/signout`: device-key signature; deletes the row (204,
   idempotent).
+- A renewed token carries `arkavo_apple_linked` from the `credentials` row
+  it re-reads (`passkey_auth_claims`), so a link or unlink on another Mac
+  shows on the next renewal.
 - **A renewed token carries `auth_time` = the session's assertion time** and
   `exp` ≤ the 24 h deadline. Every "recent passkey assertion" check reads
   `cwt::passkey_assertion_time` (`auth_time` else `iat`): enrollment,

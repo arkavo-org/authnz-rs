@@ -46,6 +46,14 @@ paths:
   `identity_links` table. Idempotent on repeat; returns HTTP 409 if the same
   Apple `sub` is already linked to a different arkavo user. **Minimum-PII**:
   no email/name/relay claims are persisted, even if Apple sends them.
+  Once the id_token is verified, and before anything is linked, the
+  account's `apple_linked_at` is set (`mark_apple_linked`, `LIVE_ROW`; 401
+  on a deleted account), so no passkey token says
+  `arkavo_apple_linked: false` while a link exists. Every Apple link write
+  must come after it, and is followed by a second mark
+  (`mark_linked_again`): an unlink from another device during the code
+  exchange finds no link and clears the first. A link that fails leaves
+  the mark.
   With token revocation configured (`apple_tokens.rs`) the body must also
   carry `authorization_code` (400 `authorization_code_required` otherwise).
   The server exchanges it at Apple's `/auth/token` (client secret: ES256,
@@ -88,7 +96,10 @@ paths:
   on the `credentials` row, **before** anything is removed; each token-less
   link deleted on `user_id = :uid AND HOLDS_NO_TOKEN` (one that gained a
   token meanwhile stays); each stored token revoked with Apple, then its
-  link deleted (`delete_apple_link`). Answers:
+  link deleted (`delete_apple_link`); once no Apple link is left (also
+  when there was none), `apple_linked_at` is removed unless a link was
+  marked since the unlink began (`clear_apple_linked`; a failure there is
+  logged and the answer is still 204). Answers:
   - 204 unlinked, or nothing linked;
   - 401 bad token or deleted account (the sweep removes a deleted
     account's links);

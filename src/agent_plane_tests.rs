@@ -92,7 +92,8 @@ impl Plane {
             .put_user_entitlements(&user.user_id, &ents)
             .await
             .unwrap();
-        let token = crate::authn::mint_auth_token(&self.state, &user.user_id, None, None).unwrap();
+        let token =
+            crate::authn::mint_auth_token(&self.state, &user.user_id, false, None, None).unwrap();
         (user.user_id, token)
     }
 

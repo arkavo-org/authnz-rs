@@ -192,8 +192,9 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     assert_eq!(snap.campaign_id.as_deref(), Some("creators-own-campaign"));
 
     // Passkey auth CWT.
-    let auth =
-        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+    let auth = decode(
+        &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
+    );
     assert!(has_publish(&auth), "auth CWT must carry it");
 
     // OIDC access token.
@@ -239,7 +240,8 @@ async fn qualifying_creator_gets_publish_on_auth_access_and_devicecheck_not_regi
     // ~99-year registration token: never.
     let cnf = crate::cwt::cnf_from_ed25519(&[5u8; 32], b"kid");
     let reg = decode(
-        &crate::authn::mint_registration_token(&f.state, &f.user_id, Some(&user), cnf).unwrap(),
+        &crate::authn::mint_registration_token(&f.state, &f.user_id, Some(&user), None, cnf)
+            .unwrap(),
     );
     assert!(!has_publish(&reg), "registration token must not carry it");
     assert_eq!(reg.custom.arkavo_entitlements, Some(f.stored.clone()));
@@ -262,8 +264,9 @@ async fn suspension_withholds_publish_until_lifted() {
     );
     // Membership is still reported; only the derived entitlement is withheld.
     assert!(user.patreon.is_some());
-    let auth =
-        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+    let auth = decode(
+        &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
+    );
     assert!(!has_publish(&auth));
 
     f.store
@@ -294,8 +297,9 @@ async fn the_publisher_campaign_owner_publishes_unless_suspended() {
         without_own_creator(&user, f.user_id),
         vec![ENTITLEMENT_CREATOR_PUBLISH.to_string()]
     );
-    let auth =
-        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+    let auth = decode(
+        &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
+    );
     assert!(has_publish(&auth), "auth CWT must carry it");
 
     f.suspend().await;
@@ -417,7 +421,7 @@ mod app_store_source {
                 .contains(&ENTITLEMENT_CREATOR_PUBLISH.to_string())
         );
         let auth = decode(
-            &crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap(),
+            &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
         );
         assert!(has_publish(&auth));
     }
@@ -699,7 +703,7 @@ async fn suspension_endpoint_auth_set_lift_and_audit_fields() {
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let user_cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, None, None).unwrap();
+    let user_cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, false, None, None).unwrap();
     let (s, _) = send(
         &app,
         req("PUT", f.user_id, Some(&user_cwt), Some(body.clone())),
@@ -816,7 +820,8 @@ async fn publish_is_never_delegable_to_an_agent() {
     };
     // The owner's auth CWT does carry it...
     let user = f.claims().await;
-    let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap();
+    let cwt =
+        crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap();
     assert!(has_publish(&decode(&cwt)));
     // ...but authorize delegates from the stored list, which never holds it.
     let app = crate::agent_plane_tests::router(f.state.clone());
@@ -907,7 +912,7 @@ async fn a_stored_copy_is_never_emitted_or_delegated() {
     );
 
     // And it cannot be delegated.
-    let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, None, None).unwrap();
+    let cwt = crate::authn::mint_auth_token(&f.state, &f.user_id, false, None, None).unwrap();
     let app = crate::agent_plane_tests::router(f.state.clone());
     let a = fresh_agent();
     let mut body = authorize_body(&a, "", false);
@@ -940,8 +945,9 @@ async fn entities_person_is_the_fresh_mint_view() {
         return;
     };
     let user = f.claims().await;
-    let token =
-        decode(&crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap());
+    let token = decode(
+        &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
+    );
 
     let app = Router::new()
         .route("/entities/:id", get(crate::entities::get_entity))
@@ -1200,7 +1206,7 @@ mod online_play_source {
 
         // The 1 h passkey auth CWT carries it.
         let auth = decode(
-            &crate::authn::mint_auth_token(&f.state, &f.user_id, Some(&user), None).unwrap(),
+            &crate::authn::mint_auth_token(&f.state, &f.user_id, false, Some(&user), None).unwrap(),
         );
         assert!(has_pass(&auth));
         assert!(auth.exp - auth.iat <= 3600);
@@ -1208,7 +1214,8 @@ mod online_play_source {
         // The ~99-year registration token never does.
         let cnf = crate::cwt::cnf_from_ed25519(&[5u8; 32], b"kid");
         let reg = decode(
-            &crate::authn::mint_registration_token(&f.state, &f.user_id, Some(&user), cnf).unwrap(),
+            &crate::authn::mint_registration_token(&f.state, &f.user_id, Some(&user), None, cnf)
+                .unwrap(),
         );
         assert!(!has_pass(&reg));
 

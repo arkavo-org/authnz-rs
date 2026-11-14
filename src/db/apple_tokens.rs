@@ -100,6 +100,27 @@ impl fmt::Debug for AppleTokensOfUser {
 /// such a session once this is set.
 const APPLE_UNLINKED_AT: &str = "apple_unlinked_at";
 
+/// The `credentials` attribute present while the account may have an Apple
+/// link: the time (unix milliseconds) of the last link attempt that got past
+/// the id_token check.
+/// Set before and after every Apple link write, removed only by an unlink
+/// that leaves no Apple link. A passkey token's `arkavo_apple_linked` reads
+/// it, so it errs toward present: a link that fails after it was set leaves
+/// it, and the unlink route (204 when nothing is linked) clears it.
+pub(super) const APPLE_LINKED_AT: &str = "apple_linked_at";
+
+/// Counts every mark of [`APPLE_LINKED_AT`] and is never removed. An unlink
+/// reads it before its scan and clears the mark only while it is unchanged,
+/// so a link marked during the unlink keeps its mark whatever the clocks
+/// say. Absent on a mark written by the backfill script.
+const APPLE_LINK_GENERATION: &str = "apple_link_generation";
+
+/// The Apple link mark as an unlink saw it before its scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppleLinkMark {
+    generation: Option<i64>,
+}
+
 impl DynamoDBStore {
     /// Link an Apple identity to `user_id` and store its sealed refresh token
     /// on the link, in one conditional update: the link and its token are
@@ -298,6 +319,105 @@ impl DynamoDBStore {
         Ok(())
     }
 
+    /// Record on the live `credentials` row that the account is linking Apple
+    /// at `now_ms` ([`APPLE_LINKED_AT`], unix milliseconds), and count it
+    /// ([`APPLE_LINK_GENERATION`]). Called before the link is written, so no
+    /// token can say "not linked" while a link exists, and again after.
+    /// `ConditionalConflict`: the account is deleted.
+    pub async fn mark_apple_linked(
+        &self,
+        user_id: &Uuid,
+        now_ms: i64,
+    ) -> Result<(), DynamoDBError> {
+        let table = &self.credentials_table;
+        self.client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("SET #at = :now ADD #gen :one")
+            .condition_expression(super::account::LIVE_ROW)
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_names("#gen", APPLE_LINK_GENERATION)
+            .expression_attribute_values(":now", n(now_ms))
+            .expression_attribute_values(":one", n(1))
+            .send()
+            .await
+            .map_err(|e| classify(e, table))?;
+        Ok(())
+    }
+
+    /// The account's Apple link mark, if it is marked (consistent read). An
+    /// unlink reads it before its scan and passes it to
+    /// [`Self::clear_apple_linked`].
+    pub async fn apple_link_mark(
+        &self,
+        user_id: &Uuid,
+    ) -> Result<Option<AppleLinkMark>, DynamoDBError> {
+        let table = &self.credentials_table;
+        let out = self
+            .client
+            .get_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .projection_expression("#at, #gen")
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_names("#gen", APPLE_LINK_GENERATION)
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| classify(e, table))?;
+        let Some(item) = out.item.filter(|item| item.contains_key(APPLE_LINKED_AT)) else {
+            return Ok(None);
+        };
+        Ok(Some(AppleLinkMark {
+            generation: item
+                .get(APPLE_LINK_GENERATION)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse().ok()),
+        }))
+    }
+
+    /// Remove [`APPLE_LINKED_AT`] after an unlink that left no Apple link,
+    /// only while the mark is still `seen`, the one the unlink read before its
+    /// scan: a link marked since then may have been written after the scan,
+    /// so its mark stays. `false` when it was kept or is gone.
+    pub async fn clear_apple_linked(
+        &self,
+        user_id: &Uuid,
+        seen: AppleLinkMark,
+    ) -> Result<bool, DynamoDBError> {
+        let table = &self.credentials_table;
+        let mut update = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("REMOVE #at")
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_names("#gen", APPLE_LINK_GENERATION);
+        let unchanged = match seen.generation {
+            Some(g) => {
+                update = update.expression_attribute_values(":gen", n(g));
+                "#gen = :gen"
+            }
+            None => "attribute_not_exists(#gen)",
+        };
+        let result = update
+            .condition_expression(format!(
+                "{} AND attribute_exists(#at) AND {unchanged}",
+                super::account::LIVE_ROW
+            ))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
+    }
+
     /// When the account last unlinked Apple, if ever (consistent read).
     pub async fn apple_unlinked_at(&self, user_id: &Uuid) -> Result<Option<i64>, DynamoDBError> {
         let table = &self.credentials_table;
@@ -316,6 +436,23 @@ impl DynamoDBStore {
             .item
             .and_then(|item| item.get(APPLE_UNLINKED_AT).cloned())
             .and_then(|v| v.as_n().ok().and_then(|n| n.parse().ok())))
+    }
+
+    /// Mark the account as `scripts/backfill-apple-linked.sh` does: the time
+    /// only, no generation.
+    #[cfg(test)]
+    pub(crate) async fn backfill_apple_link_mark(&self, user_id: &Uuid, at_ms: i64) {
+        self.client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("SET #at = :at")
+            .condition_expression(super::account::LIVE_ROW)
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_values(":at", n(at_ms))
+            .send()
+            .await
+            .unwrap();
     }
 
     /// Write an arbitrary identity link item, to plant a malformed row.

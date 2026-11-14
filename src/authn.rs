@@ -432,7 +432,11 @@ pub async fn finish_register(
             // `X-Auth-Token` for the now-non-empty credential list, locking
             // the user out. A claims-less account token still works for
             // `POST /authenticate`, which mints a fully-claimed auth token.
-            let (arkavo_user, handle) = match app_state.db_store.get_user_by_id(&user_id).await {
+            let (arkavo_user, handle, apple_linked) = match app_state
+                .db_store
+                .get_user_by_id(&user_id)
+                .await
+            {
                 Ok(Some(record)) => {
                     let user = crate::oidc::AuthenticatedUser::webauthn(
                         record.user_id,
@@ -441,6 +445,7 @@ pub async fn finish_register(
                     (
                         Some(crate::oidc::arkavo_user_claims(&app_state, &patreon, &user).await),
                         Some(record.handle),
+                        Some(record.apple_linked),
                     )
                 }
                 Ok(None) => {
@@ -449,7 +454,7 @@ pub async fn finish_register(
                          without arkavo claims",
                         user_id
                     );
-                    (None, None)
+                    (None, None, None)
                 }
                 Err(e) => {
                     error!(
@@ -457,14 +462,20 @@ pub async fn finish_register(
                          account token without arkavo claims",
                         user_id, e
                     );
-                    (None, None)
+                    (None, None, None)
                 }
             };
             // The handle `create_user` stored. Unreadable, it is the one a
             // registration issues, which is what was stored.
             let handle = handle.unwrap_or_else(|| crate::db::handle_for_new_account(&username));
 
-            let token = mint_registration_token(&app_state, &user_id, arkavo_user.as_ref(), cnf)?;
+            let token = mint_registration_token(
+                &app_state,
+                &user_id,
+                arkavo_user.as_ref(),
+                apple_linked,
+                cnf,
+            )?;
 
             // did:webvh passport: build (and, with the `webvh` feature + a KMS
             // signer, sign + persist) the DID log for this passkey. Non-fatal —
@@ -829,7 +840,13 @@ async fn signed_in(
     let arkavo_user = crate::oidc::arkavo_user_claims_rechecking(app_state, patreon, &user).await;
     // Generate CWT auth token (1-hour, no cnf binding at this point;
     // cnf binding is added in Task 15 once the passkey is retrieved from DB).
-    let token = mint_auth_token(app_state, &record.user_id, Some(&arkavo_user), None)?;
+    let token = mint_auth_token(
+        app_state,
+        &record.user_id,
+        record.apple_linked,
+        Some(&arkavo_user),
+        None,
+    )?;
     info!("Authentication successful for user: {}", record.user_id);
 
     Ok((
@@ -899,6 +916,9 @@ impl AttestationEnvelope {
 
 /// Mint the WebAuthn auth CWT ([`PASSKEY_SESSION_TOKEN_SECONDS`]) for `user_id`.
 ///
+/// `apple_linked` is the account's `UserCredentials::apple_linked`, carried
+/// as `arkavo_apple_linked` (see [`passkey_auth_claims`]).
+///
 /// `arkavo_user` carries the per-user Arkavo custom claims
 /// (`arkavo_account_id`, `arkavo_roles`, `arkavo_entitlements`,
 /// `arkavo_patreon`) as derived by `oidc::arkavo_user_claims`, the same
@@ -908,10 +928,11 @@ impl AttestationEnvelope {
 pub fn mint_auth_token(
     app_state: &AppState,
     user_id: &Uuid,
+    apple_linked: bool,
     arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
     cnf: Option<crate::cwt::Cnf>,
 ) -> Result<String, WebauthnError> {
-    let mut claims = passkey_auth_claims(app_state, user_id);
+    let mut claims = passkey_auth_claims(app_state, user_id, apple_linked);
     if let Some(u) = arkavo_user {
         claims = claims.with_arkavo_user(u);
     }
@@ -924,10 +945,13 @@ pub fn mint_auth_token(
 
 /// The registered claims of a passkey auth CWT minted now, shared by
 /// [`mint_auth_token`] and the session renewal (#108) so the two stay one
-/// shape.
+/// shape. Every passkey auth CWT carries `arkavo_apple_linked`, `true` or
+/// `false`, never omitted: Creator decides from it whether to offer
+/// "Unlink Apple" on a Mac other than the one that linked.
 pub(crate) fn passkey_auth_claims(
     app_state: &AppState,
     user_id: &Uuid,
+    apple_linked: bool,
 ) -> crate::cwt::ArkavoClaims {
     let mut claims = crate::cwt::ArkavoClaims::auth(
         &app_state.issuer,
@@ -939,7 +963,8 @@ pub(crate) fn passkey_auth_claims(
     // fixed. Set it for parity with the OIDC access token, which always
     // carries `idp` — a verifier keying on it must see the same shape from
     // either token.
-    .with_idp(IDP_WEBAUTHN);
+    .with_idp(IDP_WEBAUTHN)
+    .with_arkavo_apple_linked(apple_linked);
     claims.exp = claims.iat + PASSKEY_SESSION_TOKEN_SECONDS;
     claims
 }
@@ -958,10 +983,17 @@ pub(crate) fn passkey_auth_claims(
 /// membership holds, and this token lives ~99 years. `finish_register` also
 /// runs when an existing account adds a passkey, so a qualifying user does
 /// reach this function.
+///
+/// `apple_linked` (the account's `UserCredentials::apple_linked`, read with
+/// the claims) is carried as `arkavo_apple_linked`, as on the auth token: a
+/// passkey added on another Mac yields this token. It holds at mint; a
+/// client takes the current value from its latest auth token. `None` only
+/// where `arkavo_user` is `None` too (the row could not be read).
 pub fn mint_registration_token(
     app_state: &AppState,
     user_id: &Uuid,
     arkavo_user: Option<&crate::cwt::ArkavoUserClaims>,
+    apple_linked: Option<bool>,
     cnf: crate::cwt::Cnf,
 ) -> Result<String, WebauthnError> {
     let mut claims = crate::cwt::ArkavoClaims::registration(
@@ -973,6 +1005,9 @@ pub fn mint_registration_token(
     .with_cnf(cnf);
     if let Some(u) = arkavo_user {
         claims = claims.with_arkavo_user(&u.stored_only());
+    }
+    if let Some(linked) = apple_linked {
+        claims = claims.with_arkavo_apple_linked(linked);
     }
     let bytes = crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid)?;
     Ok(crate::cwt::encode_for_header(&bytes))
@@ -1381,7 +1416,7 @@ mod tests {
         }
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token = mint_auth_token(&app_state, &user_id, None, None).expect("mint");
+        let token = mint_auth_token(&app_state, &user_id, false, None, None).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).expect("decode header");
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
         let sign1 = coset::CoseSign1::from_slice(inner).expect("parse COSE_Sign1");
@@ -1413,7 +1448,7 @@ mod tests {
             kid: b"cred-1".to_vec(),
         };
 
-        let token = mint_registration_token(&app_state, &user_id, None, cnf).expect("mint");
+        let token = mint_registration_token(&app_state, &user_id, None, None, cnf).expect("mint");
         let raw = crate::cwt::decode_from_header(&token).unwrap();
         let inner = crate::cwt::strip_cwt_tag(&raw).expect("CWT tag");
         let sign1 = coset::CoseSign1::from_slice(inner).unwrap();
@@ -1469,7 +1504,7 @@ mod tests {
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token = mint_auth_token(&app_state, &user_id, None, None).expect("mint");
+        let token = mint_auth_token(&app_state, &user_id, false, None, None).expect("mint");
         let claims = verify_inbound_account_token(&app_state, &token).expect("verify");
         assert_eq!(claims.sub, user_id.to_string());
     }
@@ -1531,7 +1566,7 @@ mod tests {
         };
 
         let auth = decode_claims(
-            &mint_auth_token(&app_state, &user_id, Some(&user), None).expect("mint auth"),
+            &mint_auth_token(&app_state, &user_id, false, Some(&user), None).expect("mint auth"),
         );
         let access = decode_claims(
             &crate::oidc::mint_access_token(
@@ -1622,7 +1657,7 @@ mod tests {
         };
 
         let claims = decode_claims(
-            &mint_registration_token(&app_state, &user_id, Some(&user), cnf).expect("mint"),
+            &mint_registration_token(&app_state, &user_id, Some(&user), None, cnf).expect("mint"),
         );
         assert_eq!(
             claims.custom.arkavo_account_id.as_deref(),
@@ -1655,11 +1690,51 @@ mod tests {
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
         let claims =
-            decode_claims(&mint_auth_token(&app_state, &user_id, None, None).expect("mint"));
+            decode_claims(&mint_auth_token(&app_state, &user_id, false, None, None).expect("mint"));
         assert!(claims.custom.arkavo_account_id.is_none());
         assert!(claims.custom.arkavo_roles.is_none());
         assert!(claims.custom.arkavo_entitlements.is_none());
         assert!(claims.custom.arkavo_patreon.is_none());
+    }
+
+    /// Creator reads `arkavo_apple_linked` from the raw CBOR map: a
+    /// top-level text key holding a CBOR boolean, on every passkey auth
+    /// token, `false` included.
+    #[tokio::test]
+    async fn every_auth_token_carries_arkavo_apple_linked_as_a_cbor_bool() {
+        use ciborium::value::Value;
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+        let user_id = uuid::Uuid::new_v4();
+        for linked in [true, false] {
+            let token = mint_auth_token(&app_state, &user_id, linked, None, None).unwrap();
+            assert_eq!(
+                crate::test_helpers::raw_claim(&token, "arkavo_apple_linked"),
+                Some(Value::Bool(linked))
+            );
+            assert_eq!(
+                decode_claims(&token).custom.arkavo_apple_linked,
+                Some(linked)
+            );
+        }
+
+        let cnf = || crate::cwt::cnf_from_ed25519(&[9u8; 32], b"kid");
+        let registration =
+            mint_registration_token(&app_state, &user_id, None, Some(true), cnf()).unwrap();
+        assert_eq!(
+            crate::test_helpers::raw_claim(&registration, "arkavo_apple_linked"),
+            Some(Value::Bool(true))
+        );
+        // Unread row: no Arkavo claims at all, this one included.
+        let bare = mint_registration_token(&app_state, &user_id, None, None, cnf()).unwrap();
+        assert_eq!(
+            crate::test_helpers::raw_claim(&bare, "arkavo_apple_linked"),
+            None
+        );
     }
 
     /// A detached session backed by an empty in-memory store.

@@ -94,9 +94,10 @@ arkavo-session-refresh-v1
 
 - The old credential is now spent. Store the new one before using the token.
 - `token` is a passkey auth CWT, the same shape as `POST /authenticate`'s,
-  with the entitlements, roles and publishing suspension read again now. It
-  adds `auth_time` = the time of the assertion that opened the session. Its
-  `exp` never passes `sessionExpiresAt`.
+  with the entitlements, roles, publishing suspension and
+  `arkavo_apple_linked` read again now. It adds `auth_time` = the time of
+  the assertion that opened the session. Its `exp` never passes
+  `sessionExpiresAt`.
 - A renewed token never counts as a recent passkey assertion: adding a
   passkey, account deletion, agent recovery and delegation, and OIDC
   `max_age` all read `auth_time`, not `iat`. Those still need a real sign-in.
@@ -162,6 +163,23 @@ changed by any of these. Every message the key signs starts with a fixed context
 line. A client library must never sign caller-supplied bytes with it: the
 sign-out message is only a context line and the session id, so raw signing
 would let another party obtain one.
+
+## `arkavo_apple_linked`
+
+Every passkey auth CWT, from `POST /authenticate` and from every
+`POST /session/refresh`, carries the top-level claim `arkavo_apple_linked`
+(text key, CBOR boolean): `true` while the account has a linked Apple ID,
+`false` otherwise. It is never omitted (0.42.0). Creator reads it to decide
+whether to offer "Unlink Apple" (`DELETE /oauth/apple/link`) on any Mac,
+not only the one that linked.
+
+- It is read when the token is minted. A link or unlink on another device
+  shows in this device's next renewal or sign-in.
+- It may be `true` with nothing linked, after a link attempt that failed.
+  The unlink then answers `204` and later tokens say `false`. It is never
+  `false` while a link exists.
+- The ~99-year registration token from `POST /register` carries the value
+  at registration. Read the current value from the latest auth token.
 
 ## Server notes
 

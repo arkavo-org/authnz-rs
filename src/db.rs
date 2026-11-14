@@ -61,6 +61,11 @@ pub struct UserCredentials {
     /// list attribute; rows written before the attribute existed get
     /// [`crate::constants::DEFAULT_USER_ENTITLEMENTS`].
     pub entitlements: Vec<String>,
+    /// Whether the account may have a linked Apple ID: the `apple_linked_at`
+    /// attribute is present (`db/apple_tokens.rs`). A passkey token carries
+    /// it as `arkavo_apple_linked`.
+    #[serde(default)]
+    pub apple_linked: bool,
 }
 
 /// Delegation of a human (PE) or agent to an agent NPE identified by did:key.
@@ -859,6 +864,7 @@ impl DynamoDBStore {
             credentials: Vec::new(),
             did: did.to_string(),
             entitlements: self.default_entitlements.clone(),
+            apple_linked: false,
         };
 
         // Try to create user record first
@@ -1193,6 +1199,7 @@ impl DynamoDBStore {
             credentials,
             did,
             entitlements,
+            apple_linked: item.contains_key(apple_tokens::APPLE_LINKED_AT),
         })
     }
 
@@ -2532,6 +2539,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            apple_linked: false,
         };
 
         assert_eq!(user.username, "testuser");
@@ -2551,6 +2559,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            apple_linked: false,
         };
 
         // Serialize to JSON

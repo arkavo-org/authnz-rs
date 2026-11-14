@@ -1987,8 +1987,8 @@ mod tests {
             derived_entitlements: vec![],
             patreon: None,
         };
-        let token =
-            crate::authn::mint_auth_token(&app_state, &user_id, Some(&user), None).expect("mint");
+        let token = crate::authn::mint_auth_token(&app_state, &user_id, false, Some(&user), None)
+            .expect("mint");
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", token.parse().unwrap());
         // The token checks alone: the account lookup that follows them in
@@ -2017,8 +2017,9 @@ mod tests {
             derived_entitlements: vec![],
             patreon: None,
         };
-        let token = crate::authn::mint_registration_token(&app_state, &user_id, Some(&user), cnf)
-            .expect("mint");
+        let token =
+            crate::authn::mint_registration_token(&app_state, &user_id, Some(&user), None, cnf)
+                .expect("mint");
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", token.parse().unwrap());
         let err = authenticate_human(&app_state, &headers)

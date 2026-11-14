@@ -1108,7 +1108,7 @@ impl LinkFixture {
             .await
             .unwrap()
             .user_id;
-        let token = crate::authn::mint_auth_token(&self.state, &id, None, None).unwrap();
+        let token = crate::authn::mint_auth_token(&self.state, &id, false, None, None).unwrap();
         (id, token)
     }
 

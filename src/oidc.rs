@@ -2592,9 +2592,14 @@ pub(crate) mod tests {
             .to_public_key_der()
             .unwrap();
         let cnf = crate::cwt::cnf_from_app_attest(spki.as_bytes(), &[7u8; 32]).unwrap();
-        let token =
-            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf.clone()))
-                .unwrap();
+        let token = crate::authn::mint_auth_token(
+            &app_state,
+            &uid,
+            false,
+            Some(&claims),
+            Some(cnf.clone()),
+        )
+        .unwrap();
         assert!(token.len() < 48 * 1024, "{} bytes", token.len());
 
         // The worst creator: the same memberships and a 40-tier campaign with
@@ -2629,7 +2634,8 @@ pub(crate) mod tests {
             .count();
         assert_eq!(owned_tier_values, 80);
         let token =
-            crate::authn::mint_auth_token(&app_state, &uid, Some(&claims), Some(cnf)).unwrap();
+            crate::authn::mint_auth_token(&app_state, &uid, false, Some(&claims), Some(cnf))
+                .unwrap();
         assert!(token.len() < 60 * 1024, "{} bytes", token.len());
     }
 
@@ -4202,8 +4208,8 @@ pub(crate) mod tests {
 
         let app_state = crate::test_helpers::build_test_app_state().await;
         let user_id = uuid::Uuid::new_v4();
-        let token =
-            crate::authn::mint_auth_token(&app_state, &user_id, None, None).expect("mint cwt");
+        let token = crate::authn::mint_auth_token(&app_state, &user_id, false, None, None)
+            .expect("mint cwt");
 
         let oidc = OidcConfig {
             issuer: "https://identity.arkavo.net".into(),
@@ -4382,7 +4388,8 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let auth = crate::authn::mint_auth_token(&app_state, &user.user_id, None, None).unwrap();
+        let auth =
+            crate::authn::mint_auth_token(&app_state, &user.user_id, false, None, None).unwrap();
         let mut unlisted = closurekb_authorize_query();
         unlisted.scope = Some("openid agents:delegate".into());
         unlisted.idp = None;
@@ -4457,14 +4464,16 @@ pub(crate) mod tests {
         // A registration CWT is a WebAuthn token too, but not an assertion.
         let cnf = crate::cwt::cnf_from_ed25519(&[7u8; 32], b"kid");
         let registration =
-            crate::authn::mint_registration_token(&app_state, &user.user_id, None, cnf).unwrap();
+            crate::authn::mint_registration_token(&app_state, &user.user_id, None, None, cnf)
+                .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", registration.parse().unwrap());
         let resp = call_authorize(&app_state, headers, edge_delegate_query(), &codes).await;
         assert_eq!(redirect_error(&resp).as_deref(), Some("invalid_scope"));
 
         // The 1-hour auth CWT from POST /authenticate is.
-        let auth = crate::authn::mint_auth_token(&app_state, &user.user_id, None, None).unwrap();
+        let auth =
+            crate::authn::mint_auth_token(&app_state, &user.user_id, false, None, None).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("X-Auth-Token", auth.parse().unwrap());
         let resp = call_authorize(&app_state, headers, edge_delegate_query(), &codes).await;
