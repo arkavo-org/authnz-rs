@@ -780,7 +780,8 @@ pub async fn apple_idtoken_handler(
 ///
 /// Once the id_token is verified, and before either path writes, the
 /// account's `apple_linked_at` is set: its passkey tokens then carry
-/// `arkavo_apple_linked: true`. A link that fails afterwards leaves it set.
+/// `arkavo_apple_linked: true`. It is set again once the link is written.
+/// A link that fails afterwards leaves it set.
 ///
 /// Apple's revoke ends the whole authorization for an Apple ID and client,
 /// including a token stored for it earlier, so the cases differ:
@@ -918,6 +919,7 @@ async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Re
     let sub_prefix = subject_prefix(&link.claims.sub);
     match db.link_identity(user_id, "apple", &link.claims.sub).await {
         Ok(()) => {
+            mark_linked_again(db, &user_id).await;
             // Audit trail: subject_prefix (not full sub) is enough to triangulate
             // with the DDB row during incident response without leaking the
             // pseudonymous identifier into logs.
@@ -941,6 +943,21 @@ async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Re
             error!("Failed to link Apple identity: {}", e);
             AppleSigninError::Internal("identity_link_write_failed".to_string()).into_response()
         }
+    }
+}
+
+/// Mark the account as linked again once its link is written. An unlink from
+/// another device that ran between the first mark and the write found no link
+/// and may have cleared the mark; this one is newer than that unlink's start,
+/// so it stands. On a deleted account it is refused, which the caller's own
+/// checks handle; any other failure is logged, and the first mark may stand.
+async fn mark_linked_again(db: &crate::db::DynamoDBStore, user_id: &Uuid) {
+    match db
+        .mark_apple_linked(user_id, Utc::now().timestamp_millis())
+        .await
+    {
+        Ok(()) | Err(crate::db::DynamoDBError::ConditionalConflict) => {}
+        Err(e) => error!("Marking the Apple link of {} again failed: {}", user_id, e),
     }
 }
 
@@ -1045,7 +1062,7 @@ async fn link_with_token(
         .link_apple_with_token(user_id, sub, client_id, &sealed, Utc::now().timestamp())
         .await
     {
-        Ok(()) => {}
+        Ok(()) => mark_linked_again(db, &user_id).await,
         Err(crate::db::DynamoDBError::LinkConflict) => {
             // Another account's link holds this Apple authorization, and that
             // account's deletion revokes it if the link stored a token.

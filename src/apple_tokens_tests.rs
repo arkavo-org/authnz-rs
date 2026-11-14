@@ -1338,3 +1338,40 @@ async fn the_mark_needs_a_live_account_and_survives_a_later_link() {
         "already clear"
     );
 }
+
+/// An unlink from another device that runs while a link's code exchange is
+/// in flight finds nothing and clears the mark; the link, written after it,
+/// marks the account again, so its tokens never say "not linked".
+#[tokio::test]
+async fn an_unlink_during_a_links_exchange_does_not_unmark_the_link() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let sub = new_sub();
+    let (cookie, nonce) = h.nonce().await;
+    h.apple_returns("rt-1", &sub, Some(&nonce));
+    let id_token = h.id_token(&sub, Some(&nonce));
+    let gate = h.stub.hold_next_token_reply();
+    let ((st, body), ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(h.post_link(&cookie, &cwt, &id_token, Some("code")), async {
+            gate.wait().await; // marked; the exchange is in flight
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let (st, body, _) = h.unlink(Some(&cwt)).await;
+            assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+            assert!(!apple_linked(&h, &uid).await, "the unlink cleared the mark");
+            gate.wait().await;
+        })
+    })
+    .await
+    .expect("the link request never reached Apple's token endpoint");
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        h.store.get_identity_link("apple", &sub).await.unwrap(),
+        Some(uid)
+    );
+    assert!(
+        apple_linked(&h, &uid).await,
+        "the link marked the account again"
+    );
+}

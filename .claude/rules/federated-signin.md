@@ -50,7 +50,10 @@ paths:
   account's `apple_linked_at` is set (`mark_apple_linked`, `LIVE_ROW`; 401
   on a deleted account), so no passkey token says
   `arkavo_apple_linked: false` while a link exists. Every Apple link write
-  must come after it; a link that fails afterwards leaves it.
+  must come after it, and is followed by a second mark
+  (`mark_linked_again`): an unlink from another device during the code
+  exchange finds no link and clears the first. A link that fails leaves
+  the mark.
   With token revocation configured (`apple_tokens.rs`) the body must also
   carry `authorization_code` (400 `authorization_code_required` otherwise).
   The server exchanges it at Apple's `/auth/token` (client secret: ES256,

@@ -15,11 +15,14 @@ LINKS=${DYNAMODB_IDENTITY_LINKS_TABLE:-identity_links}
 CREDS=${DYNAMODB_CREDENTIALS_TABLE:-credentials}
 export AWS_PAGER=
 
-ids=$(aws dynamodb scan --table-name "$LINKS" --consistent-read \
+# Its own command, so a wrong table or credentials fail the script.
+found=$(aws dynamodb scan --table-name "$LINKS" --consistent-read \
   --filter-expression 'begins_with(link_pk, :p)' \
   --expression-attribute-values '{":p":{"S":"apple#"}}' \
   --projection-expression user_id \
-  --query 'Items[].user_id.S' --output text | tr '\t' '\n' | grep -v '^None$' | sort -u || true)
+  --query 'Items[].user_id.S' --output text)
+ids=$(printf '%s\n' "$found" | tr '\t' '\n' | grep -v -e '^None$' -e '^$' | sort -u || true)
+echo "accounts with an Apple link: $(printf '%s\n' "$ids" | grep -c . || true)"
 
 now_ms=$(($(date +%s) * 1000))
 err=$(mktemp)
@@ -40,4 +43,4 @@ for id in $ids; do
     exit 1
   fi
 done
-echo "accounts with an Apple link: marked $marked, already marked or deleted $skipped"
+echo "marked $marked, already marked or deleted $skipped"
