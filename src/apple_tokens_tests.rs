@@ -1307,7 +1307,7 @@ async fn an_unlink_that_leaves_a_link_keeps_the_mark() {
 }
 
 /// The mark is written only onto a live account, and an unlink's clear
-/// keeps a mark made at or after the unlink began.
+/// keeps a mark made after the unlink read it, whatever its time says.
 #[tokio::test]
 async fn the_mark_needs_a_live_account_and_survives_a_later_link() {
     let Some(h) = Harness::new(true).await else {
@@ -1322,21 +1322,73 @@ async fn the_mark_needs_a_live_account_and_survives_a_later_link() {
         h.store.get_user_by_id(&ghost).await.unwrap().is_none(),
         "no row upserted"
     );
-    assert!(!h.store.clear_apple_linked(&ghost, 100).await.unwrap());
+    assert_eq!(h.store.apple_link_mark(&ghost).await.unwrap(), None);
 
     let (uid, _) = h.user().await;
+    assert_eq!(h.store.apple_link_mark(&uid).await.unwrap(), None);
+    h.store.mark_apple_linked(&uid, 200).await.unwrap();
+    let seen = h
+        .store
+        .apple_link_mark(&uid)
+        .await
+        .unwrap()
+        .expect("marked");
+    // A link on a host whose clock is behind marks it again, earlier.
     h.store.mark_apple_linked(&uid, 100).await.unwrap();
     assert!(
-        !h.store.clear_apple_linked(&uid, 100).await.unwrap(),
-        "marked at `since`"
+        !h.store.clear_apple_linked(&uid, seen).await.unwrap(),
+        "marked since it was read"
     );
     assert!(apple_linked(&h, &uid).await);
-    assert!(h.store.clear_apple_linked(&uid, 101).await.unwrap());
+
+    let seen = h
+        .store
+        .apple_link_mark(&uid)
+        .await
+        .unwrap()
+        .expect("marked");
+    assert!(h.store.clear_apple_linked(&uid, seen).await.unwrap());
     assert!(!apple_linked(&h, &uid).await);
+    assert_eq!(h.store.apple_link_mark(&uid).await.unwrap(), None);
     assert!(
-        !h.store.clear_apple_linked(&uid, 101).await.unwrap(),
+        !h.store.clear_apple_linked(&uid, seen).await.unwrap(),
         "already clear"
     );
+}
+
+/// A mark written by the backfill script (no generation) is cleared by an
+/// unlink that read it, and kept when a link marks it meanwhile.
+#[tokio::test]
+async fn a_backfilled_mark_is_cleared_only_while_unchanged() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let backfill = |uid: Uuid| {
+        let store = h.store.clone();
+        async move { store.backfill_apple_link_mark(&uid, 1).await }
+    };
+    let (uid, _) = h.user().await;
+    backfill(uid).await;
+    let seen = h
+        .store
+        .apple_link_mark(&uid)
+        .await
+        .unwrap()
+        .expect("marked");
+    h.store.mark_apple_linked(&uid, 2).await.unwrap();
+    assert!(!h.store.clear_apple_linked(&uid, seen).await.unwrap());
+    assert!(apple_linked(&h, &uid).await);
+
+    let (other, _) = h.user().await;
+    backfill(other).await;
+    let seen = h
+        .store
+        .apple_link_mark(&other)
+        .await
+        .unwrap()
+        .expect("marked");
+    assert!(h.store.clear_apple_linked(&other, seen).await.unwrap());
+    assert!(!apple_linked(&h, &other).await);
 }
 
 /// An unlink from another device that runs while a link's code exchange is

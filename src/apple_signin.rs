@@ -1181,8 +1181,9 @@ fn subject_prefix(sub: &str) -> &str {
 ///  4. each stored token is revoked with Apple (TN3194), then its link is
 ///     deleted. A token Apple did not revoke keeps its link;
 ///  5. once no Apple link is left (also when there was none), the account's
-///     `apple_linked_at` is removed, unless a link was marked since step 1,
-///     so its passkey tokens carry `arkavo_apple_linked: false`.
+///     `apple_linked_at` is removed, unless a link was marked since the
+///     mark was read before step 1 (its generation changed), so its passkey
+///     tokens carry `arkavo_apple_linked: false`.
 ///
 /// After it, the Apple IDs sign in nowhere, and every refresh token from an
 /// Apple sign-in fails; access tokens already issued run out (1 hour).
@@ -1217,19 +1218,22 @@ pub async fn apple_unlink_handler(
         warn!("audit identity_unlink outcome=rate_limited user_id={user_id} provider=apple");
         return AppleSigninError::RateLimited(after).into_response();
     }
-    // Before the scan: a link marked from here on may outlive this unlink.
-    let started_ms = Utc::now().timestamp_millis();
+    // Before the scan: a link marked from here on may outlive this unlink,
+    // and changes the mark, so the clear below keeps it.
+    let seen = app_state.db_store.apple_link_mark(&user_id).await;
     let unlinked = unlink_apple(&app_state.db_store, &apple_tokens, &user_id, now).await;
     if unlinked.is_ok() {
         // No Apple link is left: tokens minted from now on say so, unless a
         // link was marked since the unlink began. A failure keeps the mark
         // (a later unlink clears it).
-        if let Err(e) = app_state
-            .db_store
-            .clear_apple_linked(&user_id, started_ms)
-            .await
-        {
-            error!("Apple unlink: clearing the link mark of {user_id} failed: {e}");
+        match seen {
+            Ok(Some(seen)) => {
+                if let Err(e) = app_state.db_store.clear_apple_linked(&user_id, seen).await {
+                    error!("Apple unlink: clearing the link mark of {user_id} failed: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => error!("Apple unlink: reading the link mark of {user_id} failed: {e}"),
         }
     }
     match unlinked {

@@ -722,7 +722,10 @@ async fn a_renewed_token_says_whether_apple_is_linked_now() {
     for (step, want) in [("not linked", false), ("linked", true), ("unlinked", false)] {
         match step {
             "linked" => store.mark_apple_linked(&r.user_id, now).await.unwrap(),
-            "unlinked" => assert!(store.clear_apple_linked(&r.user_id, now + 1).await.unwrap()),
+            "unlinked" => {
+                let seen = store.apple_link_mark(&r.user_id).await.unwrap().unwrap();
+                assert!(store.clear_apple_linked(&r.user_id, seen).await.unwrap())
+            }
             _ => {}
         }
         let (st, renewed) = h.refresh(&device, &id, &credential).await;
