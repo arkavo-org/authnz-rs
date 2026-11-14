@@ -778,6 +778,10 @@ pub async fn apple_idtoken_handler(
 /// the token sealed in `apple_tokens` so that account deletion can revoke it
 /// (TN3194). Without that configuration a code is ignored.
 ///
+/// Once the id_token is verified, and before either path writes, the
+/// account's `apple_linked_at` is set: its passkey tokens then carry
+/// `arkavo_apple_linked: true`. A link that fails afterwards leaves it set.
+///
 /// Apple's revoke ends the whole authorization for an Apple ID and client,
 /// including a token stored for it earlier, so the cases differ:
 ///  - a code for another identity or ceremony (401): the new token is revoked;
@@ -856,6 +860,26 @@ pub async fn apple_link_handler(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+
+    // 4. Mark the account as linked before anything is linked, so no
+    //    passkey token says `arkavo_apple_linked: false` while a link exists.
+    //    A link that fails from here on leaves the mark: a stale `true` only
+    //    offers an unlink that answers 204.
+    match app_state
+        .db_store
+        .mark_apple_linked(&user_id, Utc::now().timestamp_millis())
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::db::DynamoDBError::ConditionalConflict) => {
+            return AppleSigninError::InvalidAuth.into_response();
+        }
+        Err(e) => {
+            error!("Marking the Apple link of {} failed: {}", user_id, e);
+            return AppleSigninError::Internal("identity_link_write_failed".to_string())
+                .into_response();
+        }
+    }
 
     let link = VerifiedLink {
         user_id,
@@ -1138,7 +1162,10 @@ fn subject_prefix(sub: &str) -> &str {
 ///  3. each link holding no token is deleted, only while it is still the
 ///     account's and still holds none;
 ///  4. each stored token is revoked with Apple (TN3194), then its link is
-///     deleted. A token Apple did not revoke keeps its link.
+///     deleted. A token Apple did not revoke keeps its link;
+///  5. once no Apple link is left (also when there was none), the account's
+///     `apple_linked_at` is removed, unless a link was marked since step 1,
+///     so its passkey tokens carry `arkavo_apple_linked: false`.
 ///
 /// After it, the Apple IDs sign in nowhere, and every refresh token from an
 /// Apple sign-in fails; access tokens already issued run out (1 hour).
@@ -1173,7 +1200,22 @@ pub async fn apple_unlink_handler(
         warn!("audit identity_unlink outcome=rate_limited user_id={user_id} provider=apple");
         return AppleSigninError::RateLimited(after).into_response();
     }
-    match unlink_apple(&app_state.db_store, &apple_tokens, &user_id, now).await {
+    // Before the scan: a link marked from here on may outlive this unlink.
+    let started_ms = Utc::now().timestamp_millis();
+    let unlinked = unlink_apple(&app_state.db_store, &apple_tokens, &user_id, now).await;
+    if unlinked.is_ok() {
+        // No Apple link is left: tokens minted from now on say so, unless a
+        // link was marked since the unlink began. A failure keeps the mark
+        // (a later unlink clears it).
+        if let Err(e) = app_state
+            .db_store
+            .clear_apple_linked(&user_id, started_ms)
+            .await
+        {
+            error!("Apple unlink: clearing the link mark of {user_id} failed: {e}");
+        }
+    }
+    match unlinked {
         Ok(0) => {
             info!("audit identity_unlink outcome=not_linked user_id={user_id} provider=apple");
             StatusCode::NO_CONTENT.into_response()

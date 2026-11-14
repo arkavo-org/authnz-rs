@@ -586,3 +586,47 @@ async fn an_account_scoped_start_refuses_another_accounts_credential_without_a_h
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, r#"{"token":""}"#);
 }
+
+/// Every token a passkey sign-in mints says whether the account has an Apple
+/// link, as a CBOR boolean, `false` included: Creator offers "Unlink Apple"
+/// from it on a Mac other than the one that linked.
+#[tokio::test]
+async fn a_sign_in_token_says_whether_apple_is_linked() {
+    use ciborium::value::Value;
+    let Some(Registered {
+        ceremony: c,
+        mut auth,
+        user_id,
+        cred,
+        token: registration,
+    }) = registered_account(&unique_name()).await
+    else {
+        return;
+    };
+    assert_eq!(
+        crate::test_helpers::raw_claim(&registration, "arkavo_apple_linked"),
+        Some(Value::Bool(false)),
+        "the registration token"
+    );
+
+    let mut sign_in = async || {
+        let options = start(&c, None).await;
+        let (status, body) = finish(
+            &c,
+            &answer_discoverable(&mut auth, options, &cred, Some(user_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = reply["token"].as_str().unwrap().to_string();
+        assert_eq!(verified_claims(&c, &token).sub, user_id.to_string());
+        crate::test_helpers::raw_claim(&token, "arkavo_apple_linked")
+    };
+
+    assert_eq!(sign_in().await, Some(Value::Bool(false)));
+    c.store
+        .mark_apple_linked(&user_id, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert_eq!(sign_in().await, Some(Value::Bool(true)));
+}

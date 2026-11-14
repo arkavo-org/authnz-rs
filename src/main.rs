@@ -2225,6 +2225,34 @@ pub(crate) mod test_helpers {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    /// The value of the top-level text key `key` in the payload of an
+    /// `X-Auth-Token` CWT, read from the raw CBOR as a client would, without
+    /// the server's claim decoder.
+    pub(crate) fn raw_claim(header_token: &str, key: &str) -> Option<ciborium::value::Value> {
+        use ciborium::value::Value;
+        let bytes = cwt::decode_from_header(header_token).expect("base64url");
+        let mut v: Value = ciborium::de::from_reader(bytes.as_slice()).expect("CBOR");
+        // CWT tag 61, then COSE_Sign1 tag 18 (or an untagged array).
+        while let Value::Tag(_, inner) = v {
+            v = *inner;
+        }
+        let Value::Array(parts) = v else {
+            panic!("not a COSE_Sign1");
+        };
+        let Some(Value::Bytes(payload)) = parts.get(2) else {
+            panic!("no payload");
+        };
+        let Value::Map(entries) =
+            ciborium::de::from_reader::<Value, _>(payload.as_slice()).expect("payload CBOR")
+        else {
+            panic!("the payload is not a map");
+        };
+        entries.into_iter().find_map(|(k, v)| match k {
+            Value::Text(t) if t == key => Some(v),
+            _ => None,
+        })
+    }
+
     /// A passkey auth CWT for `user` whose assertion happened `age` seconds ago.
     pub(crate) fn auth_cwt_aged(app_state: &AppState, user: uuid::Uuid, age: i64) -> String {
         let hours = crate::constants::AUTH_TOKEN_HOURS;

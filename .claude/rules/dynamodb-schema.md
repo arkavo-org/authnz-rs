@@ -62,6 +62,18 @@ paths:
   by the refresh grant, for an Apple refresh token that names no Apple `sub`
   (issued before 0.40.0), which it then refuses. Never removed by a request;
   the tombstone drops it.
+- **apple_linked_at** (Number, unix **milliseconds**, optional; 0.42.0):
+  present while the account may have an Apple link; every passkey auth
+  token carries its presence as `arkavo_apple_linked`
+  (`UserCredentials::apple_linked`). Set under `LIVE_ROW` by
+  `mark_apple_linked` once a link request's id_token is verified, before
+  any link is written; removed by `clear_apple_linked` only when
+  `DELETE /oauth/apple/link` leaves no Apple link, conditioned on
+  `apple_linked_at < ` the unlink's start, so a link marked meanwhile
+  stays. It errs toward present (a failed link leaves it; the unlink,
+  204 with nothing linked, clears it): a stale `false` would hide Creator's
+  "Unlink Apple". Links from before 0.42.0 were marked by
+  `scripts/backfill-apple-linked.sh`, run once at that deploy.
 - **GSI**: username-index (partition key: username)
 
 ### handles table

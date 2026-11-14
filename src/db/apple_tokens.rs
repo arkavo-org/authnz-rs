@@ -100,6 +100,15 @@ impl fmt::Debug for AppleTokensOfUser {
 /// such a session once this is set.
 const APPLE_UNLINKED_AT: &str = "apple_unlinked_at";
 
+/// The `credentials` attribute present while the account may have an Apple
+/// link: the time (unix milliseconds) of the last link attempt that got past
+/// the id_token check.
+/// Set before every Apple link write, removed only by an unlink that leaves
+/// no Apple link. A passkey token's `arkavo_apple_linked` reads it, so it
+/// errs toward present: a link that fails after it was set leaves it, and the
+/// unlink route (204 when nothing is linked) clears it.
+pub(super) const APPLE_LINKED_AT: &str = "apple_linked_at";
+
 impl DynamoDBStore {
     /// Link an Apple identity to `user_id` and store its sealed refresh token
     /// on the link, in one conditional update: the link and its token are
@@ -296,6 +305,60 @@ impl DynamoDBStore {
             .await
             .map_err(|e| classify(e, table))?;
         Ok(())
+    }
+
+    /// Record on the live `credentials` row that the account is linking Apple
+    /// at `now_ms` ([`APPLE_LINKED_AT`], unix milliseconds). Called before the
+    /// link is written, so no token can say "not linked" while a link exists.
+    /// `ConditionalConflict`: the account is deleted.
+    pub async fn mark_apple_linked(
+        &self,
+        user_id: &Uuid,
+        now_ms: i64,
+    ) -> Result<(), DynamoDBError> {
+        let table = &self.credentials_table;
+        self.client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("SET #at = :now")
+            .condition_expression(super::account::LIVE_ROW)
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_values(":now", n(now_ms))
+            .send()
+            .await
+            .map_err(|e| classify(e, table))?;
+        Ok(())
+    }
+
+    /// Remove [`APPLE_LINKED_AT`] after an unlink that began at `since_ms`
+    /// (unix milliseconds) left no Apple link, unless a link was marked at or
+    /// after `since_ms` (it may have been written after the unlink's scan, so
+    /// it stays). `false` when it was kept or absent.
+    pub async fn clear_apple_linked(
+        &self,
+        user_id: &Uuid,
+        since_ms: i64,
+    ) -> Result<bool, DynamoDBError> {
+        let table = &self.credentials_table;
+        let result = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key("user_id", s(&user_id.to_string()))
+            .update_expression("REMOVE #at")
+            .condition_expression(format!("{} AND #at < :since", super::account::LIVE_ROW))
+            .expression_attribute_names("#at", APPLE_LINKED_AT)
+            .expression_attribute_values(":since", n(since_ms))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
     }
 
     /// When the account last unlinked Apple, if ever (consistent read).

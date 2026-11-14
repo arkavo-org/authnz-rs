@@ -265,6 +265,7 @@ async fn deletion_needs_a_fresh_passkey_auth_token() {
         &p.state,
         &uid,
         None,
+        None,
         crate::cwt::cnf_from_ed25519(&[7u8; 32], b"kid"),
     )
     .unwrap();
@@ -279,7 +280,8 @@ async fn deletion_needs_a_fresh_passkey_auth_token() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // An account that never existed.
-    let ghost = crate::authn::mint_auth_token(&p.state, &Uuid::new_v4(), None, None).unwrap();
+    let ghost =
+        crate::authn::mint_auth_token(&p.state, &Uuid::new_v4(), false, None, None).unwrap();
     let (st, body) = delete_account(&app, &ghost).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{body}");
 

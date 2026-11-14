@@ -1176,7 +1176,7 @@ mod transactions_route {
         }
 
         pub(super) fn token(&self, id: &Uuid) -> String {
-            crate::authn::mint_auth_token(&self.state, id, None, None).unwrap()
+            crate::authn::mint_auth_token(&self.state, id, false, None, None).unwrap()
         }
 
         /// A token that carries the derived creator-publishing entitlement.
@@ -1188,7 +1188,7 @@ mod transactions_route {
                 derived_entitlements: vec![ENTITLEMENT_CREATOR_PUBLISH.into()],
                 patreon: None,
             };
-            crate::authn::mint_auth_token(&self.state, id, Some(&user), None).unwrap()
+            crate::authn::mint_auth_token(&self.state, id, false, Some(&user), None).unwrap()
         }
 
         pub(super) fn expired_token(&self, id: &Uuid) -> String {

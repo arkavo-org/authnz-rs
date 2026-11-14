@@ -102,7 +102,8 @@ impl Harness {
             )
             .await
             .unwrap();
-        let cwt = crate::authn::mint_auth_token(&self.state, &u.user_id, None, None).unwrap();
+        let cwt =
+            crate::authn::mint_auth_token(&self.state, &u.user_id, false, None, None).unwrap();
         (u.user_id, cwt)
     }
 
@@ -1095,7 +1096,7 @@ async fn a_stored_token_without_revocation_configured_is_kept() {
         StatusCode::OK
     );
     let off = Harness::build_with(crate::db::tests::local_store().unwrap(), Tokens::Off).await;
-    let cwt_off = crate::authn::mint_auth_token(&off.state, &uid, None, None).unwrap();
+    let cwt_off = crate::authn::mint_auth_token(&off.state, &uid, false, None, None).unwrap();
 
     let (status, body, _) = off.unlink(Some(&cwt_off)).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
@@ -1226,4 +1227,114 @@ async fn a_permanent_revocation_failure_is_reported_ahead_of_a_transient_one() {
                 .is_some()
         );
     }
+}
+
+/// Whether the account's passkey tokens would say Apple is linked.
+async fn apple_linked(h: &Harness, uid: &Uuid) -> bool {
+    h.store
+        .get_user_by_id(uid)
+        .await
+        .unwrap()
+        .expect("a live account")
+        .apple_linked
+}
+
+/// A link marks the account before it writes, with or without revocation,
+/// and an unlink that leaves nothing linked clears the mark.
+#[tokio::test]
+async fn a_link_marks_the_account_and_an_unlink_clears_it() {
+    for tokens_on in [true, false] {
+        let Some(h) = Harness::new(tokens_on).await else {
+            return;
+        };
+        let (uid, cwt) = h.user().await;
+        assert!(!apple_linked(&h, &uid).await, "a new account");
+
+        let code = tokens_on.then_some("code-1");
+        let (st, body) = h.link(&cwt, &new_sub(), code, "rt-1").await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(apple_linked(&h, &uid).await, "linked (tokens {tokens_on})");
+
+        let (st, body, _) = h.unlink(Some(&cwt)).await;
+        assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+        assert!(
+            !apple_linked(&h, &uid).await,
+            "unlinked (tokens {tokens_on})"
+        );
+    }
+}
+
+/// A link that fails after the mark leaves it (a stale `true` only offers an
+/// unlink), and the unlink, finding nothing, clears it.
+#[tokio::test]
+async fn a_failed_link_leaves_the_mark_for_the_unlink_to_clear() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (owner, owner_cwt) = h.user().await;
+    let (other, other_cwt) = h.user().await;
+    let sub = new_sub();
+    let (st, body) = h.link(&owner_cwt, &sub, Some("code-1"), "rt-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let (st, _) = h.link(&other_cwt, &sub, Some("code-2"), "rt-2").await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(apple_linked(&h, &other).await, "marked before the conflict");
+
+    let (st, body, _) = h.unlink(Some(&other_cwt)).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+    assert!(!apple_linked(&h, &other).await);
+    assert!(
+        apple_linked(&h, &owner).await,
+        "the owner's link is untouched"
+    );
+}
+
+/// A refused unlink (Apple did not revoke) keeps the mark: a link is left.
+#[tokio::test]
+async fn an_unlink_that_leaves_a_link_keeps_the_mark() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let (uid, cwt) = h.user().await;
+    let (st, body) = h.link(&cwt, &new_sub(), Some("code-1"), "rt-1").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    h.stub.reply_revoke(503, json!({}));
+    let (st, body, _) = h.unlink(Some(&cwt)).await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(apple_linked(&h, &uid).await);
+}
+
+/// The mark is written only onto a live account, and an unlink's clear
+/// keeps a mark made at or after the unlink began.
+#[tokio::test]
+async fn the_mark_needs_a_live_account_and_survives_a_later_link() {
+    let Some(h) = Harness::new(true).await else {
+        return;
+    };
+    let ghost = Uuid::new_v4();
+    assert!(matches!(
+        h.store.mark_apple_linked(&ghost, 100).await,
+        Err(crate::db::DynamoDBError::ConditionalConflict)
+    ));
+    assert!(
+        h.store.get_user_by_id(&ghost).await.unwrap().is_none(),
+        "no row upserted"
+    );
+    assert!(!h.store.clear_apple_linked(&ghost, 100).await.unwrap());
+
+    let (uid, _) = h.user().await;
+    h.store.mark_apple_linked(&uid, 100).await.unwrap();
+    assert!(
+        !h.store.clear_apple_linked(&uid, 100).await.unwrap(),
+        "marked at `since`"
+    );
+    assert!(apple_linked(&h, &uid).await);
+    assert!(h.store.clear_apple_linked(&uid, 101).await.unwrap());
+    assert!(!apple_linked(&h, &uid).await);
+    assert!(
+        !h.store.clear_apple_linked(&uid, 101).await.unwrap(),
+        "already clear"
+    );
 }

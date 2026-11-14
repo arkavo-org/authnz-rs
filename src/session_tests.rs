@@ -69,7 +69,7 @@ fn claims_of(state: &AppState, token: &str) -> crate::cwt::ArkavoClaims {
 /// A renewed passkey token for `user`: minted now, asserted `age` seconds ago.
 fn renewed_token(state: &AppState, user: Uuid, age: i64) -> String {
     let now = Utc::now().timestamp();
-    let claims = crate::authn::passkey_auth_claims(state, &user).with_auth_time(now - age);
+    let claims = crate::authn::passkey_auth_claims(state, &user, false).with_auth_time(now - age);
     crate::cwt::encode_for_header(
         &crate::cwt::mint(&claims, &state.cwt_signing_key, &state.cwt_kid).unwrap(),
     )
@@ -699,4 +699,42 @@ async fn signing_out_or_deleting_the_account_ends_the_session() {
         (st, reason(&b)),
         (StatusCode::UNAUTHORIZED, Some("account_deleted"))
     );
+}
+
+/// A renewal re-reads the account: its token says whether Apple is linked
+/// now, as a CBOR boolean, `false` included.
+#[tokio::test]
+async fn a_renewed_token_says_whether_apple_is_linked_now() {
+    use ciborium::value::Value;
+    let Some(r) = registered_account(&unique_name()).await else {
+        return;
+    };
+    let h = harness(&r);
+    let device = Device::new();
+    let sign_in = crate::test_helpers::auth_cwt_aged(&h.state, r.user_id, 10);
+    let (st, opened) = h.open(&sign_in, &device).await;
+    assert_eq!(st, StatusCode::CREATED, "{opened}");
+    let id = opened["sessionId"].as_str().unwrap().to_string();
+    let mut credential = opened["credential"].as_str().unwrap().to_string();
+
+    let store = &r.ceremony.store;
+    let now = Utc::now().timestamp_millis();
+    for (step, want) in [("not linked", false), ("linked", true), ("unlinked", false)] {
+        match step {
+            "linked" => store.mark_apple_linked(&r.user_id, now).await.unwrap(),
+            "unlinked" => assert!(store.clear_apple_linked(&r.user_id, now + 1).await.unwrap()),
+            _ => {}
+        }
+        let (st, renewed) = h.refresh(&device, &id, &credential).await;
+        assert_eq!(st, StatusCode::OK, "{step}: {renewed}");
+        assert_eq!(
+            crate::test_helpers::raw_claim(
+                renewed["token"].as_str().unwrap(),
+                "arkavo_apple_linked"
+            ),
+            Some(Value::Bool(want)),
+            "{step}"
+        );
+        credential = renewed["credential"].as_str().unwrap().to_string();
+    }
 }
