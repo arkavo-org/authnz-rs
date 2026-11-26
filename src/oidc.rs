@@ -114,6 +114,8 @@ pub struct OidcClaims {
     pub exp: i64,
     pub iat: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -241,6 +243,11 @@ pub struct RefreshTokenRecord {
     /// Absent on records issued before it was kept.
     #[serde(default)]
     pub upstream_subject: Option<String>,
+    /// Immutable Unix timestamp when this refresh-token session was originally
+    /// issued (carried unchanged across rotations). Prevents re-linking the
+    /// same Apple ID from reviving refresh tokens minted before an unlink.
+    #[serde(default)]
+    pub session_created_at: Option<i64>,
 }
 
 /// The relying-party-facing parameters of a validated authorize request —
@@ -258,7 +265,10 @@ pub struct AuthorizeRequest {
     pub code_challenge_method: Option<String>,
 }
 
-/// Redis-backed (with local in-memory fallback) authorization code store.
+/// Hard cap on local fallback entries when Redis is unavailable.
+const MAX_LOCAL_OIDC_ENTRIES: usize = 16_384;
+
+/// Redis-backed (with bounded local in-memory fallback) authorization code store.
 ///
 /// Authorization codes are short-lived (10 minutes) and single-use.
 #[derive(Clone)]
@@ -275,6 +285,26 @@ impl AuthorizationCodeStore {
         }
     }
 
+    fn lock_local(&self) -> std::sync::MutexGuard<'_, HashMap<String, AuthorizationCodeRecord>> {
+        self.local_fallback.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert_local(&self, code: String, record: AuthorizationCodeRecord) {
+        let mut map = self.lock_local();
+        let now = Utc::now().timestamp();
+        map.retain(|_, v| v.expires_at > now);
+        if map.len() >= MAX_LOCAL_OIDC_ENTRIES
+            && !map.contains_key(&code)
+            && let Some(evict) = map
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&evict);
+        }
+        map.insert(code, record);
+    }
+
     pub async fn insert(
         &self,
         code: String,
@@ -284,9 +314,9 @@ impl AuthorizationCodeStore {
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            let _: () = self
+            match self
                 .redis
-                .set(
+                .set::<(), _, _>(
                     &key,
                     value,
                     Some(fred::types::Expiration::EX(600)),
@@ -294,20 +324,36 @@ impl AuthorizationCodeStore {
                     false,
                 )
                 .await
-                .map_err(|e| format!("Redis set failed: {}", e))?;
-            Ok(())
+            {
+                Ok(()) => {
+                    self.lock_local().remove(&code);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("Redis set failed for authz code; falling back to local: {}", e);
+                }
+            }
         } else {
             log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
-            let mut map = self.local_fallback.lock().unwrap();
-            let now = Utc::now().timestamp();
-            map.retain(|_, v| v.expires_at > now);
-            map.insert(code, record);
-            Ok(())
         }
+        self.insert_local(code, record);
+        Ok(())
     }
 
     pub async fn take(&self, code: &str) -> Result<Option<AuthorizationCodeRecord>, String> {
         let key = format!("oidc:code:{}", code);
+        // Check local fallback first so codes stored during a Redis blip are
+        // still redeemable (and single-use) after Redis reconnects.
+        let local_record = { self.lock_local().remove(code) };
+        if let Some(record) = local_record {
+            if self.redis.is_connected() {
+                let _: Result<(), _> = self.redis.del(&key).await;
+            }
+            if record.expires_at < Utc::now().timestamp() {
+                return Ok(None);
+            }
+            return Ok(Some(record));
+        }
         if self.redis.is_connected() {
             // GETDEL so two concurrent token requests presenting the same code
             // cannot both win the race between a separate GET and DEL — an
@@ -328,21 +374,12 @@ impl AuthorizationCodeStore {
                 Ok(None)
             }
         } else {
-            log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
-            let mut map = self.local_fallback.lock().unwrap();
-            if let Some(record) = map.remove(code) {
-                if record.expires_at < Utc::now().timestamp() {
-                    return Ok(None);
-                }
-                Ok(Some(record))
-            } else {
-                Ok(None)
-            }
+            Ok(None)
         }
     }
 }
 
-/// Redis-backed (with local in-memory fallback) refresh token store.
+/// Redis-backed (with bounded local in-memory fallback) refresh token store.
 ///
 /// Stores SHA-256 hash of refresh tokens with 30-day automatic expiration.
 #[derive(Clone)]
@@ -359,6 +396,26 @@ impl RefreshTokenStore {
         }
     }
 
+    fn lock_local(&self) -> std::sync::MutexGuard<'_, HashMap<String, RefreshTokenRecord>> {
+        self.local_fallback.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert_local(&self, token_hash: String, record: RefreshTokenRecord) {
+        let mut map = self.lock_local();
+        let now = Utc::now().timestamp();
+        map.retain(|_, v| v.expires_at > now);
+        if map.len() >= MAX_LOCAL_OIDC_ENTRIES
+            && !map.contains_key(&token_hash)
+            && let Some(evict) = map
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&evict);
+        }
+        map.insert(token_hash, record);
+    }
+
     fn hash_token(&self, token: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
@@ -368,14 +425,15 @@ impl RefreshTokenStore {
     pub async fn insert(&self, token: &str, record: RefreshTokenRecord) -> Result<(), String> {
         let token_hash = self.hash_token(token);
         let key = format!("oidc:refresh:{}", token_hash);
-        let ttl_seconds = crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS;
+        let ttl_seconds = (record.expires_at - Utc::now().timestamp())
+            .clamp(1, crate::constants::REFRESH_TOKEN_LIFETIME_SECONDS);
 
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            let _: () = self
+            match self
                 .redis
-                .set(
+                .set::<(), _, _>(
                     &key,
                     value,
                     Some(fred::types::Expiration::EX(ttl_seconds)),
@@ -383,21 +441,38 @@ impl RefreshTokenStore {
                     false,
                 )
                 .await
-                .map_err(|e| format!("Redis set failed: {}", e))?;
-            Ok(())
+            {
+                Ok(()) => {
+                    self.lock_local().remove(&token_hash);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("Redis set failed for refresh token; falling back to local: {}", e);
+                }
+            }
         } else {
             log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
-            let mut map = self.local_fallback.lock().unwrap();
-            let now = Utc::now().timestamp();
-            map.retain(|_, v| v.expires_at > now);
-            map.insert(token_hash, record);
-            Ok(())
         }
+        self.insert_local(token_hash, record);
+        Ok(())
     }
 
     pub async fn take(&self, token: &str) -> Result<Option<RefreshTokenRecord>, String> {
         let token_hash = self.hash_token(token);
         let key = format!("oidc:refresh:{}", token_hash);
+
+        // Check local fallback first so tokens stored during a Redis blip
+        // remain redeemable (and single-use) after Redis reconnects.
+        let local_record = { self.lock_local().remove(&token_hash) };
+        if let Some(record) = local_record {
+            if self.redis.is_connected() {
+                let _: Result<(), _> = self.redis.del(&key).await;
+            }
+            if record.expires_at < Utc::now().timestamp() {
+                return Ok(None);
+            }
+            return Ok(Some(record));
+        }
 
         if self.redis.is_connected() {
             // GETDEL so refresh token rotation is actually single-use: a
@@ -419,16 +494,7 @@ impl RefreshTokenStore {
                 Ok(None)
             }
         } else {
-            log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
-            let mut map = self.local_fallback.lock().unwrap();
-            if let Some(record) = map.remove(&token_hash) {
-                if record.expires_at < Utc::now().timestamp() {
-                    return Ok(None);
-                }
-                Ok(Some(record))
-            } else {
-                Ok(None)
-            }
+            Ok(None)
         }
     }
 }
@@ -437,7 +503,10 @@ impl OidcConfig {
     /// `keys` is the CWT key set, so the JWKS and `cose-keys` list the same
     /// keys under the same `kid`s.
     pub fn from_env(keys: &crate::keys::KeySet) -> Result<Self, String> {
-        let issuer = env::var("OIDC_ISSUER").unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string());
+        let issuer = env::var("OIDC_ISSUER")
+            .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string())
+            .trim_end_matches('/')
+            .to_string();
 
         let jwks = keys
             .iter()
@@ -865,6 +934,26 @@ pub async fn authorize(
         }
     }
 
+    // Bound optional parameter lengths before storing in AuthorizationCodeStore
+    // or PendingAuthorizeStore (prevents memory DoS via unauthenticated
+    // GET /oauth/authorize?idp=google).
+    const MAX_PARAM_LEN: usize = 512;
+    if params.scope.as_deref().is_some_and(|s| s.len() > MAX_PARAM_LEN)
+        || params.state.as_deref().is_some_and(|s| s.len() > MAX_PARAM_LEN)
+        || params.nonce.as_deref().is_some_and(|s| s.len() > MAX_PARAM_LEN)
+        || params
+            .code_challenge
+            .as_deref()
+            .is_some_and(|s| s.len() > MAX_PARAM_LEN)
+    {
+        return redirect_error_to_client(
+            &params.redirect_uri,
+            None,
+            "invalid_request",
+            "authorize parameter exceeds maximum length",
+        );
+    }
+
     let request = AuthorizeRequest {
         client_id: client.client_id.clone(),
         redirect_uri: params.redirect_uri.clone(),
@@ -956,7 +1045,12 @@ pub(crate) async fn complete_authorization(
     if let Some(state) = request.state.as_deref() {
         pairs.push(("state", state));
     }
-    Redirect::temporary(&append_query(&request.redirect_uri, &pairs)).into_response()
+    let mut resp = Redirect::temporary(&append_query(&request.redirect_uri, &pairs)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 /// RFC 6749 §4.1.2.1: report an authorization failure to the relying party
@@ -971,7 +1065,12 @@ pub(crate) fn redirect_error_to_client(
     if let Some(state) = state {
         pairs.push(("state", state));
     }
-    Redirect::temporary(&append_query(redirect_uri, &pairs)).into_response()
+    let mut resp = Redirect::temporary(&append_query(redirect_uri, &pairs)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 /// The single refusal shape for a federated sign-in whose identity is not
@@ -1175,40 +1274,43 @@ async fn handle_authorization_code_grant(
             );
         }
         (None, _) => {
-            // Public client: require PKCE.
-            let challenge = match record.code_challenge.as_deref() {
-                Some(c) => c,
-                None => {
-                    return oidc_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request",
-                        "Public clients must use PKCE (code_challenge)",
-                    );
-                }
-            };
-            let verifier = match form.code_verifier.as_deref() {
-                Some(v) => v,
-                None => {
-                    return oidc_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request",
-                        "code_verifier is required for public clients",
-                    );
-                }
-            };
-            if !verify_pkce_s256(verifier, challenge) {
+            // Public clients must always present PKCE.
+            if record.code_challenge.is_none() {
                 return oidc_error_response(
                     StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "PKCE verification failed",
+                    "invalid_request",
+                    "Public clients must use PKCE (code_challenge)",
                 );
             }
         }
     }
 
-    if let Some(redirect_uri) = form.redirect_uri.as_deref()
-        && redirect_uri != record.redirect_uri
-    {
+    // RFC 7636 §4.6 / OAuth 2.1 §4.1.3: enforce PKCE whenever a
+    // code_challenge was bound to the authorization code, for both public
+    // AND confidential clients.
+    if let Some(challenge) = record.code_challenge.as_deref() {
+        let verifier = match form.code_verifier.as_deref() {
+            Some(v) => v,
+            None => {
+                return oidc_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "code_verifier is required when code_challenge was used",
+                );
+            }
+        };
+        if !verify_pkce_s256(verifier, challenge) {
+            return oidc_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "PKCE verification failed",
+            );
+        }
+    }
+
+    // RFC 6749 §4.1.3: redirect_uri was required at /oauth/authorize, so it
+    // must be present and match identically at /oauth/token.
+    if form.redirect_uri.as_deref() != Some(record.redirect_uri.as_str()) {
         return oidc_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -1216,11 +1318,68 @@ async fn handle_authorization_code_grant(
         );
     }
 
-    // The code was minted before the account may have been deleted (#88).
+    let mut record = record;
+    let code_issued_at = record.expires_at - AUTHORIZATION_CODE_LIFETIME_SECONDS;
+
+    // Re-read the account row: verify liveness, refresh stored entitlements,
+    // and verify any upstream Apple/Google identity link is still intact.
     if let Ok(user_id) = Uuid::parse_str(&record.user.arkavo_account_id) {
-        match app_state.db_store.is_account_live(&user_id).await {
-            Ok(true) => {}
-            Ok(false) => {
+        match app_state.db_store.get_user_by_id(&user_id).await {
+            Ok(Some(user)) => {
+                record.user.entitlements = user.entitlements;
+                let link_ok = match (record.user.idp.as_str(), record.user.upstream_subject.as_deref()) {
+                    ("apple", Some(sub)) => {
+                        let unlinked = match app_state.db_store.apple_unlinked_at(&user_id).await {
+                            Ok(ts) => ts.is_some_and(|t| t >= code_issued_at),
+                            Err(e) => {
+                                error!("authorization_code grant: apple unlink lookup failed: {}", e);
+                                return oidc_error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "temporarily_unavailable",
+                                    "account lookup failed",
+                                );
+                            }
+                        };
+                        if unlinked {
+                            false
+                        } else {
+                            match app_state.db_store.get_identity_link("apple", sub).await {
+                                Ok(owner) => owner == Some(user_id),
+                                Err(e) => {
+                                    error!("authorization_code grant: apple link lookup failed: {}", e);
+                                    return oidc_error_response(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "temporarily_unavailable",
+                                        "account lookup failed",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ("google", Some(sub)) => {
+                        match app_state.db_store.get_identity_link("google", sub).await {
+                            Ok(owner) => owner == Some(user_id),
+                            Err(e) => {
+                                error!("authorization_code grant: google link lookup failed: {}", e);
+                                return oidc_error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "temporarily_unavailable",
+                                    "account lookup failed",
+                                );
+                            }
+                        }
+                    }
+                    _ => true,
+                };
+                if !link_ok {
+                    return oidc_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "identity no longer linked",
+                    );
+                }
+            }
+            Ok(None) => {
                 return oidc_error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
@@ -1257,6 +1416,7 @@ async fn handle_authorization_code_grant(
         aud: record.client_id.clone(),
         exp: id_exp,
         iat: now,
+        auth_time: record.user.auth_time,
         nonce: record.nonce.clone(),
         email: record.user.email.clone(),
         email_verified: record.user.email_verified,
@@ -1336,6 +1496,7 @@ async fn handle_authorization_code_grant(
             name: record.user.name.clone(),
             auth_time: record.user.auth_time,
             upstream_subject: record.user.upstream_subject.clone(),
+            session_created_at: Some(now),
         };
         if let Err(err) = refresh_store.insert(&r_token, refresh_record).await {
             error!("Failed to store refresh token: {}", err);
@@ -1433,6 +1594,7 @@ async fn handle_client_credentials_grant(
         aud: client.client_id.clone(),
         exp,
         iat: now,
+        auth_time: None,
         nonce: None,
         email: None,
         email_verified: None,
@@ -1534,10 +1696,19 @@ async fn upstream_link_ended(
     record: &RefreshTokenRecord,
     user_id: &Uuid,
 ) -> Result<bool, crate::db::DynamoDBError> {
+    let session_born = record.session_created_at.unwrap_or(record.created_at);
     match (idp, record.upstream_subject.as_deref()) {
-        ("apple" | "google", Some(sub)) => {
-            Ok(db.get_identity_link(idp, sub).await? != Some(*user_id))
+        ("apple", Some(sub)) => {
+            if db
+                .apple_unlinked_at(user_id)
+                .await?
+                .is_some_and(|unlinked_at| unlinked_at >= session_born)
+            {
+                return Ok(true);
+            }
+            Ok(db.get_identity_link("apple", sub).await? != Some(*user_id))
         }
+        ("google", Some(sub)) => Ok(db.get_identity_link("google", sub).await? != Some(*user_id)),
         ("apple", None) => Ok(db.apple_unlinked_at(user_id).await?.is_some()),
         _ => Ok(false),
     }
@@ -1790,6 +1961,7 @@ async fn handle_refresh_token_grant(
         aud: record.client_id.clone(),
         exp: id_exp,
         iat: now,
+        auth_time: record.auth_time,
         nonce: None,
         email: record.email.clone(),
         email_verified: record.email_verified,
@@ -1857,6 +2029,7 @@ async fn handle_refresh_token_grant(
         name: record.name.clone(),
         auth_time: record.auth_time,
         upstream_subject: record.upstream_subject.clone(),
+        session_created_at: Some(record.session_created_at.unwrap_or(record.created_at)),
     };
     if let Err(err) = refresh_store
         .insert(&new_refresh_token, new_refresh_record)
@@ -2099,28 +2272,24 @@ async fn resolve_user(
     headers: &HeaderMap,
     params: &AuthorizeQuery,
 ) -> Result<AuthenticatedUser, AuthorizeError> {
-    // Prefer explicit idp hint.
-    if params.idp.as_deref() == Some("apple")
-        || params.id_token.is_some()
-        || headers.get("X-Apple-Id-Token").is_some()
-    {
-        let token = params
-            .id_token
-            .clone()
-            .or_else(|| {
-                headers
-                    .get("X-Apple-Id-Token")
-                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-            })
+    // Prefer explicit idp hint. Reject id_token in query parameters (URLs leak
+    // into proxy logs, browser history, and Referer headers); require the
+    // X-Apple-Id-Token header instead.
+    if params.id_token.is_some() {
+        return Err(AuthorizeError::InvalidAppleIdToken(
+            "id_token must be passed in the X-Apple-Id-Token header, not the query string".into(),
+        ));
+    }
+    if params.idp.as_deref() == Some("apple") || headers.get("X-Apple-Id-Token").is_some() {
+        let token = headers
+            .get("X-Apple-Id-Token")
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
             .ok_or_else(|| {
-                AuthorizeError::InvalidAppleIdToken("id_token is required for idp=apple".into())
+                AuthorizeError::InvalidAppleIdToken(
+                    "X-Apple-Id-Token header is required for idp=apple".into(),
+                )
             })?;
 
-        // For the authorize flow the OIDC `nonce` query parameter doubles as
-        // the Apple nonce: the client uses the same value when invoking Apple
-        // Sign In, Apple echoes it in the id_token, and we verify the match.
-        // We refuse to validate Apple tokens without a nonce — this is the
-        // mandatory anti-replay binding for the upstream Apple ceremony.
         let nonce = params
             .nonce
             .as_deref()
@@ -2130,6 +2299,33 @@ async fn resolve_user(
         }
 
         let apple_claims = apple_signin::verify_apple_id_token(apple, &token, nonce).await?;
+
+        // Single-use anti-replay cache: record the SHA-256 of the verified
+        // Apple id_token for its remaining lifetime so it can never be
+        // replayed across clients or redirect URIs even if its nonce claim is
+        // decoded from the JWT.
+        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let now = Utc::now().timestamp();
+        let remaining_ttl = (apple_claims.exp - now + crate::cwt::DEFAULT_SKEW_SECS).clamp(60, 86_400);
+        match app_state
+            .ephemeral_store
+            .mark_consumed_once("apple_authorize_idtoken", &token_hash, remaining_ttl)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AuthorizeError::InvalidAppleIdToken(
+                    "Apple id_token has already been used".into(),
+                ));
+            }
+            Err(e) => {
+                error!("Failed to record Apple id_token replay guard: {}", e);
+                return Err(AuthorizeError::Database(
+                    "replay protection unavailable".into(),
+                ));
+            }
+        }
+
         return apple_signin::resolve_apple_user(&app_state.db_store, &apple_claims)
             .await
             .map_err(|e| match e {
@@ -2222,6 +2418,45 @@ pub(crate) async fn resolve_from_arkavo_jwt(
         .with_auth_time(webauthn_auth_time(&claims)))
 }
 
+/// Decode an `application/x-www-form-urlencoded` component per RFC 6749 §2.3.1
+/// (`+` -> space, `%XX` -> byte) without splitting on unencoded `&` or `=`.
+fn form_url_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn extract_client_credentials(
     headers: &HeaderMap,
     form: &TokenForm,
@@ -2234,7 +2469,7 @@ fn extract_client_credentials(
         && let Ok(s) = std::str::from_utf8(&decoded)
         && let Some((id, secret)) = s.split_once(':')
     {
-        return (Some(id.to_string()), Some(secret.to_string()));
+        return (Some(form_url_decode(id)), Some(form_url_decode(secret)));
     }
     (form.client_id.clone(), form.client_secret.clone())
 }
@@ -2259,6 +2494,15 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
+    // RFC 7636 §4.1: code_verifier must be 43..=128 characters from
+    // ALPHA / DIGIT / "-" / "." / "_" / "~".
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return false;
+    }
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
@@ -3000,6 +3244,7 @@ pub(crate) mod tests {
             upstream_subject: None,
             expires_at: Utc::now().timestamp() + 600,
             created_at: Utc::now().timestamp(),
+            session_created_at: Some(Utc::now().timestamp()),
         };
         store.insert(token, record).await.unwrap();
         let taken = store.take(token).await.unwrap();
@@ -3266,6 +3511,7 @@ pub(crate) mod tests {
             aud: "opentdf".into(),
             exp: 0,
             iat: 0,
+            auth_time: None,
             nonce: None,
             email: None,
             email_verified: None,
@@ -3373,6 +3619,7 @@ pub(crate) mod tests {
             owner_kas_relay_client_ids: Arc::new(vec![]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
+            ephemeral_store: crate::ephemeral::EphemeralStore::new(test_redis()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -3461,6 +3708,7 @@ pub(crate) mod tests {
                 upstream_subject: upstream.map(Into::into),
                 expires_at: now + 3600,
                 created_at: now,
+                session_created_at: Some(now),
             };
             let store = refresh_store.clone();
             async move {
@@ -3627,6 +3875,7 @@ pub(crate) mod tests {
             owner_kas_relay_client_ids: Arc::new(vec![]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
+            ephemeral_store: crate::ephemeral::EphemeralStore::new(test_redis()),
         };
 
         let mut oidc = (*test_oidc_config()).clone();
@@ -3661,6 +3910,7 @@ pub(crate) mod tests {
             upstream_subject: None,
             expires_at: Utc::now().timestamp() + 3600,
             created_at: Utc::now().timestamp(),
+            session_created_at: Some(Utc::now().timestamp()),
         };
         refresh_store.insert(token, record).await.unwrap();
 
@@ -4005,6 +4255,7 @@ pub(crate) mod tests {
                     upstream_subject: None,
                     expires_at: Utc::now().timestamp() + 3600,
                     created_at: Utc::now().timestamp(),
+                    session_created_at: Some(Utc::now().timestamp()),
                 },
             )
             .await

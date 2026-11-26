@@ -525,24 +525,78 @@ pub fn is_held_by_every_account(fqn: &str) -> bool {
     fqn == ENTITLEMENT_MARKET_REQUEST || fqn == ENTITLEMENT_MARKET_PAY
 }
 
+/// Normalize an attribute FQN URL for prefix classification so non-canonical
+/// spellings (default `:443` port, trailing DNS dot, userinfo, percent-encoding)
+/// can never slip past `is_derived_only` or `is_never_stored`.
+fn normalize_fqn_for_check(fqn: &str) -> Option<String> {
+    let parsed = url::Url::parse(fqn).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.trim_end_matches('.');
+    // Percent-decode path segments so `%63reator` normalizes to `creator`.
+    let raw_path = parsed.path();
+    let decoded_path = percent_decode_ascii(raw_path);
+    Some(format!("https://{}{}", host.to_ascii_lowercase(), decoded_path))
+}
+
+fn percent_decode_ascii(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn fqn_starts_with(fqn: &str, prefix: &str) -> bool {
+    let raw_match = fqn
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix));
+    if raw_match {
+        return true;
+    }
+    normalize_fqn_for_check(fqn).is_some_and(|norm| {
+        norm.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 /// Whether `fqn` is a value of an attribute no account may store although
-/// it is not derived at mint ([`MARKET_ATTRIBUTE`]). ASCII case-insensitive,
-/// like [`is_derived_only`].
+/// it is not derived at mint ([`MARKET_ATTRIBUTE`]). ASCII case-insensitive
+/// and URL-normalization-aware, like [`is_derived_only`].
 pub fn is_never_stored(fqn: &str) -> bool {
-    fqn.get(..MARKET_ATTRIBUTE.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(MARKET_ATTRIBUTE))
+    fqn_starts_with(fqn, MARKET_ATTRIBUTE)
 }
 
 /// Whether `fqn` may only be derived at mint, never stored or delegated.
 ///
-/// ASCII case-insensitive: hosts are, and the platform lowercases FQNs, so
-/// `https://Patreon.arkavo.com/…` must not slip past as a storable value.
+/// ASCII case-insensitive and URL-normalization-aware: non-canonical URLs
+/// (explicit `:443`, trailing DNS dot, userinfo, `%`-encoding) cannot slip
+/// past as storable values.
 pub fn is_derived_only(fqn: &str) -> bool {
-    let starts = |prefix: &str| {
-        fqn.get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    };
-    starts(PATREON_ENTITLEMENT_NAMESPACE) || starts(CREATOR_ATTRIBUTE) || starts(NETWORK_ATTRIBUTE)
+    fqn_starts_with(fqn, PATREON_ENTITLEMENT_NAMESPACE)
+        || fqn_starts_with(fqn, CREATOR_ATTRIBUTE)
+        || fqn_starts_with(fqn, NETWORK_ATTRIBUTE)
 }
 
 /// Patreon OAuth scope a link must hold for its memberships to be readable.

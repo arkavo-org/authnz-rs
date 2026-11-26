@@ -71,6 +71,10 @@ use x509_parser::prelude::*;
 
 const SESSION_ATTEST_STATE_KEY: &str = "attest_state";
 const SESSION_ASSERT_STATE_KEY: &str = "assert_state";
+pub(crate) const EPH_NS_REG_CHALLENGE: &str = "dc_reg_challenge";
+pub(crate) const EPH_NS_REG_TICKET: &str = "dc_reg_ticket";
+const EPH_NS_ATTEST_STATE: &str = "dc_attest_state";
+const EPH_NS_ASSERT_STATE: &str = "dc_assert_state";
 
 // Cached parsed Apple root certificate data (initialized on first use)
 // Stores the DER-encoded certificate bytes to avoid lifetime issues
@@ -273,11 +277,17 @@ pub fn verify_attestation_at(
         return Err(DeviceCheckError::ChallengeMismatch);
     }
 
-    // Validate certificate chain
-    validate_certificate_chain_at(&attestation.att_stmt.x5c, now)?;
-
-    // Extract public key from certificate
-    let public_key = extract_public_key_from_cert(&attestation.att_stmt.x5c[0])?;
+    // Cheap structural/binding checks BEFORE expensive X.509 signature
+    // verification (prevents CPU DoS from unauthenticated callers sending
+    // bogus attestations).
+    if attestation.att_stmt.x5c.len() < 2
+        || attestation.att_stmt.x5c.len() > MAX_APP_ATTEST_CHAIN_LEN
+    {
+        return Err(DeviceCheckError::InvalidCertificateChain(format!(
+            "expected 2..={MAX_APP_ATTEST_CHAIN_LEN} certificates, got {}",
+            attestation.att_stmt.x5c.len()
+        )));
+    }
 
     // Parse authenticator data
     let auth_data = parse_authenticator_data(&attestation.auth_data)?;
@@ -291,15 +301,9 @@ pub fn verify_attestation_at(
     }
 
     // SECURITY: `rpIdHash` identifies the app that produced the attestation.
-    // Unenforced, any App Attest-capable app — not just ours — can mint
-    // bindings. Enforced only when `APP_ATTEST_APP_ID` is configured, so
-    // deployments that have not set it keep today's behaviour and a warning.
     let expected_app_ids = opts.expected_app_ids;
     if expected_app_ids.is_empty() {
         if opts.require_app_id {
-            // Admission control: an unset value would admit an attestation
-            // from any App Attest-capable app at all, so the gate refuses
-            // rather than warns.
             error!("APP_ATTEST_APP_ID is unset and this path requires it; refusing");
             return Err(DeviceCheckError::AppIdNotConfigured);
         }
@@ -317,17 +321,8 @@ pub fn verify_attestation_at(
         return Err(DeviceCheckError::AppIdMismatch);
     }
 
-    // SECURITY: bind the claimed key_id to the key Apple actually attested.
-    //
-    // key_id is caller-supplied and keys the registration budget. Without
-    // this, one genuine attestation could be presented under any key_id, and
-    // the per-key budget would bound nothing. Apple defines key_id as
-    // SHA256 of the credCert's public key, and authData's credentialId as
-    // that same hash. The key_id string must be its canonical (padded
-    // standard base64) encoding so one key cannot own two budget rows.
-    //
-    // Runs before the nonce compare: every tamper here also changes the
-    // nonce, and a check shadowed by NonceMismatch is a check nobody can test.
+    // SECURITY: bind the claimed key_id and aaguid to the attested credential
+    // before spending CPU verifying the certificate chain.
     let credential = parse_attested_credential(&attestation.auth_data)?;
     let Some(app_env) = AppEnv::from_aaguid(&credential.aaguid) else {
         return Err(DeviceCheckError::InvalidAaguid(hex::encode(
@@ -350,13 +345,6 @@ pub fn verify_attestation_at(
     nonce_data.extend_from_slice(&client_data_hash);
     let calculated_nonce = Sha256::digest(&nonce_data);
 
-    // SECURITY: bind the attestation to the challenge this server issued.
-    //
-    // The credCert carries the nonce Apple computed at attestation time in
-    // extension 1.2.840.113635.100.8.2, and the Secure Enclave signs the cert
-    // over it. Comparing it against our own SHA256(authData || clientDataHash)
-    // is what makes a captured attestation useless against a later challenge —
-    // every other check (chain, rpIdHash, counter) is satisfied by a replay.
     let cert_nonce = extract_attestation_nonce(&attestation.att_stmt.x5c[0])?;
     if cert_nonce.as_slice() != &calculated_nonce[..] {
         warn!(
@@ -367,6 +355,13 @@ pub fn verify_attestation_at(
         );
         return Err(DeviceCheckError::NonceMismatch);
     }
+
+    // Expensive cryptographic chain verification runs only after every cheap
+    // structural, rpIdHash, aaguid, key_id, and nonce check passes.
+    validate_certificate_chain_at(&attestation.att_stmt.x5c, now)?;
+
+    // Extract public key from verified leaf certificate
+    let public_key = extract_public_key_from_cert(&attestation.att_stmt.x5c[0])?;
 
     Ok(AttestedKey {
         key_id: key_id.to_string(),
@@ -496,9 +491,30 @@ pub fn preflight_error_mapping(err: &DeviceCheckError) -> (StatusCode, &'static 
 impl IntoResponse for PreflightRejection {
     fn into_response(self) -> axum::response::Response {
         let (status, error, retry_after) = preflight_error_mapping(&self.0);
+        // Never leak raw AWS/DynamoDB or internal session error strings to
+        // unauthenticated callers.
+        let error_description = match &self.0 {
+            DeviceCheckError::DynamoDBOperationError(db) => match **db {
+                DynamoDBError::AttestLifetimeCapExceeded => {
+                    "registration cap exceeded for this device".to_string()
+                }
+                DynamoDBError::RateLimited { .. } => {
+                    "too many registrations; try again later".to_string()
+                }
+                _ => {
+                    error!("Preflight storage error: {}", self.0);
+                    "device attestation temporarily unavailable".to_string()
+                }
+            },
+            DeviceCheckError::InvalidSessionState(_) | DeviceCheckError::SessionError(_) => {
+                warn!("Preflight session error: {}", self.0);
+                "invalid or expired attestation session".to_string()
+            }
+            other => other.to_string(),
+        };
         let body = PreflightErrorBody {
             error,
-            error_description: self.0.to_string(),
+            error_description,
         };
         let mut resp = (status, Json(body)).into_response();
         if let Some(secs) = retry_after
@@ -511,14 +527,58 @@ impl IntoResponse for PreflightRejection {
     }
 }
 
+/// Store a [`RegistrationTicket`] in the atomic ephemeral store and record its
+/// opaque handle in `session`. Replaces any prior ticket handle for this session.
+pub(crate) async fn store_registration_ticket(
+    app_state: &AppState,
+    session: &Session,
+    ticket: &RegistrationTicket,
+) -> Result<(), DeviceCheckError> {
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_REG_TICKET_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_REG_TICKET, &old_id)
+            .await;
+    }
+    let ttl = (ticket.expires_at - Utc::now().timestamp()).max(1);
+    let ticket_id = app_state
+        .ephemeral_store
+        .insert(EPH_NS_REG_TICKET, ticket, ttl)
+        .await
+        .map_err(DeviceCheckError::SessionError)?;
+    session
+        .insert(SESSION_REG_TICKET_KEY, ticket_id)
+        .await
+        .map_err(DeviceCheckError::InvalidSessionState)?;
+    Ok(())
+}
+
 /// Issue an attestation challenge to a caller with no account yet.
 ///
 /// Deliberately takes no username: pre-account, a username-keyed endpoint
 /// would tell an unauthenticated caller which handles exist.
-pub async fn register_challenge(session: Session) -> Result<impl IntoResponse, PreflightRejection> {
+pub async fn register_challenge(
+    Extension(app_state): Extension<AppState>,
+    session: Session,
+) -> Result<impl IntoResponse, PreflightRejection> {
     let challenge = generate_random_challenge();
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_REG_CHALLENGE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_REG_CHALLENGE, &old_id)
+            .await;
+    }
+    let challenge_id = app_state
+        .ephemeral_store
+        .insert(
+            EPH_NS_REG_CHALLENGE,
+            &challenge,
+            crate::ephemeral::DEVICE_CHECK_CHALLENGE_TTL_SECONDS,
+        )
+        .await
+        .map_err(DeviceCheckError::SessionError)?;
     session
-        .insert(SESSION_REG_CHALLENGE_KEY, challenge.clone())
+        .insert(SESSION_REG_CHALLENGE_KEY, challenge_id)
         .await
         .map_err(DeviceCheckError::InvalidSessionState)?;
     Ok(Json(ChallengeResponse { challenge }))
@@ -526,26 +586,26 @@ pub async fn register_challenge(session: Session) -> Result<impl IntoResponse, P
 
 /// Verify an attestation from an unregistered caller and issue a one-shot
 /// registration ticket.
-///
-/// **This does not gate registration.** `/register` does not require a ticket
-/// until Task 6, so a 200 here is not evidence that registration is protected.
 pub async fn register_attest(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Json(request): Json<AttestationRequest>,
 ) -> Result<impl IntoResponse, PreflightRejection> {
-    let challenge: String = session
+    let challenge_id: String = session
         .get(SESSION_REG_CHALLENGE_KEY)
         .await
         .map_err(DeviceCheckError::InvalidSessionState)?
         .ok_or(DeviceCheckError::CorruptSession)?;
 
-    // One challenge, one attempt — consumed whether or not what follows
-    // succeeds, so a caller cannot grind attestations against one challenge.
-    session
-        .remove_value(SESSION_REG_CHALLENGE_KEY)
+    // One challenge, one attempt — atomically consumed from the ephemeral
+    // store regardless of concurrent requests or response status.
+    let _ = session.remove_value(SESSION_REG_CHALLENGE_KEY).await;
+    let challenge: String = app_state
+        .ephemeral_store
+        .take(EPH_NS_REG_CHALLENGE, &challenge_id)
         .await
-        .map_err(|e| DeviceCheckError::SessionError(e.to_string()))?;
+        .map_err(DeviceCheckError::SessionError)?
+        .ok_or(DeviceCheckError::CorruptSession)?;
 
     let attested = verify_attestation(
         &challenge,
@@ -577,10 +637,7 @@ pub async fn register_attest(
         issued_at: now,
         expires_at: now + REG_TICKET_TTL_SECONDS,
     };
-    session
-        .insert(SESSION_REG_TICKET_KEY, ticket.clone())
-        .await
-        .map_err(DeviceCheckError::InvalidSessionState)?;
+    store_registration_ticket(&app_state, &session, &ticket).await?;
 
     info!(
         "Issued registration ticket for attested key_id {} (expires {})",
@@ -624,14 +681,24 @@ pub async fn generate_challenge(
     // Generate a random challenge (32 bytes = 256 bits)
     let challenge = generate_random_challenge();
 
-    // Store challenge in session for verification
-    if let Err(err) = session
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_ATTEST_STATE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_ATTEST_STATE, &old_id)
+            .await;
+    }
+    let state_id = app_state
+        .ephemeral_store
         .insert(
-            SESSION_ATTEST_STATE_KEY,
-            (username.clone(), user_id, challenge.clone()),
+            EPH_NS_ATTEST_STATE,
+            &(username.clone(), user_id, challenge.clone()),
+            crate::ephemeral::DEVICE_CHECK_CHALLENGE_TTL_SECONDS,
         )
         .await
-    {
+        .map_err(DeviceCheckError::SessionError)?;
+
+    // Store opaque challenge handle in session
+    if let Err(err) = session.insert(SESSION_ATTEST_STATE_KEY, state_id).await {
         error!("Failed to save attestation state: {:?}", err);
         return Err(DeviceCheckError::InvalidSessionState(err));
     }
@@ -651,22 +718,24 @@ pub async fn finish_attestation(
         request.key_id
     );
 
-    // Retrieve challenge from session. `user_id` was resolved from the CWT at
-    // challenge time, so the binding below cannot name an account the caller
-    // never authenticated as.
-    let (username, user_id, challenge): (String, Uuid, String) = session
+    // Retrieve and atomically consume challenge handle from ephemeral store.
+    let state_id: String = session
         .get(SESSION_ATTEST_STATE_KEY)
         .await?
         .ok_or_else(|| {
             error!("No attestation state found in session");
             DeviceCheckError::CorruptSession
         })?;
-
-    // Clean up session immediately to prevent reuse
-    if let Err(e) = session.remove_value(SESSION_ATTEST_STATE_KEY).await {
-        error!("Failed to remove attestation state from session: {}", e);
-        return Err(DeviceCheckError::SessionError(e.to_string()));
-    }
+    let _ = session.remove_value(SESSION_ATTEST_STATE_KEY).await;
+    let (username, user_id, challenge): (String, Uuid, String) = app_state
+        .ephemeral_store
+        .take(EPH_NS_ATTEST_STATE, &state_id)
+        .await
+        .map_err(DeviceCheckError::SessionError)?
+        .ok_or_else(|| {
+            error!("Attestation state expired or already consumed");
+            DeviceCheckError::CorruptSession
+        })?;
 
     let attested = verify_attestation(
         &challenge,
@@ -744,14 +813,24 @@ pub async fn generate_assertion_challenge(
     // Generate challenge
     let challenge = generate_random_challenge();
 
-    // Store challenge in session
-    if let Err(err) = session
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_ASSERT_STATE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_ASSERT_STATE, &old_id)
+            .await;
+    }
+    let state_id = app_state
+        .ephemeral_store
         .insert(
-            SESSION_ASSERT_STATE_KEY,
-            (username.clone(), user_id, challenge.clone()),
+            EPH_NS_ASSERT_STATE,
+            &(username.clone(), user_id, challenge.clone()),
+            crate::ephemeral::DEVICE_CHECK_CHALLENGE_TTL_SECONDS,
         )
         .await
-    {
+        .map_err(DeviceCheckError::SessionError)?;
+
+    // Store opaque handle in session
+    if let Err(err) = session.insert(SESSION_ASSERT_STATE_KEY, state_id).await {
         error!("Failed to save assertion state: {:?}", err);
         return Err(DeviceCheckError::InvalidSessionState(err));
     }
@@ -769,20 +848,24 @@ pub async fn finish_assertion(
 ) -> Result<impl IntoResponse, DeviceCheckError> {
     info!("Finishing assertion for key_id: {}", request.key_id);
 
-    // Retrieve challenge from session
-    let (username, session_user_id, challenge): (String, Uuid, String) = session
+    // Retrieve and atomically consume challenge handle from ephemeral store.
+    let state_id: String = session
         .get(SESSION_ASSERT_STATE_KEY)
         .await?
         .ok_or_else(|| {
             error!("No assertion state found in session");
             DeviceCheckError::CorruptSession
         })?;
-
-    // Clean up session
-    if let Err(e) = session.remove_value(SESSION_ASSERT_STATE_KEY).await {
-        error!("Failed to remove assertion state from session: {}", e);
-        return Err(DeviceCheckError::SessionError(e.to_string()));
-    }
+    let _ = session.remove_value(SESSION_ASSERT_STATE_KEY).await;
+    let (username, session_user_id, challenge): (String, Uuid, String) = app_state
+        .ephemeral_store
+        .take(EPH_NS_ASSERT_STATE, &state_id)
+        .await
+        .map_err(DeviceCheckError::SessionError)?
+        .ok_or_else(|| {
+            error!("Assertion state expired or already consumed");
+            DeviceCheckError::CorruptSession
+        })?;
 
     // Get device binding from database
     let binding = app_state
@@ -888,10 +971,14 @@ fn generate_random_challenge() -> String {
 /// leaf is valid for about three days, and a suite wired to the wall clock
 /// would start failing on a calendar date with no code change behind it —
 /// which is how people learn to ignore a red suite.
+/// Upper bound on certificates in an App Attest `x5c` chain (Apple sends
+/// leaf + 1 intermediate; cap at 4 to prevent CPU amplification).
+const MAX_APP_ATTEST_CHAIN_LEN: usize = 4;
+
 fn validate_certificate_chain_at(x5c: &[Vec<u8>], now: ASN1Time) -> Result<(), DeviceCheckError> {
-    if x5c.len() < 2 {
+    if x5c.len() < 2 || x5c.len() > MAX_APP_ATTEST_CHAIN_LEN {
         return Err(DeviceCheckError::InvalidCertificateChain(format!(
-            "expected leaf + intermediate, got {} certificate(s)",
+            "expected 2..={MAX_APP_ATTEST_CHAIN_LEN} certificates, got {}",
             x5c.len()
         )));
     }
@@ -917,6 +1004,60 @@ fn validate_certificate_chain_at(x5c: &[Vec<u8>], now: ASN1Time) -> Result<(), D
             return Err(DeviceCheckError::InvalidCertificateChain(format!(
                 "certificate expired or not yet valid: {}",
                 cert.subject()
+            )));
+        }
+    }
+
+    // Leaf must NOT be a CA certificate.
+    if let Ok(Some(bc)) = parsed[0].basic_constraints()
+        && bc.value.ca
+    {
+        return Err(DeviceCheckError::InvalidCertificateChain(
+            "leaf certificate must not be a CA".into(),
+        ));
+    }
+
+    // Every intermediate certificate must be a valid CA with BasicConstraints
+    // (ca == true, pathLenConstraint satisfied) and KeyUsage (keyCertSign).
+    for (idx, ca_cert) in parsed.iter().enumerate().skip(1) {
+        let bc = ca_cert
+            .basic_constraints()
+            .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?
+            .ok_or_else(|| {
+                DeviceCheckError::InvalidCertificateChain(format!(
+                    "intermediate CA {} missing BasicConstraints",
+                    ca_cert.subject()
+                ))
+            })?;
+        if !bc.value.ca {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "intermediate certificate {} is not a CA",
+                ca_cert.subject()
+            )));
+        }
+        // `idx - 1` intermediates sit between this CA and the leaf.
+        let intermediates_below = idx - 1;
+        if let Some(max_path_len) = bc.value.path_len_constraint
+            && intermediates_below > max_path_len as usize
+        {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "intermediate CA {} exceeds pathLenConstraint ({max_path_len})",
+                ca_cert.subject()
+            )));
+        }
+        let ku = ca_cert
+            .key_usage()
+            .map_err(|e| DeviceCheckError::InvalidCertificateChain(e.to_string()))?
+            .ok_or_else(|| {
+                DeviceCheckError::InvalidCertificateChain(format!(
+                    "intermediate CA {} missing KeyUsage",
+                    ca_cert.subject()
+                ))
+            })?;
+        if !ku.value.key_cert_sign() {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "intermediate CA {} lacks keyCertSign",
+                ca_cert.subject()
             )));
         }
     }
@@ -1517,20 +1658,20 @@ impl IntoResponse for DeviceCheckError {
             DeviceCheckError::InvalidToken => {
                 (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
             }
-            DeviceCheckError::DynamoDBOperationError(err) => match *err {
-                DynamoDBError::TableNotExists(table) => (
-                    StatusCode::BAD_REQUEST,
-                    format!("Service setup incomplete: {} table not configured", table),
-                ),
-                _ => (
-                    StatusCode::BAD_REQUEST,
-                    format!("Database operation failed: {}", err),
-                ),
-            },
-            DeviceCheckError::SessionError(err) => (
-                StatusCode::BAD_REQUEST,
-                format!("Session operation failed: {}", err),
-            ),
+            DeviceCheckError::DynamoDBOperationError(err) => {
+                error!("DeviceCheck DynamoDB error: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal storage error".to_string(),
+                )
+            }
+            DeviceCheckError::SessionError(err) => {
+                error!("DeviceCheck session error: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Session operation failed".to_string(),
+                )
+            }
             DeviceCheckError::InvalidAttestationObject(err) => (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid attestation object: {}", err),
@@ -1580,8 +1721,15 @@ mod tests {
         use tower::ServiceExt;
         use tower_sessions::{MemoryStore, SessionManagerLayer};
 
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
         let app = Router::new()
             .route("/device-check/register-challenge", get(register_challenge))
+            .layer(Extension(app_state))
             .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
 
         let resp = app

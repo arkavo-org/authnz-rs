@@ -55,8 +55,16 @@ fn opt_s(item: &HashMap<String, AttributeValue>, k: &str) -> Option<String> {
     item.get(k).and_then(|v| v.as_s().ok()).cloned()
 }
 
-fn opt_n(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
-    item.get(k)?.as_n().ok()?.parse().ok()
+fn opt_n(item: &HashMap<String, AttributeValue>, k: &str) -> Result<Option<i64>, DynamoDBError> {
+    match item.get(k) {
+        None => Ok(None),
+        Some(v) => v
+            .as_n()
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .map(Some)
+            .ok_or_else(|| DynamoDBError::Internal(format!("owner-KAS route has malformed {k}"))),
+    }
 }
 
 impl DynamoDBStore {
@@ -83,25 +91,31 @@ impl DynamoDBStore {
             .ok_or_else(|| DynamoDBError::Internal("owner-KAS route has no user_id".into()))?;
         Ok(Some(OwnerKasRoute {
             user_id: Uuid::parse_str(user_id)?,
-            seq: opt_n(&item, "seq").unwrap_or(0).max(0) as u64,
+            seq: opt_n(&item, "seq")?.unwrap_or(0).max(0) as u64,
             bundle: opt_s(&item, "bundle"),
             apns_token: opt_s(&item, "apns_token"),
             apns_environment: opt_s(&item, "apns_environment"),
-            retired_at: opt_n(&item, "retired_at"),
+            retired_at: opt_n(&item, "retired_at")?,
         }))
     }
 
     /// After a refused conditional write by `user_id`: why.
+    /// `seq_checked` is true only for `put_owner_kas_route`; when false
+    /// (`DELETE` / `PUT /push`), seeing a live row owned by `user_id` means
+    /// the route was created concurrently after the conditional write failed
+    /// on a missing row, so report `Unknown` rather than a spurious `StaleSeq`.
     async fn route_refusal(
         &self,
         route_id: &str,
         user_id: &Uuid,
+        seq_checked: bool,
     ) -> Result<RouteWrite, DynamoDBError> {
         Ok(match self.get_owner_kas_route(route_id).await? {
             None => RouteWrite::Unknown,
             Some(r) if r.user_id != *user_id => RouteWrite::NotOwner,
             Some(r) if r.retired_at.is_some() => RouteWrite::Retired,
-            Some(_) => RouteWrite::StaleSeq,
+            Some(_) if seq_checked => RouteWrite::StaleSeq,
+            Some(_) => RouteWrite::Unknown,
         })
     }
 
@@ -142,7 +156,7 @@ impl DynamoDBStore {
             Ok(_) => Ok(RouteWrite::Done),
             Err(e) => match classify(e, table) {
                 DynamoDBError::ConditionalConflict => {
-                    match self.route_refusal(route_id, user_id).await? {
+                    match self.route_refusal(route_id, user_id, true).await? {
                         // Vanished between the write and the read: never happens
                         // (rows are not deleted), but report it as a race.
                         RouteWrite::Unknown => Err(DynamoDBError::ConditionalConflict),
@@ -180,7 +194,9 @@ impl DynamoDBStore {
         match result {
             Ok(_) => Ok(RouteWrite::Done),
             Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => self.route_refusal(route_id, user_id).await,
+                DynamoDBError::ConditionalConflict => {
+                    self.route_refusal(route_id, user_id, false).await
+                }
                 other => Err(other),
             },
         }
@@ -216,7 +232,9 @@ impl DynamoDBStore {
         match req.send().await {
             Ok(_) => Ok(RouteWrite::Done),
             Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => self.route_refusal(route_id, user_id).await,
+                DynamoDBError::ConditionalConflict => {
+                    self.route_refusal(route_id, user_id, false).await
+                }
                 other => Err(other),
             },
         }

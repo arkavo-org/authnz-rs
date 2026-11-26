@@ -238,8 +238,7 @@ pub(crate) async fn put_route(
             }
             return refuse(StatusCode::UNAUTHORIZED, ERR_UNAUTHORIZED);
         }
-        // Stored: the sweep retires it if the account is gone.
-        Err(e) => warn!("owner-KAS route liveness re-check failed for {uid}: {e}"),
+        Err(e) => return server_error("liveness re-check", e),
     }
     info!("audit owner_kas_route outcome=stored user_id={uid} route_id={route_id} seq={seq}");
     (

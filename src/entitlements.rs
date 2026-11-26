@@ -109,14 +109,45 @@ pub(crate) fn validate_fqns(list: &[String]) -> Result<(), EntitlementError> {
 }
 
 fn is_attribute_fqn(f: &str) -> bool {
+    // Require exact canonical HTTPS URL with no userinfo, no port (including
+    // `:443`), no query/fragment, no trailing DNS dot, and no percent-encoding.
     let Some(rest) = f.strip_prefix("https://") else {
         return false;
     };
+    if f.contains('%') || f.contains('?') || f.contains('#') || f.contains('@') {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(f) else {
+        return false;
+    };
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(url::Host::Domain(host)) = parsed.host() else {
+        return false;
+    };
+    if host.is_empty() || host.ends_with('.') {
+        return false;
+    }
+    // Reject explicit default port `:443` or non-canonical authority/path
+    // encodings that `url::Url` silently normalizes away.
     let parts: Vec<&str> = rest.split('/').collect();
-    parts.len() == 5
-        && !parts.iter().any(|p| p.is_empty())
-        && parts[1] == "attr"
-        && parts[3] == "value"
+    if parts.len() != 5
+        || parts.iter().any(|p| p.is_empty())
+        || parts[0].contains(':')
+        || parts[0].ends_with('.')
+        || parts[1] != "attr"
+        || parts[3] != "value"
+    {
+        return false;
+    }
+    parsed.as_str().eq_ignore_ascii_case(f)
 }
 
 /// `USER_DEFAULT_ENTITLEMENTS` — comma-separated FQNs. Unset/empty uses
@@ -501,5 +532,33 @@ mod tests {
             ),
             "ADMIN_CLIENT_IDS (\"it\") does not include the status client"
         );
+    }
+
+    #[test]
+    fn fqn_rejects_url_smuggling_variants() {
+        for bad in [
+            "https://patreon.arkavo.com:443/attr/arkavo-creator/value/publish",
+            "https://patreon.arkavo.com./attr/arkavo-creator/value/publish",
+            "https://patreon.arkavo.com/attr/arkavo-creator/value/%70ublish",
+            "https://user@arkavo.net/attr/role/value/admin",
+            "https://arkavo.net/attr/role/value/admin?x=1",
+            "https://arkavo.net/attr/role/value/admin#frag",
+            "https://arkavo.net:443/attr/network/value/online-play",
+            "https://arkavo.net./attr/market/value/request",
+        ] {
+            assert!(
+                !is_attribute_fqn(bad),
+                "expected is_attribute_fqn to reject {bad}"
+            );
+        }
+        assert!(crate::constants::is_derived_only(
+            "https://patreon.arkavo.com:443/attr/arkavo-creator/value/publish"
+        ));
+        assert!(crate::constants::is_derived_only(
+            "https://arkavo.net./attr/network/value/online-play"
+        ));
+        assert!(crate::constants::is_never_stored(
+            "https://arkavo.net:443/attr/market/value/request"
+        ));
     }
 }

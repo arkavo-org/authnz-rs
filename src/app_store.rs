@@ -573,6 +573,7 @@ pub struct VerifiedTransaction {
     pub grant: Grant,
     pub environment: Environment,
     pub app_account_token: Option<Uuid>,
+    pub purchase_at: Option<i64>,
     pub expires_at: i64,
     pub revoked_at: Option<i64>,
     pub signed_at: i64,
@@ -694,6 +695,7 @@ pub(crate) fn decode_transaction(
         grant,
         environment,
         app_account_token,
+        purchase_at: seconds_field(&payload, "purchaseDate")?,
         expires_at: required_seconds(&payload, "expiresDate")?,
         revoked_at: seconds_field(&payload, "revocationDate")?,
         signed_at: required_seconds(&payload, "signedDate")?,
@@ -882,6 +884,37 @@ enum Binding {
 /// move is conditional on the owner read, so a race with another bind, move
 /// or the deletion sweep is re-evaluated (a few times at most); the old
 /// owner's row is never touched (its Sandbox entry is left to expire).
+/// Whether a Sandbox transaction `tx` is fresh enough to move a live
+/// owner's subscription link to `to`. Refuses cross-environment moves,
+/// earlier billing periods, older `signedDate` snapshots, or replays of the
+/// same billing period at or before the stored `last_signed_at`.
+fn sandbox_tx_may_move_from(stored: &AppStoreRecord, tx: &VerifiedTransaction) -> bool {
+    if stored.environment != tx.environment {
+        return false;
+    }
+    let incoming = AppStoreRecord {
+        original_transaction_id: tx.original_transaction_id.clone(),
+        transaction_id: Some(tx.transaction_id.clone()),
+        product_id: tx.product_id.clone(),
+        environment: tx.environment,
+        purchase_at: tx.purchase_at,
+        expires_at: tx.expires_at,
+        grace_expires_at: None,
+        revoked_at: tx.revoked_at,
+        last_signed_at: tx.signed_at,
+    };
+    if crate::db::app_store_is_past_period(stored, &incoming) {
+        return false;
+    }
+    if crate::db::app_store_is_newer_period(stored, &incoming) {
+        return true;
+    }
+    if stored.transaction_id.as_deref() == Some(tx.transaction_id.as_str()) {
+        return tx.signed_at > stored.last_signed_at;
+    }
+    tx.signed_at >= stored.last_signed_at
+}
+
 async fn bind_or_move(
     store: &DynamoDBStore,
     tx: &VerifiedTransaction,
@@ -903,7 +936,20 @@ async fn bind_or_move(
         if owner == *to {
             continue;
         }
-        if !sandbox_for_to && store.is_account_live(&owner).await? {
+        if sandbox_for_to {
+            // Check whether the current owner is live and holds a newer/same
+            // record for this subscription so an old Sandbox JWS cannot hijack
+            // it back from a newer live Sandbox owner.
+            if let Some(state) = store.get_publishing_state(&owner).await?
+                && let Some(stored) = state
+                    .app_store
+                    .iter()
+                    .find(|r| r.original_transaction_id == *otid)
+                && !sandbox_tx_may_move_from(stored, tx)
+            {
+                return Ok(Binding::Elsewhere(owner));
+            }
+        } else if store.is_account_live(&owner).await? {
             return Ok(Binding::Elsewhere(owner));
         }
         if store.move_app_store_link(otid, &owner, to).await? {
@@ -1041,6 +1087,7 @@ async fn post_transaction(
         transaction_id: Some(tx.transaction_id),
         product_id: tx.product_id,
         environment: tx.environment,
+        purchase_at: tx.purchase_at,
         expires_at: tx.expires_at,
         grace_expires_at: None,
         revoked_at: tx.revoked_at,
@@ -1184,6 +1231,12 @@ async fn post_notification(
             trace.outcome = "ignored=product";
             return StatusCode::OK.into_response();
         }
+        // Family-shared or non-direct purchase: permanent property of the
+        // notification, so acknowledge with 200 to prevent Apple retry storms.
+        Err(AppStoreError::NotPurchased) => {
+            trace.outcome = "ignored=not_purchased";
+            return StatusCode::OK.into_response();
+        }
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     trace.notification_type = Some(loggable_type(&notification.notification_type));
@@ -1251,6 +1304,7 @@ async fn post_notification(
         transaction_id: Some(tx.transaction_id),
         product_id: tx.product_id,
         environment: tx.environment,
+        purchase_at: tx.purchase_at,
         expires_at: tx.expires_at,
         grace_expires_at: match notification.grace {
             GraceUpdate::Set(grace) => grace,

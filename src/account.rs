@@ -251,12 +251,14 @@ fn accepted(d: &AccountDeletion) -> Response {
 pub async fn get_deletion_status(
     Extension(app_state): Extension<AppState>,
     Path(deletion_id): Path<String>,
-) -> Result<Json<DeletionStatus>, AccountError> {
+) -> Result<Response, AccountError> {
     let user_id = user_id_of(&deletion_id).ok_or(AccountError::NotFound)?;
     match app_state.db_store.get_account_deletion(&user_id).await? {
-        Some(d) if crate::oidc::constant_time_eq(&d.deletion_id, &deletion_id) => {
-            Ok(Json(DeletionStatus::from(&d)))
-        }
+        Some(d) if crate::oidc::constant_time_eq(&d.deletion_id, &deletion_id) => Ok((
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(DeletionStatus::from(&d)),
+        )
+            .into_response()),
         _ => Err(AccountError::NotFound),
     }
 }
@@ -381,21 +383,51 @@ pub(crate) fn schedule_sweep(
                 Err(e) if e.is_permanent() => return,
                 Err(e) => {
                     warn!("Account deletion sweep for {user_id} failed: {e}");
-                    let give_up = ACCOUNT_DELETION_RETRY_SECONDS.len() as u32 + 1;
-                    match db.record_deletion_failure(&user_id, give_up).await {
-                        Ok(attempts) if attempts < give_up => {}
-                        Ok(_) => {
-                            error!(
-                                "audit account_deletion outcome=failed user_id={user_id}: \
-                                 retries exhausted; resumes at next startup"
-                            );
+                    // Track per-run retry budget independently of persisted
+                    // cumulative `deletion_attempts` so `resume_unfinished`
+                    // gets its full retry schedule after a restart.
+                    match retries.next() {
+                        Some(&next) => {
+                            if let Err(err) = db.record_deletion_failure(&user_id, u32::MAX).await {
+                                warn!("Recording the failed sweep for {user_id} failed: {err}");
+                            }
+                            wait = next;
+                        }
+                        None => {
+                            // Exhausted per-run retries: persist `failed` state,
+                            // retrying the status update itself on transient DB
+                            // errors so the row does not remain `pending`.
+                            let mut marked = db.record_deletion_failure(&user_id, 1).await.is_ok();
+                            if !marked {
+                                for backoff in [15u64, 30, 60] {
+                                    tokio::time::sleep(std::time::Duration::from_secs(backoff))
+                                        .await;
+                                    match db.mark_deletion_failed(&user_id).await {
+                                        Ok(()) => {
+                                            marked = true;
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                "Marking failed sweep for {user_id} failed: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if marked {
+                                error!(
+                                    "audit account_deletion outcome=failed user_id={user_id}: \
+                                     retries exhausted; resumes at next startup"
+                                );
+                            } else {
+                                error!(
+                                    "audit account_deletion outcome=failed_unmarked user_id={user_id}: \
+                                     could not persist failed state after retries"
+                                );
+                            }
                             return;
                         }
-                        Err(e) => warn!("Recording the failed sweep for {user_id} failed: {e}"),
-                    }
-                    match retries.next() {
-                        Some(next) => wait = *next,
-                        None => return,
                     }
                 }
             }

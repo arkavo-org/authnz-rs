@@ -175,6 +175,7 @@ pub fn verify(
     }
     if header.content_type != Some(coset::ContentType::Text(CONTENT_TYPE.into()))
         || !header.crit.is_empty()
+        || sign1.unprotected != coset::Header::default()
     {
         return Err(CwtError::Malformed);
     }
@@ -186,20 +187,27 @@ pub fn verify(
         })
         .map_err(|_| CwtError::InvalidSignature)?;
     let t = parse_payload(sign1.payload.as_deref().ok_or(CwtError::Malformed)?)?;
-    if t.iat > t.exp || t.exp - t.iat > LIFETIME_SECONDS {
+    if t.exp
+        .checked_sub(t.iat)
+        .is_none_or(|d| !(0..=LIFETIME_SECONDS).contains(&d))
+    {
         return Err(CwtError::Malformed);
     }
-    if t.exp <= now - skew_secs {
+    if t.exp <= now.saturating_sub(skew_secs) {
         return Err(CwtError::Expired);
     }
-    if t.iat > now + skew_secs {
+    if t.iat > now.saturating_add(skew_secs) {
         return Err(CwtError::NotYetValid);
     }
     Ok(t)
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<OwnerKasToken, CwtError> {
-    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor).map_err(|_| CwtError::Malformed)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(CwtError::Malformed);
+    }
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
     };

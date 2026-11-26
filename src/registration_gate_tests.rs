@@ -20,7 +20,7 @@
 //! `patreon` and `device_check` along with it.
 
 use crate::AppState;
-use crate::device_check::{RegistrationTicket, SESSION_REG_TICKET_KEY};
+use crate::device_check::{RegistrationTicket, store_registration_ticket};
 use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{Request, StatusCode};
@@ -66,19 +66,17 @@ struct SeedParams {
 /// Writes a [`RegistrationTicket`] into the caller's session — live and for
 /// `attested-key` unless the query says otherwise.
 async fn seed_ticket(
+    Extension(app_state): Extension<AppState>,
     session: tower_sessions::Session,
     Query(params): Query<SeedParams>,
 ) -> StatusCode {
     let now = chrono::Utc::now().timestamp();
-    session
-        .insert(
-            SESSION_REG_TICKET_KEY,
-            RegistrationTicket {
-                key_id: params.key_id.unwrap_or_else(|| "attested-key".into()),
-                issued_at: now,
-                expires_at: now + params.expires_in.unwrap_or(300),
-            },
-        )
+    let ticket = RegistrationTicket {
+        key_id: params.key_id.unwrap_or_else(|| "attested-key".into()),
+        issued_at: now,
+        expires_at: now + params.expires_in.unwrap_or(300),
+    };
+    store_registration_ticket(&app_state, &session, &ticket)
         .await
         .unwrap();
     StatusCode::OK

@@ -595,12 +595,19 @@ async fn a_failure_never_replaces_an_answer_learned_meanwhile() {
         Subscription::Active
     );
     let now = Utc::now().timestamp();
-    h.lookup().record(&account, Subscription::Unavailable, now);
+    let s1 = h.lookup().next_seq();
+    h.lookup().record(&account, Subscription::Unavailable, now, s1);
     assert_eq!(h.lookup().cached(&account, now), Some(Subscription::Active));
     // An answer does replace a failure.
     let other = Uuid::new_v4();
-    h.lookup().record(&other, Subscription::Unavailable, now);
-    h.lookup().record(&other, Subscription::None, now);
+    let s2 = h.lookup().next_seq();
+    h.lookup().record(&other, Subscription::Unavailable, now, s2);
+    let s3 = h.lookup().next_seq();
+    h.lookup().record(&other, Subscription::None, now, s3);
+    assert_eq!(h.lookup().cached(&other, now), Some(Subscription::None));
+    // A slower older lookup (lower seq) never overwrites a fresher cached answer.
+    let stale_seq = s2;
+    h.lookup().record(&other, Subscription::Active, now, stale_seq);
     assert_eq!(h.lookup().cached(&other, now), Some(Subscription::None));
 }
 
@@ -1044,6 +1051,7 @@ async fn an_app_store_pass_is_not_asked_about_and_grants_once() {
                 transaction_id: Some(otid),
                 product_id: PASS.into(),
                 environment: Environment::Production,
+                purchase_at: None,
                 expires_at: now + 3600,
                 grace_expires_at: None,
                 revoked_at: None,

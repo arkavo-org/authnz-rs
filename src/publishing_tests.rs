@@ -370,6 +370,7 @@ mod app_store_source {
             transaction_id: Some(otid.into()),
             product_id: PRODUCT.into(),
             environment: env,
+            purchase_at: None,
             expires_at,
             grace_expires_at: None,
             revoked_at: None,
@@ -1082,6 +1083,7 @@ mod online_play_source {
             transaction_id: Some(otid),
             product_id: product.into(),
             environment: Environment::Production,
+            purchase_at: None,
             expires_at,
             grace_expires_at: None,
             revoked_at: None,
@@ -1160,6 +1162,7 @@ mod online_play_source {
             state,
             market: MarketGrant::Unavailable,
             subscription: crate::market::subscription::Subscription::None,
+            evaluated_at: Utc::now().timestamp(),
         };
         let derived = derive(&f.state, Some(f.user_id), None, sources)
             .await
@@ -1286,6 +1289,7 @@ mod paths {
                     transaction_id: Some("1".into()),
                     product_id: PASS.into(),
                     environment: Environment::Production,
+                    purchase_at: None,
                     expires_at: now + 3600,
                     grace_expires_at: None,
                     revoked_at: None,
@@ -1315,6 +1319,7 @@ mod paths {
             state: Some(state),
             market,
             subscription,
+            evaluated_at: Utc::now().timestamp(),
         };
         derive(&app_state, Some(Uuid::new_v4()), None, sources)
             .await

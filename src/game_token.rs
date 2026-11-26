@@ -191,7 +191,7 @@ pub fn request_proof_verifies(
     now: i64,
     skew_secs: i64,
 ) -> bool {
-    (now - t).abs() <= skew_secs
+    u64::try_from(skew_secs).is_ok_and(|s| now.abs_diff(t) <= s)
         && signature_verifies(
             &token.x,
             &token.y,
@@ -272,6 +272,7 @@ pub fn verify(
     }
     if header.content_type != Some(coset::ContentType::Text(CONTENT_TYPE.into()))
         || !header.crit.is_empty()
+        || sign1.unprotected != coset::Header::default()
     {
         return Err(CwtError::Malformed);
     }
@@ -289,20 +290,27 @@ pub fn verify(
     if t.aud != expected_aud {
         return Err(CwtError::AudienceMismatch);
     }
-    if t.iat > t.exp || t.exp - t.iat > MAX_LIFETIME_SECONDS {
+    if t.exp
+        .checked_sub(t.iat)
+        .is_none_or(|d| !(0..=MAX_LIFETIME_SECONDS).contains(&d))
+    {
         return Err(CwtError::Malformed);
     }
-    if t.exp <= now - skew_secs {
+    if t.exp <= now.saturating_sub(skew_secs) {
         return Err(CwtError::Expired);
     }
-    if t.iat > now + skew_secs {
+    if t.iat > now.saturating_add(skew_secs) {
         return Err(CwtError::NotYetValid);
     }
     Ok(t)
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<GameToken, CwtError> {
-    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor).map_err(|_| CwtError::Malformed)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(CwtError::Malformed);
+    }
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
     };
@@ -798,6 +806,16 @@ mod tests {
         };
         assert!(!request_proof_verifies(
             &elsewhere, text, "POST", "/v1/runs", b"{}", now, &proof, now, 60
+        ));
+        // Negative skew or extreme timestamps never overflow/panic.
+        assert!(!request_proof_verifies(
+            &token, text, "POST", "/v1/runs", b"{}", now, &proof, now, -1
+        ));
+        assert!(!request_proof_verifies(
+            &token, text, "POST", "/v1/runs", b"{}", i64::MIN, &proof, i64::MAX, 60
+        ));
+        assert!(!request_proof_verifies(
+            &token, text, "POST", "/v1/runs", b"{}", i64::MAX, &proof, i64::MIN, i64::MIN
         ));
     }
 }

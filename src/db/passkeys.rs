@@ -56,8 +56,16 @@ pub struct PasskeyStatus {
     pub revoked_at: Option<i64>,
 }
 
-fn num(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
-    item.get(k)?.as_n().ok()?.parse().ok()
+fn opt_num(item: &HashMap<String, AttributeValue>, k: &str) -> Result<Option<i64>, DynamoDBError> {
+    match item.get(k) {
+        None => Ok(None),
+        Some(v) => v
+            .as_n()
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .map(Some)
+            .ok_or_else(|| DynamoDBError::Internal(format!("passkey row has malformed {k}"))),
+    }
 }
 
 impl DynamoDBStore {
@@ -127,7 +135,10 @@ impl DynamoDBStore {
             .get("user_id")
             .and_then(|v| v.as_s().ok())
             .ok_or_else(|| DynamoDBError::Internal("passkey link has no user_id".into()))?;
-        Ok(Some((Uuid::parse_str(user_id)?, num(&item, "revoked_at"))))
+        Ok(Some((
+            Uuid::parse_str(user_id)?,
+            opt_num(&item, "revoked_at")?,
+        )))
     }
 
     /// Whether a credential is revoked. `None` for a credential no
@@ -161,7 +172,7 @@ impl DynamoDBStore {
             .map_err(|e| self.map_get_item_err(&self.credentials_table, e))?
             .item;
         let (revoked, revoked_at) = match item {
-            Some(item) if is_tombstone(&item) => (true, num(&item, super::account::DELETED_AT)),
+            Some(item) if is_tombstone(&item) => (true, opt_num(&item, super::account::DELETED_AT)?),
             Some(item) => {
                 let user = self.item_to_user_credentials(&item)?;
                 let held = user

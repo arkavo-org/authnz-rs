@@ -23,8 +23,12 @@ use super::agent_state::{classify, n, s};
 use super::publishing::{self, PublishingSuspension};
 use super::{DynamoDBError, DynamoDBStore, account};
 use crate::app_store::Environment;
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue, ReturnValuesOnConditionCheckFailure};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, ConditionCheck, ReturnValuesOnConditionCheckFailure, TransactWriteItem, Update,
+};
 use log::warn;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -46,6 +50,9 @@ pub struct AppStoreRecord {
     pub transaction_id: Option<String>,
     pub product_id: String,
     pub environment: Environment,
+    /// Apple's `purchaseDate` (unix seconds) for monotonic billing-period
+    /// ordering across plan duration changes (e.g. annual -> monthly).
+    pub purchase_at: Option<i64>,
     pub expires_at: i64,
     pub grace_expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -128,6 +135,9 @@ fn to_attr(rec: &AppStoreRecord) -> AttributeValue {
         "environment".to_string(),
         s(environment_str(rec.environment)),
     );
+    if let Some(p) = rec.purchase_at {
+        m.insert("purchase_at".to_string(), n(p));
+    }
     m.insert("expires_at".to_string(), n(rec.expires_at));
     if let Some(g) = rec.grace_expires_at {
         m.insert("grace_expires_at".to_string(), n(g));
@@ -163,11 +173,47 @@ fn from_attr(otid: &str, v: &AttributeValue) -> Option<AppStoreRecord> {
         transaction_id,
         product_id: text("product_id")?,
         environment: parse_environment(&text("environment")?)?,
+        purchase_at: optional("purchase_at")?,
         expires_at: num("expires_at")?,
         grace_expires_at: optional("grace_expires_at")?,
         revoked_at: optional("revoked_at")?,
         last_signed_at: num("last_signed_at")?,
     })
+}
+
+/// Whether `incoming` is from an earlier billing period than `stored`.
+/// Uses monotonic `purchase_at` when both carry it (with `expires_at` as
+/// tie-breaker), falling back to `expires_at` for legacy records.
+pub(crate) fn app_store_is_past_period(stored: &AppStoreRecord, incoming: &AppStoreRecord) -> bool {
+    let different_tid = matches!(
+        (&stored.transaction_id, &incoming.transaction_id),
+        (Some(stored_tid), Some(tid)) if stored_tid != tid
+    );
+    if !different_tid {
+        return false;
+    }
+    match (stored.purchase_at, incoming.purchase_at) {
+        (Some(sp), Some(ip)) => sp > ip || (sp == ip && stored.expires_at > incoming.expires_at),
+        _ => stored.expires_at > incoming.expires_at,
+    }
+}
+
+/// Whether `incoming` is from a strictly newer billing period than `stored`.
+pub(crate) fn app_store_is_newer_period(
+    stored: &AppStoreRecord,
+    incoming: &AppStoreRecord,
+) -> bool {
+    let different_tid = matches!(
+        (&stored.transaction_id, &incoming.transaction_id),
+        (Some(stored_tid), Some(tid)) if stored_tid != tid
+    );
+    if !different_tid {
+        return false;
+    }
+    match (stored.purchase_at, incoming.purchase_at) {
+        (Some(sp), Some(ip)) => sp < ip || (sp == ip && stored.expires_at < incoming.expires_at),
+        _ => stored.expires_at < incoming.expires_at,
+    }
 }
 
 /// What a field-level update of an entry came to.
@@ -177,6 +223,13 @@ enum EntryUpdate {
     Done(StateOutcome),
     /// The row is live but holds no entry for the subscription yet.
     Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodMatch {
+    Any,
+    SameOrLegacy,
+    Different,
 }
 
 /// Why the update's condition refused `rec`, given the row it was checked
@@ -202,158 +255,193 @@ fn refusal(row: Option<&HashMap<String, AttributeValue>>, rec: &AppStoreRecord) 
     if stored.environment != rec.environment {
         return EntryUpdate::Done(StateOutcome::OtherEnvironment);
     }
-    // A newer period (another transaction ending later) is never refused by
-    // the signed order, so what remains here is a past period or a stale one.
-    let past_period = matches!(
-        (&stored.transaction_id, &rec.transaction_id),
-        (Some(stored_tid), Some(tid)) if stored_tid != tid
-    ) && stored.expires_at > rec.expires_at;
-    EntryUpdate::Done(if past_period {
+    EntryUpdate::Done(if app_store_is_past_period(&stored, rec) {
         StateOutcome::PastPeriod
     } else {
         StateOutcome::Stale
     })
 }
 
+fn is_different_period_on_row(
+    row: Option<&HashMap<String, AttributeValue>>,
+    rec: &AppStoreRecord,
+) -> bool {
+    let Some(tid) = rec.transaction_id.as_deref() else {
+        return false;
+    };
+    let Some(row) = row.filter(|r| !account::is_tombstone(r)) else {
+        return false;
+    };
+    let Some(entry) = row
+        .get(ATTR)
+        .and_then(|m| m.as_m().ok())
+        .and_then(|m| m.get(&rec.original_transaction_id))
+    else {
+        return false;
+    };
+    let Some(stored) = from_attr(&rec.original_transaction_id, entry) else {
+        return false;
+    };
+    stored.environment == rec.environment
+        && stored.transaction_id.as_deref().is_some_and(|s| s != tid)
+}
+
 impl DynamoDBStore {
-    /// Bind a subscription to an account: a conditional write of
-    /// `appstore#<otid>` that succeeds when the link is absent or already this
-    /// account's (a re-bind keeps `created_at`). Afterwards the account is
-    /// checked again: a deletion may have swept the links before this one
-    /// landed, so on a dead account the link is deleted and
-    /// [`DynamoDBError::AccountGone`] returned (even when the delete fails;
-    /// the sweep removes the link then). If the re-check itself fails, its
-    /// error is returned and a link this call created is taken back; the
-    /// caller retries, which is idempotent.
+    fn live_account_check(&self, user_id: &Uuid) -> Result<ConditionCheck, DynamoDBError> {
+        ConditionCheck::builder()
+            .table_name(&self.credentials_table)
+            .key("user_id", s(&user_id.to_string()))
+            .condition_expression(account::LIVE_ROW)
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build live account check failed: {e}")))
+    }
+
+    /// Atomically bind `appstore#<otid>` to `user_id` while verifying
+    /// `credentials[user_id]` satisfies `LIVE_ROW` via `TransactWriteItems`.
+    /// Because both checks run in one transaction, a bind for a dead account
+    /// or during a transient failure never writes an orphaned link or disturbs
+    /// an existing binding.
     pub async fn bind_app_store_link(
         &self,
         otid: &str,
         user_id: &Uuid,
     ) -> Result<LinkOutcome, DynamoDBError> {
-        let table = &self.identity_links_table;
-        let uid = s(&user_id.to_string());
-        let result = self
-            .client
-            .update_item()
-            .table_name(table)
+        let now = chrono::Utc::now().timestamp();
+        let live_check = self.live_account_check(user_id)?;
+
+        // Attempt 1: brand-new binding (`attribute_not_exists(link_pk)`).
+        let create_link = Update::builder()
+            .table_name(&self.identity_links_table)
             .key("link_pk", s(&link_pk(otid)))
-            .update_expression("SET user_id = :uid, created_at = if_not_exists(created_at, :now)")
-            .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
-            .expression_attribute_values(":uid", uid)
-            .expression_attribute_values(":now", n(chrono::Utc::now().timestamp()))
-            .return_values(ReturnValue::AllOld)
+            .update_expression("SET user_id = :uid, created_at = :now")
+            .condition_expression("attribute_not_exists(link_pk)")
+            .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .expression_attribute_values(":now", n(now))
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build app store link create failed: {e}")))?;
+        match self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(create_link).build())
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(live_check.clone())
+                    .build(),
+            )
             .send()
-            .await;
-        let outcome = match result {
-            Ok(out) => {
-                if out.attributes.is_some_and(|a| !a.is_empty()) {
-                    LinkOutcome::AlreadyYours
+            .await
+        {
+            Ok(_) => return Ok(LinkOutcome::Bound),
+            Err(e) => {
+                if let SdkError::ServiceError(ref se) = e
+                    && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                        se.err()
+                {
+                    let reasons = canceled.cancellation_reasons();
+                    if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                        return Err(DynamoDBError::AccountGone);
+                    }
+                    if reasons.first().and_then(|r| r.code()) != Some("ConditionalCheckFailed") {
+                        return Err(classify(e, &self.identity_links_table));
+                    }
                 } else {
-                    LinkOutcome::Bound
+                    return Err(classify(e, &self.identity_links_table));
                 }
             }
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => return Ok(LinkOutcome::BoundElsewhere),
-                other => return Err(other),
-            },
-        };
-        self.recheck_app_store_link(otid, user_id, outcome == LinkOutcome::Bound)
-            .await?;
-        Ok(outcome)
+        }
+
+        // Attempt 2: already bound to `user_id` (preserves `created_at`).
+        let rebind_link = Update::builder()
+            .table_name(&self.identity_links_table)
+            .key("link_pk", s(&link_pk(otid)))
+            .update_expression("SET user_id = :uid, created_at = if_not_exists(created_at, :now)")
+            .condition_expression("user_id = :uid")
+            .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .expression_attribute_values(":now", n(now))
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build app store rebind failed: {e}")))?;
+        match self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(rebind_link).build())
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(live_check)
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            Ok(_) => Ok(LinkOutcome::AlreadyYours),
+            Err(e) => {
+                if let SdkError::ServiceError(ref se) = e
+                    && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                        se.err()
+                {
+                    let reasons = canceled.cancellation_reasons();
+                    if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                        return Err(DynamoDBError::AccountGone);
+                    }
+                    if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                        return Ok(LinkOutcome::BoundElsewhere);
+                    }
+                }
+                Err(classify(e, &self.identity_links_table))
+            }
+        }
     }
 
-    /// Move `appstore#<otid>` from `from` to `to`: one conditional update on
-    /// the link still naming `from` (a move is a new binding, so `created_at`
-    /// restarts). `Ok(false)`: it no longer does (another bind or move, or the
-    /// deletion sweep, changed it) and nothing was written. Whether a move is
-    /// allowed is the caller's decision. Afterwards `to` is checked again as a
-    /// bind checks it, and the link this call wrote is taken back (deleted)
-    /// when `to` is dead or the check fails. `from`'s `credentials` row is
-    /// never touched.
+    /// Atomically move `appstore#<otid>` from `from` to `to` while verifying
+    /// `credentials[to]` satisfies `LIVE_ROW` via `TransactWriteItems`. If
+    /// `to` is dead or storage errors, `from`'s existing link is never deleted
+    /// or modified.
     pub async fn move_app_store_link(
         &self,
         otid: &str,
         from: &Uuid,
         to: &Uuid,
     ) -> Result<bool, DynamoDBError> {
-        let table = &self.identity_links_table;
-        let result = self
-            .client
-            .update_item()
-            .table_name(table)
+        let now = chrono::Utc::now().timestamp();
+        let move_link = Update::builder()
+            .table_name(&self.identity_links_table)
             .key("link_pk", s(&link_pk(otid)))
             .update_expression("SET user_id = :to, created_at = :now")
             .condition_expression("user_id = :from")
             .expression_attribute_values(":from", s(&from.to_string()))
             .expression_attribute_values(":to", s(&to.to_string()))
-            .expression_attribute_values(":now", n(chrono::Utc::now().timestamp()))
-            .send()
-            .await;
-        if let Err(e) = result {
-            return match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(false),
-                other => Err(other),
-            };
-        }
-        self.recheck_app_store_link(otid, to, true).await?;
-        Ok(true)
-    }
+            .expression_attribute_values(":now", n(now))
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build app store move failed: {e}")))?;
+        let live_check = self.live_account_check(to)?;
 
-    /// The check after a link write: a deletion may have swept the links
-    /// before this one landed. On a dead account the link is deleted and
-    /// [`DynamoDBError::AccountGone`] returned (even when the delete fails;
-    /// the sweep removes the link then). If the check itself fails, a link
-    /// this call `wrote` is taken back and the check's error returned.
-    async fn recheck_app_store_link(
-        &self,
-        otid: &str,
-        user_id: &Uuid,
-        wrote: bool,
-    ) -> Result<(), DynamoDBError> {
-        match self.is_account_live(user_id).await {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                // Dead either way: a link that could not be taken back stays
-                // for the deletion sweep (it removes every link of the
-                // account), and the caller still hears the account is gone.
-                if let Err(e) = self.delete_app_store_link(otid, user_id).await {
-                    warn!("could not take back app store link original_transaction_id={otid}: {e}");
-                }
-                Err(DynamoDBError::AccountGone)
-            }
-            Err(e) => {
-                // Unknown whether the account died. A link this call just
-                // wrote is taken back so the failed write leaves nothing; one
-                // that was already this account's was bound by an earlier,
-                // checked call and stays.
-                if wrote && let Err(del) = self.delete_app_store_link(otid, user_id).await {
-                    warn!(
-                        "could not take back app store link original_transaction_id={otid}: {del}"
-                    );
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Delete `appstore#<otid>` while it still names `user_id`.
-    async fn delete_app_store_link(&self, otid: &str, user_id: &Uuid) -> Result<(), DynamoDBError> {
-        let table = &self.identity_links_table;
-        let result = self
+        match self
             .client
-            .delete_item()
-            .table_name(table)
-            .key("link_pk", s(&link_pk(otid)))
-            .condition_expression("user_id = :uid")
-            .expression_attribute_values(":uid", s(&user_id.to_string()))
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(move_link).build())
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(live_check)
+                    .build(),
+            )
             .send()
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(()),
-                other => Err(other),
-            },
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if let SdkError::ServiceError(ref se) = e
+                    && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                        se.err()
+                {
+                    let reasons = canceled.cancellation_reasons();
+                    if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                        return Err(DynamoDBError::AccountGone);
+                    }
+                    if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                        return Ok(false);
+                    }
+                }
+                Err(classify(e, &self.identity_links_table))
+            }
         }
     }
 
@@ -433,14 +521,58 @@ impl DynamoDBStore {
         }
     }
 
-    /// Update the fields of an existing entry. When the condition refuses
-    /// it, the reason is read from the row as the condition saw it.
+    /// Update the fields of an existing entry. When `grace` is
+    /// [`GraceUpdate::Keep`] and `rec` carries a `transaction_id`, keep
+    /// `#grace` on same/legacy periods but clear `#grace` when advancing to a
+    /// different billing period so an earlier period's grace cannot bleed into
+    /// a newer period.
     async fn update_app_store_entry(
         &self,
         user_id: &Uuid,
         rec: &AppStoreRecord,
         grace: GraceUpdate,
     ) -> Result<EntryUpdate, DynamoDBError> {
+        if grace == GraceUpdate::Keep && rec.transaction_id.is_some() {
+            match self
+                .update_app_store_entry_once(user_id, rec, GraceUpdate::Keep, PeriodMatch::SameOrLegacy)
+                .await?
+            {
+                Ok(outcome) => return Ok(EntryUpdate::Done(outcome)),
+                Err(refused_row) => {
+                    if is_different_period_on_row(refused_row.as_ref(), rec) {
+                        return match self
+                            .update_app_store_entry_once(
+                                user_id,
+                                rec,
+                                GraceUpdate::Set(None),
+                                PeriodMatch::Different,
+                            )
+                            .await?
+                        {
+                            Ok(outcome) => Ok(EntryUpdate::Done(outcome)),
+                            Err(row2) => Ok(refusal(row2.as_ref(), rec)),
+                        };
+                    }
+                    return Ok(refusal(refused_row.as_ref(), rec));
+                }
+            }
+        }
+        match self
+            .update_app_store_entry_once(user_id, rec, grace, PeriodMatch::Any)
+            .await?
+        {
+            Ok(outcome) => Ok(EntryUpdate::Done(outcome)),
+            Err(refused_row) => Ok(refusal(refused_row.as_ref(), rec)),
+        }
+    }
+
+    async fn update_app_store_entry_once(
+        &self,
+        user_id: &Uuid,
+        rec: &AppStoreRecord,
+        grace: GraceUpdate,
+        period_match: PeriodMatch,
+    ) -> Result<Result<StateOutcome, Option<HashMap<String, AttributeValue>>>, DynamoDBError> {
         let table = &self.credentials_table;
         let entry = "#as.#otid";
         // The environment is never changed: the condition requires it equal.
@@ -453,6 +585,10 @@ impl DynamoDBStore {
         match rec.transaction_id {
             Some(_) => sets.push(format!("{entry}.#tid = :tid")),
             None => removes.push(format!("{entry}.#tid")),
+        }
+        match rec.purchase_at {
+            Some(_) => sets.push(format!("{entry}.#pur = :pur")),
+            None => removes.push(format!("{entry}.#pur")),
         }
         match rec.revoked_at {
             Some(_) => sets.push(format!("{entry}.#rev = :rev")),
@@ -467,15 +603,33 @@ impl DynamoDBStore {
         if !removes.is_empty() {
             expression.push_str(&format!(" REMOVE {}", removes.join(", ")));
         }
-        // Another transaction ending earlier is a past period. Without an
-        // incoming id (a record built in a test) the rule cannot apply.
+        // Another transaction from an earlier billing period is refused. Uses
+        // monotonic `purchase_at` when both carry it (with `expires_at` as
+        // tie-breaker), falling back to `expires_at` for legacy records.
         let period = if rec.transaction_id.is_some() {
-            format!(
-                " AND (attribute_not_exists({entry}.#tid) OR {entry}.#tid = :tid OR \
-                 {entry}.#exp <= :exp)"
-            )
+            if rec.purchase_at.is_some() {
+                format!(
+                    " AND (attribute_not_exists({entry}.#tid) OR {entry}.#tid = :tid OR \
+                     (attribute_exists({entry}.#pur) AND ({entry}.#pur < :pur OR ({entry}.#pur = :pur AND {entry}.#exp <= :exp))) OR \
+                     (attribute_not_exists({entry}.#pur) AND {entry}.#exp <= :exp))"
+                )
+            } else {
+                format!(
+                    " AND (attribute_not_exists({entry}.#tid) OR {entry}.#tid = :tid OR \
+                     {entry}.#exp <= :exp)"
+                )
+            }
         } else {
             String::new()
+        };
+        let period_guard = match period_match {
+            PeriodMatch::Any => String::new(),
+            PeriodMatch::SameOrLegacy => {
+                format!(" AND (attribute_not_exists({entry}.#tid) OR {entry}.#tid = :tid)")
+            }
+            PeriodMatch::Different => {
+                format!(" AND attribute_exists({entry}.#tid) AND {entry}.#tid <> :tid")
+            }
         };
         // A tie replaces a stored snapshot unless that drops its revocation.
         let signed_order = if rec.revoked_at.is_some() {
@@ -486,15 +640,20 @@ impl DynamoDBStore {
                  ({entry}.#signed = :signed AND attribute_not_exists({entry}.#rev)))"
             )
         };
-        // Another transaction that ends later is a newer period and applies
-        // whatever its signing time: a snapshot of the previous period may
-        // have been signed after it (a REFUND_DECLINED sent after the
-        // renewal). Without an incoming id the rule cannot apply.
+        // A strictly newer billing period applies whatever its signing time.
         let ordering = if rec.transaction_id.is_some() {
-            format!(
-                "((attribute_exists({entry}.#tid) AND {entry}.#tid <> :tid AND \
-                 {entry}.#exp < :exp) OR {signed_order})"
-            )
+            if rec.purchase_at.is_some() {
+                format!(
+                    "((attribute_exists({entry}.#tid) AND {entry}.#tid <> :tid AND \
+                     ((attribute_exists({entry}.#pur) AND ({entry}.#pur < :pur OR ({entry}.#pur = :pur AND {entry}.#exp < :exp))) OR \
+                      (attribute_not_exists({entry}.#pur) AND {entry}.#exp < :exp))) OR {signed_order})"
+                )
+            } else {
+                format!(
+                    "((attribute_exists({entry}.#tid) AND {entry}.#tid <> :tid AND \
+                     {entry}.#exp < :exp) OR {signed_order})"
+                )
+            }
         } else {
             signed_order
         };
@@ -505,7 +664,7 @@ impl DynamoDBStore {
             .key("user_id", s(&user_id.to_string()))
             .update_expression(expression)
             .condition_expression(format!(
-                "{} AND attribute_exists({entry}) AND {entry}.#env = :env{period} AND {ordering}",
+                "{} AND attribute_exists({entry}) AND {entry}.#env = :env{period}{period_guard} AND {ordering}",
                 account::LIVE_ROW
             ))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
@@ -513,6 +672,7 @@ impl DynamoDBStore {
             .expression_attribute_names("#otid", &rec.original_transaction_id)
             .expression_attribute_names("#pid", "product_id")
             .expression_attribute_names("#env", "environment")
+            .expression_attribute_names("#pur", "purchase_at")
             .expression_attribute_names("#exp", "expires_at")
             .expression_attribute_names("#signed", "last_signed_at")
             .expression_attribute_names("#tid", "transaction_id")
@@ -522,6 +682,9 @@ impl DynamoDBStore {
             .expression_attribute_values(":signed", n(rec.last_signed_at));
         if let Some(tid) = &rec.transaction_id {
             update = update.expression_attribute_values(":tid", s(tid));
+        }
+        if let Some(pur) = rec.purchase_at {
+            update = update.expression_attribute_values(":pur", n(pur));
         }
         if let Some(revoked) = rec.revoked_at {
             update = update
@@ -542,12 +705,12 @@ impl DynamoDBStore {
             GraceUpdate::Keep => {}
         }
         match update.send().await {
-            Ok(_) => Ok(EntryUpdate::Done(StateOutcome::Applied)),
+            Ok(_) => Ok(Ok(StateOutcome::Applied)),
             Err(e) => {
                 if let Some(UpdateItemError::ConditionalCheckFailedException(refused)) =
                     e.as_service_error()
                 {
-                    return Ok(refusal(refused.item(), rec));
+                    return Ok(Err(refused.item().cloned()));
                 }
                 Err(classify(e, table))
             }
@@ -760,6 +923,7 @@ mod tests {
             transaction_id: Some(otid.to_string()),
             product_id: "com.arkavo.ArkavoCreator.membership.monthly".into(),
             environment: Environment::Production,
+            purchase_at: None,
             expires_at: signed + 2_592_000,
             grace_expires_at: None,
             revoked_at: None,
@@ -919,14 +1083,9 @@ mod tests {
         tombstone(&store, &gone).await;
         let t = otid();
 
-        // The take-back itself fails (proved below by the link surviving),
-        // yet the caller is told the account is gone, not given a 5xx.
+        // The transactional bind refuses a dead account without writing any link.
         let err = no_deletes.bind_app_store_link(&t, &gone).await.unwrap_err();
         assert!(matches!(err, DynamoDBError::AccountGone), "{err:?}");
-        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(gone));
-
-        // The deletion sweep removes what the take-back could not.
-        store.delete_identity_links_of(&gone).await.unwrap();
         assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
     }
 
@@ -985,7 +1144,8 @@ mod tests {
 
         let err = store.move_app_store_link(&t, &a, &gone).await.unwrap_err();
         assert!(matches!(err, DynamoDBError::AccountGone), "{err:?}");
-        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
+        // Transaction aborted: the existing owner's link stays intact.
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(a));
     }
 
     #[tokio::test]
@@ -998,8 +1158,8 @@ mod tests {
 
         let err = blind.move_app_store_link(&t, &a, &b).await.unwrap_err();
         assert!(!matches!(err, DynamoDBError::AccountGone), "{err:?}");
-        // The link this call wrote is taken back.
-        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), None);
+        // Transaction aborted: the existing owner's link stays intact.
+        assert_eq!(store.app_store_link_owner(&t).await.unwrap(), Some(a));
     }
 
     async fn link_item(store: &DynamoDBStore, t: &str) -> HashMap<String, AttributeValue> {
@@ -1736,5 +1896,28 @@ mod tests {
             );
         }
         assert_eq!(state_of(&store, &id).await, vec![production]);
+    }
+
+    #[test]
+    fn purchase_at_orders_periods_across_plan_duration_changes() {
+        let annual = AppStoreRecord {
+            transaction_id: Some("annual-1".into()),
+            purchase_at: Some(1_700_000_000),
+            expires_at: 1_731_536_000, // +1 year
+            revoked_at: Some(1_700_100_000),
+            ..rec("otid-1", 1_700_100_000)
+        };
+        let monthly = AppStoreRecord {
+            transaction_id: Some("monthly-2".into()),
+            purchase_at: Some(1_700_200_000),
+            expires_at: 1_702_792_000, // +1 month (ends BEFORE annual.expires_at!)
+            ..rec("otid-1", 1_700_200_000)
+        };
+        // Resubscribing on a shorter plan after an annual refund is a NEWER period.
+        assert!(app_store_is_newer_period(&annual, &monthly));
+        assert!(!app_store_is_past_period(&annual, &monthly));
+        // Replaying the older unrevoked annual JWS after monthly resubscription is a PAST period.
+        assert!(app_store_is_past_period(&monthly, &annual));
+        assert!(!app_store_is_newer_period(&monthly, &annual));
     }
 }

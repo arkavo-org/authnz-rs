@@ -53,7 +53,7 @@ The challenge signature is verified with strict Ed25519 verification against the
 | `aud` | 3 | array: `AGENT_TOKEN_AUDIENCES` |
 | `exp`, `iat` | 4, 6 | `exp − iat ≤ 900`; `≤ 300` when the delegation is `short_lived`; `exp ≤ appraised_until`; and `exp ≤` the delegation's `expires_at` |
 | `cti` | 7 | 16 random bytes |
-| `cnf` | 8 | `{1: COSE_Key (OKP, Ed25519, the agent key), 2: kid = the DID bytes}` |
+| `cnf` | 8 | `{1: COSE_Key (OKP, Ed25519, the agent key), 3: kid = the DID bytes}` |
 | `act` | `"act"` | `[{"sub": <each AGENT_AUTHORIZED_ACTORS entry>}]`, omitted when empty |
 | `arkavo_account_id` | text | the owner's account UUID |
 | `arkavo_roles` | text | `["agent"]` |

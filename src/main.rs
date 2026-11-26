@@ -28,7 +28,7 @@ use tower::ServiceBuilder;
 use tower::ServiceExt; // Router::oneshot in the HTTP/3 → Axum bridge
 use tower_sessions::cookie::SameSite;
 use tower_sessions::cookie::time::Duration;
-use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
+use tower_sessions::{Expiry, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 use crate::apple_signin::{
@@ -74,6 +74,7 @@ mod device_check;
 mod edge;
 mod entities;
 mod entitlements;
+mod ephemeral;
 mod game;
 mod google_signin;
 mod guardian;
@@ -209,18 +210,27 @@ async fn handle_h3_connection(
         .build(h3_quinn::Connection::new(conn))
         .await?;
 
+    // Track per-stream tasks in a JoinSet tied to this connection's
+    // `ConnectionGuard`, so closing the QUIC connection cancels/drains
+    // in-flight stream tasks before releasing the peer's connection slot.
+    let mut stream_tasks = tokio::task::JoinSet::new();
+
     loop {
+        while stream_tasks.try_join_next().is_some() {}
         match h3_conn.accept().await {
             // h3 0.0.8: accept() yields a RequestResolver; resolve_request()
             // awaits the headers and produces the (Request, RequestStream) pair.
             Ok(Some(resolver)) => {
                 let app = app.clone();
-                tokio::spawn(async move {
-                    match resolver.resolve_request().await {
-                        Ok((req, stream)) => {
-                            // The router's timeout does not cover reading
-                            // the body, which happens before it here.
-                            let deadline = edge::REQUEST_TIMEOUT * 2;
+                stream_tasks.spawn(async move {
+                    let resolved = tokio::time::timeout(
+                        edge::HEADER_READ_TIMEOUT,
+                        resolver.resolve_request(),
+                    )
+                    .await;
+                    match resolved {
+                        Ok(Ok((req, stream))) => {
+                            let deadline = edge::REQUEST_TIMEOUT;
                             match tokio::time::timeout(
                                 deadline,
                                 handle_h3_request(req, stream, peer, app),
@@ -232,74 +242,120 @@ async fn handle_h3_connection(
                                 Err(_) => debug!("HTTP/3 request from {peer} timed out"),
                             }
                         }
-                        Err(e) => debug!("HTTP/3 request resolve error: {}", e),
+                        Ok(Err(e)) => debug!("HTTP/3 request resolve error: {}", e),
+                        Err(_) => debug!("HTTP/3 header read from {peer} timed out"),
                     }
                 });
             }
             Ok(None) => break,
             Err(e) => {
-                // accept() returns Err when the connection ends — a client
-                // disconnecting (graceful close, ApplicationClose, timeout) is
-                // routine and terminal, not an operator-actionable error. Record
-                // it at debug instead of spamming stderr on every closed
-                // connection.
                 debug!("HTTP/3 connection accept loop ended: {}", e);
                 break;
             }
         }
     }
 
+    // Abort and reap any remaining stream tasks before returning so the
+    // caller's `ConnectionGuard` is never released while tasks keep running.
+    stream_tasks.shutdown().await;
     Ok(())
+}
+
+#[cfg(feature = "http3")]
+struct H3ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    _pump: AbortOnDrop,
+}
+
+#[cfg(feature = "http3")]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "http3")]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(feature = "http3")]
+impl http_body::Body for H3ChannelBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 #[cfg(feature = "http3")]
 async fn handle_h3_request(
     req: http::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+    stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
     peer: std::net::SocketAddr,
     app: Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Buf;
 
-    // 1. Collect the H3 request body into an axum Body (bounded — auth/OIDC
-    //    payloads are tiny; refuse anything larger rather than buffering
-    //    unbounded memory from an untrusted peer). The routes' own body
-    //    limits then apply as on TCP.
-    const MAX_H3_BODY: usize = edge::MAX_BUFFERED_BODY_BYTES;
-    let mut body_bytes: Vec<u8> = Vec::new();
-    while let Some(mut chunk) = stream.recv_data().await? {
-        let remaining = chunk.remaining();
-        if body_bytes.len() + remaining > MAX_H3_BODY {
-            let resp = http::Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(())
-                .unwrap();
-            stream.send_response(resp).await?;
-            stream.finish().await?;
-            return Ok(());
+    // 1. Stream the H3 request body into Axum via a small bounded channel so
+    //    routing, rate-limiting, and each route's `DefaultBodyLimit` run
+    //    before buffering any request payload.
+    let (mut send_stream, mut recv_stream) = stream.split();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+    let pump = tokio::spawn(async move {
+        let mut total = 0usize;
+        loop {
+            match recv_stream.recv_data().await {
+                Ok(Some(mut chunk)) => {
+                    let remaining = chunk.remaining();
+                    total = total.saturating_add(remaining);
+                    if total > edge::MAX_BUFFERED_BODY_BYTES {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "request body exceeds maximum size",
+                            )))
+                            .await;
+                        break;
+                    }
+                    let data = chunk.copy_to_bytes(remaining);
+                    if tx.send(Ok(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("h3 recv error: {e}"))))
+                        .await;
+                    break;
+                }
+            }
         }
-        body_bytes.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
-    }
+    });
 
     // A response to HEAD must carry the same headers as the GET-equivalent
-    // (including Content-Length) but no message body. The TCP path gets this for
-    // free from hyper; on H3 we serve the response ourselves, so capture the
-    // method now and suppress the body frame below.
+    // (including Content-Length) but no message body.
     let is_head = req.method() == Method::HEAD;
 
-    // The QUIC stream frames the body, so the bytes we actually buffered are
-    // authoritative. Normalize Content-Length so the router never sees a
-    // client-supplied value that disagrees with the real body length.
     let (mut parts, _) = req.into_parts();
     parts.extensions.insert(ConnectInfo(peer));
-    parts.headers.remove(http::header::CONTENT_LENGTH);
-    if !body_bytes.is_empty() {
-        parts.headers.insert(
-            http::header::CONTENT_LENGTH,
-            http::HeaderValue::from(body_bytes.len() as u64),
-        );
-    }
-    let axum_req = http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+    let axum_req = http::Request::from_parts(
+        parts,
+        axum::body::Body::new(H3ChannelBody {
+            rx,
+            _pump: AbortOnDrop(pump),
+        }),
+    );
 
     // 2. Drive the Axum router as a tower::Service (its error type is Infallible).
     let response = app
@@ -307,18 +363,9 @@ async fn handle_h3_request(
         .await
         .map_err(|e| format!("router error: {e}"))?;
 
-    // 3. Send status + headers, then forward the response body frame by frame
-    //    (no full-body buffering — keeps memory bounded and preserves streaming
-    //    for any future chunked response). A HEAD response carries the headers
-    //    but no body.
+    // 3. Send status + headers, then forward the response body frame by frame.
     let (mut resp_parts, mut resp_body) = response.into_parts();
 
-    // hyper synthesizes Content-Length from the body size at the wire layer on
-    // the TCP path; that layer is bypassed here, so replicate it — advertise
-    // Content-Length when the body length is exactly known and not already set.
-    // This gives H3 clients (including HEAD probes, where the body is suppressed
-    // below) the same Content-Length they would see over HTTP/2. Streaming bodies
-    // of unknown size are left without it, exactly as on the TCP path.
     if !resp_parts
         .headers
         .contains_key(http::header::CONTENT_LENGTH)
@@ -330,22 +377,21 @@ async fn handle_h3_request(
             .insert(http::header::CONTENT_LENGTH, value);
     }
 
-    stream
+    send_stream
         .send_response(http::Response::from_parts(resp_parts, ()))
         .await?;
 
     if !is_head {
         use http_body_util::BodyExt;
         while let Some(frame) = resp_body.frame().await {
-            // Forward data frames; trailers (rare on these routes) are skipped.
             if let Ok(data) = frame?.into_data()
                 && !data.is_empty()
             {
-                stream.send_data(data).await?;
+                send_stream.send_data(data).await?;
             }
         }
     }
-    stream.finish().await?;
+    send_stream.finish().await?;
 
     Ok(())
 }
@@ -439,6 +485,9 @@ pub struct AppState {
     /// Empty ⇒ unset: the value is recorded on the binding but not enforced
     /// (logged as a warning at attestation time).
     pub app_attest_app_id: Arc<Vec<String>>,
+    /// Atomic take-once store for single-use WebAuthn ceremonies, App Attest
+    /// challenges/tickets, OAuth nonces, and id_token replay tracking.
+    pub ephemeral_store: ephemeral::EphemeralStore,
 }
 
 /// The key material loaded at boot: attestation-envelope signing key, the
@@ -603,7 +652,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // single value (eliminates per-request env reads and runtime-mutation
     // footguns).
     let issuer = env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     // did:webvh Ed25519 update-signing key (fail-open: None when WEBVH_SIGN_KEY_PATH unset)
     let webvh_sign_key = webvh::load_sign_key();
@@ -670,6 +721,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The claims' audience is this identity's issuer.
     let market = market::MarketSource::from_env(&issuer);
 
+    // Set up Redis Client using fred (created before AppState so
+    // `ephemeral_store` shares the same connection pool).
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_config = fred::types::RedisConfig::from_url(&redis_url).unwrap_or_else(|_| {
+        log::warn!(
+            "Invalid REDIS_URL '{}', falling back to default config",
+            redis_url
+        );
+        fred::types::RedisConfig::default()
+    });
+    let redis_client = fred::clients::RedisClient::new(redis_config, None, None, None);
+
+    // Spawn connection in the background so a connection failure doesn't crash app startup
+    let redis_conn_client = redis_client.clone();
+    tokio::spawn(async move {
+        let _conn_handle = redis_conn_client.connect();
+        if let Err(err) = redis_conn_client.wait_for_connect().await {
+            log::warn!("Failed to connect to Redis: {:?}", err);
+        } else {
+            log::info!("Successfully connected to Redis");
+        }
+    });
+
     // Create the app state
     let app_state = AppState {
         webauthn,
@@ -700,29 +774,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_attest_app_id: Arc::new(parse_app_attest_app_ids(
             env::var("APP_ATTEST_APP_ID").ok().as_deref(),
         )),
+        ephemeral_store: ephemeral::EphemeralStore::new(redis_client.clone()),
     };
-
-    // Set up Redis Client using fred
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let redis_config = fred::types::RedisConfig::from_url(&redis_url).unwrap_or_else(|_| {
-        log::warn!(
-            "Invalid REDIS_URL '{}', falling back to default config",
-            redis_url
-        );
-        fred::types::RedisConfig::default()
-    });
-    let redis_client = fred::clients::RedisClient::new(redis_config, None, None, None);
-
-    // Spawn connection in the background so a connection failure doesn't crash app startup
-    let redis_conn_client = redis_client.clone();
-    tokio::spawn(async move {
-        let _conn_handle = redis_conn_client.connect();
-        if let Err(err) = redis_conn_client.wait_for_connect().await {
-            log::warn!("Failed to connect to Redis: {:?}", err);
-        } else {
-            log::info!("Successfully connected to Redis");
-        }
-    });
 
     // OIDC provider configuration (issuer, JWKS, registered clients).
     let oidc_config = Arc::new(
@@ -767,7 +820,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apple_tokens.clone(),
     ));
 
-    let session_store = MemoryStore::default();
+    let session_store = ephemeral::BoundedSessionStore::default();
+    let sweep_store = session_store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let removed = sweep_store.purge_expired();
+            if removed > 0 {
+                debug!("Purged {removed} expired sessions");
+            }
+        }
+    });
     let session_service = ServiceBuilder::new().layer(
         SessionManagerLayer::new(session_store)
             .with_name("authnz-rs")
@@ -810,14 +874,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/oauth/authorize",
             get(oidc_authorize).layer(oauth_limit.clone()),
         )
-        .route("/oauth/token", post(oidc_token).layer(oauth_limit))
+        .route("/oauth/token", post(oidc_token).layer(oauth_limit.clone()))
         .route("/oauth/userinfo", get(oidc_userinfo))
         // Sign in with Apple
         .route(
             "/oauth/apple/nonce",
             get(apple_nonce_handler).layer(ceremony_limit.clone()),
         )
-        .route("/oauth/apple/idtoken", post(apple_idtoken_handler))
+        .route(
+            "/oauth/apple/idtoken",
+            post(apple_idtoken_handler).layer(ceremony_limit.clone()),
+        )
         .route(
             "/oauth/apple/link",
             post(apple_link_handler).delete(apple_unlink_handler),
@@ -838,7 +905,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `idp=google` /oauth/authorize request parked in Redis.
         .route(
             "/oauth/google/callback",
-            get(google_signin::google_callback_handler),
+            get(google_signin::google_callback_handler).layer(oauth_limit.clone()),
         )
         // Patreon linking (mirrors /oauth/apple/link — same auth-required,
         // identity_links-write contract). Membership + tier are surfaced
@@ -887,8 +954,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // A game session: the passkey session's device key, good for 30
         // days for the game-token mint and nothing else.
-        .route("/game/session", post(game::open_session_handler))
-        .route("/game/session/end", post(game::end_session_handler))
+        .route(
+            "/game/session",
+            post(game::open_session_handler).layer(mint_limit.clone()),
+        )
+        .route(
+            "/game/session/end",
+            post(game::end_session_handler).layer(ceremony_limit.clone()),
+        )
         .route("/owner-kas/token", post(owner_kas::token_handler))
         // Owner-KAS routes (#148): the owner's passkey-signed route record
         // and push token live here so account deletion reaches them; the
@@ -920,15 +993,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/passkeys/credentials/:credential_id/status",
-            get(passkeys::credential_status),
+            get(passkeys::credential_status).layer(oauth_limit),
         )
         // Passkey session renewal (#108): open with a fresh passkey auth CWT
         // and a device key; renew and sign out with that key's signature.
         .route("/session", post(session::open_session))
-        .route("/session/refresh", post(session::refresh_session))
-        .route("/session/signout", post(session::signout_session))
+        .route(
+            "/session/refresh",
+            post(session::refresh_session).layer(mint_limit.clone()),
+        )
+        .route(
+            "/session/signout",
+            post(session::signout_session).layer(ceremony_limit.clone()),
+        )
         .route("/account", axum::routing::delete(account::delete_account))
-        .route("/account/deletions/:id", get(account::get_deletion_status))
+        .route(
+            "/account/deletions/:id",
+            get(account::get_deletion_status).layer(ceremony_limit.clone()),
+        )
         // Entity lookup (service CWT required). Spec §2.4.
         .route("/entities/:id", get(entities::get_entity))
         // Existing OAuth callback for native-app deep links (Patreon/Twitch/Discord/Reddit)
@@ -1287,7 +1369,7 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
         port: env::var("PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse()?,
-        tls_enabled: env::var("TLS_CERT_PATH").is_ok(),
+        tls_enabled: env::var("TLS_CERT_PATH").is_ok() || env::var("TLS_KEY_PATH").is_ok(),
         tls_cert_path: env::var("TLS_CERT_PATH").unwrap_or_else(|_| {
             current_dir
                 .join("fullchain.pem")
@@ -1549,10 +1631,19 @@ fn with_state(uri: String, state: Option<&str>) -> String {
     }
 }
 
+fn no_store_redirect(uri: &str) -> Response {
+    let mut resp = Redirect::temporary(uri).into_response();
+    resp.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
 async fn handle_oauth_callback(
     uri: Uri,
     axum::extract::Path((client, provider)): axum::extract::Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     debug!(
         "Received OAuth callback for client: {} and provider: {}",
         client.trim(),
@@ -1564,7 +1655,7 @@ async fn handle_oauth_callback(
         Ok(client) => client,
         Err(e) => {
             error!("Invalid OAuth client: {}", e);
-            return Redirect::temporary("arkavo://oauth/error?error=invalid_client");
+            return no_store_redirect("arkavo://oauth/error?error=invalid_client");
         }
     };
 
@@ -1573,7 +1664,7 @@ async fn handle_oauth_callback(
         Ok(provider) => provider,
         Err(e) => {
             error!("Invalid OAuth provider: {}", e);
-            return Redirect::temporary(&format!(
+            return no_store_redirect(&format!(
                 "{}://oauth/error?error=invalid_provider",
                 client.as_scheme()
             ));
@@ -1589,7 +1680,7 @@ async fn handle_oauth_callback(
     let state = match params.get("state").map(|s| s.as_ref()) {
         Some(state) if !validate_oauth_state(state) => {
             error!("Invalid OAuth state parameter for {:?}", provider);
-            return Redirect::temporary(&provider.get_error_uri("invalid_state", client, None));
+            return no_store_redirect(&provider.get_error_uri("invalid_state", client, None));
         }
         state => state,
     };
@@ -1598,17 +1689,17 @@ async fn handle_oauth_callback(
     match params.get("code").map(|s| s.as_ref()) {
         Some(code) if !code.is_empty() => {
             debug!("Processing OAuth code for {:?}", provider);
-            Redirect::temporary(&provider.get_redirect_uri(code, client, state))
+            no_store_redirect(&provider.get_redirect_uri(code, client, state))
         }
         _ => {
             // Check for error parameters from OAuth provider
             if let Some(error) = params.get("error").map(|s| s.as_ref()) {
                 error!("OAuth error from provider: {}", error);
-                return Redirect::temporary(&provider.get_error_uri(error, client, state));
+                return no_store_redirect(&provider.get_error_uri(error, client, state));
             }
 
             error!("No code provided in OAuth callback for {:?}", provider);
-            Redirect::temporary(&provider.get_error_uri("no_code", client, state))
+            no_store_redirect(&provider.get_error_uri("no_code", client, state))
         }
     }
 }
@@ -2372,6 +2463,7 @@ pub(crate) mod test_helpers {
             owner_kas_relay_client_ids: Arc::new(vec!["owner-kas-relay".into()]),
             appraisal: crate::agent_state::AppraisalConfig::default(),
             app_attest_app_id: Arc::new(Vec::new()),
+            ephemeral_store: crate::ephemeral::EphemeralStore::local_only(),
         }
     }
 }

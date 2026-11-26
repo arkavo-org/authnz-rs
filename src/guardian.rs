@@ -243,8 +243,19 @@ pub(crate) async fn verify_guardian_request(
         &header.signature,
     )
     .map_err(|_| AgentError::Unauthorized(DOES_NOT_VERIFY.into()))?;
-    // Only after the signature verifies, so unauthenticated traffic cannot
-    // move a Guardian's clock.
+    // Re-check owner liveness before advancing the Guardian clock so a
+    // Guardian of a tombstoned account cannot quarantine or appraise during
+    // the deletion grace/retry window.
+    if !app_state
+        .db_store
+        .is_account_live(&guardian.owner)
+        .await
+        .map_err(db_err)?
+    {
+        return Err(AgentError::Unauthorized(DOES_NOT_VERIFY.into()));
+    }
+    // Only after the signature verifies and owner is live, so unauthenticated
+    // traffic or a deleted account cannot move a Guardian's clock.
     match app_state
         .db_store
         .advance_guardian_clock(&guardian.guardian_id, header.timestamp)

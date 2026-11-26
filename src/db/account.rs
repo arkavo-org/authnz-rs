@@ -418,6 +418,7 @@ impl DynamoDBStore {
                 .client
                 .scan()
                 .table_name(table)
+                .consistent_read(true)
                 .filter_expression(&filter)
                 .projection_expression("#k")
                 .expression_attribute_names("#k", key)
@@ -516,22 +517,26 @@ impl DynamoDBStore {
                 None => break,
             }
         }
+        let uid_av = s(&user_id.to_string());
+        let mut owned_dids = std::collections::HashSet::new();
         for did in &dids {
             // A newly revoked row moves `state_version`, as every revocation
             // does; an already revoked one keeps it (a repeated sweep is not
-            // a state change).
+            // a state change). Conditioned on `root_user_id = :uid` so a stale
+            // GSI read can never revoke another account's re-authorized DID.
             let revoke = self
                 .client
                 .update_item()
                 .table_name(table)
                 .key("agent_did", s(did))
                 .condition_expression(
-                    "attribute_exists(agent_did) AND attribute_not_exists(revoked_at)",
+                    "attribute_exists(agent_did) AND root_user_id = :uid AND attribute_not_exists(revoked_at)",
                 )
                 .update_expression(
                     "SET revoked_at = :now, \
                      state_version = if_not_exists(state_version, :zero) + :one",
                 )
+                .expression_attribute_values(":uid", uid_av.clone())
                 .expression_attribute_values(":now", n(now))
                 .expression_attribute_values(":zero", n(0))
                 .expression_attribute_values(":one", n(1))
@@ -544,23 +549,36 @@ impl DynamoDBStore {
                     other => return Err(other),
                 },
             }
-            self.client
+            let scrub = self
+                .client
                 .update_item()
                 .table_name(table)
                 .key("agent_did", s(did))
-                .condition_expression("attribute_exists(agent_did)")
+                .condition_expression("attribute_exists(agent_did) AND root_user_id = :uid")
                 .update_expression(
                     "SET #nm = :empty \
                      REMOVE delegator_username, challenge, challenge_nonce, challenge_issued_at",
                 )
                 .expression_attribute_names("#nm", "name")
+                .expression_attribute_values(":uid", uid_av.clone())
                 .expression_attribute_values(":empty", s(""))
                 .send()
-                .await
-                .map_err(|e| classify(e, table))?;
-            self.revoke_delegations_with_chain(did).await?;
+                .await;
+            match scrub {
+                Ok(_) => {
+                    owned_dids.insert(did.clone());
+                }
+                Err(e) => match classify(e, table) {
+                    // Row was taken over by another owner or removed since the GSI read:
+                    // skip it and do NOT cascade revocation to the new owner's children.
+                    DynamoDBError::ConditionalConflict => continue,
+                    other => return Err(other),
+                },
+            }
         }
-        Ok(dids.len() as u32)
+        // One paginated scan across all actually-owned DIDs instead of N scans.
+        self.revoke_delegations_with_chains(&owned_dids).await?;
+        Ok(owned_dids.len() as u32)
     }
 
     /// Revoke every Guardian the account enrolled and clear its label. The

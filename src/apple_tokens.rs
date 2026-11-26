@@ -304,7 +304,10 @@ struct ErrorResponse {
 /// Apple's sanitized `error` code); 429, 5xx and anything else are
 /// transient. Same split as `patreon::token_exchange_error`.
 fn apple_failure(status: reqwest::StatusCode, body: &str) -> AppleTokenError {
-    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if status.is_client_error()
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+    {
         let code = serde_json::from_str::<ErrorResponse>(body)
             .ok()
             .and_then(|b| b.error)
@@ -469,7 +472,11 @@ impl AppleTokens {
     pub async fn seal(&self, refresh_token: &str) -> Result<SealedToken, AppleTokenError> {
         self.enabled()?
             .sealer
-            .seal(refresh_token.as_bytes())
+            .seal_with_context(
+                refresh_token.as_bytes(),
+                b"apple_tokens:v1",
+                &[("purpose", "apple_tokens")],
+            )
             .await
             .map_err(from_sealer)
     }
@@ -478,7 +485,11 @@ impl AppleTokens {
         let bytes = self
             .enabled()?
             .sealer
-            .open(sealed)
+            .open_with_context(
+                sealed,
+                b"apple_tokens:v1",
+                &[("purpose", "apple_tokens")],
+            )
             .await
             .map_err(from_sealer)?;
         String::from_utf8(bytes)

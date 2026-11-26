@@ -343,6 +343,24 @@ pub(crate) async fn open_session_handler(
                 _ => unauthorized("ended_during_open"),
             };
         }
+    } else {
+        // Idempotent open: verify the existing game session is actually bound
+        // to this account and device key (not an orphaned row from another key).
+        match app_state
+            .db_store
+            .get_game_session(&game_session.game_session_id)
+            .await
+        {
+            Ok(Some(existing))
+                if existing.user_id == user_id
+                    && existing.public_key == game_session.public_key => {}
+            Ok(Some(_)) => return unauthorized("key_mismatch"),
+            Ok(None) => return unauthorized("ended_during_open"),
+            Err(e) => {
+                error!("game session: existing-row verify failed for {user_id}: {e}");
+                return refuse(StatusCode::INTERNAL_SERVER_ERROR, ERR_SERVER);
+            }
+        }
     }
     info!(
         "audit game_session_open outcome=opened user_id={user_id} game_session={}",

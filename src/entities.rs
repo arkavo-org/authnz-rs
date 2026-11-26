@@ -115,19 +115,34 @@ pub async fn get_entity(
                 .await
                 .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
+            let owner_live = db
+                .is_account_live(&d.root_user_id)
+                .await
+                .map_err(|e| EntityError::Database(Box::new(e)))?;
+            if !owner_live && d.trust.state != crate::db::AgentState::Quarantined {
+                return Err(EntityError::NotFound);
+            }
+            let now = Utc::now().timestamp();
+            let effective_state = d.trust.effective(now);
+            let mut claims = serde_json::json!({
+                "sub": d.agent_did,
+                "arkavo_account_id": d.root_user_id,
+                "arkavo_roles": ["agent"],
+                "arkavo_entitlements": crate::db::strip_derived_only(d.entitlements.clone(), &d.agent_did),
+                "arkavo_npe": {"type": "agent", "delegation_id": d.agent_did, "depth": d.depth, "chain": d.chain},
+                "revoked": d.revoked_at.is_some() || !owner_live,
+                "expires_at": d.expires_at,
+                "state": effective_state.as_str(),
+                "state_version": d.trust.state_version,
+            });
+            if let Some(until) = d.trust.appraised_until {
+                claims["appraised_until"] = until.into();
+            }
             EntityRepresentation {
                 id,
                 category: "environment",
                 npe_type: Some("agent"),
-                claims: serde_json::json!({
-                    "sub": d.agent_did,
-                    "arkavo_account_id": d.root_user_id,
-                    "arkavo_roles": ["agent"],
-                    "arkavo_entitlements": crate::db::strip_derived_only(d.entitlements.clone(), &d.agent_did),
-                    "arkavo_npe": {"type": "agent", "delegation_id": d.agent_did, "depth": d.depth, "chain": d.chain},
-                    "revoked": d.revoked_at.is_some(),
-                    "expires_at": d.expires_at,
-                }),
+                claims,
             }
         }
         EntityId::Device(key_id) => {
@@ -136,6 +151,13 @@ pub async fn get_entity(
                 .await
                 .map_err(|e| EntityError::Database(Box::new(e)))?
                 .ok_or(EntityError::NotFound)?;
+            let owner_live = db
+                .is_account_live(&b.user_id)
+                .await
+                .map_err(|e| EntityError::Database(Box::new(e)))?;
+            if !owner_live {
+                return Err(EntityError::NotFound);
+            }
             let (class, expiry) =
                 crate::device_check::device_class(b.updated_at, Utc::now().timestamp());
             let mut npe = serde_json::json!({"type": "device", "class": class.as_str(), "attestation_expiry": expiry, "device_id": b.device_id});

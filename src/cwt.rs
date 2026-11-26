@@ -139,7 +139,9 @@ impl ArkavoUserClaims {
         let mut out: Vec<String> = self
             .entitlements
             .iter()
-            .filter(|e| !crate::constants::is_derived_only(e))
+            .filter(|e| {
+                !crate::constants::is_derived_only(e) && !crate::constants::is_never_stored(e)
+            })
             .cloned()
             .collect();
         for e in &self.derived_entitlements {
@@ -606,8 +608,9 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
             .clone()
             .to_cbor_value()
             .map_err(|_| CwtError::Malformed)?;
+        // RFC 8747 §3.2: 1 = COSE_Key, 3 = kid (2 is Encrypted_COSE_Key).
         cnf_entries.push((Value::Integer(1.into()), cose_key_value));
-        cnf_entries.push((Value::Integer(2.into()), Value::Bytes(cnf.kid.clone())));
+        cnf_entries.push((Value::Integer(3.into()), Value::Bytes(cnf.kid.clone())));
         entries.push((Value::Integer(8.into()), Value::Map(cnf_entries)));
     }
 
@@ -863,16 +866,23 @@ fn patreon_to_cbor(p: &ArkavoPatreon) -> Value {
                     Value::Text("tier_ids".into()),
                     Value::Array(m.tier_ids.iter().map(|t| Value::Text(t.clone())).collect()),
                 ));
-                if !m.tier_slugs.is_empty() {
-                    m_entries.push((
-                        Value::Text("tier_slugs".into()),
-                        Value::Array(
-                            m.tier_slugs
-                                .iter()
-                                .map(|t| Value::Text(t.clone()))
-                                .collect(),
-                        ),
-                    ));
+                // Drop any `tier-<digits>` impersonation slug that does not
+                // match one of the member's own `tier_ids`.
+                let safe_slugs: Vec<Value> = m
+                    .tier_slugs
+                    .iter()
+                    .filter(|s| {
+                        !s.strip_prefix("tier-")
+                            .is_some_and(|rest| {
+                                !rest.is_empty()
+                                    && rest.bytes().all(|b| b.is_ascii_digit())
+                                    && !m.tier_ids.iter().any(|id| id == rest)
+                            })
+                    })
+                    .map(|t| Value::Text(t.clone()))
+                    .collect();
+                if !safe_slugs.is_empty() {
+                    m_entries.push((Value::Text("tier_slugs".into()), Value::Array(safe_slugs)));
                 }
                 // Names only where they entitle, to bound the token (#128).
                 if let Some(name) = &m.campaign_name
@@ -1014,7 +1024,11 @@ fn patreon_from_cbor(v: Value) -> Result<ArkavoPatreon, CwtError> {
 
 // `pub` for the same cross-crate test-access reason as `strip_cwt_tag` above.
 pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
-    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor).map_err(|_| CwtError::Malformed)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(CwtError::Malformed);
+    }
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
     };
@@ -1110,6 +1124,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                 }
                 let mut cose_key: Option<coset::CoseKey> = None;
                 let mut kid: Option<Vec<u8>> = None;
+                let mut legacy_kid: Option<Vec<u8>> = None;
                 for (kk, vv) in map {
                     match (kk, vv) {
                         (Value::Integer(j), val) if int_label(&j) == 1 => {
@@ -1118,28 +1133,45 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                                     .map_err(|_| CwtError::Malformed)?,
                             );
                         }
-                        (Value::Integer(j), Value::Bytes(b)) if int_label(&j) == 2 => {
+                        // RFC 8747 §3.2: label 3 = kid.
+                        (Value::Integer(j), Value::Bytes(b)) if int_label(&j) == 3 => {
                             kid = Some(b);
+                        }
+                        (Value::Integer(j), _) if int_label(&j) == 3 => {
+                            return Err(CwtError::Malformed);
+                        }
+                        // Backward-compat read for pre-0.42.1 ~99y registration CWTs
+                        // that encoded kid at label 2.
+                        (Value::Integer(j), Value::Bytes(b)) if int_label(&j) == 2 => {
+                            legacy_kid = Some(b);
                         }
                         _ => {}
                     }
                 }
                 cnf = Some(Cnf {
                     cose_key: cose_key.ok_or(CwtError::Malformed)?,
-                    kid: kid.unwrap_or_default(),
+                    kid: kid.or(legacy_kid).unwrap_or_default(),
                 });
             }
+            (Value::Integer(i), _) if matches!(int_label(&i), 1 | 2 | 3 | 4 | 6 | 7 | 8) => {
+                return Err(CwtError::Malformed);
+            }
             (Value::Text(s), Value::Text(t)) if s == "idp" => custom.idp = Some(t),
+            (Value::Text(s), _) if s == "idp" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Text(t)) if s == "email" => custom.email = Some(t),
+            (Value::Text(s), _) if s == "email" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Bool(b)) if s == "email_verified" => {
                 custom.email_verified = Some(b)
             }
+            (Value::Text(s), _) if s == "email_verified" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Bool(b)) if s == "arkavo_apple_linked" => {
                 custom.arkavo_apple_linked = Some(b)
             }
+            (Value::Text(s), _) if s == "arkavo_apple_linked" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Text(t)) if s == "arkavo_account_id" => {
                 custom.arkavo_account_id = Some(t)
             }
+            (Value::Text(s), _) if s == "arkavo_account_id" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Array(a)) if s == "arkavo_roles" => {
                 let parts: Result<Vec<String>, _> = a
                     .into_iter()
@@ -1150,6 +1182,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     .collect();
                 custom.arkavo_roles = Some(parts?);
             }
+            (Value::Text(s), _) if s == "arkavo_roles" => return Err(CwtError::Malformed),
             (Value::Text(s), Value::Array(a)) if s == "arkavo_entitlements" => {
                 let parts: Result<Vec<String>, _> = a
                     .into_iter()
@@ -1160,6 +1193,7 @@ pub fn claims_from_cbor(bytes: &[u8]) -> Result<ArkavoClaims, CwtError> {
                     .collect();
                 custom.arkavo_entitlements = Some(parts?);
             }
+            (Value::Text(s), _) if s == "arkavo_entitlements" => return Err(CwtError::Malformed),
             (Value::Text(s), v) if s == "arkavo_patreon" => {
                 custom.arkavo_patreon = Some(patreon_from_cbor(v)?);
             }
@@ -1321,10 +1355,12 @@ pub fn verify(
         Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
         _ => return Err(CwtError::UnsupportedAlg),
     }
-    // No CWT minted here carries a content type; a passkey credential
-    // attestation (`credential_attestation`) always does. Refusing it keeps
-    // an attestation from ever passing as a token (#104).
-    if sign1.protected.header.content_type.is_some() {
+    // No CWT minted here carries a content type, critical headers, or
+    // unprotected header parameters (#104).
+    if sign1.protected.header.content_type.is_some()
+        || !sign1.protected.header.crit.is_empty()
+        || sign1.unprotected != coset::Header::default()
+    {
         return Err(CwtError::Malformed);
     }
 

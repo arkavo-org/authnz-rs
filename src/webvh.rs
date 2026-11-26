@@ -249,6 +249,13 @@ pub fn load_sign_key() -> Option<String> {
             );
         }
     }
+    #[cfg(feature = "webvh")]
+    if let Err(e) = serde_json::from_str::<didwebvh_rs::prelude::Secret>(&contents) {
+        error!(
+            "webvh: WEBVH_SIGN_KEY_PATH={path} is not valid Secret JSON ({e}) — webvh signing DISABLED"
+        );
+        return None;
+    }
     info!("webvh: update-signing key loaded from {path}");
     Some(contents)
 }
@@ -550,6 +557,8 @@ pub async fn refresh_handle_binding(app: &crate::AppState, uid: &Uuid, handle: &
             uid: &Uuid,
             handle: &str,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let handle = handle.to_lowercase();
+            let handle = handle.as_str();
             let Some(log) = app.db_store.get_webvh_log(uid).await? else {
                 return Ok(());
             };
