@@ -414,18 +414,12 @@ expires. The server refuses to start when the list contains
 `https://kas.arkavo.net` or `arkavo` (the passkey CWT audience). Remove
 the KAS from a running environment's list before deploying this release.
 
-IAM: agent trust-state writes are single conditional `UpdateItem`s on
-`agent_delegations` and `guardians`. Separately, since 0.42.1, passkey
-registration (`create_user_with_credential`) and subscription/purchase link
-writes (`bind_app_store_link`, `link_market_purchase`) use
-`dynamodb:TransactWriteItems` across `credentials`, `handles`, and
-`identity_links`, so the service role needs `dynamodb:PutItem` on `handles`,
-`dynamodb:ConditionCheckItem` on `credentials`, and `dynamodb:PutItem` /
-`dynamodb:UpdateItem` across those tables (DynamoDB IAM authorizes
-`TransactWriteItems` via the underlying `PutItem`/`UpdateItem`/`DeleteItem`/
-`ConditionCheckItem` actions). The service role needs, in addition to the
-actions track 1 already uses on `agent_delegations` (`PutItem`, `UpdateItem`,
-`GetItem`, `Query` on `root_user_id-index`, `Scan`):
+IAM: every agent trust-state write is a single conditional `UpdateItem` on
+`agent_delegations` or `guardians` (no `TransactWriteItems` for agent trust;
+see the 0.42.1 section below for registration, App Store, and market
+transactions). The service role needs, in addition to the actions track 1
+already uses on `agent_delegations` (`PutItem`, `UpdateItem`, `GetItem`,
+`Query` on `root_user_id-index`, `Scan`):
 
 | Table | Actions |
 |---|---|
@@ -454,6 +448,22 @@ after recovery: a recovered key can never be re-authorized by its owner
 (only a Guardian may appraise it from then on), so a recovered key stops
 minting at most 30 days after its last authorize even while a Guardian
 keeps appraising it — the owner authorizes a new key before then.
+
+#### Transactional writes and KMS encryption context (0.42.1)
+
+No new tables or indexes. Passkey account creation
+(`create_user_with_credential`), App Store link binding/moves
+(`bind_app_store_link`, `move_app_store_link`), and market purchase linking
+(`link_market_purchase`) now use `TransactWriteItems` across `credentials`,
+`handles`, and `identity_links`. DynamoDB authorizes `TransactWriteItems` via
+the underlying per-item actions on each referenced table:
+
+| Resource | Actions |
+|---|---|
+| `DYNAMODB_CREDENTIALS_TABLE` | **`dynamodb:ConditionCheckItem`** (new, for App Store link transactions), plus existing `PutItem`, `UpdateItem`, `GetItem`, `DeleteItem`, `Scan`, and `Query` on `username-index` |
+| `DYNAMODB_HANDLES_TABLE` | **`dynamodb:PutItem`** (new, for transactional handle reservation at registration), plus existing `GetItem`, `UpdateItem` |
+| `DYNAMODB_IDENTITY_LINKS_TABLE` | existing `UpdateItem`, `GetItem`, `DeleteItem`, `Scan`, `BatchGetItem`, `PutItem` |
+| `PATREON_KMS_KEY_ID` | existing `kms:Encrypt` and `kms:Decrypt`; new writes pass `EncryptionContext` (`purpose=patreon_tokens, user_id=<uuid>` or `purpose=apple_tokens`) while `Decrypt` falls back to empty context for pre-0.42.1 rows — ensure no key policy or IAM condition restricts `kms:EncryptionContext:*` |
 
 ### Systemd Service Setup
 
