@@ -872,18 +872,6 @@ enum Binding {
     Elsewhere(Uuid),
 }
 
-/// Bind `tx`'s subscription to `to`, moving its link from the current owner
-/// when the move rule allows it, which is when either holds:
-///
-/// - (a) the owner is not live (deleted, not yet swept, or unknown);
-/// - (b) the transaction is Sandbox and its `appAccountToken` names `to`.
-///   App Review reuses Sandbox Apple IDs with fresh accounts, and a
-///   resubscription keeps its `originalTransactionId`.
-///
-/// A Production subscription of another live account stays where it is. The
-/// move is conditional on the owner read, so a race with another bind, move
-/// or the deletion sweep is re-evaluated (a few times at most); the old
-/// owner's row is never touched (its Sandbox entry is left to expire).
 /// Whether a Sandbox transaction `tx` is fresh enough to move a live
 /// owner's subscription link to `to`. Refuses cross-environment moves,
 /// earlier billing periods, older `signedDate` snapshots, or replays of the
@@ -915,6 +903,19 @@ fn sandbox_tx_may_move_from(stored: &AppStoreRecord, tx: &VerifiedTransaction) -
     tx.signed_at >= stored.last_signed_at
 }
 
+/// Bind `tx`'s subscription to `to`, moving its link from the current owner
+/// when the move rule allows it, which is when either holds:
+///
+/// - (a) the owner is not live (deleted, not yet swept, or unknown);
+/// - (b) the transaction is Sandbox and its `appAccountToken` names `to`, and
+///   the live owner has a stored Sandbox record that `tx` supersedes.
+///   App Review reuses Sandbox Apple IDs with fresh accounts, and a
+///   resubscription keeps its `originalTransactionId`.
+///
+/// A Production subscription of another live account stays where it is. The
+/// move is conditional on the owner read, so a race with another bind, move
+/// or the deletion sweep is re-evaluated (a few times at most); the old
+/// owner's row is never touched (its Sandbox entry is left to expire).
 async fn bind_or_move(
     store: &DynamoDBStore,
     tx: &VerifiedTransaction,
@@ -937,17 +938,19 @@ async fn bind_or_move(
             continue;
         }
         if sandbox_for_to {
-            // Check whether the current owner is live and holds a newer/same
-            // record for this subscription so an old Sandbox JWS cannot hijack
-            // it back from a newer live Sandbox owner.
-            if let Some(state) = store.get_publishing_state(&owner).await?
-                && let Some(stored) = state
+            // Check whether the current owner is live: if live, only move when
+            // it holds a stored Sandbox record that `tx` supersedes (so an old
+            // Sandbox JWS cannot hijack a subscription while the new live owner
+            // is still finishing its write or holds a fresher record).
+            if let Some(state) = store.get_publishing_state(&owner).await? {
+                match state
                     .app_store
                     .iter()
                     .find(|r| r.original_transaction_id == *otid)
-                && !sandbox_tx_may_move_from(stored, tx)
-            {
-                return Ok(Binding::Elsewhere(owner));
+                {
+                    Some(stored) if sandbox_tx_may_move_from(stored, tx) => {}
+                    _ => return Ok(Binding::Elsewhere(owner)),
+                }
             }
         } else if store.is_account_live(&owner).await? {
             return Ok(Binding::Elsewhere(owner));

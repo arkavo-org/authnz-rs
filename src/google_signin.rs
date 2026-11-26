@@ -346,6 +346,11 @@ pub async fn google_link_handler(
                 }
                 Err(e) => {
                     error!("Post-link liveness check failed for {}: {}", user_id, e);
+                    let _ = app_state
+                        .db_store
+                        .delete_identity_link("google", &claims.sub, &user_id)
+                        .await;
+                    return GoogleSigninError::Storage.into_response();
                 }
             }
             // Audit: a subject prefix is enough to triangulate with the DDB row
@@ -425,8 +430,7 @@ impl PendingAuthorizeStore {
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            match self
-                .redis
+            self.redis
                 .set::<(), _, _>(
                     Self::key(state),
                     value,
@@ -437,39 +441,21 @@ impl PendingAuthorizeStore {
                     false,
                 )
                 .await
-            {
-                Ok(()) => {
-                    self.lock_local().remove(state);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "Redis set failed for PendingAuthorizeStore; falling back to local: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            warn!("Redis is offline; falling back to in-memory PendingAuthorizeStore");
+                .map_err(|e| format!("Redis set failed for PendingAuthorizeStore: {}", e))?;
+            self.lock_local().remove(state);
+            return Ok(());
         }
+        warn!("Redis is offline; falling back to in-memory PendingAuthorizeStore");
         self.insert_local(state.to_string(), record);
         Ok(())
     }
 
     /// Fetch and delete (single-use). Expired records read as absent.
     pub async fn take(&self, state: &str) -> Result<Option<PendingAuthorize>, String> {
-        // Check local fallback first so entries written during a Redis blip
-        // are not stranded after Redis reconnects.
-        let local_record = { self.lock_local().remove(state) };
-        if let Some(record) = local_record {
-            if self.redis.is_connected() {
-                let _: Result<(), _> = self.redis.del(Self::key(state)).await;
-            }
-            return Ok((record.expires_at >= Utc::now().timestamp()).then_some(record));
-        }
         let record = if self.redis.is_connected() {
-            // GETDEL so two concurrent callbacks presenting the same state
-            // cannot both win the race between a GET and a DEL.
+            // GETDEL is the sole authoritative single-use redemption path when
+            // Redis is connected.
+            self.lock_local().remove(state);
             let val: Option<String> = self
                 .redis
                 .getdel(Self::key(state))
@@ -483,7 +469,7 @@ impl PendingAuthorizeStore {
                 None => None,
             }
         } else {
-            None
+            self.lock_local().remove(state)
         };
         Ok(record.filter(|r| r.expires_at >= Utc::now().timestamp()))
     }
@@ -665,7 +651,7 @@ impl GoogleSignin {
         {
             let state = self.jwks.read().await;
             if !state.keys.is_empty()
-                && now - state.fetched_at < GOOGLE_JWKS_CACHE_TTL_SECONDS
+                && now.saturating_sub(state.fetched_at) < GOOGLE_JWKS_CACHE_TTL_SECONDS
                 && let Some(jwk) = find_jwk(&state.keys, kid)
             {
                 return Ok(jwk.clone());
@@ -678,35 +664,38 @@ impl GoogleSignin {
         {
             let state = self.jwks.read().await;
             if !state.keys.is_empty()
-                && now - state.fetched_at < GOOGLE_JWKS_CACHE_TTL_SECONDS
+                && now.saturating_sub(state.fetched_at) < GOOGLE_JWKS_CACHE_TTL_SECONDS
                 && let Some(jwk) = find_jwk(&state.keys, kid)
             {
                 return Ok(jwk.clone());
             }
-            let cache_fresh =
-                !state.keys.is_empty() && now - state.fetched_at < GOOGLE_JWKS_CACHE_TTL_SECONDS;
-            if cache_fresh
-                && self.refresh_cooldown_secs > 0
-                && now - state.last_refresh_attempt < self.refresh_cooldown_secs
+            if self.refresh_cooldown_secs > 0
+                && now.saturating_sub(state.last_refresh_attempt) < self.refresh_cooldown_secs
             {
                 return Err(GoogleSigninError::UnknownKid(kid.to_string()));
             }
         }
 
-        {
-            let mut state = self.jwks.write().await;
-            state.last_refresh_attempt = now;
+        let fetched = fetch_jwks(&self.client, jwks_url).await;
+        let finished_at = Utc::now().timestamp();
+        match fetched {
+            Ok(keys) => {
+                let mut state = self.jwks.write().await;
+                state.last_refresh_attempt = finished_at;
+                if !keys.is_empty() {
+                    state.keys = keys;
+                    state.fetched_at = finished_at;
+                }
+                find_jwk(&state.keys, kid)
+                    .cloned()
+                    .ok_or_else(|| GoogleSigninError::UnknownKid(kid.to_string()))
+            }
+            Err(e) => {
+                let mut state = self.jwks.write().await;
+                state.last_refresh_attempt = finished_at;
+                Err(e)
+            }
         }
-
-        let keys = fetch_jwks(&self.client, jwks_url).await?;
-        let mut state = self.jwks.write().await;
-        if !keys.is_empty() {
-            state.keys = keys;
-            state.fetched_at = Utc::now().timestamp();
-        }
-        find_jwk(&state.keys, kid)
-            .cloned()
-            .ok_or_else(|| GoogleSigninError::UnknownKid(kid.to_string()))
     }
 
     /// Exchange the Google authorization code for an id_token.

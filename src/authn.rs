@@ -158,16 +158,16 @@ async fn take_registration_ticket(
         .map_err(WebauthnError::InvalidSessionState)?
         .ok_or(WebauthnError::AttestationRequired)?;
 
-    let _ = session
-        .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
-        .await;
-
     let ticket: crate::device_check::RegistrationTicket = app_state
         .ephemeral_store
         .take(crate::device_check::EPH_NS_REG_TICKET, &ticket_id)
         .await
         .map_err(WebauthnError::SessionError)?
         .ok_or(WebauthnError::AttestationRequired)?;
+
+    let _ = session
+        .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
+        .await;
 
     if !crate::device_check::ticket_is_valid(&ticket, chrono::Utc::now().timestamp()) {
         warn!(

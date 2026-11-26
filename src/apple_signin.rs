@@ -327,7 +327,7 @@ impl AppleJwksCache {
         {
             let state = self.inner.read().await;
             if !state.keys.is_empty()
-                && now - state.fetched_at < APPLE_JWKS_CACHE_TTL_SECONDS
+                && now.saturating_sub(state.fetched_at) < APPLE_JWKS_CACHE_TTL_SECONDS
                 && let Some(jwk) = find_jwk(&state.keys, kid)
             {
                 return Ok(jwk.clone());
@@ -340,38 +340,40 @@ impl AppleJwksCache {
         {
             let state = self.inner.read().await;
             if !state.keys.is_empty()
-                && now - state.fetched_at < APPLE_JWKS_CACHE_TTL_SECONDS
+                && now.saturating_sub(state.fetched_at) < APPLE_JWKS_CACHE_TTL_SECONDS
                 && let Some(jwk) = find_jwk(&state.keys, kid)
             {
                 return Ok(jwk.clone());
             }
-            // If we already hold valid cached keys and refreshed recently,
-            // refuse to hit upstream again for an unknown kid.
-            let cache_fresh =
-                !state.keys.is_empty() && now - state.fetched_at < APPLE_JWKS_CACHE_TTL_SECONDS;
-            if cache_fresh
-                && self.refresh_cooldown_secs > 0
-                && now - state.last_refresh_attempt < self.refresh_cooldown_secs
+            // Enforce refresh cooldown across both fresh-cache kid misses and
+            // recent failed fetches so concurrent waiters do not stampede upstream.
+            if self.refresh_cooldown_secs > 0
+                && now.saturating_sub(state.last_refresh_attempt) < self.refresh_cooldown_secs
             {
                 return Err(AppleSigninError::UnknownKid(kid.to_string()));
             }
         }
 
-        // Record the attempt timestamp without wiping existing valid keys.
-        {
-            let mut state = self.inner.write().await;
-            state.last_refresh_attempt = now;
+        let fetched = fetch_jwks(&self.client, &self.jwks_url).await;
+        let finished_at = Utc::now().timestamp();
+        match fetched {
+            Ok(keys) => {
+                let mut state = self.inner.write().await;
+                state.last_refresh_attempt = finished_at;
+                if !keys.is_empty() {
+                    state.keys = keys;
+                    state.fetched_at = finished_at;
+                }
+                find_jwk(&state.keys, kid)
+                    .cloned()
+                    .ok_or_else(|| AppleSigninError::UnknownKid(kid.to_string()))
+            }
+            Err(e) => {
+                let mut state = self.inner.write().await;
+                state.last_refresh_attempt = finished_at;
+                Err(e)
+            }
         }
-
-        let keys = fetch_jwks(&self.client, &self.jwks_url).await?;
-        let mut state = self.inner.write().await;
-        if !keys.is_empty() {
-            state.keys = keys;
-            state.fetched_at = Utc::now().timestamp();
-        }
-        find_jwk(&state.keys, kid)
-            .cloned()
-            .ok_or_else(|| AppleSigninError::UnknownKid(kid.to_string()))
     }
 
     /// A cache for tests: these client ids, and the JWKS of a stub Apple.
@@ -889,7 +891,7 @@ pub async fn apple_link_handler(
 
     // 1. Caller must be authenticated. The CWT's `sub` is the arkavo user_id
     //    we'll bind the Apple identity to.
-    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+    let user_id = match extract_fresh_authenticated_user_id(&app_state, &headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
@@ -977,17 +979,20 @@ async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Re
         Ok(()) => {
             // Re-check account liveness after writing: if account deletion ran
             // concurrently and its sweep already scanned `identity_links`,
-            // roll back the newly written row so it is never orphaned.
+            // roll back a token-less row so it is never orphaned without
+            // deleting a pre-existing token-holding row unrevoked.
             match db.is_account_live(&user_id).await {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = db
-                        .delete_identity_link("apple", &link.claims.sub, &user_id)
+                        .delete_apple_link_without_token(&apple_link_key(&link.claims.sub), &user_id)
                         .await;
                     return AppleSigninError::InvalidAuth.into_response();
                 }
                 Err(e) => {
                     error!("Post-link liveness check failed for {}: {}", user_id, e);
+                    return AppleSigninError::Internal("account_lookup_failed".to_string())
+                        .into_response();
                 }
             }
             mark_linked_again(db, &user_id).await;
@@ -1272,8 +1277,8 @@ pub async fn apple_unlink_handler(
     Extension(apple_tokens): Extension<AppleTokens>,
     headers: HeaderMap,
 ) -> Response {
-    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
-        Ok(id) => id,
+    let user_id = match extract_passkey_auth_user_id(&app_state, &headers) {
+        Ok((id, _)) => id,
         Err(e) => return e.into_response(),
     };
     match app_state.db_store.is_account_live(&user_id).await {
@@ -1429,12 +1434,12 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
 }
 
 /// Extract the authenticated arkavo user_id from the inbound `X-Auth-Token`
-/// CWT header, requiring a fresh short-lived passkey auth CWT (not a ~99-year
-/// registration CWT).
-fn extract_authenticated_user_id(
+/// CWT header, requiring a passkey auth CWT (never a ~99-year registration
+/// CWT). Renewed session passkey CWTs are accepted.
+fn extract_passkey_auth_user_id(
     app_state: &AppState,
     headers: &HeaderMap,
-) -> Result<Uuid, AppleSigninError> {
+) -> Result<(Uuid, i64), AppleSigninError> {
     let token_header = headers
         .get("X-Auth-Token")
         .ok_or(AppleSigninError::MissingAuth)?;
@@ -1446,27 +1451,39 @@ fn extract_authenticated_user_id(
         warn!("X-Auth-Token rejected: CWT verification failed ({})", e);
         AppleSigninError::InvalidAuth
     })?;
-    // Reject ~99-year registration CWTs and stale passkey assertions.
+    // Reject ~99-year registration CWTs.
     let Some(asserted_at) = crate::oidc::webauthn_auth_time(&claims) else {
         warn!("X-Auth-Token rejected for Apple link/unlink: requires passkey auth CWT");
         return Err(AppleSigninError::InvalidAuth);
     };
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|e| {
+        warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
+        AppleSigninError::InvalidAuth
+    })?;
+    Ok((user_id, asserted_at))
+}
+
+/// Extract the authenticated arkavo user_id from `X-Auth-Token`, requiring a
+/// fresh passkey assertion (≤ `ENROLLMENT_TOKEN_MAX_AGE_SECONDS`). Used for
+/// `POST /oauth/apple/link`.
+fn extract_fresh_authenticated_user_id(
+    app_state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, AppleSigninError> {
+    let (user_id, asserted_at) = extract_passkey_auth_user_id(app_state, headers)?;
     if !crate::oidc::within_age(
         asserted_at,
         Utc::now().timestamp(),
         crate::constants::ENROLLMENT_TOKEN_MAX_AGE_SECONDS,
     ) {
         warn!(
-            "X-Auth-Token rejected for Apple link/unlink: assertion at {} is older than {}s",
+            "X-Auth-Token rejected for Apple link: assertion at {} is older than {}s",
             asserted_at,
             crate::constants::ENROLLMENT_TOKEN_MAX_AGE_SECONDS
         );
         return Err(AppleSigninError::InvalidAuth);
     }
-    Uuid::parse_str(&claims.sub).map_err(|e| {
-        warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
-        AppleSigninError::InvalidAuth
-    })
+    Ok(user_id)
 }
 
 #[derive(Debug, Deserialize)]

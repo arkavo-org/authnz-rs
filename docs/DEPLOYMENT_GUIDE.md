@@ -414,11 +414,18 @@ expires. The server refuses to start when the list contains
 `https://kas.arkavo.net` or `arkavo` (the passkey CWT audience). Remove
 the KAS from a running environment's list before deploying this release.
 
-IAM: every trust-state write is a single conditional `UpdateItem`; nothing
-uses `TransactWriteItems`, so `ConditionCheckItem` is not needed. The service
-role needs, in addition to the actions track 1 already uses on
-`agent_delegations` (`PutItem`, `UpdateItem`, `GetItem`, `Query` on
-`root_user_id-index`, `Scan`):
+IAM: agent trust-state writes are single conditional `UpdateItem`s on
+`agent_delegations` and `guardians`. Separately, since 0.42.1, passkey
+registration (`create_user_with_credential`) and subscription/purchase link
+writes (`bind_app_store_link`, `link_market_purchase`) use
+`dynamodb:TransactWriteItems` across `credentials`, `handles`, and
+`identity_links`, so the service role needs `dynamodb:PutItem` on `handles`,
+`dynamodb:ConditionCheckItem` on `credentials`, and `dynamodb:PutItem` /
+`dynamodb:UpdateItem` across those tables (DynamoDB IAM authorizes
+`TransactWriteItems` via the underlying `PutItem`/`UpdateItem`/`DeleteItem`/
+`ConditionCheckItem` actions). The service role needs, in addition to the
+actions track 1 already uses on `agent_delegations` (`PutItem`, `UpdateItem`,
+`GetItem`, `Query` on `root_user_id-index`, `Scan`):
 
 | Table | Actions |
 |---|---|

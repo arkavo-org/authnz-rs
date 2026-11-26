@@ -34,6 +34,11 @@ use tower_sessions::session_store::{self, SessionStore};
 /// Hard cap on in-memory entries for [`EphemeralStore`]'s local fallback.
 pub(crate) const MAX_EPHEMERAL_LOCAL_ENTRIES: usize = 16_384;
 
+/// Hard cap on local replay-protection markers held in [`EphemeralStore`] when
+/// Redis is offline. Unexpired markers are NEVER evicted; once full, new
+/// `mark_consumed_once` calls fail closed.
+pub(crate) const MAX_CONSUMED_LOCAL_ENTRIES: usize = 65_536;
+
 /// Hard cap on sessions held in [`BoundedSessionStore`].
 pub(crate) const MAX_BOUNDED_SESSIONS: usize = 32_768;
 
@@ -61,12 +66,17 @@ pub struct EphemeralStore {
     redis: fred::clients::RedisClient,
     local: Arc<Mutex<HashMap<String, LocalEntry>>>,
     max_local_entries: usize,
+    /// Dedicated replay-marker map when Redis is offline. Isolated from
+    /// ceremony entries and never evicts unexpired markers.
+    consumed: Arc<Mutex<HashMap<String, i64>>>,
+    max_consumed_entries: usize,
 }
 
 impl std::fmt::Debug for EphemeralStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EphemeralStore")
             .field("max_local_entries", &self.max_local_entries)
+            .field("max_consumed_entries", &self.max_consumed_entries)
             .finish()
     }
 }
@@ -81,6 +91,22 @@ impl EphemeralStore {
             redis,
             local: Arc::new(Mutex::new(HashMap::new())),
             max_local_entries: max_local_entries.max(1),
+            consumed: Arc::new(Mutex::new(HashMap::new())),
+            max_consumed_entries: MAX_CONSUMED_LOCAL_ENTRIES.min(max_local_entries.max(1) * 4),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_consumed_capacity(
+        redis: fred::clients::RedisClient,
+        max_consumed_entries: usize,
+    ) -> Self {
+        Self {
+            redis,
+            local: Arc::new(Mutex::new(HashMap::new())),
+            max_local_entries: MAX_EPHEMERAL_LOCAL_ENTRIES,
+            consumed: Arc::new(Mutex::new(HashMap::new())),
+            max_consumed_entries: max_consumed_entries.max(1),
         }
     }
 
@@ -103,6 +129,10 @@ impl EphemeralStore {
 
     fn lock_local(&self) -> std::sync::MutexGuard<'_, HashMap<String, LocalEntry>> {
         self.local.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_consumed(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+        self.consumed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn insert_local(&self, key: String, json: String, expires_at: i64) {
@@ -153,26 +183,21 @@ impl EphemeralStore {
         let redis_ttl = ttl_secs.max(1);
 
         if self.redis.is_connected() {
-            match self
-                .redis
+            // Fail closed on ambiguous Redis SET errors: writing a local copy
+            // after an attempted Redis write could leave the single-use item in
+            // both stores and permit double-redemption.
+            self.redis
                 .set::<(), _, _>(
                     &key,
-                    json.clone(),
+                    json,
                     Some(fred::types::Expiration::EX(redis_ttl)),
                     None,
                     false,
                 )
                 .await
-            {
-                Ok(()) => {
-                    // Ensure no stale local copy shadows the fresh Redis entry.
-                    self.lock_local().remove(&key);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("EphemeralStore Redis SET failed ({namespace}); falling back to local: {e}");
-                }
-            }
+                .map_err(|e| format!("Redis SET failed ({namespace}): {e}"))?;
+            self.lock_local().remove(&key);
+            return Ok(());
         }
         self.insert_local(key, json, expires_at);
         Ok(())
@@ -187,21 +212,6 @@ impl EphemeralStore {
         let key = Self::key(namespace, id);
         let now = Utc::now().timestamp();
 
-        // Check local first so items written during a Redis blip remain visible
-        // after Redis reconnects.
-        {
-            let mut map = self.lock_local();
-            if let Some(entry) = map.get(&key) {
-                if entry.expires_at < now {
-                    map.remove(&key);
-                    return Ok(None);
-                }
-                let env: OwnedEnvelope<T> = serde_json::from_str(&entry.json)
-                    .map_err(|e| format!("deserialize failed: {e}"))?;
-                return Ok((env.expires_at >= now).then_some(env.payload));
-            }
-        }
-
         if self.redis.is_connected() {
             let val: Option<String> = self
                 .redis
@@ -213,6 +223,18 @@ impl EphemeralStore {
                     serde_json::from_str(&json).map_err(|e| format!("deserialize failed: {e}"))?;
                 return Ok((env.expires_at >= now).then_some(env.payload));
             }
+            return Ok(None);
+        }
+
+        let mut map = self.lock_local();
+        if let Some(entry) = map.get(&key) {
+            if entry.expires_at < now {
+                map.remove(&key);
+                return Ok(None);
+            }
+            let env: OwnedEnvelope<T> =
+                serde_json::from_str(&entry.json).map_err(|e| format!("deserialize failed: {e}"))?;
+            return Ok((env.expires_at >= now).then_some(env.payload));
         }
         Ok(None)
     }
@@ -227,21 +249,10 @@ impl EphemeralStore {
         let key = Self::key(namespace, id);
         let now = Utc::now().timestamp();
 
-        // Check local first (covers entries stored while Redis was offline).
-        let local_hit = self.lock_local().remove(&key);
-        if let Some(entry) = local_hit {
-            if self.redis.is_connected() {
-                let _: Result<(), _> = self.redis.del(&key).await;
-            }
-            if entry.expires_at < now {
-                return Ok(None);
-            }
-            let env: OwnedEnvelope<T> = serde_json::from_str(&entry.json)
-                .map_err(|e| format!("deserialize failed: {e}"))?;
-            return Ok((env.expires_at >= now).then_some(env.payload));
-        }
-
         if self.redis.is_connected() {
+            // Redis GETDEL is the sole authoritative redemption path when
+            // connected, avoiding split-brain double redemption across stores.
+            self.lock_local().remove(&key);
             let val: Option<String> = self
                 .redis
                 .getdel(&key)
@@ -252,6 +263,17 @@ impl EphemeralStore {
                     serde_json::from_str(&json).map_err(|e| format!("deserialize failed: {e}"))?;
                 return Ok((env.expires_at >= now).then_some(env.payload));
             }
+            return Ok(None);
+        }
+
+        let local_hit = self.lock_local().remove(&key);
+        if let Some(entry) = local_hit {
+            if entry.expires_at < now {
+                return Ok(None);
+            }
+            let env: OwnedEnvelope<T> =
+                serde_json::from_str(&entry.json).map_err(|e| format!("deserialize failed: {e}"))?;
+            return Ok((env.expires_at >= now).then_some(env.payload));
         }
         Ok(None)
     }
@@ -279,20 +301,22 @@ impl EphemeralStore {
         let ttl = ttl_secs.max(1);
         let expires_at = now.saturating_add(ttl);
 
-        // If already marked locally (e.g. recorded during a Redis blip),
+        // If already marked locally (e.g. recorded while Redis was offline),
         // refuse replay immediately.
         {
-            let mut map = self.lock_local();
-            map.retain(|_, v| v.expires_at > now);
+            let mut map = self.lock_consumed();
+            map.retain(|_, exp| *exp > now);
             if map.contains_key(&key) {
                 return Ok(false);
             }
         }
 
         if self.redis.is_connected() {
-            match self
+            // Fail closed on Redis errors: never fall back to local after an
+            // ambiguous SET NX.
+            let res: Option<String> = self
                 .redis
-                .set::<Option<String>, _, _>(
+                .set(
                     &key,
                     "1",
                     Some(fred::types::Expiration::EX(ttl)),
@@ -300,37 +324,21 @@ impl EphemeralStore {
                     false,
                 )
                 .await
-            {
-                Ok(Some(_)) => return Ok(true),
-                Ok(None) => return Ok(false),
-                Err(e) => {
-                    warn!(
-                        "EphemeralStore Redis SET NX failed ({namespace}); falling back to local: {e}"
-                    );
-                }
-            }
+                .map_err(|e| format!("Redis SET NX failed ({namespace}): {e}"))?;
+            return Ok(res.is_some());
         }
 
-        let mut map = self.lock_local();
-        map.retain(|_, v| v.expires_at > now);
+        let mut map = self.lock_consumed();
+        map.retain(|_, exp| *exp > now);
         if map.contains_key(&key) {
             return Ok(false);
         }
-        if map.len() >= self.max_local_entries
-            && let Some(evict_key) = map
-                .iter()
-                .min_by_key(|(_, v)| v.expires_at)
-                .map(|(k, _)| k.clone())
-        {
-            map.remove(&evict_key);
+        // Never evict an unexpired replay marker: fail closed if full.
+        if map.len() >= self.max_consumed_entries {
+            warn!("EphemeralStore replay cache full ({namespace}); failing closed");
+            return Err("replay protection cache at capacity".into());
         }
-        map.insert(
-            key,
-            LocalEntry {
-                json: String::new(),
-                expires_at,
-            },
-        );
+        map.insert(key, expires_at);
         Ok(true)
     }
 }
@@ -516,6 +524,19 @@ mod tests {
         assert!(store.mark_consumed_once("replay", "tok1", 60).await.unwrap());
         assert!(!store.mark_consumed_once("replay", "tok1", 60).await.unwrap());
         assert!(store.mark_consumed_once("replay", "tok2", 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn replay_markers_never_evict_unexpired_entries_when_full() {
+        let redis =
+            fred::clients::RedisClient::new(fred::types::RedisConfig::default(), None, None, None);
+        let store = EphemeralStore::with_consumed_capacity(redis, 2);
+        assert!(store.mark_consumed_once("replay", "a", 60).await.unwrap());
+        assert!(store.mark_consumed_once("replay", "b", 60).await.unwrap());
+        // Full of unexpired markers: fail closed instead of evicting "a".
+        assert!(store.mark_consumed_once("replay", "c", 60).await.is_err());
+        // Original marker is still intact and blocks replay.
+        assert!(!store.mark_consumed_once("replay", "a", 60).await.unwrap());
     }
 
     #[tokio::test]

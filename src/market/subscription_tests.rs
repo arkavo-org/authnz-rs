@@ -404,11 +404,11 @@ impl Harness {
 
     /// Close the breaker, as if its window had passed and a probe succeeded.
     fn close_breaker(&self) {
-        *self.lookup().breaker_until.lock().unwrap() = 0;
+        self.lookup().breaker.lock().unwrap().0 = 0;
     }
 
     fn breaker_open(&self) -> bool {
-        *self.lookup().breaker_until.lock().unwrap() > Utc::now().timestamp()
+        self.lookup().breaker.lock().unwrap().0 > Utc::now().timestamp()
     }
 }
 
@@ -739,7 +739,7 @@ fn when_the_breaker_window_ends_one_caller_probes() {
     assert!(lookup.admit(now), "closed: everyone is admitted");
     assert!(lookup.admit(now));
 
-    lookup.settle(Fetched::Outage, now);
+    lookup.settle(Fetched::Outage, now, lookup.next_seq());
     assert!(!lookup.admit(now));
     assert!(!lookup.admit(now + MARKET_FAILURE_CACHE_TTL_SECONDS - 1));
 
@@ -750,7 +750,7 @@ fn when_the_breaker_window_ends_one_caller_probes() {
     assert!(!lookup.admit(later + MARKET_FETCH_DEADLINE_SECONDS as i64));
 
     // A probe that fails opens it for another window.
-    lookup.settle(Fetched::Outage, later + 3);
+    lookup.settle(Fetched::Outage, later + 3, lookup.next_seq());
     assert!(!lookup.admit(later + 3 + MARKET_FAILURE_CACHE_TTL_SECONDS - 1));
     // One that answers closes it, whatever the answer.
     for answer in [
@@ -758,15 +758,30 @@ fn when_the_breaker_window_ends_one_caller_probes() {
         Fetched::Answer(Subscription::Active),
         Fetched::Unverified,
     ] {
-        lookup.settle(Fetched::Outage, now);
-        lookup.settle(answer, now + 1);
+        lookup.settle(Fetched::Outage, now, lookup.next_seq());
+        lookup.settle(answer, now + 1, lookup.next_seq());
         assert!(lookup.admit(now + 1));
         assert!(lookup.admit(now + 1));
     }
     // A probe that never reports back does not shut the breaker for good.
-    lookup.settle(Fetched::Outage, now);
+    lookup.settle(Fetched::Outage, now, lookup.next_seq());
     assert!(lookup.admit(later));
     assert!(lookup.admit(later + MARKET_FETCH_DEADLINE_SECONDS as i64 + 1));
+}
+
+#[test]
+fn an_older_outage_does_not_reopen_the_breaker_after_a_newer_answer() {
+    let lookup = SubscriptionLookup::new(LookupToken::parse(Some(&token_text())).unwrap().unwrap());
+    let now = 1_800_000_000;
+    let older = lookup.next_seq();
+    let newer = lookup.next_seq();
+
+    lookup.settle(Fetched::Answer(Subscription::Active), now, newer);
+    assert!(lookup.admit(now));
+
+    // A slow earlier lookup finishing later must not reopen the breaker.
+    lookup.settle(Fetched::Outage, now + 1, older);
+    assert!(lookup.admit(now + 1));
 }
 
 #[tokio::test]
@@ -850,7 +865,8 @@ async fn a_recheck_never_passes_a_cached_failure_or_an_open_breaker() {
     );
     assert_eq!(h.hits(), asked);
     // Another account's recheck while the breaker is open.
-    h.lookup().settle(Fetched::Outage, Utc::now().timestamp());
+    let seq = h.lookup().next_seq();
+    h.lookup().settle(Fetched::Outage, Utc::now().timestamp(), seq);
     assert_eq!(
         h.source.subscription(&waiting, true).await,
         Subscription::Unavailable

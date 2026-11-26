@@ -1283,8 +1283,9 @@ impl DynamoDBStore {
     /// [`DynamoDBError::Internal`], exactly as the previous read-first
     /// implementation did.
     /// Append a passkey to a legacy zero-credential user row only while
-    /// `credentials` is still empty. Prevents an unauthenticated registration
-    /// ceremony from appending onto an account that already received a passkey.
+    /// `credentials` is still absent or an empty list. Uses two conditional
+    /// `UpdateItem`s so DynamoDB never evaluates `size(credentials)` on a
+    /// missing attribute (DynamoDB does not short-circuit `OR`).
     pub async fn add_credential_if_empty(
         &self,
         user_id: Uuid,
@@ -1295,8 +1296,8 @@ impl DynamoDBStore {
             DynamoDBError::SerdeJsonError(e)
         })?);
 
-        let condition = format!(
-            "{} AND (attribute_not_exists(credentials) OR size(credentials) = :zero)",
+        let absent_condition = format!(
+            "{} AND attribute_not_exists(credentials)",
             account::LIVE_ROW
         );
 
@@ -1305,12 +1306,44 @@ impl DynamoDBStore {
             .update_item()
             .table_name(&self.credentials_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
-            .update_expression(
-                "SET credentials = list_append(if_not_exists(credentials, :empty), :new)",
-            )
-            .condition_expression(condition)
-            .expression_attribute_values(":empty", AttributeValue::L(vec![]))
+            .update_expression("SET credentials = :new")
+            .condition_expression(absent_condition)
+            .expression_attribute_values(":new", AttributeValue::L(vec![serialized.clone()]))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully added initial credential to empty row for user {}",
+                    user_id
+                );
+                return Ok(());
+            }
+            Err(SdkError::ServiceError(ref service_error))
+                if service_error.err().meta().code() == Some("ConditionalCheckFailedException") =>
+            {
+                // Fall through: `credentials` may exist as an empty list `[]`.
+            }
+            Err(e) => {
+                error!("Failed to set initial credential: {:?}", e);
+                return Err(DynamoDBError::SdkError(e.to_string()));
+            }
+        }
+
+        let empty_list_condition = format!(
+            "{} AND attribute_type(credentials, :list_type) AND size(credentials) = :zero",
+            account::LIVE_ROW
+        );
+
+        match self
+            .client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .update_expression("SET credentials = :new")
+            .condition_expression(empty_list_condition)
             .expression_attribute_values(":new", AttributeValue::L(vec![serialized]))
+            .expression_attribute_values(":list_type", AttributeValue::S("L".to_string()))
             .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
             .send()
             .await

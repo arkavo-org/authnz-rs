@@ -652,9 +652,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // single value (eliminates per-request env reads and runtime-mutation
     // footguns).
     let issuer = env::var("OIDC_ISSUER")
-        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string())
-        .trim_end_matches('/')
-        .to_string();
+        .unwrap_or_else(|_| crate::constants::DEFAULT_OIDC_ISSUER.to_string());
 
     // did:webvh Ed25519 update-signing key (fail-open: None when WEBVH_SIGN_KEY_PATH unset)
     let webvh_sign_key = webvh::load_sign_key();

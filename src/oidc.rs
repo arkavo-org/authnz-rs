@@ -314,50 +314,33 @@ impl AuthorizationCodeStore {
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            match self
-                .redis
+            let ttl_seconds = (record.expires_at - Utc::now().timestamp()).clamp(1, 600);
+            // Fail closed on ambiguous Redis SET errors: falling back locally
+            // after an attempted Redis write risks dual storage and double redemption.
+            self.redis
                 .set::<(), _, _>(
                     &key,
                     value,
-                    Some(fred::types::Expiration::EX(600)),
+                    Some(fred::types::Expiration::EX(ttl_seconds)),
                     None,
                     false,
                 )
                 .await
-            {
-                Ok(()) => {
-                    self.lock_local().remove(&code);
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::warn!("Redis set failed for authz code; falling back to local: {}", e);
-                }
-            }
-        } else {
-            log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
+                .map_err(|e| format!("Redis set failed for authz code: {}", e))?;
+            self.lock_local().remove(&code);
+            return Ok(());
         }
+        log::warn!("Redis is offline; falling back to in-memory AuthorizationCodeStore");
         self.insert_local(code, record);
         Ok(())
     }
 
     pub async fn take(&self, code: &str) -> Result<Option<AuthorizationCodeRecord>, String> {
         let key = format!("oidc:code:{}", code);
-        // Check local fallback first so codes stored during a Redis blip are
-        // still redeemable (and single-use) after Redis reconnects.
-        let local_record = { self.lock_local().remove(code) };
-        if let Some(record) = local_record {
-            if self.redis.is_connected() {
-                let _: Result<(), _> = self.redis.del(&key).await;
-            }
-            if record.expires_at < Utc::now().timestamp() {
-                return Ok(None);
-            }
-            return Ok(Some(record));
-        }
         if self.redis.is_connected() {
-            // GETDEL so two concurrent token requests presenting the same code
-            // cannot both win the race between a separate GET and DEL — an
-            // authorization code must be redeemable exactly once.
+            // GETDEL is the sole authoritative single-use redemption path when
+            // Redis is connected, preventing split-brain double redemption.
+            self.lock_local().remove(code);
             let val: Option<String> = self
                 .redis
                 .getdel(&key)
@@ -374,7 +357,15 @@ impl AuthorizationCodeStore {
                 Ok(None)
             }
         } else {
-            Ok(None)
+            let local_record = { self.lock_local().remove(code) };
+            if let Some(record) = local_record {
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -431,8 +422,9 @@ impl RefreshTokenStore {
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            match self
-                .redis
+            // Fail closed on ambiguous Redis SET errors: falling back locally
+            // risks dual storage and double redemption.
+            self.redis
                 .set::<(), _, _>(
                     &key,
                     value,
@@ -441,18 +433,11 @@ impl RefreshTokenStore {
                     false,
                 )
                 .await
-            {
-                Ok(()) => {
-                    self.lock_local().remove(&token_hash);
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::warn!("Redis set failed for refresh token; falling back to local: {}", e);
-                }
-            }
-        } else {
-            log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
+                .map_err(|e| format!("Redis set failed for refresh token: {}", e))?;
+            self.lock_local().remove(&token_hash);
+            return Ok(());
         }
+        log::warn!("Redis is offline; falling back to in-memory RefreshTokenStore");
         self.insert_local(token_hash, record);
         Ok(())
     }
@@ -461,23 +446,10 @@ impl RefreshTokenStore {
         let token_hash = self.hash_token(token);
         let key = format!("oidc:refresh:{}", token_hash);
 
-        // Check local fallback first so tokens stored during a Redis blip
-        // remain redeemable (and single-use) after Redis reconnects.
-        let local_record = { self.lock_local().remove(&token_hash) };
-        if let Some(record) = local_record {
-            if self.redis.is_connected() {
-                let _: Result<(), _> = self.redis.del(&key).await;
-            }
-            if record.expires_at < Utc::now().timestamp() {
-                return Ok(None);
-            }
-            return Ok(Some(record));
-        }
-
         if self.redis.is_connected() {
-            // GETDEL so refresh token rotation is actually single-use: a
-            // separate GET and DEL let two concurrent refreshes both consume
-            // the same token.
+            // GETDEL is the sole authoritative single-use redemption path when
+            // Redis is connected.
+            self.lock_local().remove(&token_hash);
             let val: Option<String> = self
                 .redis
                 .getdel(&key)
@@ -494,7 +466,15 @@ impl RefreshTokenStore {
                 Ok(None)
             }
         } else {
-            Ok(None)
+            let local_record = { self.lock_local().remove(&token_hash) };
+            if let Some(record) = local_record {
+                if record.expires_at < Utc::now().timestamp() {
+                    return Ok(None);
+                }
+                Ok(Some(record))
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -504,9 +484,7 @@ impl OidcConfig {
     /// keys under the same `kid`s.
     pub fn from_env(keys: &crate::keys::KeySet) -> Result<Self, String> {
         let issuer = env::var("OIDC_ISSUER")
-            .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string())
-            .trim_end_matches('/')
-            .to_string();
+            .unwrap_or_else(|_| DEFAULT_OIDC_ISSUER.to_string());
 
         let jwks = keys
             .iter()
@@ -659,13 +637,13 @@ pub fn ec_public_key_to_jwk(pub_key: &PublicKey) -> Result<Jwk, String> {
 // --------- Endpoint handlers ---------
 
 pub async fn discovery(Extension(oidc): Extension<Arc<OidcConfig>>) -> impl IntoResponse {
-    let issuer = oidc.issuer.trim_end_matches('/').to_string();
+    let base = oidc.issuer.trim_end_matches('/');
     let doc = DiscoveryDocument {
-        authorization_endpoint: format!("{}/oauth/authorize", issuer),
-        token_endpoint: format!("{}/oauth/token", issuer),
-        userinfo_endpoint: format!("{}/oauth/userinfo", issuer),
-        jwks_uri: format!("{}/.well-known/jwks.json", issuer),
-        issuer,
+        authorization_endpoint: format!("{}/oauth/authorize", base),
+        token_endpoint: format!("{}/oauth/token", base),
+        userinfo_endpoint: format!("{}/oauth/userinfo", base),
+        jwks_uri: format!("{}/.well-known/jwks.json", base),
+        issuer: oidc.issuer.clone(),
         response_types_supported: vec!["code"],
         subject_types_supported: vec!["public"],
         id_token_signing_alg_values_supported: vec!["ES256"],
@@ -1218,18 +1196,26 @@ async fn handle_authorization_code_grant(
 
     let record = match code_store.take(code).await {
         Ok(Some(r)) => r,
-        _ => {
+        Ok(None) => {
             return oidc_error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "Authorization code is invalid, expired, or already redeemed",
             );
         }
+        Err(e) => {
+            error!("authorization_code grant: code store take failed: {}", e);
+            return oidc_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "authorization code store unavailable",
+            );
+        }
     };
 
     // Authenticate the client. Support either form params or HTTP Basic.
     let (presented_client_id, presented_client_secret) =
-        extract_client_credentials(&headers, &form);
+        extract_client_credentials_for(&headers, &form, &oidc);
     let presented_client_id = match presented_client_id {
         Some(id) => id,
         None => {
@@ -1323,16 +1309,20 @@ async fn handle_authorization_code_grant(
 
     // Re-read the account row: verify liveness, refresh stored entitlements,
     // and verify any upstream Apple/Google identity link is still intact.
+    // On transient 503 storage errors, restore the authorization code (same
+    // expires_at) so a DynamoDB hiccup does not force a full re-login.
     if let Ok(user_id) = Uuid::parse_str(&record.user.arkavo_account_id) {
+        let original_record = record.clone();
         match app_state.db_store.get_user_by_id(&user_id).await {
             Ok(Some(user)) => {
                 record.user.entitlements = user.entitlements;
                 let link_ok = match (record.user.idp.as_str(), record.user.upstream_subject.as_deref()) {
                     ("apple", Some(sub)) => {
                         let unlinked = match app_state.db_store.apple_unlinked_at(&user_id).await {
-                            Ok(ts) => ts.is_some_and(|t| t >= code_issued_at),
+                            Ok(ts) => ts.is_some_and(|t| t > code_issued_at),
                             Err(e) => {
                                 error!("authorization_code grant: apple unlink lookup failed: {}", e);
+                                let _ = code_store.insert(code.to_string(), original_record).await;
                                 return oidc_error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     "temporarily_unavailable",
@@ -1347,6 +1337,7 @@ async fn handle_authorization_code_grant(
                                 Ok(owner) => owner == Some(user_id),
                                 Err(e) => {
                                     error!("authorization_code grant: apple link lookup failed: {}", e);
+                                    let _ = code_store.insert(code.to_string(), original_record).await;
                                     return oidc_error_response(
                                         StatusCode::SERVICE_UNAVAILABLE,
                                         "temporarily_unavailable",
@@ -1361,6 +1352,7 @@ async fn handle_authorization_code_grant(
                             Ok(owner) => owner == Some(user_id),
                             Err(e) => {
                                 error!("authorization_code grant: google link lookup failed: {}", e);
+                                let _ = code_store.insert(code.to_string(), original_record).await;
                                 return oidc_error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     "temporarily_unavailable",
@@ -1388,6 +1380,7 @@ async fn handle_authorization_code_grant(
             }
             Err(e) => {
                 error!("authorization_code grant: account lookup failed: {}", e);
+                let _ = code_store.insert(code.to_string(), original_record).await;
                 return oidc_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "temporarily_unavailable",
@@ -1545,7 +1538,7 @@ async fn handle_client_credentials_grant(
     form: TokenForm,
 ) -> Response {
     let (presented_client_id, presented_client_secret) =
-        extract_client_credentials(&headers, &form);
+        extract_client_credentials_for(&headers, &form, &oidc);
     let presented_client_id = match presented_client_id {
         Some(id) => id,
         None => {
@@ -1696,15 +1689,19 @@ async fn upstream_link_ended(
     record: &RefreshTokenRecord,
     user_id: &Uuid,
 ) -> Result<bool, crate::db::DynamoDBError> {
-    let session_born = record.session_created_at.unwrap_or(record.created_at);
     match (idp, record.upstream_subject.as_deref()) {
         ("apple", Some(sub)) => {
-            if db
-                .apple_unlinked_at(user_id)
-                .await?
-                .is_some_and(|unlinked_at| unlinked_at >= session_born)
-            {
-                return Ok(true);
+            if let Some(unlinked_at) = db.apple_unlinked_at(user_id).await? {
+                match record.session_created_at {
+                    // Strict `>`: an unlink, relink, and new sign-in within the
+                    // same unix second must not kill the newly created session.
+                    Some(session_born) if unlinked_at > session_born => return Ok(true),
+                    // Legacy pre-0.42.1 refresh token without immutable
+                    // `session_created_at` (its `created_at` was reset on prior
+                    // rotations): fail closed if the account has unlinked Apple.
+                    None => return Ok(true),
+                    _ => {}
+                }
             }
             Ok(db.get_identity_link("apple", sub).await? != Some(*user_id))
         }
@@ -1735,7 +1732,7 @@ async fn handle_refresh_token_grant(
 
     // Authenticate the client (if client_secret exists, must authenticate)
     let (presented_client_id, presented_client_secret) =
-        extract_client_credentials(&headers, &form);
+        extract_client_credentials_for(&headers, &form, &oidc);
     let presented_client_id = match presented_client_id {
         Some(id) => id,
         None => {
@@ -2300,13 +2297,26 @@ async fn resolve_user(
 
         let apple_claims = apple_signin::verify_apple_id_token(apple, &token, nonce).await?;
 
+        // Resolve the linked user BEFORE burning the single-use replay marker
+        // so a transient DB outage or unlinked-account redirect does not burn
+        // the caller's Apple id_token.
+        let user = apple_signin::resolve_apple_user(&app_state.db_store, &apple_claims)
+            .await
+            .map_err(|e| match e {
+                crate::identity::IdentityResolveError::NotLinked => {
+                    AuthorizeError::IdentityNotLinked
+                }
+                other => AuthorizeError::Database(other.to_string()),
+            })?;
+
         // Single-use anti-replay cache: record the SHA-256 of the verified
         // Apple id_token for its remaining lifetime so it can never be
         // replayed across clients or redirect URIs even if its nonce claim is
         // decoded from the JWT.
         let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
         let now = Utc::now().timestamp();
-        let remaining_ttl = (apple_claims.exp - now + crate::cwt::DEFAULT_SKEW_SECS).clamp(60, 86_400);
+        let remaining_ttl =
+            (apple_claims.exp - now + crate::cwt::DEFAULT_SKEW_SECS).clamp(60, 86_400);
         match app_state
             .ephemeral_store
             .mark_consumed_once("apple_authorize_idtoken", &token_hash, remaining_ttl)
@@ -2326,14 +2336,7 @@ async fn resolve_user(
             }
         }
 
-        return apple_signin::resolve_apple_user(&app_state.db_store, &apple_claims)
-            .await
-            .map_err(|e| match e {
-                crate::identity::IdentityResolveError::NotLinked => {
-                    AuthorizeError::IdentityNotLinked
-                }
-                other => AuthorizeError::Database(other.to_string()),
-            });
+        return Ok(user);
     }
 
     // Otherwise expect an Arkavo CWT (from WebAuthn flow).
@@ -2457,9 +2460,10 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn extract_client_credentials(
+fn extract_client_credentials_for(
     headers: &HeaderMap,
     form: &TokenForm,
+    oidc: &OidcConfig,
 ) -> (Option<String>, Option<String>) {
     if let Some(basic) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -2467,9 +2471,20 @@ fn extract_client_credentials(
         .and_then(|s| s.strip_prefix("Basic "))
         && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(basic)
         && let Ok(s) = std::str::from_utf8(&decoded)
-        && let Some((id, secret)) = s.split_once(':')
+        && let Some((raw_id, raw_secret)) = s.split_once(':')
     {
-        return (Some(form_url_decode(id)), Some(form_url_decode(secret)));
+        // Prefer exact match on raw Basic credentials first so clients with
+        // unencoded `+` or `%` in base64 secrets keep working, then fall back
+        // to RFC 6749 §2.3.1 application/x-www-form-urlencoded decoding.
+        if let Some(client) = oidc.clients.get(raw_id)
+            && client
+                .client_secret
+                .as_deref()
+                .is_some_and(|exp| constant_time_eq(exp, raw_secret))
+        {
+            return (Some(raw_id.to_string()), Some(raw_secret.to_string()));
+        }
+        return (Some(form_url_decode(raw_id)), Some(form_url_decode(raw_secret)));
     }
     (form.client_id.clone(), form.client_secret.clone())
 }

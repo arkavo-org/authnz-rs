@@ -1008,13 +1008,19 @@ fn validate_certificate_chain_at(x5c: &[Vec<u8>], now: ASN1Time) -> Result<(), D
         }
     }
 
-    // Leaf must NOT be a CA certificate.
-    if let Ok(Some(bc)) = parsed[0].basic_constraints()
-        && bc.value.ca
-    {
-        return Err(DeviceCheckError::InvalidCertificateChain(
-            "leaf certificate must not be a CA".into(),
-        ));
+    // Leaf must NOT be a CA certificate; fail closed if BasicConstraints is malformed.
+    match parsed[0].basic_constraints() {
+        Ok(Some(bc)) if bc.value.ca => {
+            return Err(DeviceCheckError::InvalidCertificateChain(
+                "leaf certificate must not be a CA".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(DeviceCheckError::InvalidCertificateChain(format!(
+                "malformed BasicConstraints on leaf certificate: {e}"
+            )));
+        }
     }
 
     // Every intermediate certificate must be a valid CA with BasicConstraints

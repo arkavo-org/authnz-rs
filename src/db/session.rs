@@ -194,7 +194,7 @@ impl DynamoDBStore {
             .table_name(table)
             .key("link_pk", s(&link_pk(session_id)))
             .update_expression(
-                "SET ended_at = if_not_exists(ended_at, :t), ended_reason = if_not_exists(ended_reason, :r) REMOVE credential_hash",
+                "SET ended_at = if_not_exists(ended_at, :t), ended_reason = if_not_exists(ended_reason, :r) REMOVE credential_hash, public_key",
             )
             .condition_expression("attribute_exists(link_pk)")
             .expression_attribute_values(":t", n(ended_at))

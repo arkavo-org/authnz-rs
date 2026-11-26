@@ -423,7 +423,32 @@ impl TokenSealer {
 
     /// Open a sealed token, pinning `key_id` and `encryption_context` on KMS
     /// decrypt and verifying AES-GCM `aad`.
+    ///
+    /// Backward compatibility: pre-0.42.1 rows were sealed with empty AES-GCM
+    /// AAD and no KMS `EncryptionContext`. When contextual decrypt fails and
+    /// `aad`/`context` are non-empty, fall back once to legacy decrypt (empty
+    /// AAD, no KMS `EncryptionContext`, still pinning `key_id`). New contextual
+    /// ciphertexts cannot be opened by the legacy path because both KMS and
+    /// AES-256-GCM authenticate the original context/AAD.
     pub async fn open_with_context(
+        &self,
+        sealed: &SealedToken,
+        aad: &[u8],
+        context: &[(&str, &str)],
+    ) -> Result<Vec<u8>, PatreonError> {
+        match self.open_once(sealed, aad, context).await {
+            Ok(plain) => Ok(plain),
+            Err(primary_err) if !aad.is_empty() || !context.is_empty() => {
+                match self.open_once(sealed, b"", &[]).await {
+                    Ok(plain) => Ok(plain),
+                    Err(_) => Err(primary_err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn open_once(
         &self,
         sealed: &SealedToken,
         aad: &[u8],
@@ -946,6 +971,31 @@ async fn abandon_link(
         return;
     }
     let db = &app_state.db_store;
+    // Re-read the current `patreon_tokens` row before touching `identity_links`:
+    // if a concurrent link request for the same user won with `patreon_user_id`,
+    // deleting `patreon#<patreon_user_id>` would strip the winner's uniqueness
+    // guard. If a third link won, do not restore the superseded `previous` link.
+    let current = match db.get_patreon_link_ref(&user_id).await {
+        Ok(cur) => cur,
+        Err(e) => {
+            warn!(
+                "Could not verify patreon_tokens before rollback for user {}: {}; skipping link delete",
+                user_id, e
+            );
+            return;
+        }
+    };
+    if current
+        .as_ref()
+        .is_some_and(|cur| cur.patreon_user_id == patreon_user_id)
+    {
+        debug!(
+            "Concurrent Patreon link for user {} already owns subject_prefix={}; preserving identity link",
+            user_id,
+            subject_prefix(patreon_user_id)
+        );
+        return;
+    }
     if let Err(e) = db
         .delete_identity_link_if_owned(crate::db::PATREON_PROVIDER, patreon_user_id, &user_id)
         .await
@@ -958,7 +1008,12 @@ async fn abandon_link(
             e
         );
     }
-    if let Some(previous) = previous
+    let should_restore_previous = match (previous, current.as_ref()) {
+        (Some(prev), Some(cur)) => cur.patreon_user_id == prev.patreon_user_id,
+        _ => false,
+    };
+    if should_restore_previous
+        && let Some(previous) = previous
         && let Err(e) = db
             .link_identity(
                 user_id,
@@ -1802,10 +1857,16 @@ async fn materialize_link(
         );
         return None;
     }
-    persist_ownership(app_state, link, &snap).await;
+    let wrote_ownership = persist_ownership(app_state, link, &snap).await;
     let snap = with_creator_subs(app_state, snap).await;
 
     if !link_is_still_current(app_state, link).await {
+        if wrote_ownership && let Some(cid) = snap.campaign_id.as_deref() {
+            let _ = app_state
+                .db_store
+                .delete_patreon_campaign_owner(cid, &user_id)
+                .await;
+        }
         return None;
     }
     state.cache.put(user_id, &snap).await;
@@ -1927,10 +1988,15 @@ pub(crate) fn claim_snapshot(
 /// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]. `None` for a link last seen owning
 /// no campaign, which fails closed with no claim at all.
 fn owner_fallback(link: &PatreonLink, now: i64) -> Option<ArkavoPatreon> {
-    let verified_at = link.last_verified_at.unwrap_or(link.linked_at);
-    if now.saturating_sub(verified_at) > PATREON_FALLBACK_MAX_STALE_SECONDS {
+    // Enforce the 24h staleness cap whenever `last_verified_at` is recorded.
+    // Pre-0.42.1 rows without `last_verified_at` remain eligible until their
+    // first post-upgrade materialization records it.
+    if let Some(verified_at) = link.last_verified_at
+        && now.saturating_sub(verified_at) > PATREON_FALLBACK_MAX_STALE_SECONDS
+    {
         return None;
     }
+    let verified_at = link.last_verified_at.unwrap_or(link.linked_at);
     link.campaign_id.as_ref().map(|cid| ArkavoPatreon {
         role: ROLE_CREATOR.into(),
         patreon_user_id: link.patreon_user_id.clone(),
@@ -2024,12 +2090,22 @@ pub async fn materialize_for_user_resolved(
                     "no claim"
                 }
             );
-            if let Some(f) = &fallback
-                && link_is_still_current(app_state, &link_for_check).await
-            {
-                state.cache.put_if_absent(user_id, f).await;
+            if let Some(f) = &fallback {
+                let still_current = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    link_is_still_current(app_state, &link_for_check),
+                )
+                .await
+                .unwrap_or(false);
+                if still_current {
+                    state.cache.put_if_absent(user_id, f).await;
+                    fallback
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            fallback
         }
     };
     snap.map_or(Materialized::Unavailable, |s| {
@@ -2062,9 +2138,9 @@ async fn persist_rotated_tokens(
     }
 }
 
-async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) {
+async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) -> bool {
     // Persist ownership + `last_verified_at` conditionally on `(patreon_user_id, linked_at)`
-    // FIRST, and only touch `patreon-campaign#<cid>` if the row is still ours.
+    // FIRST, and only touch `patreon-campaign#<cid>` if the conditional write succeeded.
     let updated = match app_state
         .db_store
         .put_patreon_ownership(
@@ -2097,11 +2173,10 @@ async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &Arka
         }
         Err(e) => {
             warn!(
-                "Failed to store Patreon ownership for user {}: {} — the fallback keeps the older copy",
+                "Failed to store Patreon ownership for user {}: {} — skipping campaign owner update",
                 link.user_id, e
             );
-            // Fall back to verifying liveness/link identity before touching campaign owner.
-            link_is_still_current(app_state, link).await
+            false
         }
     };
     if updated {
@@ -2113,6 +2188,7 @@ async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &Arka
         )
         .await;
     }
+    updated
 }
 
 /// Keep the `patreon-campaign#<cid>` owner row (#128) in step with what
@@ -2408,7 +2484,50 @@ async fn fetch_identity_with_refresh(
             })?;
 
             let new_tokens =
-                refresh_access_token(&state.http, client, &refresh_token, &state.token_url).await?;
+                match refresh_access_token(&state.http, client, &refresh_token, &state.token_url)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(PatreonError::InvalidGrant) => {
+                        // A concurrent mint may have already rotated this single-use
+                        // refresh token. Re-read `patreon_tokens`: if the same link
+                        // now carries a newer `refresh_token_nonce`, retry `/identity`
+                        // once with the freshly stored access token instead of
+                        // treating the race loser as permanently revoked.
+                        if let Some(app) = app_state
+                            && let Ok(Some(fresh)) = app.db_store.get_patreon_link(link.user_id).await
+                            && fresh.patreon_user_id == link.patreon_user_id
+                            && fresh.linked_at == link.linked_at
+                            && fresh.refresh_token_nonce != link.refresh_token_nonce
+                            && let Ok(fresh_plain) = open_patreon_token(
+                                sealer,
+                                &fresh.user_id,
+                                "access",
+                                &SealedToken {
+                                    wrapped_dek: fresh.wrapped_dek.clone(),
+                                    nonce: fresh.access_token_nonce.clone(),
+                                    ciphertext: fresh.access_token_ct.clone(),
+                                },
+                            )
+                            .await
+                            && let Ok(fresh_access) = String::from_utf8(fresh_plain)
+                        {
+                            return match fetch_identity_read(
+                                &state.http,
+                                &fresh_access,
+                                &state.identity_url,
+                                query,
+                            )
+                            .await
+                            {
+                                Ok(read) => Ok((read, None, fresh_access)),
+                                Err(err) => Err(err.into()),
+                            };
+                        }
+                        return Err(PatreonError::InvalidGrant.into());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
             // Re-seal both rotated tokens under ONE fresh DEK in a single KMS
             // round-trip, bound to per-user AAD & EncryptionContext.
@@ -3948,6 +4067,7 @@ mod tests {
         .unwrap();
         assert_eq!(opened, b"new-access");
         // Bound to user_id via AAD: another user's ID cannot open the same blob.
+        // Bound to user_id via AAD: another user's ID cannot open a newly sealed blob.
         assert!(
             open_patreon_token(
                 &sealer,
@@ -3962,6 +4082,14 @@ mod tests {
             .await
             .is_err()
         );
+        // Legacy pre-0.42.1 ciphertext (empty AAD, no KMS context) still opens
+        // cleanly for zero-downtime upgrade.
+        let legacy_blob = sealer.seal(b"legacy-access").await.unwrap();
+        let opened_legacy =
+            open_patreon_token(&sealer, &new_link.user_id, "access", &legacy_blob)
+                .await
+                .unwrap();
+        assert_eq!(opened_legacy, b"legacy-access");
     }
 
     #[tokio::test]
@@ -4712,7 +4840,29 @@ mod tests {
         let app_state =
             crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
         let sealer = TokenSealer::Plaintext;
-        let link = creator_link_with_token(&sealer, b"access", "").await;
+        let user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) = seal_patreon_pair(&sealer, &user.user_id, b"access", b"refresh")
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let link = PatreonLink {
+            user_id: user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "").await
+        };
         app_state.db_store.put_patreon_link(&link).await.unwrap();
         let state = enabled_state(
             &sealer,
@@ -4782,8 +4932,29 @@ mod tests {
         ))
         .await;
         let sealer = TokenSealer::Plaintext;
-        let link =
-            creator_link_with_token(&sealer, b"access", "identity identity.memberships").await;
+        let user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) = seal_patreon_pair(&sealer, &user.user_id, b"access", b"refresh")
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let link = PatreonLink {
+            user_id: user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "identity identity.memberships").await
+        };
         app_state.db_store.put_patreon_link(&link).await.unwrap();
         let state = enabled_state(
             &sealer,
@@ -4874,7 +5045,30 @@ mod tests {
                 .is_none()
         );
 
-        let creator = creator_link_with_token(&sealer, b"access", "").await;
+        let creator_user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) =
+            seal_patreon_pair(&sealer, &creator_user.user_id, b"access", b"refresh")
+                .await
+                .unwrap();
+        let now = Utc::now().timestamp();
+        let creator = PatreonLink {
+            user_id: creator_user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "").await
+        };
         app_state.db_store.put_patreon_link(&creator).await.unwrap();
         match materialize_for_user_resolved(&app_state, &state, creator.user_id).await {
             Materialized::Snapshot(s) => {

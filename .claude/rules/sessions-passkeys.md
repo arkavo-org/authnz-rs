@@ -34,7 +34,10 @@ paths:
   is reuse (RFC 9700): the session is deleted. Re-reads entitlements and the
   publishing suspension (`oidc::arkavo_user_claims`); a suspension does not
   end the session. Every refusal is 401 `{"error":"session_ended","reason"}`.
-- `POST /session/signout`: device-key signature; deletes the row (204,
+- `POST /session/signout`: device-key signature; retires the session row in
+  place (`retire_session`: sets `retired_at`, removes `credential_hash` and
+  `public_key`) so a `session_id` derived from a CWT `cti` can never be
+  re-opened while the original token is still within the 300 s window (204,
   idempotent).
 - A renewed token carries `arkavo_apple_linked` from the `credentials` row
   it re-reads (`passkey_auth_claims`), so a link or unlink on another Mac

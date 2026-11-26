@@ -1407,10 +1407,10 @@ pub fn verify(
     }
 
     // exp / iat with ±skew.
-    if claims.exp <= opts.now - opts.skew_secs {
+    if claims.exp <= opts.now.saturating_sub(opts.skew_secs) {
         return Err(CwtError::Expired);
     }
-    if claims.iat > opts.now + opts.skew_secs {
+    if claims.iat > opts.now.saturating_add(opts.skew_secs) {
         return Err(CwtError::NotYetValid);
     }
 

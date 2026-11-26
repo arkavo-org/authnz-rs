@@ -133,8 +133,8 @@ struct Entry {
 pub struct SubscriptionLookup {
     token: LookupToken,
     cache: Mutex<HashMap<Uuid, Entry>>,
-    /// No account is asked before this time (unix seconds). 0: closed.
-    breaker_until: Mutex<i64>,
+    /// Breaker state: `(until_unix_secs, last_settled_seq)`. `until == 0` means closed.
+    breaker: Mutex<(i64, u64)>,
     /// Rechecks per account in the current minute: (window start, count).
     rechecks: Mutex<HashMap<Uuid, (i64, u32)>>,
     /// Monotonic sequence assigned before each outbound lookup.
@@ -146,7 +146,7 @@ impl SubscriptionLookup {
         Self {
             token,
             cache: Mutex::new(HashMap::new()),
-            breaker_until: Mutex::new(0),
+            breaker: Mutex::new((0, 0)),
             rechecks: Mutex::new(HashMap::new()),
             fetch_seq: AtomicU64::new(1),
         }
@@ -167,8 +167,8 @@ impl SubscriptionLookup {
     /// Whether the breaker is currently blocking lookups (without admitting a
     /// probe). Checked before consuming a caller's recheck budget.
     fn breaker_is_open(&self, now: i64) -> bool {
-        let until = self.breaker_until.lock().unwrap_or_else(|e| e.into_inner());
-        *until != 0 && now < *until
+        let state = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 != 0 && now < state.0
     }
 
     /// Cache `status`. A failure never replaces an unexpired answer, and an
@@ -200,23 +200,29 @@ impl SubscriptionLookup {
     /// the breaker stays shut behind it for one fetch deadline, so the other
     /// mints of that moment do not all wait on a market that is still down.
     fn admit(&self, now: i64) -> bool {
-        let mut until = self.breaker_until.lock().unwrap_or_else(|e| e.into_inner());
-        if *until == 0 {
+        let mut state = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 == 0 {
             return true;
         }
-        if now < *until {
+        if now < state.0 {
             return false;
         }
-        *until = now + MARKET_FETCH_DEADLINE_SECONDS as i64 + 1;
+        state.0 = now + MARKET_FETCH_DEADLINE_SECONDS as i64 + 1;
         true
     }
 
     /// Open the breaker for the failure window after an outage; close it
     /// after anything the market answered, a claim that does not verify
     /// included: that is one account's failure, and the market is up.
-    fn settle(&self, fetched: Fetched, now: i64) {
-        let mut until = self.breaker_until.lock().unwrap_or_else(|e| e.into_inner());
-        *until = match fetched {
+    /// An older fetch (`seq < last_settled_seq`) never reopens or overwrites
+    /// what a fresher fetch already settled.
+    fn settle(&self, fetched: Fetched, now: i64, seq: u64) {
+        let mut state = self.breaker.lock().unwrap_or_else(|e| e.into_inner());
+        if seq < state.1 {
+            return;
+        }
+        state.1 = seq;
+        state.0 = match fetched {
             Fetched::Answer(_) | Fetched::Unverified => 0,
             Fetched::Outage => now + MARKET_FAILURE_CACHE_TTL_SECONDS,
         };
@@ -298,7 +304,7 @@ impl MarketSource {
         let seq = lookup.next_seq();
         let fetched = self.fetch_subscription(lookup, account).await;
         let now = Utc::now().timestamp();
-        lookup.settle(fetched, now);
+        lookup.settle(fetched, now, seq);
         let status = fetched.status();
         lookup.record(account, status, now, seq);
         status
