@@ -131,6 +131,7 @@ pub fn verify(bytes: &[u8], keys: &crate::keys::KeySet) -> Result<CredentialAtte
     }
     if header.content_type != Some(coset::ContentType::Text(CONTENT_TYPE.into()))
         || !header.crit.is_empty()
+        || sign1.unprotected != coset::Header::default()
     {
         return Err(CwtError::Malformed);
     }
@@ -146,7 +147,11 @@ pub fn verify(bytes: &[u8], keys: &crate::keys::KeySet) -> Result<CredentialAtte
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<CredentialAttestation, CwtError> {
-    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CwtError::Malformed)?;
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor).map_err(|_| CwtError::Malformed)?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(CwtError::Malformed);
+    }
     let Value::Map(entries) = value else {
         return Err(CwtError::Malformed);
     };

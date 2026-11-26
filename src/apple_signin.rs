@@ -74,7 +74,12 @@ use tokio::sync::RwLock;
 use tower_sessions::Session;
 use uuid::Uuid;
 
+/// Session key holding the opaque handle to the server-issued Apple nonce.
 const SESSION_APPLE_NONCE_KEY: &str = "apple_nonce_state";
+const EPH_NS_APPLE_NONCE: &str = "apple_nonce";
+
+/// Minimum seconds between kid-miss forced JWKS refreshes (DoS / amplification guard).
+const APPLE_JWKS_REFRESH_COOLDOWN_SECONDS: i64 = 30;
 
 /// Nonce TTL (seconds). Short-lived to bound the replay window.
 const APPLE_NONCE_TTL_SECONDS: i64 = 600;
@@ -254,6 +259,9 @@ impl UnlinkLimiter {
 /// the web flow) without needing parallel deployments.
 pub struct AppleJwksCache {
     inner: RwLock<CacheState>,
+    /// Singleflight mutex coalescing concurrent JWKS refreshes.
+    refresh_lock: tokio::sync::Mutex<()>,
+    refresh_cooldown_secs: i64,
     client_ids: Vec<String>,
     /// Reused HTTP client with a bounded total timeout. Built once so the
     /// connection pool survives cache refreshes, and so a stalled
@@ -266,6 +274,7 @@ pub struct AppleJwksCache {
 struct CacheState {
     keys: Vec<Jwk>,
     fetched_at: i64,
+    last_refresh_attempt: i64,
 }
 
 impl AppleJwksCache {
@@ -294,7 +303,10 @@ impl AppleJwksCache {
             inner: RwLock::new(CacheState {
                 keys: Vec::new(),
                 fetched_at: 0,
+                last_refresh_attempt: 0,
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_cooldown_secs: APPLE_JWKS_REFRESH_COOLDOWN_SECONDS,
             client_ids,
             client,
             jwks_url: APPLE_JWKS_URL.to_string(),
@@ -306,27 +318,62 @@ impl AppleJwksCache {
         &self.client_ids
     }
 
-    async fn get_keys(&self) -> Result<Vec<Jwk>, AppleSigninError> {
+    /// Look up `kid` in the cached JWKS, performing at most one singleflight
+    /// upstream refresh (subject to `refresh_cooldown_secs`) on TTL expiry or
+    /// kid miss. Never clears valid cached keys before a replacement fetch
+    /// succeeds.
+    async fn get_jwk_for_kid(&self, kid: &str) -> Result<Jwk, AppleSigninError> {
         let now = Utc::now().timestamp();
         {
             let state = self.inner.read().await;
-            if !state.keys.is_empty() && now - state.fetched_at < APPLE_JWKS_CACHE_TTL_SECONDS {
-                return Ok(state.keys.clone());
+            if !state.keys.is_empty()
+                && now.saturating_sub(state.fetched_at) < APPLE_JWKS_CACHE_TTL_SECONDS
+                && let Some(jwk) = find_jwk(&state.keys, kid)
+            {
+                return Ok(jwk.clone());
             }
         }
 
-        let keys = fetch_jwks(&self.client, &self.jwks_url).await?;
+        // Singleflight: only one task refreshes upstream at a time.
+        let _guard = self.refresh_lock.lock().await;
+        let now = Utc::now().timestamp();
+        {
+            let state = self.inner.read().await;
+            if !state.keys.is_empty()
+                && now.saturating_sub(state.fetched_at) < APPLE_JWKS_CACHE_TTL_SECONDS
+                && let Some(jwk) = find_jwk(&state.keys, kid)
+            {
+                return Ok(jwk.clone());
+            }
+            // Enforce refresh cooldown across both fresh-cache kid misses and
+            // recent failed fetches so concurrent waiters do not stampede upstream.
+            if self.refresh_cooldown_secs > 0
+                && now.saturating_sub(state.last_refresh_attempt) < self.refresh_cooldown_secs
+            {
+                return Err(AppleSigninError::UnknownKid(kid.to_string()));
+            }
+        }
 
-        let mut state = self.inner.write().await;
-        state.keys = keys;
-        state.fetched_at = now;
-        Ok(state.keys.clone())
-    }
-
-    async fn invalidate(&self) {
-        let mut state = self.inner.write().await;
-        state.fetched_at = 0;
-        state.keys.clear();
+        let fetched = fetch_jwks(&self.client, &self.jwks_url).await;
+        let finished_at = Utc::now().timestamp();
+        match fetched {
+            Ok(keys) => {
+                let mut state = self.inner.write().await;
+                state.last_refresh_attempt = finished_at;
+                if !keys.is_empty() {
+                    state.keys = keys;
+                    state.fetched_at = finished_at;
+                }
+                find_jwk(&state.keys, kid)
+                    .cloned()
+                    .ok_or_else(|| AppleSigninError::UnknownKid(kid.to_string()))
+            }
+            Err(e) => {
+                let mut state = self.inner.write().await;
+                state.last_refresh_attempt = finished_at;
+                Err(e)
+            }
+        }
     }
 
     /// A cache for tests: these client ids, and the JWKS of a stub Apple.
@@ -336,7 +383,10 @@ impl AppleJwksCache {
             inner: RwLock::new(CacheState {
                 keys: Vec::new(),
                 fetched_at: 0,
+                last_refresh_attempt: 0,
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_cooldown_secs: 0,
             client_ids: client_ids.iter().map(|s| s.to_string()).collect(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -452,17 +502,8 @@ async fn verify_with(
         .map_err(|e| AppleSigninError::InvalidToken(format!("header decode: {}", e)))?;
     let kid = header.kid.ok_or(AppleSigninError::MissingKid)?;
 
-    let keys = cache.get_keys().await?;
-    if let Some(jwk) = find_jwk(&keys, &kid) {
-        return verify_apple_id_token_with_jwk(jwk, id_token, client_ids, nonce);
-    }
-
-    // Cache miss: force a refresh in case Apple rotated keys.
-    warn!("Apple kid {} not in cache; forcing JWKS refresh", kid);
-    cache.invalidate().await;
-    let keys = cache.get_keys().await?;
-    let jwk = find_jwk(&keys, &kid).ok_or_else(|| AppleSigninError::UnknownKid(kid.clone()))?;
-    verify_apple_id_token_with_jwk(jwk, id_token, client_ids, nonce)
+    let jwk = cache.get_jwk_for_kid(&kid).await?;
+    verify_apple_id_token_with_jwk(&jwk, id_token, client_ids, nonce)
 }
 
 fn find_jwk<'a>(keys: &'a [Jwk], kid: &str) -> Option<&'a Jwk> {
@@ -620,10 +661,12 @@ struct AppleNonceState {
     expires_at: i64,
 }
 
-/// Issue a fresh server-side Apple nonce, persist it in the session, and
-/// return the raw value. The session is the binding between this nonce and
-/// the subsequent `/oauth/apple/idtoken` call from the same client.
-pub async fn issue_apple_nonce(session: &Session) -> Result<String, AppleSigninError> {
+/// Issue a fresh server-side Apple nonce, persist it in the atomic ephemeral
+/// store (handle in session), and return the raw value.
+pub async fn issue_apple_nonce(
+    store: &crate::ephemeral::EphemeralStore,
+    session: &Session,
+) -> Result<String, AppleSigninError> {
     // 256 bits of entropy from two UUIDs concatenated and base64url-encoded.
     let part1 = Uuid::new_v4();
     let part2 = Uuid::new_v4();
@@ -633,29 +676,41 @@ pub async fn issue_apple_nonce(session: &Session) -> Result<String, AppleSigninE
     let raw_nonce =
         base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
 
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_APPLE_NONCE_KEY).await {
+        store.delete(EPH_NS_APPLE_NONCE, &old_id).await;
+    }
     let state = AppleNonceState {
         raw_nonce: raw_nonce.clone(),
         expires_at: Utc::now().timestamp() + APPLE_NONCE_TTL_SECONDS,
     };
+    let nonce_id = store
+        .insert(EPH_NS_APPLE_NONCE, &state, APPLE_NONCE_TTL_SECONDS)
+        .await
+        .map_err(AppleSigninError::SessionError)?;
     session
-        .insert(SESSION_APPLE_NONCE_KEY, &state)
+        .insert(SESSION_APPLE_NONCE_KEY, nonce_id)
         .await
         .map_err(|e| AppleSigninError::SessionError(e.to_string()))?;
     Ok(raw_nonce)
 }
 
-/// Single-use consume of the session-stored Apple nonce.
-async fn consume_apple_nonce(session: &Session) -> Result<String, AppleSigninError> {
-    let state: AppleNonceState = session
+/// Atomic single-use consume of the server-stored Apple nonce.
+async fn consume_apple_nonce(
+    store: &crate::ephemeral::EphemeralStore,
+    session: &Session,
+) -> Result<String, AppleSigninError> {
+    let nonce_id: String = session
         .get(SESSION_APPLE_NONCE_KEY)
         .await
         .map_err(|e| AppleSigninError::SessionError(e.to_string()))?
         .ok_or(AppleSigninError::MissingSessionNonce)?;
-    // Clear immediately — single-use, regardless of whether validation succeeds.
-    session
-        .remove_value(SESSION_APPLE_NONCE_KEY)
+    let _ = session.remove_value(SESSION_APPLE_NONCE_KEY).await;
+
+    let state: AppleNonceState = store
+        .take(EPH_NS_APPLE_NONCE, &nonce_id)
         .await
-        .map_err(|e| AppleSigninError::SessionError(e.to_string()))?;
+        .map_err(AppleSigninError::SessionError)?
+        .ok_or(AppleSigninError::MissingSessionNonce)?;
 
     if state.expires_at < Utc::now().timestamp() {
         return Err(AppleSigninError::MissingSessionNonce);
@@ -677,8 +732,11 @@ pub struct AppleNonceResponse {
 
 /// Issue a server-side Apple nonce. Required step before
 /// `POST /oauth/apple/idtoken` in the native flow.
-pub async fn apple_nonce_handler(session: Session) -> Response {
-    match issue_apple_nonce(&session).await {
+pub async fn apple_nonce_handler(
+    Extension(app_state): Extension<AppState>,
+    session: Session,
+) -> Response {
+    match issue_apple_nonce(&app_state.ephemeral_store, &session).await {
         Ok(nonce) => Json(AppleNonceResponse {
             nonce,
             expires_in: APPLE_NONCE_TTL_SECONDS,
@@ -719,7 +777,7 @@ pub async fn apple_idtoken_handler(
     session: Session,
     Json(req): Json<AppleIdTokenRequest>,
 ) -> Response {
-    let raw_nonce = match consume_apple_nonce(&session).await {
+    let raw_nonce = match consume_apple_nonce(&app_state.ephemeral_store, &session).await {
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
@@ -833,7 +891,7 @@ pub async fn apple_link_handler(
 
     // 1. Caller must be authenticated. The CWT's `sub` is the arkavo user_id
     //    we'll bind the Apple identity to.
-    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+    let user_id = match extract_passkey_auth_user_id(&app_state, &headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
@@ -849,7 +907,7 @@ pub async fn apple_link_handler(
 
     // 2. Same nonce dance as the bootstrap endpoint — single-use consume,
     //    bound to this session.
-    let raw_nonce = match consume_apple_nonce(&session).await {
+    let raw_nonce = match consume_apple_nonce(&app_state.ephemeral_store, &session).await {
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
@@ -919,6 +977,24 @@ async fn link_only(db: &crate::db::DynamoDBStore, link: &VerifiedLink<'_>) -> Re
     let sub_prefix = subject_prefix(&link.claims.sub);
     match db.link_identity(user_id, "apple", &link.claims.sub).await {
         Ok(()) => {
+            // Re-check account liveness after writing: if account deletion ran
+            // concurrently and its sweep already scanned `identity_links`,
+            // roll back a token-less row so it is never orphaned without
+            // deleting a pre-existing token-holding row unrevoked.
+            match db.is_account_live(&user_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = db
+                        .delete_apple_link_without_token(&apple_link_key(&link.claims.sub), &user_id)
+                        .await;
+                    return AppleSigninError::InvalidAuth.into_response();
+                }
+                Err(e) => {
+                    error!("Post-link liveness check failed for {}: {}", user_id, e);
+                    return AppleSigninError::Internal("account_lookup_failed".to_string())
+                        .into_response();
+                }
+            }
             mark_linked_again(db, &user_id).await;
             // Audit trail: subject_prefix (not full sub) is enough to triangulate
             // with the DDB row during incident response without leaking the
@@ -1034,7 +1110,7 @@ async fn link_with_token(
     //    depends on who holds the authorization (see the 409 below): a link
     //    already there, this account's or another's, holds it, and only a
     //    token for an identity linked to nobody is revoked.
-    let sealed = match apple.seal(&tokens.refresh_token).await {
+    let sealed = match apple.seal(&user_id, &tokens.refresh_token).await {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -1201,7 +1277,7 @@ pub async fn apple_unlink_handler(
     Extension(apple_tokens): Extension<AppleTokens>,
     headers: HeaderMap,
 ) -> Response {
-    let user_id = match extract_authenticated_user_id(&app_state, &headers) {
+    let user_id = match extract_passkey_auth_user_id(&app_state, &headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
@@ -1277,21 +1353,38 @@ async fn unlink_apple(
     db.mark_apple_unlinked(user_id, now)
         .await
         .map_err(storage("mark"))?;
+    let mut unlinked_count = 0usize;
+    let mut raced_token_link = false;
     for key in &found.without_token {
-        db.delete_apple_link_without_token(key, user_id)
+        let deleted = db
+            .delete_apple_link_without_token(key, user_id)
             .await
             .map_err(storage("delete"))?;
+        if deleted {
+            unlinked_count += 1;
+        } else {
+            // The row gained a token concurrently (or was removed/changed):
+            // report as transient so the caller retries and revokes the token
+            // rather than clearing `apple_linked_at` while a token-bearing link
+            // remains.
+            warn!(
+                "Apple unlink: token-less link for {user_id} was not deleted (concurrent token write)"
+            );
+            raced_token_link = true;
+        }
     }
     // Whether any revocation failed, and whether any failure was permanent:
     // a permanent one is reported ahead of a transient one, since retrying
     // cannot fix it (as the deletion sweep's `revoke_apple_tokens` does).
-    let (mut transient, mut permanent) = (false, false);
+    let (mut transient, mut permanent) = (raced_token_link, false);
     for row in &found.rows {
         match apple.revoke_stored(row).await {
-            Ok(()) => db
-                .delete_apple_link(&row.link_key, user_id)
-                .await
-                .map_err(storage("delete"))?,
+            Ok(()) => {
+                db.delete_apple_link(&row.link_key, user_id)
+                    .await
+                    .map_err(storage("delete"))?;
+                unlinked_count += 1;
+            }
             // Status and Apple's error code only (AppleTokenError's Display).
             Err(e) => {
                 error!("Apple unlink: revocation failed for {user_id}: {e}");
@@ -1323,34 +1416,28 @@ async fn unlink_apple(
     if transient {
         return Err(AppleSigninError::TokenRevokeFailed);
     }
-    Ok(found.rows.len() + found.without_token.len())
+    Ok(unlinked_count)
 }
 
-/// Behind HAProxy / nginx we expect `X-Forwarded-For`; first comma-separated
-/// value is the original client. Falls back to `"unknown"` when no proxy
-/// header is present (e.g. local dev hitting the server directly). We do
-/// **not** trust this for any security decision — it's a hint for log
-/// correlation only.
+/// Sanitize the first `X-Forwarded-For` value strictly as an `IpAddr` for log
+/// correlation only. Never trusted for security decisions, and refusing
+/// non-IP strings prevents newline / `key=value` audit log injection.
 fn client_ip_from_headers(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Extract the authenticated arkavo user_id from the inbound `X-Auth-Token`
-/// CWT header. Returns [`AppleSigninError::MissingAuth`] (HTTP 401) if the
-/// header is absent, [`AppleSigninError::InvalidAuth`] (HTTP 401) if the CWT
-/// fails to verify or its `sub` is not a valid UUID.
-///
-/// The HTTP response intentionally collapses every CWT failure into the same
-/// opaque `InvalidAuth` so an attacker cannot distinguish "wrong issuer" from
-/// "expired" from "bad signature". The specific reason is logged at `warn!`
-/// for the operator's audit trail.
-fn extract_authenticated_user_id(
+/// CWT header, requiring a passkey auth CWT (never a ~99-year registration
+/// CWT). Renewed session passkey CWTs are accepted so Creator and mobile apps
+/// can link/unlink without forcing an extra passkey prompt.
+fn extract_passkey_auth_user_id(
     app_state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Uuid, AppleSigninError> {
@@ -1365,6 +1452,11 @@ fn extract_authenticated_user_id(
         warn!("X-Auth-Token rejected: CWT verification failed ({})", e);
         AppleSigninError::InvalidAuth
     })?;
+    // Reject ~99-year registration CWTs.
+    if crate::oidc::webauthn_auth_time(&claims).is_none() {
+        warn!("X-Auth-Token rejected for Apple link/unlink: requires passkey auth CWT");
+        return Err(AppleSigninError::InvalidAuth);
+    }
     Uuid::parse_str(&claims.sub).map_err(|e| {
         warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
         AppleSigninError::InvalidAuth
@@ -1689,8 +1781,16 @@ mod tests {
             .with_secure(false)
             .with_expiry(Expiry::OnInactivity(SessionDuration::seconds(600)));
 
+        unsafe {
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "fake_access_key");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_secret_key");
+        }
+        let app_state = crate::test_helpers::build_test_app_state().await;
+
         let app = Router::new()
             .route("/oauth/apple/nonce", get(apple_nonce_handler))
+            .layer(Extension(app_state))
             .layer(session_layer);
 
         let resp1 = app
@@ -1736,24 +1836,25 @@ mod tests {
         use tower_sessions::{Expiry, MemoryStore, Session};
 
         let store = Arc::new(MemoryStore::default());
+        let eph = crate::ephemeral::EphemeralStore::local_only();
         let session = Session::new(
             None,
             store,
             Some(Expiry::OnInactivity(SessionDuration::seconds(600))),
         );
 
-        let issued = issue_apple_nonce(&session).await.expect("issue ok");
+        let issued = issue_apple_nonce(&eph, &session).await.expect("issue ok");
         assert!(!issued.is_empty());
 
         // First consume returns the nonce we issued.
-        let first = consume_apple_nonce(&session)
+        let first = consume_apple_nonce(&eph, &session)
             .await
             .expect("first consume ok");
         assert_eq!(first, issued);
 
         // Second consume must fail with MissingSessionNonce (HTTP 400). If
         // this ever returns Ok(...), the nonce is being replayed.
-        let second = consume_apple_nonce(&session).await;
+        let second = consume_apple_nonce(&eph, &session).await;
         assert!(
             matches!(second, Err(AppleSigninError::MissingSessionNonce)),
             "expected MissingSessionNonce on replay, got {:?}",

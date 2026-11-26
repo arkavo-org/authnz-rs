@@ -588,6 +588,7 @@ async fn an_account_that_may_publish_gets_the_pass_and_no_other_entitlement() {
                     transaction_id: Some(otid),
                     product_id: product.into(),
                     environment: Environment::Production,
+                    purchase_at: None,
                     expires_at: now + 3600,
                     grace_expires_at: None,
                     revoked_at: None,

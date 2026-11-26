@@ -217,10 +217,16 @@ fn version_condition(read_version: u64) -> &'static str {
 
 pub(super) fn trust_from_item(item: &Item) -> Result<AgentTrust, DynamoDBError> {
     let text = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
-    let int = |k: &str| {
-        item.get(k)
-            .and_then(|v| v.as_n().ok())
-            .and_then(|v| v.parse::<i64>().ok())
+    let int = |k: &str| -> Result<Option<i64>, DynamoDBError> {
+        match item.get(k) {
+            None => Ok(None),
+            Some(v) => v
+                .as_n()
+                .ok()
+                .and_then(|n| n.parse::<i64>().ok())
+                .map(Some)
+                .ok_or_else(|| DynamoDBError::Internal(format!("agent trust has malformed {k}"))),
+        }
     };
     Ok(AgentTrust {
         state: match text("state") {
@@ -235,14 +241,14 @@ pub(super) fn trust_from_item(item: &Item) -> Result<AgentTrust, DynamoDBError> 
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or_else(|| DynamoDBError::Internal("state_version is not a number".into()))?,
         },
-        appraised_until: int("appraised_until"),
+        appraised_until: int("appraised_until")?,
         appraised_by: text("appraised_by"),
         incident: text("incident"),
         evidence_ref: text("evidence_ref"),
         quarantined_by: text("quarantined_by"),
-        quarantined_at: int("quarantined_at"),
+        quarantined_at: int("quarantined_at")?,
         last_cleared_incident: text("last_cleared_incident"),
-        recovered_at: int("recovered_at"),
+        recovered_at: int("recovered_at")?,
     })
 }
 

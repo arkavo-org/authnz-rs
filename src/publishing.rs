@@ -183,6 +183,9 @@ pub(crate) enum Sources {
         market: MarketGrant,
         /// The market's answer about a prepaid online-play term (#151).
         subscription: Subscription,
+        /// The timestamp captured when `load_sources` evaluated App Store
+        /// active status, reused in `derive` so boundary expiry does not drift.
+        evaluated_at: i64,
     },
 }
 
@@ -204,6 +207,7 @@ pub(crate) async fn load_sources(
         state,
         market: MarketGrant::NotGranted,
         subscription: Subscription::None,
+        evaluated_at: Utc::now().timestamp(),
     };
     let Some(user_id) = user_id else {
         return Ok(nothing(None));
@@ -247,6 +251,7 @@ pub(crate) async fn load_sources(
         state: Some(state),
         market,
         subscription,
+        evaluated_at: now,
     })
 }
 
@@ -347,12 +352,13 @@ pub(crate) async fn derive(
         (Some(cfg), Some(snap)) => qualifies(cfg, snap, now),
         _ => false,
     };
-    let (state, market, subscription) = match sources {
+    let (state, market, subscription, eval_now) = match sources {
         Sources::Read {
             state,
             market,
             subscription,
-        } => (state, market, subscription),
+            evaluated_at,
+        } => (state, market, subscription, evaluated_at),
         // Unread means neither an App Store app nor the market is
         // configured: nothing but Patreon can grant anything.
         Sources::Unread if !patreon_ok => return Ok(Derived::default()),
@@ -360,14 +366,29 @@ pub(crate) async fn derive(
             read_state(app_state, &user_id).await?,
             MarketGrant::NotGranted,
             Subscription::None,
+            now,
         ),
     };
     let Some(state) = state else {
         return Ok(Derived::default());
     };
     let app_store_cfg = app_state.app_store.as_ref().as_ref();
-    let mut derived = publishing(&user_id, patreon_ok, app_store_cfg, &state, &market, now);
-    if online_play(&user_id, app_store_cfg, &state, &market, subscription, now) {
+    let mut derived = publishing(
+        &user_id,
+        patreon_ok,
+        app_store_cfg,
+        &state,
+        &market,
+        eval_now,
+    );
+    if online_play(
+        &user_id,
+        app_store_cfg,
+        &state,
+        &market,
+        subscription,
+        eval_now,
+    ) {
         derived
             .entitlements
             .push(ENTITLEMENT_ONLINE_PLAY.to_string());

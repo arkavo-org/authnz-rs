@@ -299,15 +299,34 @@ pub struct RefreshResponse {
 }
 
 /// End `session` for `why`, and say so.
+///
+/// Retires (tombstones) `session#<id>` rather than hard-deleting it so the
+/// opening auth CWT cannot reopen a fresh 24h session with a new device key
+/// during `SESSION_OPEN_MAX_AUTH_AGE_SECONDS`. On [`Ended::Reused`], also
+/// revokes the sibling 30-day game session bound to the compromised key.
 async fn end(
     app_state: &AppState,
     session: &Session,
     why: Ended,
 ) -> Result<SessionError, SessionError> {
+    let now = Utc::now().timestamp();
+    let game_session_id = authnz_rs::game_token::game_session_id_for(&session.session_id);
+    if why == Ended::Reused {
+        app_state
+            .db_store
+            .delete_game_session(&game_session_id)
+            .await?;
+    }
     app_state
         .db_store
-        .delete_session(&session.session_id)
+        .retire_session(&session.session_id, now, why.reason())
         .await?;
+    if why == Ended::Reused {
+        app_state
+            .db_store
+            .delete_game_session(&game_session_id)
+            .await?;
+    }
     info!(
         "Session {} of {} ended: {}",
         session.session_id,
@@ -378,6 +397,11 @@ pub async fn refresh_session(
         crate::authn::passkey_auth_claims(&app_state, &session.user_id, record.apple_linked)
             .with_arkavo_user(&arkavo_user)
             .with_auth_time(session.assertion_at);
+    // The await above may have crossed the 24h deadline; never sign a CWT
+    // whose iat >= exp (which cwt::verify rejects as Malformed).
+    if claims.iat >= deadline {
+        return Err(end(&app_state, &session, Ended::Expired).await?);
+    }
     claims.exp = claims.exp.min(deadline);
     let token =
         crate::cwt::mint(&claims, &app_state.cwt_signing_key, &app_state.cwt_kid).map_err(|e| {
@@ -476,11 +500,11 @@ pub async fn signout_session(
         .await?;
     app_state
         .db_store
-        .delete_session(&session.session_id)
+        .retire_session(&session.session_id, Utc::now().timestamp(), "signout")
         .await?;
-    // And again, now that the session is gone: an open that wrote its game
+    // And again, now that the session is retired: an open that wrote its game
     // session between the first delete and this point passed its own
-    // re-check. One that writes after this finds no session and takes its
+    // re-check. One that writes after this finds no live session and takes its
     // row back (`game::open_session_handler`).
     app_state
         .db_store

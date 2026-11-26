@@ -280,7 +280,10 @@ const HSTS: &str = "max-age=31536000";
 /// No CORS headers are sent, so browsers keep every response from other
 /// origins' scripts.
 pub async fn response_headers(State(tls): State<bool>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let sensitive_get = path.starts_with("/oauth/") || path.starts_with("/account/deletions/");
     let private = !matches!(*request.method(), Method::GET | Method::HEAD)
+        || sensitive_get
         || CREDENTIAL_HEADERS
             .iter()
             .any(|name| request.headers().contains_key(*name));

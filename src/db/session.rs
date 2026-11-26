@@ -120,6 +120,9 @@ impl DynamoDBStore {
             .map_err(|e| self.map_get_item_err(table, e))?
             .item;
         let Some(item) = item else { return Ok(None) };
+        if item.contains_key("ended_at") {
+            return Ok(None);
+        }
         let user_id = item
             .get("user_id")
             .and_then(|v| v.as_s().ok())
@@ -157,7 +160,7 @@ impl DynamoDBStore {
                 "SET generation = :next, credential_hash = :new, last_renewed_at = :now",
             )
             .condition_expression(
-                "attribute_exists(link_pk) AND generation = :gen AND credential_hash = :old",
+                "attribute_exists(link_pk) AND attribute_not_exists(ended_at) AND generation = :gen AND credential_hash = :old",
             )
             .expression_attribute_values(":gen", n(from_generation))
             .expression_attribute_values(":next", n(from_generation + 1))
@@ -175,7 +178,39 @@ impl DynamoDBStore {
         }
     }
 
-    /// End a session. Idempotent.
+    /// Tombstone/retire an ended session until its `expires_at` TTL so the
+    /// opening auth CWT cannot reopen `session#<id>` with a fresh device key.
+    /// Idempotent: a missing or already-retired row is a no-op.
+    pub async fn retire_session(
+        &self,
+        session_id: &Uuid,
+        ended_at: i64,
+        reason: &str,
+    ) -> Result<(), DynamoDBError> {
+        let table = &self.identity_links_table;
+        let result = self
+            .client
+            .update_item()
+            .table_name(table)
+            .key("link_pk", s(&link_pk(session_id)))
+            .update_expression(
+                "SET ended_at = if_not_exists(ended_at, :t), ended_reason = if_not_exists(ended_reason, :r) REMOVE credential_hash, public_key",
+            )
+            .condition_expression("attribute_exists(link_pk)")
+            .expression_attribute_values(":t", n(ended_at))
+            .expression_attribute_values(":r", s(reason))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => match classify(e, table) {
+                DynamoDBError::ConditionalConflict => Ok(()),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Hard-delete a session row (rollback on failed open / tests). Idempotent.
     pub async fn delete_session(&self, session_id: &Uuid) -> Result<(), DynamoDBError> {
         let table = &self.identity_links_table;
         self.client

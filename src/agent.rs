@@ -536,18 +536,35 @@ pub async fn authorize_agent(
             "At least one entitlement is required".into(),
         ));
     }
+    const MAX_DELEGATED_ENTITLEMENTS: usize = 64;
+    if request.entitlements.len() > MAX_DELEGATED_ENTITLEMENTS {
+        return Err(AgentError::InvalidRequest(format!(
+            "At most {} entitlements may be delegated",
+            MAX_DELEGATED_ENTITLEMENTS
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(request.entitlements.len());
+    let entitlements: Vec<String> = request
+        .entitlements
+        .into_iter()
+        .filter(|e| seen.insert(e.clone()))
+        .collect();
 
     let human =
         authenticate_operator(&app_state, &headers, AGENTS_DELEGATE_MAX_AUTH_AGE_SECONDS).await?;
 
-    // Subset check against the delegator's own stored entitlements.
-    let delegable = app_state
+    // Subset check against the live delegator's own stored entitlements (do
+    // not collapse a tombstoned account to an empty list).
+    let Some(user) = app_state
         .db_store
-        .get_user_entitlements(&human.user_id)
+        .get_user_by_id(&human.user_id)
         .await
-        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?;
-    for entitlement in &request.entitlements {
-        if !holds_entitlement(&delegable, entitlement) {
+        .map_err(|e| AgentError::DatabaseError(Box::new(e)))?
+    else {
+        return Err(AgentError::Unauthorized("account does not exist".into()));
+    };
+    for entitlement in &entitlements {
+        if !holds_entitlement(&user.entitlements, entitlement) {
             return Err(AgentError::InsufficientEntitlements(format!(
                 "Entitlement '{}' is not held by the delegator",
                 entitlement
@@ -576,7 +593,7 @@ pub async fn authorize_agent(
         delegator_type: "human".to_string(),
         delegator_id: human.user_id.to_string(),
         delegator_username: human.username,
-        entitlements: request.entitlements,
+        entitlements,
         name: request.name,
         depth,
         root_user_id: human.user_id,
@@ -778,6 +795,7 @@ pub async fn revoke_delegation(
     Path(agent_did): Path<String>,
 ) -> Result<impl IntoResponse, AgentError> {
     refuse_guardian(&headers)?;
+    validate_did_key(&agent_did)?;
     // The owner's passkey auth CWT, or an `agents:delegate` Bearer token
     // under the rule quarantine uses: revoking only removes power, so the
     // owner can do it from the client the agent was authorized with.

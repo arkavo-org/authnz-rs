@@ -1,9 +1,9 @@
 [package]
 name = "authnz-rs"
-version = "0.42.0"
+version = "0.42.1"
 edition = "2024"
 license = "BSD-2"
-rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs 0.5.5 (webvh feature)
+rust-version = "1.95"  # raised from 1.91.1 for didwebvh-rs (webvh feature)
 # Adding src/bin/seed-test-user.rs makes `cargo run` ambiguous without this.
 default-run = "authnz-rs"
 
@@ -70,7 +70,7 @@ getrandom = "0.2"
 # Heavy transitive tree, so gated to keep the default build lean. Needs the MSRV
 # bump to 1.95 (rust-version above). The Ed25519 update key is loaded via the
 # crate's re-exported `Secret`, so no other direct dep is required.
-didwebvh-rs = { version = "0.5.5", default-features = false, optional = true }
+didwebvh-rs = { version = "0.8.3", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # getrlimit: size the TCP connection cap to the open-file limit (edge.rs).

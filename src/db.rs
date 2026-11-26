@@ -27,6 +27,7 @@ pub use agent_state::{
     AgentState, AgentTrust, AuthorizeOver, AuthorizeWrite, EffectiveState, QuarantineOutcome,
     SwarmWrite,
 };
+pub(crate) use app_store::{app_store_is_newer_period, app_store_is_past_period};
 pub use app_store::{AppStoreRecord, GraceUpdate, LinkOutcome, PublishingState, StateOutcome};
 pub use game_session::GameSession;
 pub use guardians::Guardian;
@@ -341,14 +342,8 @@ impl DynamoDBStore {
         DynamoDBError::SdkError(err.to_string())
     }
 
-    /// Persist (or replace) the Patreon token bundle for a user.
-    ///
-    /// This is keyed by the arkavo `user_id` — one Patreon link per user, per
-    /// role. Re-linking overwrites the previous row (a user can re-authorize
-    /// to refresh consent or change role from consumer to creator). The
-    /// per-(provider, patreon_user_id) uniqueness invariant is enforced
-    /// separately via [`link_identity`] on the `identity_links` table, which
-    /// mirrors the Apple linking pattern.
+    /// Persist (or replace) the Patreon token bundle for a user unconditionally.
+    #[cfg(test)]
     pub async fn put_patreon_link(
         &self,
         link: &crate::patreon::PatreonLink,
@@ -382,26 +377,76 @@ impl DynamoDBStore {
         }
     }
 
-    /// Persist a token rotation of `link`: the same whole-row put as
-    /// [`Self::put_patreon_link`], but only while the row is still that link
-    /// (same Patreon user, same `linked_at`). A mint in flight across an
-    /// unlink would otherwise recreate the row with no `patreon#` link
-    /// beside it, and one across a relink would put the old account back
-    /// (#97). `Ok(false)` when the condition fails.
+    /// Conditionally persist a new/relinked Patreon token bundle, requiring
+    /// that the `patreon_tokens` row still matches `expected_previous` (absent
+    /// if `None`, or the same `(patreon_user_id, linked_at)` if `Some`).
+    /// Prevents concurrent relinks from overwriting each other and permanently
+    /// orphaning `patreon#<pid>` / `patreon-campaign#<cid>` rows.
+    /// Returns `Ok(false)` on a concurrent conflict.
+    pub async fn put_patreon_link_expected(
+        &self,
+        link: &crate::patreon::PatreonLink,
+        expected_previous: Option<&PatreonLinkRef>,
+    ) -> Result<bool, DynamoDBError> {
+        info!(
+            "Persisting Patreon link (conditional). Table: {}, user_id: {}, role: {}",
+            self.patreon_tokens_table, link.user_id, link.role
+        );
+
+        let req = match expected_previous {
+            None => self
+                .patreon_link_put(link)
+                .condition_expression("attribute_not_exists(user_id)"),
+            Some(prev) => self
+                .patreon_link_put(link)
+                .condition_expression(
+                    "attribute_exists(user_id) AND patreon_user_id = :prev_pid AND linked_at = :prev_la",
+                )
+                .expression_attribute_values(
+                    ":prev_pid",
+                    AttributeValue::S(prev.patreon_user_id.clone()),
+                )
+                .expression_attribute_values(":prev_la", AttributeValue::N(prev.linked_at.to_string())),
+        };
+
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(err) => match agent_state::classify(err, &self.patreon_tokens_table) {
+                DynamoDBError::ConditionalConflict => Ok(false),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Persist a token rotation of `link`, conditioned on the row still being
+    /// the same link (`patreon_user_id`, `linked_at`) AND — when
+    /// `expected_refresh_nonce` is provided — still holding the exact prior
+    /// `refresh_token_nonce` so a slower concurrent refresh cannot overwrite a
+    /// newer refresh token with a spent one.
     pub async fn put_rotated_patreon_link(
         &self,
         link: &crate::patreon::PatreonLink,
+        expected_refresh_nonce: Option<&[u8]>,
     ) -> Result<bool, DynamoDBError> {
-        let result = self
+        let mut req = self
             .patreon_link_put(link)
-            .condition_expression(
-                "attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at = :la",
-            )
             .expression_attribute_values(":pid", AttributeValue::S(link.patreon_user_id.clone()))
-            .expression_attribute_values(":la", AttributeValue::N(link.linked_at.to_string()))
-            .send()
-            .await;
-        match result {
+            .expression_attribute_values(":la", AttributeValue::N(link.linked_at.to_string()));
+        if let Some(old_nonce) = expected_refresh_nonce {
+            req = req
+                .condition_expression(
+                    "attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at = :la AND refresh_token_nonce = :old_rn",
+                )
+                .expression_attribute_values(
+                    ":old_rn",
+                    AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(old_nonce.to_vec())),
+                );
+        } else {
+            req = req.condition_expression(
+                "attribute_exists(user_id) AND patreon_user_id = :pid AND linked_at = :la",
+            );
+        }
+        match req.send().await {
             Ok(_) => Ok(true),
             Err(e) => match agent_state::classify(e, &self.patreon_tokens_table) {
                 DynamoDBError::ConditionalConflict => Ok(false),
@@ -462,6 +507,12 @@ impl DynamoDBStore {
                 AttributeValue::N(link.token_expires_at.to_string()),
             )
             .item("linked_at", AttributeValue::N(link.linked_at.to_string()));
+        if let Some(verified_at) = link.last_verified_at {
+            item_builder = item_builder.item(
+                "last_verified_at",
+                AttributeValue::N(verified_at.to_string()),
+            );
+        }
         if let Some(cid) = &link.campaign_id {
             item_builder = item_builder.item("campaign_id", AttributeValue::S(cid.clone()));
         }
@@ -495,6 +546,7 @@ impl DynamoDBStore {
         linked_at: i64,
         campaign_id: Option<&str>,
         tiers: &crate::cwt::OwnedCampaignTiers,
+        verified_at: Option<i64>,
     ) -> Result<bool, DynamoDBError> {
         let mut update = self
             .client
@@ -512,6 +564,12 @@ impl DynamoDBStore {
             .expression_attribute_names("#cname", OWNED_CAMPAIGN_NAME)
             .expression_attribute_values(":pid", AttributeValue::S(patreon_user_id.to_string()))
             .expression_attribute_values(":la", AttributeValue::N(linked_at.to_string()));
+        let verified_clause = if let Some(vt) = verified_at {
+            update = update.expression_attribute_values(":lva", AttributeValue::N(vt.to_string()));
+            ", last_verified_at = :lva"
+        } else {
+            ""
+        };
         const SET_OWNED: &str =
             "SET #role = :role, #cid = :cid, #ids = :ids, #slugs = :slugs, #ladder = :ladder";
         update = match campaign_id {
@@ -524,13 +582,18 @@ impl DynamoDBStore {
                     .expression_attribute_values(":ladder", ladder_list(&tiers.ladder));
                 match &tiers.name {
                     Some(name) => update
-                        .update_expression(format!("{SET_OWNED}, #cname = :cname"))
+                        .update_expression(format!(
+                            "{SET_OWNED}, #cname = :cname{verified_clause}"
+                        ))
                         .expression_attribute_values(":cname", AttributeValue::S(name.clone())),
-                    None => update.update_expression(format!("{SET_OWNED} REMOVE #cname")),
+                    None => update
+                        .update_expression(format!("{SET_OWNED}{verified_clause} REMOVE #cname")),
                 }
             }
             None => update
-                .update_expression("SET #role = :role REMOVE #cid, #ids, #slugs, #ladder, #cname")
+                .update_expression(format!(
+                    "SET #role = :role{verified_clause} REMOVE #cid, #ids, #slugs, #ladder, #cname"
+                ))
                 .expression_attribute_values(":role", AttributeValue::S("consumer".into())),
         };
         match update.send().await {
@@ -542,9 +605,8 @@ impl DynamoDBStore {
         }
     }
 
-    /// Read the Patreon token bundle for a user, if any.
-    ///
-    /// Returns `Ok(None)` when the user has not linked Patreon.
+    /// Read the Patreon token bundle for a user, if any. Strongly consistent
+    /// so an unlink or relink is visible immediately and never re-cached stale.
     pub async fn get_patreon_link(
         &self,
         user_id: Uuid,
@@ -554,6 +616,7 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.patreon_tokens_table)
             .key("user_id", AttributeValue::S(user_id.to_string()))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|err| {
@@ -836,6 +899,34 @@ impl DynamoDBStore {
         }
     }
 
+    /// Delete an `identity_links` row (`<provider>#<subject>`) only if it still
+    /// points at `user_id`. Used for post-write rollback when a link races
+    /// account deletion. Idempotent.
+    pub async fn delete_identity_link(
+        &self,
+        provider: &str,
+        subject: &str,
+        user_id: &Uuid,
+    ) -> Result<(), DynamoDBError> {
+        let link_pk = format!("{provider}#{subject}");
+        let result = self
+            .client
+            .delete_item()
+            .table_name(&self.identity_links_table)
+            .key("link_pk", AttributeValue::S(link_pk))
+            .condition_expression("user_id = :uid")
+            .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => match agent_state::classify(e, &self.identity_links_table) {
+                DynamoDBError::ConditionalConflict => Ok(()),
+                other => Err(other),
+            },
+        }
+    }
+
     pub async fn create_user(
         &self,
         username: &str,
@@ -919,6 +1010,142 @@ impl DynamoDBStore {
         Ok(user)
     }
 
+    /// Atomically reserve the permanent handle in `handles` and create the
+    /// `credentials` row with the registrant's initial passkey in a single
+    /// DynamoDB transaction.
+    ///
+    /// Eliminates both:
+    /// 1. The zero-credential registration race / pre-registration ambush
+    ///    (no `credentials` row exists until WebAuthn completes).
+    /// 2. The duplicate handle TOCTOU race (`attribute_not_exists(handle)` in
+    ///    `handles` guarantees at most one account ever receives `<handle>`).
+    ///
+    /// Returns [`DynamoDBError::LinkConflict`] when the handle already exists
+    /// in `handles`.
+    pub async fn create_user_with_credential(
+        &self,
+        user_id: Uuid,
+        username: &str,
+        did: &str,
+        credential: Passkey,
+    ) -> Result<UserCredentials, DynamoDBError> {
+        use aws_sdk_dynamodb::types::{Put, TransactWriteItem};
+
+        if username.is_empty() {
+            return Err(DynamoDBError::Internal("Username cannot be empty".into()));
+        }
+        if !did.starts_with("did:key:") {
+            return Err(DynamoDBError::InvalidDID(
+                "DID must start with 'did:key:'".to_string(),
+            ));
+        }
+
+        let handle = handle_for_new_account(username);
+        let serialized = AttributeValue::S(serde_json::to_string(&credential).map_err(|e| {
+            error!("Failed to serialize credential: {}", e);
+            DynamoDBError::SerdeJsonError(e)
+        })?);
+
+        let put_handle = Put::builder()
+            .table_name(&self.handles_table)
+            .item("handle", AttributeValue::S(handle.to_lowercase()))
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .condition_expression("attribute_not_exists(handle)")
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build handle Put failed: {e}")))?;
+
+        let put_credentials = Put::builder()
+            .table_name(&self.credentials_table)
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .item("username", AttributeValue::S(username.to_string()))
+            .item("handle", AttributeValue::S(handle.clone()))
+            .item("credentials", AttributeValue::L(vec![serialized]))
+            .item("did", AttributeValue::S(did.to_string()))
+            .item(
+                "entitlements",
+                AttributeValue::L(
+                    self.default_entitlements
+                        .iter()
+                        .map(|s| AttributeValue::S(s.clone()))
+                        .collect(),
+                ),
+            )
+            .condition_expression("attribute_not_exists(user_id)")
+            .build()
+            .map_err(|e| DynamoDBError::Internal(format!("build credentials Put failed: {e}")))?;
+
+        for attempt in 0..3 {
+            let result = self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().put(put_handle.clone()).build())
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .put(put_credentials.clone())
+                        .build(),
+                )
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => {
+                    info!(
+                        "Atomically claimed handle {} and created credentials row for {}",
+                        handle, user_id
+                    );
+                    return Ok(UserCredentials {
+                        user_id,
+                        username: username.to_string(),
+                        handle,
+                        credentials: vec![credential],
+                        did: did.to_string(),
+                        entitlements: self.default_entitlements.clone(),
+                        apple_linked: false,
+                    });
+                }
+                Err(err) => {
+                    if let SdkError::ServiceError(ref service_error) = err {
+                        if let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(canceled) =
+                            service_error.err()
+                        {
+                            let reasons = canceled.cancellation_reasons();
+                            if reasons.first().and_then(|r| r.code())
+                                == Some("ConditionalCheckFailed")
+                            {
+                                warn!(
+                                    "create_user_with_credential: handle {} already claimed",
+                                    handle
+                                );
+                                return Err(DynamoDBError::LinkConflict);
+                            }
+                            if reasons.get(1).and_then(|r| r.code())
+                                == Some("ConditionalCheckFailed")
+                            {
+                                return Err(DynamoDBError::ConditionalConflict);
+                            }
+                            if reasons
+                                .iter()
+                                .any(|r| r.code() == Some("TransactionConflict"))
+                                && attempt < 2
+                            {
+                                continue;
+                            }
+                        }
+                        if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                            return Err(DynamoDBError::TableNotExists("credentials".to_string()));
+                        }
+                    }
+                    error!(
+                        "Failed transactional user+handle creation for {}: {:?}",
+                        username, err
+                    );
+                    return Err(DynamoDBError::SdkError(err.to_string()));
+                }
+            }
+        }
+        Err(DynamoDBError::LinkConflict)
+    }
+
     pub async fn get_user_by_name(
         &self,
         username: &str,
@@ -928,27 +1155,31 @@ impl DynamoDBStore {
             self.credentials_table, username
         );
 
-        let result = match self
-            .client
-            .query()
-            .table_name(&self.credentials_table)
-            .index_name("username-index")
-            .key_condition_expression("#username = :username")
-            .expression_attribute_names("#username", "username")
-            .expression_attribute_values(":username", AttributeValue::S(username.to_string()))
-            .send()
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                error!("Failed to query user {}: {:?}", username, err);
-                return Err(DynamoDBError::from(err));
+        let mut last_key = None;
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.credentials_table)
+                .index_name("username-index")
+                .key_condition_expression("#username = :username")
+                .expression_attribute_names("#username", "username")
+                .expression_attribute_values(":username", AttributeValue::S(username.to_string()));
+            if let Some(key) = last_key {
+                req = req.set_exclusive_start_key(Some(key));
             }
-        };
+            let result = match req.send().await {
+                Ok(result) => result,
+                Err(err) => {
+                    error!("Failed to query user {}: {:?}", username, err);
+                    return Err(DynamoDBError::from(err));
+                }
+            };
 
-        if let Some(items) = result.items {
-            if let Some(item) = items.iter().find(|i| !account::is_tombstone(i)) {
-                match self.item_to_user_credentials(item) {
+            if let Some(items) = result.items
+                && let Some(item) = items.iter().find(|i| !account::is_tombstone(i))
+            {
+                return match self.item_to_user_credentials(item) {
                     Ok(user) => {
                         info!("Found user: {}", username);
                         Ok(Some(user))
@@ -957,14 +1188,14 @@ impl DynamoDBStore {
                         error!("Failed to parse user data for {}: {:?}", username, err);
                         Err(err)
                     }
-                }
-            } else {
-                info!("No user found: {}", username);
-                Ok(None)
+                };
             }
-        } else {
-            info!("No items returned for username: {}", username);
-            Ok(None)
+
+            if result.last_evaluated_key.is_none() {
+                info!("No user found: {}", username);
+                return Ok(None);
+            }
+            last_key = result.last_evaluated_key;
         }
     }
 
@@ -1061,6 +1292,95 @@ impl DynamoDBStore {
     /// `attribute_exists(user_id)` keeps the "user is gone" case reporting as
     /// [`DynamoDBError::Internal`], exactly as the previous read-first
     /// implementation did.
+    /// Append a passkey to a legacy zero-credential user row only while
+    /// `credentials` is still absent or an empty list. Uses two conditional
+    /// `UpdateItem`s so DynamoDB never evaluates `size(credentials)` on a
+    /// missing attribute (DynamoDB does not short-circuit `OR`).
+    pub async fn add_credential_if_empty(
+        &self,
+        user_id: Uuid,
+        credential: Passkey,
+    ) -> Result<(), DynamoDBError> {
+        let serialized = AttributeValue::S(serde_json::to_string(&credential).map_err(|e| {
+            error!("Failed to serialize credential: {}", e);
+            DynamoDBError::SerdeJsonError(e)
+        })?);
+
+        let absent_condition = format!(
+            "{} AND attribute_not_exists(credentials)",
+            account::LIVE_ROW
+        );
+
+        match self
+            .client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .update_expression("SET credentials = :new")
+            .condition_expression(absent_condition)
+            .expression_attribute_values(":new", AttributeValue::L(vec![serialized.clone()]))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully added initial credential to empty row for user {}",
+                    user_id
+                );
+                return Ok(());
+            }
+            Err(SdkError::ServiceError(ref service_error))
+                if service_error.err().meta().code() == Some("ConditionalCheckFailedException") =>
+            {
+                // Fall through: `credentials` may exist as an empty list `[]`.
+            }
+            Err(e) => {
+                error!("Failed to set initial credential: {:?}", e);
+                return Err(DynamoDBError::SdkError(e.to_string()));
+            }
+        }
+
+        let empty_list_condition = format!(
+            "{} AND attribute_type(credentials, :list_type) AND size(credentials) = :zero",
+            account::LIVE_ROW
+        );
+
+        match self
+            .client
+            .update_item()
+            .table_name(&self.credentials_table)
+            .key("user_id", AttributeValue::S(user_id.to_string()))
+            .update_expression("SET credentials = :new")
+            .condition_expression(empty_list_condition)
+            .expression_attribute_values(":new", AttributeValue::L(vec![serialized]))
+            .expression_attribute_values(":list_type", AttributeValue::S("L".to_string()))
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully added initial credential to empty row for user {}",
+                    user_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                if let SdkError::ServiceError(ref service_error) = e
+                    && service_error.err().meta().code() == Some("ConditionalCheckFailedException")
+                {
+                    warn!(
+                        "add_credential_if_empty rejected for {}: row missing, deleted, or non-empty",
+                        user_id
+                    );
+                    return Err(DynamoDBError::ConditionalConflict);
+                }
+                error!("Failed to append initial credential: {:?}", e);
+                Err(DynamoDBError::SdkError(e.to_string()))
+            }
+        }
+    }
+
     pub async fn add_credential(
         &self,
         user_id: Uuid,
@@ -1179,12 +1499,30 @@ impl DynamoDBStore {
             .map_err(|_| DynamoDBError::Internal("Invalid DID format".into()))?
             .to_string();
         log::debug!("Parsed DID: {}", did);
-        let entitlements = match item.get("entitlements").and_then(|av| av.as_l().ok()) {
-            Some(list) => list
-                .iter()
-                .filter_map(|av| av.as_s().ok().map(|s| s.to_string()))
-                .collect(),
+        let entitlements = match item.get("entitlements") {
             None => default_entitlements.to_vec(),
+            Some(av) => match av.as_l() {
+                Ok(list) => list
+                    .iter()
+                    .filter_map(|elem| match elem.as_s() {
+                        Ok(s) => Some(s.to_string()),
+                        Err(_) => {
+                            warn!(
+                                "Ignoring non-string entitlement element on credentials row for {}",
+                                user_id
+                            );
+                            None
+                        }
+                    })
+                    .collect(),
+                Err(_) => {
+                    warn!(
+                        "Malformed non-list entitlements attribute on credentials row for {}; treating as empty",
+                        user_id
+                    );
+                    Vec::new()
+                }
+            },
         };
         // Patreon-namespace entitlements are derived at mint (#91). A
         // stored copy (written before `validate_fqns` refused it) would
@@ -1604,6 +1942,7 @@ impl DynamoDBStore {
             .get_item()
             .table_name(&self.device_attest_keys_table)
             .key("key_id", AttributeValue::S(key_id.to_string()))
+            .consistent_read(true)
             .send()
             .await
             .map_err(|err| self.map_get_item_err(&self.device_attest_keys_table, err))?;
@@ -1975,6 +2314,7 @@ impl DynamoDBStore {
             .update_item()
             .table_name(&self.agent_delegations_table)
             .key("agent_did", AttributeValue::S(agent_did.to_string()))
+            .condition_expression("attribute_exists(agent_did)")
             .update_expression(
                 "SET revoked_at = :revoked_at, \
                  state_version = if_not_exists(state_version, :zero) + :one",
@@ -1984,10 +2324,7 @@ impl DynamoDBStore {
             .expression_attribute_values(":one", AttributeValue::N("1".into()))
             .send()
             .await
-            .map_err(|err| {
-                error!("Failed to revoke delegation {}: {:?}", agent_did, err);
-                DynamoDBError::SdkError(err.to_string())
-            })?;
+            .map_err(|err| agent_state::classify(err, &self.agent_delegations_table))?;
         info!("Revoked delegation for: {}", agent_did);
         Ok(())
     }
@@ -2022,7 +2359,72 @@ impl DynamoDBStore {
                 {
                     match self.revoke_delegation(agent_did).await {
                         Ok(()) => revoked += 1,
-                        Err(err) => warn!("Cascade revoke failed for {}: {:?}", agent_did, err),
+                        Err(DynamoDBError::ConditionalConflict) => {}
+                        Err(err) => {
+                            error!("Cascade revoke failed for {}: {:?}", agent_did, err);
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+            match result.last_evaluated_key {
+                Some(k) => exclusive_start = Some(k),
+                None => break,
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// Cascade for a batch of revoked ancestor DIDs in a single paginated scan
+    /// of `agent_delegations` (instead of one full-table scan per DID).
+    pub(crate) async fn revoke_delegations_with_chains(
+        &self,
+        dids: &std::collections::HashSet<String>,
+    ) -> Result<u32, DynamoDBError> {
+        if dids.is_empty() {
+            return Ok(0);
+        }
+        let mut exclusive_start = None;
+        let mut revoked = 0u32;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.agent_delegations_table)
+                .filter_expression(
+                    "attribute_not_exists(revoked_at) AND attribute_exists(#chain) AND size(#chain) > :zero",
+                )
+                .projection_expression("agent_did, #chain")
+                .expression_attribute_names("#chain", "chain")
+                .expression_attribute_values(":zero", AttributeValue::N("0".into()));
+            if let Some(key) = exclusive_start {
+                scan = scan.set_exclusive_start_key(Some(key));
+            }
+            let result = scan.send().await.map_err(|err| {
+                error!("Failed to scan delegations for chain cascade: {:?}", err);
+                DynamoDBError::from(err)
+            })?;
+
+            for item in result.items.unwrap_or_default() {
+                let matches_chain = item
+                    .get("chain")
+                    .and_then(|av| av.as_l().ok())
+                    .is_some_and(|list| {
+                        list.iter()
+                            .filter_map(|av| av.as_s().ok())
+                            .any(|entry| dids.contains(entry))
+                    });
+                if !matches_chain {
+                    continue;
+                }
+                if let Some(agent_did) = item.get("agent_did").and_then(|av| av.as_s().ok()) {
+                    match self.revoke_delegation(agent_did).await {
+                        Ok(()) => revoked += 1,
+                        Err(DynamoDBError::ConditionalConflict) => {}
+                        Err(err) => {
+                            error!("Cascade revoke failed for {}: {:?}", agent_did, err);
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -2198,10 +2600,16 @@ impl DynamoDBStore {
         fn opt_n(
             item: &std::collections::HashMap<String, AttributeValue>,
             key: &str,
-        ) -> Option<i64> {
-            item.get(key)
-                .and_then(|av| av.as_n().ok())
-                .and_then(|n| n.parse::<i64>().ok())
+        ) -> Result<Option<i64>, DynamoDBError> {
+            match item.get(key) {
+                None => Ok(None),
+                Some(av) => av
+                    .as_n()
+                    .map_err(|_| DynamoDBError::Internal(format!("Invalid {} format", key)))?
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| DynamoDBError::Internal(format!("Failed to parse {}", key))),
+            }
         }
         fn list_s(
             item: &std::collections::HashMap<String, AttributeValue>,
@@ -2231,8 +2639,8 @@ impl DynamoDBStore {
             root_user_id: Uuid::parse_str(&req_s(item, "root_user_id")?)?,
             chain: list_s(item, "chain")?,
             created_at: req_n(item, "created_at")?,
-            expires_at: opt_n(item, "expires_at"),
-            revoked_at: opt_n(item, "revoked_at"),
+            expires_at: opt_n(item, "expires_at")?,
+            revoked_at: opt_n(item, "revoked_at")?,
             short_lived: item
                 .get("short_lived")
                 .and_then(|av| av.as_bool().ok())
@@ -2392,6 +2800,15 @@ fn item_to_patreon_link(
     let wrapped_dek = read_bytes(item, "wrapped_dek")?;
     let token_expires_at = read_i64(item, "token_expires_at")?;
     let linked_at = read_i64(item, "linked_at")?;
+    let last_verified_at = match item.get("last_verified_at") {
+        None => None,
+        Some(v) => Some(
+            v.as_n()
+                .map_err(|_| DynamoDBError::Internal("patreon_tokens last_verified_at not N".into()))?
+                .parse::<i64>()
+                .map_err(|_| DynamoDBError::Internal("patreon_tokens last_verified_at invalid".into()))?,
+        ),
+    };
     let campaign_id = item
         .get("campaign_id")
         .and_then(|v| v.as_s().ok())
@@ -2420,6 +2837,7 @@ fn item_to_patreon_link(
         wrapped_dek,
         token_expires_at,
         linked_at,
+        last_verified_at,
         owned_tiers,
     })
 }
@@ -2785,6 +3203,7 @@ pub(crate) mod tests {
             wrapped_dek: vec![5],
             token_expires_at: 10,
             linked_at: 1,
+            last_verified_at: None,
             owned_tiers: Default::default(),
         }
     }
@@ -2817,7 +3236,7 @@ pub(crate) mod tests {
         // No row: nothing is created.
         assert!(
             !store
-                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers)
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers, None)
                 .await
                 .unwrap()
         );
@@ -2834,14 +3253,14 @@ pub(crate) mod tests {
         for (pid, la) in [("p-2", 1), ("p-1", 2)] {
             assert!(
                 !store
-                    .put_patreon_ownership(user_id, pid, la, Some("42"), &tiers)
+                    .put_patreon_ownership(user_id, pid, la, Some("42"), &tiers, None)
                     .await
                     .unwrap()
             );
         }
         assert!(
             store
-                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers)
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &tiers, None)
                 .await
                 .unwrap()
         );
@@ -2851,7 +3270,7 @@ pub(crate) mod tests {
         assert_eq!(stored.owned_tiers, tiers);
 
         // A token rotation rewrites the row from the link it read.
-        assert!(store.put_rotated_patreon_link(&stored).await.unwrap());
+        assert!(store.put_rotated_patreon_link(&stored, None).await.unwrap());
         let rotated = store.get_patreon_link(user_id).await.unwrap().unwrap();
         assert_eq!(rotated.owned_tiers, tiers);
         assert_eq!(rotated.campaign_id.as_deref(), Some("42"));
@@ -2863,7 +3282,7 @@ pub(crate) mod tests {
         };
         assert!(
             store
-                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &unnamed)
+                .put_patreon_ownership(user_id, "p-1", 1, Some("42"), &unnamed, None)
                 .await
                 .unwrap()
         );
@@ -2873,7 +3292,7 @@ pub(crate) mod tests {
         // Patreon now says it owns none: back to a consumer row.
         assert!(
             store
-                .put_patreon_ownership(user_id, "p-1", 1, None, &Default::default())
+                .put_patreon_ownership(user_id, "p-1", 1, None, &Default::default(), None)
                 .await
                 .unwrap()
         );

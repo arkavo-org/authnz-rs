@@ -20,8 +20,9 @@
 
 use super::agent_state::{classify, n, s};
 use super::{DynamoDBError, DynamoDBStore, account};
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
-use log::warn;
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::{AttributeValue, TransactWriteItem, Update};
 use uuid::Uuid;
 
 pub(super) const ATTR: &str = "market_links";
@@ -45,196 +46,128 @@ pub enum MarketLinkOutcome {
     Elsewhere,
 }
 
-/// What a conditional write of the link row did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bind {
-    Bound,
-    AlreadyYours,
-    BoundElsewhere,
-}
-
 impl DynamoDBStore {
-    /// Link a purchase to `user_id`: the `market#` row, then the id in the
-    /// account's `market_links` (under `LIVE_ROW`).
+    /// Atomically link a purchase to `user_id` across both tables using
+    /// `TransactWriteItems`:
+    /// - `identity_links` (`market#<session_id>` → `user_id`)
+    /// - `credentials` (`ADD market_links :id` conditioned on `LIVE_ROW`).
     ///
     /// A link naming another account moves only when that account is not
     /// live (deleted, before the sweep removed the link); a live owner keeps
-    /// it ([`MarketLinkOutcome::Elsewhere`]). The move is conditional on the
-    /// owner read, so a race with another link or the sweep is re-evaluated
-    /// (a few times at most).
+    /// it ([`MarketLinkOutcome::Elsewhere`]). Because both writes commit or
+    /// abort together, a failed or timed-out link can never leave an orphaned
+    /// `market#` row or dangling `market_links` entry.
     ///
-    /// [`DynamoDBError::AccountGone`]: `user_id` has no live row. A link row
-    /// this call wrote is deleted then, and on any other failure of the
-    /// second write, so a retry starts clean (an earlier, complete link
-    /// stays). A retry is idempotent.
+    /// [`DynamoDBError::AccountGone`]: `user_id` has no live row.
     pub async fn link_market_purchase(
         &self,
         session_id: &str,
         user_id: &Uuid,
     ) -> Result<MarketLinkOutcome, DynamoDBError> {
-        for _ in 0..3 {
-            match self.bind_market_link(session_id, user_id).await? {
-                Bind::Bound => {
-                    self.add_market_link_to_account(session_id, user_id, true)
-                        .await?;
-                    return Ok(MarketLinkOutcome::Linked);
+        let now = chrono::Utc::now().timestamp();
+        for _ in 0..5 {
+            let (link_update, outcome) = match self.market_link_owner(session_id).await? {
+                None => {
+                    let update = Update::builder()
+                        .table_name(&self.identity_links_table)
+                        .key("link_pk", s(&link_pk(session_id)))
+                        .update_expression("SET user_id = :uid, provider = :p, created_at = :now")
+                        .condition_expression("attribute_not_exists(link_pk)")
+                        .expression_attribute_values(":uid", s(&user_id.to_string()))
+                        .expression_attribute_values(":p", s(PROVIDER))
+                        .expression_attribute_values(":now", n(now))
+                        .build()
+                        .map_err(|e| {
+                            DynamoDBError::Internal(format!("build market link update failed: {e}"))
+                        })?;
+                    (update, MarketLinkOutcome::Linked)
                 }
-                Bind::AlreadyYours => {
-                    self.add_market_link_to_account(session_id, user_id, false)
-                        .await?;
-                    return Ok(MarketLinkOutcome::AlreadyYours);
+                Some(owner) if owner == *user_id => {
+                    let update = Update::builder()
+                        .table_name(&self.identity_links_table)
+                        .key("link_pk", s(&link_pk(session_id)))
+                        .update_expression(
+                            "SET user_id = :uid, provider = :p, created_at = if_not_exists(created_at, :now)",
+                        )
+                        .condition_expression("user_id = :uid")
+                        .expression_attribute_values(":uid", s(&user_id.to_string()))
+                        .expression_attribute_values(":p", s(PROVIDER))
+                        .expression_attribute_values(":now", n(now))
+                        .build()
+                        .map_err(|e| {
+                            DynamoDBError::Internal(format!("build market link update failed: {e}"))
+                        })?;
+                    (update, MarketLinkOutcome::AlreadyYours)
                 }
-                Bind::BoundElsewhere => {}
-            }
-            // Gone again (swept), or now the caller's: the next bind settles it.
-            let Some(owner) = self.market_link_owner(session_id).await? else {
-                continue;
+                Some(owner) => {
+                    if self.is_account_live(&owner).await? {
+                        return Ok(MarketLinkOutcome::Elsewhere);
+                    }
+                    let update = Update::builder()
+                        .table_name(&self.identity_links_table)
+                        .key("link_pk", s(&link_pk(session_id)))
+                        .update_expression("SET user_id = :to, provider = :p, created_at = :now")
+                        .condition_expression("user_id = :from")
+                        .expression_attribute_values(":from", s(&owner.to_string()))
+                        .expression_attribute_values(":to", s(&user_id.to_string()))
+                        .expression_attribute_values(":p", s(PROVIDER))
+                        .expression_attribute_values(":now", n(now))
+                        .build()
+                        .map_err(|e| {
+                            DynamoDBError::Internal(format!("build market move update failed: {e}"))
+                        })?;
+                    (update, MarketLinkOutcome::Moved)
+                }
             };
-            if owner == *user_id {
-                continue;
-            }
-            if self.is_account_live(&owner).await? {
-                return Ok(MarketLinkOutcome::Elsewhere);
-            }
-            if self.move_market_link(session_id, &owner, user_id).await? {
-                self.add_market_link_to_account(session_id, user_id, true)
-                    .await?;
-                return Ok(MarketLinkOutcome::Moved);
+
+            let account_update = Update::builder()
+                .table_name(&self.credentials_table)
+                .key("user_id", s(&user_id.to_string()))
+                .update_expression("ADD #ml :id")
+                .condition_expression(account::LIVE_ROW)
+                .expression_attribute_names("#ml", ATTR)
+                .expression_attribute_values(":id", AttributeValue::Ss(vec![session_id.to_string()]))
+                .build()
+                .map_err(|e| {
+                    DynamoDBError::Internal(format!("build credentials market_links update failed: {e}"))
+                })?;
+
+            let result = self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().update(link_update).build())
+                .transact_items(TransactWriteItem::builder().update(account_update).build())
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => return Ok(outcome),
+                Err(e) => {
+                    if let SdkError::ServiceError(ref se) = e
+                        && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                            se.err()
+                    {
+                        let reasons = canceled.cancellation_reasons();
+                        // Item 1 is credentials (LIVE_ROW): if it failed, the account is gone.
+                        if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                            return Err(DynamoDBError::AccountGone);
+                        }
+                        // Item 0 is identity_links: owner changed concurrently; retry.
+                        if matches!(
+                            reasons.first().and_then(|r| r.code()),
+                            Some("ConditionalCheckFailed" | "TransactionConflict")
+                        ) || reasons.get(1).and_then(|r| r.code()) == Some("TransactionConflict")
+                        {
+                            continue;
+                        }
+                    }
+                    return Err(classify(e, &self.identity_links_table));
+                }
             }
         }
         Err(DynamoDBError::Internal(
             "market link changed on every attempt".into(),
         ))
-    }
-
-    /// One conditional `UpdateItem`: the link row is absent or already this
-    /// account's (a re-bind keeps `created_at`).
-    async fn bind_market_link(
-        &self,
-        session_id: &str,
-        user_id: &Uuid,
-    ) -> Result<Bind, DynamoDBError> {
-        let table = &self.identity_links_table;
-        let result = self
-            .client
-            .update_item()
-            .table_name(table)
-            .key("link_pk", s(&link_pk(session_id)))
-            .update_expression(
-                "SET user_id = :uid, provider = :p, created_at = if_not_exists(created_at, :now)",
-            )
-            .condition_expression("attribute_not_exists(link_pk) OR user_id = :uid")
-            .expression_attribute_values(":uid", s(&user_id.to_string()))
-            .expression_attribute_values(":p", s(PROVIDER))
-            .expression_attribute_values(":now", n(chrono::Utc::now().timestamp()))
-            .return_values(ReturnValue::AllOld)
-            .send()
-            .await;
-        match result {
-            Ok(out) if out.attributes().is_some_and(|a| !a.is_empty()) => Ok(Bind::AlreadyYours),
-            Ok(_) => Ok(Bind::Bound),
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(Bind::BoundElsewhere),
-                other => Err(other),
-            },
-        }
-    }
-
-    /// Move the link from `from` to `to`: one conditional update on the link
-    /// still naming `from` (a move is a new binding, so `created_at`
-    /// restarts). `Ok(false)`: it no longer does, and nothing was written.
-    async fn move_market_link(
-        &self,
-        session_id: &str,
-        from: &Uuid,
-        to: &Uuid,
-    ) -> Result<bool, DynamoDBError> {
-        let table = &self.identity_links_table;
-        let result = self
-            .client
-            .update_item()
-            .table_name(table)
-            .key("link_pk", s(&link_pk(session_id)))
-            .update_expression("SET user_id = :to, provider = :p, created_at = :now")
-            .condition_expression("user_id = :from")
-            .expression_attribute_values(":from", s(&from.to_string()))
-            .expression_attribute_values(":to", s(&to.to_string()))
-            .expression_attribute_values(":p", s(PROVIDER))
-            .expression_attribute_values(":now", n(chrono::Utc::now().timestamp()))
-            .send()
-            .await;
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(false),
-                other => Err(other),
-            },
-        }
-    }
-
-    /// `ADD` the id to the account's `market_links`, under `LIVE_ROW`.
-    ///
-    /// On a dead account the link is deleted (whoever wrote it: dead either
-    /// way) and [`DynamoDBError::AccountGone`] returned. On any other failure
-    /// a link this call `wrote` is taken back, so the failed request leaves
-    /// nothing; one that was already this account's stays.
-    async fn add_market_link_to_account(
-        &self,
-        session_id: &str,
-        user_id: &Uuid,
-        wrote: bool,
-    ) -> Result<(), DynamoDBError> {
-        let table = &self.credentials_table;
-        let result = self
-            .client
-            .update_item()
-            .table_name(table)
-            .key("user_id", s(&user_id.to_string()))
-            .update_expression("ADD #ml :id")
-            .condition_expression(account::LIVE_ROW)
-            .expression_attribute_names("#ml", ATTR)
-            .expression_attribute_values(":id", AttributeValue::Ss(vec![session_id.to_string()]))
-            .send()
-            .await;
-        let err = match result {
-            Ok(_) => return Ok(()),
-            Err(e) => classify(e, table),
-        };
-        let (take_back, err) = match err {
-            DynamoDBError::ConditionalConflict => (true, DynamoDBError::AccountGone),
-            other => (wrote, other),
-        };
-        // A link that could not be taken back stays: the sweep removes it on
-        // a dead account, and a retry completes it on a live one.
-        if take_back && let Err(e) = self.delete_market_link(session_id, user_id).await {
-            warn!("could not take back a market link: {e}");
-        }
-        Err(err)
-    }
-
-    /// Delete the link while it still names `user_id`.
-    async fn delete_market_link(
-        &self,
-        session_id: &str,
-        user_id: &Uuid,
-    ) -> Result<(), DynamoDBError> {
-        let table = &self.identity_links_table;
-        let result = self
-            .client
-            .delete_item()
-            .table_name(table)
-            .key("link_pk", s(&link_pk(session_id)))
-            .condition_expression("user_id = :uid")
-            .expression_attribute_values(":uid", s(&user_id.to_string()))
-            .send()
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => match classify(e, table) {
-                DynamoDBError::ConditionalConflict => Ok(()),
-                other => Err(other),
-            },
-        }
     }
 
     /// The account a purchase is linked to. A consistent read.

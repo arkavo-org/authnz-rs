@@ -164,11 +164,18 @@ impl IntoResponse for GoogleSigninError {
     }
 }
 
-/// Session key holding the server-issued Google nonce.
+/// Session key holding the opaque handle to the server-issued Google nonce.
 const SESSION_GOOGLE_NONCE_KEY: &str = "google_nonce_state";
+const EPH_NS_GOOGLE_NONCE: &str = "google_nonce";
 
 /// Nonce TTL (seconds). Mirrors the Apple pair; short-lived to bound replay.
 const GOOGLE_NONCE_TTL_SECONDS: i64 = 600;
+
+/// Minimum seconds between kid-miss forced JWKS refreshes.
+const GOOGLE_JWKS_REFRESH_COOLDOWN_SECONDS: i64 = 30;
+
+/// Hard cap on local fallback entries when Redis is unavailable.
+const MAX_LOCAL_PENDING_AUTHORIZE: usize = 16_384;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GoogleNonceState {
@@ -177,34 +184,52 @@ struct GoogleNonceState {
 }
 
 /// `GET /oauth/google/nonce` — issue a single-use nonce bound to this session.
-///
-/// The client passes the same value to Google when requesting an id_token, so
-/// the returned token's `nonce` claim proves the ceremony was the one this
-/// server asked for.
-pub async fn google_nonce_handler(session: Session) -> Response {
+pub async fn google_nonce_handler(
+    Extension(app_state): Extension<AppState>,
+    session: Session,
+) -> Response {
     let raw_nonce = random_token();
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_GOOGLE_NONCE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_GOOGLE_NONCE, &old_id)
+            .await;
+    }
     let state = GoogleNonceState {
         raw_nonce: raw_nonce.clone(),
         expires_at: Utc::now().timestamp() + GOOGLE_NONCE_TTL_SECONDS,
     };
-    if let Err(e) = session.insert(SESSION_GOOGLE_NONCE_KEY, &state).await {
+    let nonce_id = match app_state
+        .ephemeral_store
+        .insert(EPH_NS_GOOGLE_NONCE, &state, GOOGLE_NONCE_TTL_SECONDS)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return GoogleSigninError::SessionError(e).into_response(),
+    };
+    if let Err(e) = session.insert(SESSION_GOOGLE_NONCE_KEY, nonce_id).await {
         return GoogleSigninError::SessionError(e.to_string()).into_response();
     }
     axum::Json(serde_json::json!({ "nonce": raw_nonce })).into_response()
 }
 
-/// Single-use consume of the session-stored Google nonce.
-async fn consume_google_nonce(session: &Session) -> Result<String, GoogleSigninError> {
-    let state: GoogleNonceState = session
+/// Atomic single-use consume of the server-stored Google nonce.
+async fn consume_google_nonce(
+    store: &crate::ephemeral::EphemeralStore,
+    session: &Session,
+) -> Result<String, GoogleSigninError> {
+    let nonce_id: String = session
         .get(SESSION_GOOGLE_NONCE_KEY)
         .await
         .map_err(|e| GoogleSigninError::SessionError(e.to_string()))?
         .ok_or(GoogleSigninError::MissingSessionNonce)?;
-    // Clear immediately — single-use, whether or not validation succeeds.
-    session
-        .remove_value(SESSION_GOOGLE_NONCE_KEY)
+    let _ = session.remove_value(SESSION_GOOGLE_NONCE_KEY).await;
+
+    let state: GoogleNonceState = store
+        .take(EPH_NS_GOOGLE_NONCE, &nonce_id)
         .await
-        .map_err(|e| GoogleSigninError::SessionError(e.to_string()))?;
+        .map_err(GoogleSigninError::SessionError)?
+        .ok_or(GoogleSigninError::MissingSessionNonce)?;
 
     if state.expires_at < Utc::now().timestamp() {
         return Err(GoogleSigninError::MissingSessionNonce);
@@ -261,10 +286,19 @@ pub async fn google_link_handler(
             .and_then(|h| h.to_str().ok())
             .unwrap_or_default(),
     ) {
-        Ok(claims) => match Uuid::parse_str(&claims.sub) {
-            Ok(id) => id,
-            Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
-        },
+        Ok(claims) => {
+            // Require a passkey auth CWT (never a ~99-year registration CWT).
+            // Renewed passkey session tokens are accepted so mobile/desktop
+            // clients do not need an extra passkey prompt before linking.
+            if crate::oidc::webauthn_auth_time(&claims).is_none() {
+                warn!("X-Auth-Token rejected for Google link: requires passkey auth CWT");
+                return GoogleSigninError::Unauthenticated.into_response();
+            }
+            match Uuid::parse_str(&claims.sub) {
+                Ok(id) => id,
+                Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
+            }
+        }
         Err(_) => return GoogleSigninError::Unauthenticated.into_response(),
     };
     // The CWT outlives a deleted account; never link onto one (#88).
@@ -277,7 +311,7 @@ pub async fn google_link_handler(
         }
     }
 
-    let raw_nonce = match consume_google_nonce(&session).await {
+    let raw_nonce = match consume_google_nonce(&app_state.ephemeral_store, &session).await {
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
@@ -292,6 +326,29 @@ pub async fn google_link_handler(
 
     match link_google_identity(&app_state.db_store, user_id, &claims.sub).await {
         Ok(()) => {
+            // Post-write liveness re-check: if account deletion ran while
+            // linking was in flight, roll back the link row so it cannot be
+            // orphaned and permanently 409-block future linking.
+            match app_state.db_store.is_account_live(&user_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = app_state
+                        .db_store
+                        .delete_identity_link("google", &claims.sub, &user_id)
+                        .await;
+                    return GoogleSigninError::Unauthenticated.into_response();
+                }
+                Err(e) => {
+                    // Do NOT delete the link on a transient lookup error: a
+                    // re-link against an already-linked account is idempotent,
+                    // so rolling back here would destroy an existing live link.
+                    warn!(
+                        "Post-link liveness check failed for {}; keeping link: {}",
+                        user_id, e
+                    );
+                    return GoogleSigninError::Storage.into_response();
+                }
+            }
             // Audit: a subject prefix is enough to triangulate with the DDB row
             // without logging the pseudonymous identifier in full.
             info!(
@@ -345,13 +402,32 @@ impl PendingAuthorizeStore {
         format!("oidc:google:pending:{}", state)
     }
 
+    fn lock_local(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingAuthorize>> {
+        self.local_fallback.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert_local(&self, state: String, record: PendingAuthorize) {
+        let mut map = self.lock_local();
+        let now = Utc::now().timestamp();
+        map.retain(|_, v| v.expires_at > now);
+        if map.len() >= MAX_LOCAL_PENDING_AUTHORIZE
+            && !map.contains_key(&state)
+            && let Some(evict) = map
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&evict);
+        }
+        map.insert(state, record);
+    }
+
     pub async fn insert(&self, state: &str, record: PendingAuthorize) -> Result<(), String> {
         if self.redis.is_connected() {
             let value = serde_json::to_string(&record)
                 .map_err(|e| format!("Serialization failed: {}", e))?;
-            let _: () = self
-                .redis
-                .set(
+            self.redis
+                .set::<(), _, _>(
                     Self::key(state),
                     value,
                     Some(fred::types::Expiration::EX(
@@ -361,23 +437,21 @@ impl PendingAuthorizeStore {
                     false,
                 )
                 .await
-                .map_err(|e| format!("Redis set failed: {}", e))?;
-            Ok(())
-        } else {
-            warn!("Redis is offline; falling back to in-memory PendingAuthorizeStore");
-            let mut map = self.local_fallback.lock().unwrap();
-            let now = Utc::now().timestamp();
-            map.retain(|_, v| v.expires_at > now);
-            map.insert(state.to_string(), record);
-            Ok(())
+                .map_err(|e| format!("Redis set failed for PendingAuthorizeStore: {}", e))?;
+            self.lock_local().remove(state);
+            return Ok(());
         }
+        warn!("Redis is offline; falling back to in-memory PendingAuthorizeStore");
+        self.insert_local(state.to_string(), record);
+        Ok(())
     }
 
     /// Fetch and delete (single-use). Expired records read as absent.
     pub async fn take(&self, state: &str) -> Result<Option<PendingAuthorize>, String> {
         let record = if self.redis.is_connected() {
-            // GETDEL so two concurrent callbacks presenting the same state
-            // cannot both win the race between a GET and a DEL.
+            // GETDEL is the sole authoritative single-use redemption path when
+            // Redis is connected.
+            self.lock_local().remove(state);
             let val: Option<String> = self
                 .redis
                 .getdel(Self::key(state))
@@ -391,8 +465,7 @@ impl PendingAuthorizeStore {
                 None => None,
             }
         } else {
-            warn!("Redis is offline; falling back to in-memory PendingAuthorizeStore");
-            self.local_fallback.lock().unwrap().remove(state)
+            self.lock_local().remove(state)
         };
         Ok(record.filter(|r| r.expires_at >= Utc::now().timestamp()))
     }
@@ -401,6 +474,7 @@ impl PendingAuthorizeStore {
 struct JwksState {
     keys: Vec<Jwk>,
     fetched_at: i64,
+    last_refresh_attempt: i64,
 }
 
 /// Process-wide Google sign-in state: config, JWKS cache, HTTP client, and
@@ -408,6 +482,8 @@ struct JwksState {
 pub struct GoogleSignin {
     config: Option<GoogleConfig>,
     jwks: RwLock<JwksState>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    refresh_cooldown_secs: i64,
     client: reqwest::Client,
     pending: PendingAuthorizeStore,
 }
@@ -469,7 +545,14 @@ impl GoogleSignin {
             jwks: RwLock::new(JwksState {
                 keys: Vec::new(),
                 fetched_at: 0,
+                last_refresh_attempt: 0,
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_cooldown_secs: if cfg!(test) {
+                0
+            } else {
+                GOOGLE_JWKS_REFRESH_COOLDOWN_SECONDS
+            },
             client,
             pending: PendingAuthorizeStore::new(redis),
         }
@@ -551,28 +634,64 @@ impl GoogleSignin {
             "Redirecting client_id={} to Google for sign-in",
             request.client_id
         );
-        Redirect::temporary(url.as_str()).into_response()
+        let mut resp = Redirect::temporary(url.as_str()).into_response();
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        resp
     }
 
-    async fn get_keys(&self, jwks_url: &str) -> Result<Vec<Jwk>, GoogleSigninError> {
+    async fn get_jwk_for_kid(&self, jwks_url: &str, kid: &str) -> Result<Jwk, GoogleSigninError> {
         let now = Utc::now().timestamp();
         {
             let state = self.jwks.read().await;
-            if !state.keys.is_empty() && now - state.fetched_at < GOOGLE_JWKS_CACHE_TTL_SECONDS {
-                return Ok(state.keys.clone());
+            if !state.keys.is_empty()
+                && now.saturating_sub(state.fetched_at) < GOOGLE_JWKS_CACHE_TTL_SECONDS
+                && let Some(jwk) = find_jwk(&state.keys, kid)
+            {
+                return Ok(jwk.clone());
             }
         }
-        let keys = fetch_jwks(&self.client, jwks_url).await?;
-        let mut state = self.jwks.write().await;
-        state.keys = keys;
-        state.fetched_at = now;
-        Ok(state.keys.clone())
-    }
 
-    async fn invalidate_keys(&self) {
-        let mut state = self.jwks.write().await;
-        state.fetched_at = 0;
-        state.keys.clear();
+        // Singleflight: coalesce concurrent JWKS refreshes.
+        let _guard = self.refresh_lock.lock().await;
+        let now = Utc::now().timestamp();
+        {
+            let state = self.jwks.read().await;
+            if !state.keys.is_empty()
+                && now.saturating_sub(state.fetched_at) < GOOGLE_JWKS_CACHE_TTL_SECONDS
+                && let Some(jwk) = find_jwk(&state.keys, kid)
+            {
+                return Ok(jwk.clone());
+            }
+            if self.refresh_cooldown_secs > 0
+                && now.saturating_sub(state.last_refresh_attempt) < self.refresh_cooldown_secs
+            {
+                return Err(GoogleSigninError::UnknownKid(kid.to_string()));
+            }
+        }
+
+        let fetched = fetch_jwks(&self.client, jwks_url).await;
+        let finished_at = Utc::now().timestamp();
+        match fetched {
+            Ok(keys) => {
+                let mut state = self.jwks.write().await;
+                state.last_refresh_attempt = finished_at;
+                if !keys.is_empty() {
+                    state.keys = keys;
+                    state.fetched_at = finished_at;
+                }
+                find_jwk(&state.keys, kid)
+                    .cloned()
+                    .ok_or_else(|| GoogleSigninError::UnknownKid(kid.to_string()))
+            }
+            Err(e) => {
+                let mut state = self.jwks.write().await;
+                state.last_refresh_attempt = finished_at;
+                Err(e)
+            }
+        }
     }
 
     /// Exchange the Google authorization code for an id_token.
@@ -627,16 +746,8 @@ impl GoogleSignin {
             .map_err(|e| GoogleSigninError::InvalidToken(format!("header decode: {}", e)))?;
         let kid = header.kid.ok_or(GoogleSigninError::MissingKid)?;
 
-        let keys = self.get_keys(&config.jwks_url).await?;
-        if let Some(jwk) = find_jwk(&keys, &kid) {
-            return verify_id_token_with_jwk(jwk, id_token, &config.client_id, expected_nonce);
-        }
-        warn!("Google kid {} not in cache; forcing JWKS refresh", kid);
-        self.invalidate_keys().await;
-        let keys = self.get_keys(&config.jwks_url).await?;
-        let jwk =
-            find_jwk(&keys, &kid).ok_or_else(|| GoogleSigninError::UnknownKid(kid.clone()))?;
-        verify_id_token_with_jwk(jwk, id_token, &config.client_id, expected_nonce)
+        let jwk = self.get_jwk_for_kid(&config.jwks_url, &kid).await?;
+        verify_id_token_with_jwk(&jwk, id_token, &config.client_id, expected_nonce)
     }
 }
 

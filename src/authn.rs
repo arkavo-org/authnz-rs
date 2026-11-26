@@ -31,6 +31,32 @@ const SESSION_REG_STATE_KEY: &str = "reg_state";
 /// Session key of the open sign-in ceremony, a [`PendingAuthentication`].
 const SESSION_AUTH_STATE_KEY: &str = "auth_state";
 
+const EPH_NS_REG_STATE: &str = "webauthn_reg";
+const EPH_NS_AUTH_STATE: &str = "webauthn_auth";
+
+/// State carried across `GET /register/:username` → `POST /register`.
+#[derive(Serialize, Deserialize)]
+enum PendingRegistration {
+    /// Brand-new account: no DynamoDB row exists yet; `finish_register`
+    /// atomically claims `handles` and inserts `credentials` with the first
+    /// passkey in a single transaction.
+    NewAccount {
+        username: String,
+        user_id: Uuid,
+        did: String,
+        reg_state: PasskeyRegistration,
+    },
+    /// Adding a passkey to an already-existing account row.
+    /// `authenticated == false` is only reachable for legacy zero-credential
+    /// rows and enforces `size(credentials) = 0` at `finish_register`.
+    Enroll {
+        username: String,
+        user_id: Uuid,
+        authenticated: bool,
+        reg_state: PasskeyRegistration,
+    },
+}
+
 /// `idp` claim value for every WebAuthn-minted CWT. Matches
 /// `oidc::idp_from_subject` for an `arkavo:<uuid>` subject.
 const IDP_WEBAUTHN: &str = "webauthn";
@@ -90,19 +116,58 @@ fn is_fresh_enough_to_enroll(iat: i64, now: i64) -> bool {
 /// would be the same test.
 const _: () = assert!(ENROLLMENT_TOKEN_MAX_AGE_SECONDS < PASSKEY_SESSION_TOKEN_SECONDS);
 
-/// Read and validate the session's App Attest registration ticket.
-///
-/// Shared by `start_register` and `finish_register` so the two cannot drift:
-/// a gate checked only at the start would admit a ceremony begun with a valid
-/// ticket and finished long after it expired.
+/// Peek and validate the session's App Attest registration ticket without
+/// consuming it (`start_register`).
 pub(crate) async fn require_registration_ticket(
+    app_state: &AppState,
     session: &Session,
 ) -> Result<crate::device_check::RegistrationTicket, WebauthnError> {
-    let ticket: crate::device_check::RegistrationTicket = session
+    let ticket_id: String = session
         .get(crate::device_check::SESSION_REG_TICKET_KEY)
         .await
         .map_err(WebauthnError::InvalidSessionState)?
         .ok_or(WebauthnError::AttestationRequired)?;
+
+    let ticket: crate::device_check::RegistrationTicket = app_state
+        .ephemeral_store
+        .peek(crate::device_check::EPH_NS_REG_TICKET, &ticket_id)
+        .await
+        .map_err(WebauthnError::SessionError)?
+        .ok_or(WebauthnError::AttestationRequired)?;
+
+    if !crate::device_check::ticket_is_valid(&ticket, chrono::Utc::now().timestamp()) {
+        warn!(
+            "Registration ticket for key {} expired at {}",
+            ticket.key_id, ticket.expires_at
+        );
+        return Err(WebauthnError::AttestationRequired);
+    }
+    Ok(ticket)
+}
+
+/// Atomically consume and validate the session's App Attest registration
+/// ticket (`finish_register`). Exactly one concurrent request can claim it,
+/// and no concurrent session write can resurrect it.
+async fn take_registration_ticket(
+    app_state: &AppState,
+    session: &Session,
+) -> Result<crate::device_check::RegistrationTicket, WebauthnError> {
+    let ticket_id: String = session
+        .get(crate::device_check::SESSION_REG_TICKET_KEY)
+        .await
+        .map_err(WebauthnError::InvalidSessionState)?
+        .ok_or(WebauthnError::AttestationRequired)?;
+
+    let ticket: crate::device_check::RegistrationTicket = app_state
+        .ephemeral_store
+        .take(crate::device_check::EPH_NS_REG_TICKET, &ticket_id)
+        .await
+        .map_err(WebauthnError::SessionError)?
+        .ok_or(WebauthnError::AttestationRequired)?;
+
+    let _ = session
+        .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
+        .await;
 
     if !crate::device_check::ticket_is_valid(&ticket, chrono::Utc::now().timestamp()) {
         warn!(
@@ -155,7 +220,7 @@ pub async fn start_register(
     //
     // Checked before any DB lookup so an unattested caller learns nothing
     // about which handles exist: the refusal must not depend on the username.
-    let ticket = require_registration_ticket(&session).await?;
+    let ticket = require_registration_ticket(&app_state, &session).await?;
     debug!(
         "Registration admitted for attested key {} (ticket expires {})",
         ticket.key_id, ticket.expires_at
@@ -175,36 +240,9 @@ pub async fn start_register(
     // Add retry logic for the initial user query
     let mut retry_count = 0;
     let max_retries = 3;
-    let user = loop {
+    let existing_user = loop {
         match app_state.db_store.get_user_by_name(&username).await {
-            Ok(Some(existing_user)) => {
-                info!("Found existing user: {}", username);
-                break existing_user;
-            }
-            Ok(None) => {
-                // A handle is issued once (#132). Before `create_user`, so a
-                // refused registrant leaves no row behind.
-                let handle = crate::db::handle_for_new_account(&username);
-                match app_state.db_store.handle_has_row(&handle).await {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        warn!("Refused registration of {username}: handle {handle} was issued");
-                        return Err(WebauthnError::UsernameUnavailable);
-                    }
-                    Err(err) => {
-                        error!("Handle lookup for {} failed: {:?}", username, err);
-                        return Err(WebauthnError::DynamoDBOperationError(Box::new(err)));
-                    }
-                }
-                info!("User not found, creating new user: {}", username);
-                match app_state.db_store.create_user(&username, &params.did).await {
-                    Ok(new_user) => break new_user,
-                    Err(err) => {
-                        error!("Failed to create user {}: {:?}", username, err);
-                        return Err(WebauthnError::UserCreationFailed(err.to_string()));
-                    }
-                }
-            }
+            Ok(found) => break found,
             Err(err) => {
                 error!(
                     "Database error for {} (attempt {}): {:?}",
@@ -225,74 +263,111 @@ pub async fn start_register(
         }
     };
 
-    // SECURITY: WebAuthn registration is unauthenticated, and start_register
-    // reuses an existing user record when the username already exists. Adding a
-    // passkey to an account that ALREADY has credentials therefore requires
-    // proof of control of that account (a valid CWT for this user_id) —
-    // otherwise an unauthenticated caller could graft their own passkey onto an
-    // existing user and (under webvh) repoint that user's handle -> DID. A user
-    // with zero credentials (initial registration, possibly retried) may still
-    // finish without a token.
-    if !user.credentials.is_empty() {
-        let token_str = headers
-            .get("X-Auth-Token")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(WebauthnError::AccountExistsAuthRequired)?;
-        let claims = verify_inbound_account_token(&app_state, token_str)?;
-        let tid =
-            Uuid::parse_str(&claims.sub).map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
-        if tid != user.user_id {
-            return Err(WebauthnError::AccountExistsAuthRequired);
-        }
-        // SECURITY: possession of a still-valid token is not proof of *current*
-        // control. Registration tokens live ~99 years, so a single captured
-        // token would otherwise authorize passkey enrollment forever. Demand a
-        // recently minted one: `POST /authenticate` mints from a WebAuthn
-        // ceremony against an existing passkey, which is the fresh proof this
-        // operation actually needs.
-        // A renewed token's assertion is its `auth_time`, not its `iat` (#108).
-        let asserted_at = crate::cwt::passkey_assertion_time(&claims);
-        if !is_fresh_enough_to_enroll(asserted_at, chrono::Utc::now().timestamp()) {
-            warn!(
-                "Rejected passkey enrollment for {}: assertion at {} is older than {}s",
-                username, asserted_at, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
-            );
-            return Err(WebauthnError::StaleAuthentication);
-        }
-    }
+    // Determine whether this is a brand-new account (deferred DB creation) or
+    // passkey enrollment onto an existing account.
+    let (user_id, exclude_credentials, is_new_account, authenticated_enrollment) =
+        if let Some(user) = existing_user {
+            info!("Found existing user: {}", username);
+            let authenticated = if !user.credentials.is_empty() {
+                let token_str = headers
+                    .get("X-Auth-Token")
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or(WebauthnError::AccountExistsAuthRequired)?;
+                let claims = verify_inbound_account_token(&app_state, token_str)?;
+                let tid = Uuid::parse_str(&claims.sub)
+                    .map_err(|_| WebauthnError::AccountExistsAuthRequired)?;
+                if tid != user.user_id {
+                    return Err(WebauthnError::AccountExistsAuthRequired);
+                }
+                // A renewed token's assertion is its `auth_time`, not its `iat` (#108).
+                let asserted_at = crate::cwt::passkey_assertion_time(&claims);
+                if !is_fresh_enough_to_enroll(asserted_at, chrono::Utc::now().timestamp()) {
+                    warn!(
+                        "Rejected passkey enrollment for {}: assertion at {} is older than {}s",
+                        username, asserted_at, ENROLLMENT_TOKEN_MAX_AGE_SECONDS
+                    );
+                    return Err(WebauthnError::StaleAuthentication);
+                }
+                true
+            } else {
+                false
+            };
+            let exclude = if !user.credentials.is_empty() {
+                Some(
+                    user.credentials
+                        .iter()
+                        .map(|c| c.cred_id().clone())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            (user.user_id, exclude, false, authenticated)
+        } else {
+            // A handle is issued once (#132). Check before starting WebAuthn so
+            // a refused registrant fails fast; `finish_register` re-enforces
+            // uniqueness atomically via `TransactWriteItems` on `handles`.
+            let handle = crate::db::handle_for_new_account(&username);
+            match app_state.db_store.handle_has_row(&handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    warn!("Refused registration of {username}: handle {handle} was issued");
+                    return Err(WebauthnError::UsernameUnavailable);
+                }
+                Err(err) => {
+                    error!("Handle lookup for {} failed: {:?}", username, err);
+                    return Err(WebauthnError::DynamoDBOperationError(Box::new(err)));
+                }
+            }
+            // Defer credentials + handles writes to `finish_register`: no
+            // zero-credential row is ever persisted before WebAuthn succeeds.
+            (Uuid::new_v4(), None, true, false)
+        };
 
-    // Clean up existing session state
+    // Clean up any prior pending registration in the ephemeral store.
+    if let Ok(Some(old_id)) = session.get::<String>(SESSION_REG_STATE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_REG_STATE, &old_id)
+            .await;
+    }
     if let Err(err) = session.remove_value(SESSION_REG_STATE_KEY).await {
         error!("Failed to remove old registration state: {:?}", err);
         return Err(WebauthnError::InvalidSessionState(err));
     }
 
-    // Set up WebAuthn registration
-    let exclude_credentials = if !user.credentials.is_empty() {
-        Some(
-            user.credentials
-                .iter()
-                .map(|c| c.cred_id().clone())
-                .collect(),
-        )
-    } else {
-        None
-    };
-
     match app_state.webauthn.start_passkey_registration(
-        user.user_id,
+        user_id,
         &username,
         &username,
         exclude_credentials,
     ) {
         Ok((ccr, reg_state)) => {
-            if let Err(err) = session
+            let pending = if is_new_account {
+                PendingRegistration::NewAccount {
+                    username: username.clone(),
+                    user_id,
+                    did: params.did,
+                    reg_state,
+                }
+            } else {
+                PendingRegistration::Enroll {
+                    username: username.clone(),
+                    user_id,
+                    authenticated: authenticated_enrollment,
+                    reg_state,
+                }
+            };
+            let state_id = app_state
+                .ephemeral_store
                 .insert(
-                    SESSION_REG_STATE_KEY,
-                    (username.clone(), user.user_id, reg_state),
+                    EPH_NS_REG_STATE,
+                    &pending,
+                    crate::ephemeral::WEBAUTHN_CEREMONY_TTL_SECONDS,
                 )
                 .await
-            {
+                .map_err(WebauthnError::SessionError)?;
+            if let Err(err) = session.insert(SESSION_REG_STATE_KEY, state_id).await {
                 error!("Failed to save registration state: {:?}", err);
                 return Err(WebauthnError::InvalidSessionState(err));
             }
@@ -312,22 +387,43 @@ pub async fn finish_register(
     session: Session,
     Json(registration_credential): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_id, reg_state): (String, Uuid, PasskeyRegistration) =
-        session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
-            error!("No registration state found in session");
+    let state_id: String = session.get(SESSION_REG_STATE_KEY).await?.ok_or_else(|| {
+        error!("No registration state found in session");
+        CorruptSession
+    })?;
+
+    // Clean up session key and atomically consume the pending ceremony from
+    // `ephemeral_store` so concurrent requests or 5xx responses cannot replay it.
+    let _ = session.remove_value(SESSION_REG_STATE_KEY).await;
+    let pending: PendingRegistration = app_state
+        .ephemeral_store
+        .take(EPH_NS_REG_STATE, &state_id)
+        .await
+        .map_err(WebauthnError::SessionError)?
+        .ok_or_else(|| {
+            error!("Registration state {} already consumed or expired", state_id);
             CorruptSession
         })?;
+
+    let (username, user_id, reg_state, new_account_did, authenticated_enrollment) = match pending {
+        PendingRegistration::NewAccount {
+            username,
+            user_id,
+            did,
+            reg_state,
+        } => (username, user_id, reg_state, Some(did), false),
+        PendingRegistration::Enroll {
+            username,
+            user_id,
+            authenticated,
+            reg_state,
+        } => (username, user_id, reg_state, None, authenticated),
+    };
 
     info!(
         "Finishing registration for user: {} ({})",
         username, user_id
     );
-
-    // Clean up session immediately to prevent reuse
-    if let Err(e) = session.remove_value(SESSION_REG_STATE_KEY).await {
-        error!("Failed to remove registration state from session: {}", e);
-        return Err(WebauthnError::SessionError(e.to_string()));
-    }
 
     // Finish WebAuthn registration
     match app_state
@@ -336,34 +432,16 @@ pub async fn finish_register(
     {
         Ok(passkey) => {
             info!(
-                "WebAuthn registration successful for user: {}. Adding credential to database...",
+                "WebAuthn registration successful for user: {}. Persisting credential...",
                 username
             );
 
-            // Re-check the ticket. start_register only proves the ceremony
-            // *began* under a valid one; without this a session could hold a
-            // ceremony open past the ticket's expiry.
-            let ticket = require_registration_ticket(&session).await?;
+            // Atomically consume and re-validate the registration ticket: one
+            // ticket buys one account, and concurrent finish_register calls or
+            // concurrent start_register session writes cannot resurrect it.
+            let ticket = take_registration_ticket(&app_state, &session).await?;
 
-            // Charge the registration budget here, not at attest time: the
-            // slot pays for an account that is about to exist. A client that
-            // attests and then abandons the ceremony costs nothing, so three
-            // flaky attempts cannot lock a genuine user out for a day.
-            //
-            // The preflight already refused an exhausted key, so a refusal
-            // here means the budget was spent by a concurrent registration in
-            // between. 403 is the honest answer and the client's existing
-            // registrationCapExceeded path handles it; a distinct code is not
-            // worth a new client release.
-            //
-            // The slot and the ticket are both spent before `add_credential`,
-            // so a failed credential write burns them with no account made.
-            // Deliberately not refunded: `attestKey` is once-per-key, so the
-            // client's retry re-runs the preflight under a fresh key_id and
-            // never draws on this key's budget again. A refund would be a
-            // conditional decrement in the security path that no user could
-            // observe. Revisit if keys ever become reusable across
-            // registrations.
+            // Charge the registration budget here, not at attest time.
             if let Err(e) = app_state
                 .db_store
                 .reserve_attest_registration(&ticket.key_id)
@@ -382,28 +460,67 @@ pub async fn finish_register(
                 });
             }
 
-            // One ticket, one account. Removed before the credential is
-            // written so a replayed finish_register cannot mint a second.
-            if let Err(e) = session
-                .remove_value(crate::device_check::SESSION_REG_TICKET_KEY)
-                .await
-            {
-                error!("Failed to remove registration ticket from session: {}", e);
-                return Err(WebauthnError::SessionError(e.to_string()));
-            }
-
-            // Store the credential in DynamoDB
-            match app_state
-                .db_store
-                .add_credential(user_id, passkey.clone())
-                .await
-            {
-                Ok(_) => {
-                    info!("Successfully stored credential for user: {}", username);
+            // Persist the account/credential atomically in DynamoDB.
+            if let Some(did) = new_account_did {
+                match app_state
+                    .db_store
+                    .create_user_with_credential(user_id, &username, &did, passkey.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "Successfully created account and stored credential for user: {}",
+                            username
+                        );
+                    }
+                    Err(DynamoDBError::LinkConflict) => {
+                        warn!("Registration race lost for handle of {}", username);
+                        return Err(WebauthnError::UsernameUnavailable);
+                    }
+                    Err(e) => {
+                        error!("Failed to create account with credential: {}", e);
+                        return Err(WebauthnError::DynamoDBOperationError(Box::new(e)));
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to store credential: {}", e);
-                    return Err(WebauthnError::DynamoDBOperationError(Box::new(e)));
+            } else if authenticated_enrollment {
+                match app_state
+                    .db_store
+                    .add_credential(user_id, passkey.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Successfully stored credential for user: {}", username);
+                    }
+                    Err(e) => {
+                        error!("Failed to store credential: {}", e);
+                        return Err(WebauthnError::DynamoDBOperationError(Box::new(e)));
+                    }
+                }
+            } else {
+                // Unauthenticated enrollment into a legacy zero-credential row:
+                // enforce `size(credentials) = 0` conditionally in DynamoDB.
+                match app_state
+                    .db_store
+                    .add_credential_if_empty(user_id, passkey.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "Successfully stored initial credential for legacy empty user: {}",
+                            username
+                        );
+                    }
+                    Err(DynamoDBError::ConditionalConflict) => {
+                        warn!(
+                            "Refused unauthenticated passkey append to non-empty account {}",
+                            user_id
+                        );
+                        return Err(WebauthnError::AccountExistsAuthRequired);
+                    }
+                    Err(e) => {
+                        error!("Failed to store initial credential: {}", e);
+                        return Err(WebauthnError::DynamoDBOperationError(Box::new(e)));
+                    }
                 }
             }
 
@@ -530,12 +647,33 @@ pub(crate) enum PendingAuthentication {
 }
 
 /// Drop the session's open sign-in ceremony, if any.
-async fn remove_auth_state(session: &Session) -> Result<(), WebauthnError> {
+async fn remove_auth_state(app_state: &AppState, session: &Session) -> Result<(), WebauthnError> {
+    if let Ok(Some(id)) = session.get::<String>(SESSION_AUTH_STATE_KEY).await {
+        app_state
+            .ephemeral_store
+            .delete(EPH_NS_AUTH_STATE, &id)
+            .await;
+    }
     if let Err(err) = session.remove_value(SESSION_AUTH_STATE_KEY).await {
         error!("Failed to remove auth_state from session: {:?}", err);
         return Err(WebauthnError::InvalidSessionState(err));
     }
     Ok(())
+}
+
+/// Atomically consume the session's open sign-in ceremony by handle.
+async fn take_auth_state(
+    app_state: &AppState,
+    session: &Session,
+    auth_id: &str,
+) -> Result<PendingAuthentication, WebauthnError> {
+    let _ = session.remove_value(SESSION_AUTH_STATE_KEY).await;
+    app_state
+        .ephemeral_store
+        .take(EPH_NS_AUTH_STATE, auth_id)
+        .await
+        .map_err(WebauthnError::SessionError)?
+        .ok_or(CorruptSession)
 }
 
 /// The account named by a sign-in start's optional `X-Auth-Token`.
@@ -576,7 +714,7 @@ pub async fn start_authentication(
 ) -> Result<impl IntoResponse, WebauthnError> {
     info!("Start Authentication");
 
-    remove_auth_state(&session).await?;
+    remove_auth_state(&app_state, &session).await?;
 
     let inbound_user_id = inbound_account(&app_state, &headers)?;
 
@@ -584,7 +722,16 @@ pub async fn start_authentication(
         None => start_discoverable(&app_state, inbound_user_id)?,
         Some(account) => start_account(&app_state, account, inbound_user_id).await?,
     };
-    if let Err(err) = session.insert(SESSION_AUTH_STATE_KEY, pending).await {
+    let auth_id = app_state
+        .ephemeral_store
+        .insert(
+            EPH_NS_AUTH_STATE,
+            &pending,
+            crate::ephemeral::WEBAUTHN_CEREMONY_TTL_SECONDS,
+        )
+        .await
+        .map_err(WebauthnError::SessionError)?;
+    if let Err(err) = session.insert(SESSION_AUTH_STATE_KEY, auth_id).await {
         error!("Failed to insert auth_state into session: {:?}", err);
         return Err(WebauthnError::InvalidSessionState(err));
     }
@@ -675,28 +822,33 @@ pub async fn finish_authentication(
     session: Session,
     Json(auth): Json<PublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let pending: PendingAuthentication = session
+    let auth_id: String = session
         .get(SESSION_AUTH_STATE_KEY)
         .await?
+        .ok_or(CorruptSession)?;
+    let pending: PendingAuthentication = app_state
+        .ephemeral_store
+        .peek(EPH_NS_AUTH_STATE, &auth_id)
+        .await
+        .map_err(WebauthnError::SessionError)?
         .ok_or(CorruptSession)?;
 
     match pending {
         PendingAuthentication::Discoverable {
-            state,
-            inbound_user_id,
+            inbound_user_id, ..
         } => {
             finish_discoverable_authentication(
                 &app_state,
                 &patreon,
                 &session,
+                &auth_id,
                 &auth,
-                state,
                 inbound_user_id,
             )
             .await
         }
-        PendingAuthentication::Account { user_id, state } => {
-            finish_account_authentication(&app_state, &patreon, &session, &auth, user_id, state)
+        PendingAuthentication::Account { user_id, .. } => {
+            finish_account_authentication(&app_state, &patreon, &session, &auth_id, &auth, user_id)
                 .await
         }
     }
@@ -707,8 +859,8 @@ async fn finish_discoverable_authentication(
     app_state: &AppState,
     patreon: &crate::patreon::PatreonState,
     session: &Session,
+    auth_id: &str,
     auth: &PublicKeyCredential,
-    state: DiscoverableAuthentication,
     inbound_user_id: Option<Uuid>,
 ) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
     let (user_id, cred_id) = match app_state
@@ -718,6 +870,7 @@ async fn finish_discoverable_authentication(
         Ok(identified) => identified,
         Err(e) => {
             error!("identify_discoverable_authentication -> {:?}", e);
+            let _ = take_auth_state(app_state, session, auth_id).await;
             return Ok(ceremony_failed());
         }
     };
@@ -731,6 +884,7 @@ async fn finish_discoverable_authentication(
             "Passkey of {} answered a start authenticated as {}",
             user_id, tid
         );
+        let _ = take_auth_state(app_state, session, auth_id).await;
         return Err(WebauthnError::PasskeyAccountMismatch);
     }
 
@@ -740,11 +894,18 @@ async fn finish_discoverable_authentication(
         .await
         .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?;
 
+    // Atomically consume the ceremony now that DB lookup succeeded; a
+    // concurrent POST sharing the same session cookie will see CorruptSession.
+    let PendingAuthentication::Discoverable { state, .. } =
+        take_auth_state(app_state, session, auth_id).await?
+    else {
+        return Err(CorruptSession);
+    };
+
     // A passkey can outlive its account (deletion leaves it on the device),
     // and nothing but the record ties a user handle to a credential.
     let Some(record) = record else {
         warn!("Passkey user handle {} names no live account", user_id);
-        remove_auth_state(session).await?;
         return Err(WebauthnError::UnknownPasskey);
     };
     if !record
@@ -753,11 +914,8 @@ async fn finish_discoverable_authentication(
         .any(|c| c.cred_id().as_ref() == cred_id)
     {
         warn!("Passkey is not among the credentials of {}", user_id);
-        remove_auth_state(session).await?;
         return Err(WebauthnError::UnknownPasskey);
     }
-
-    remove_auth_state(session).await?;
 
     let keys: Vec<DiscoverableKey> = record
         .credentials
@@ -789,18 +947,23 @@ async fn finish_account_authentication(
     app_state: &AppState,
     patreon: &crate::patreon::PatreonState,
     session: &Session,
+    auth_id: &str,
     auth: &PublicKeyCredential,
     user_id: Uuid,
-    state: PasskeyAuthentication,
 ) -> Result<(StatusCode, Json<AuthResponse>), WebauthnError> {
     let record = app_state
         .db_store
         .get_user_by_id(&user_id)
         .await
-        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?
-        .ok_or(UserNotFound)?;
+        .map_err(|e| WebauthnError::DynamoDBOperationError(Box::new(e)))?;
 
-    remove_auth_state(session).await?;
+    let PendingAuthentication::Account { state, .. } =
+        take_auth_state(app_state, session, auth_id).await?
+    else {
+        return Err(CorruptSession);
+    };
+
+    let record = record.ok_or(UserNotFound)?;
 
     if auth
         .get_user_unique_id()
@@ -1098,6 +1261,7 @@ pub enum WebauthnError {
     DynamoDBOperationError(#[from] Box<crate::db::DynamoDBError>),
     #[error("Invalid username format")]
     InvalidHandle,
+    #[allow(dead_code)]
     #[error("Failed to create user: {0}")]
     UserCreationFailed(String),
     #[error("WebAuthn operation failed: {0}")]
@@ -1190,7 +1354,7 @@ impl IntoResponse for WebauthnError {
                 format!("Failed to create user: {}", reason),
             ),
             WebauthnError::WebAuthnError(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 format!("WebAuthn operation failed: {}", err),
             ),
             WebauthnError::SessionError(err) => (
@@ -1783,31 +1947,47 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_with_no_ticket_is_refused() {
+        let app_state = crate::test_helpers::build_test_app_state().await;
         let session = empty_session();
 
-        let err = require_registration_ticket(&session).await.unwrap_err();
+        let err = require_registration_ticket(&app_state, &session)
+            .await
+            .unwrap_err();
         assert!(matches!(err, WebauthnError::AttestationRequired));
     }
 
     #[tokio::test]
     async fn a_session_holding_an_expired_ticket_is_refused() {
-        use crate::device_check::{RegistrationTicket, SESSION_REG_TICKET_KEY};
+        use crate::device_check::{
+            EPH_NS_REG_TICKET, RegistrationTicket, SESSION_REG_TICKET_KEY,
+        };
+        let app_state = crate::test_helpers::build_test_app_state().await;
         let session = empty_session();
 
         let now = chrono::Utc::now().timestamp();
-        session
-            .insert(
-                SESSION_REG_TICKET_KEY,
-                RegistrationTicket {
+        let ticket_id = "expired-ticket-id";
+        app_state
+            .ephemeral_store
+            .put_keyed(
+                EPH_NS_REG_TICKET,
+                ticket_id,
+                &RegistrationTicket {
                     key_id: "spent".into(),
                     issued_at: now - 3600,
                     expires_at: now - 1,
                 },
+                60,
             )
             .await
             .unwrap();
+        session
+            .insert(SESSION_REG_TICKET_KEY, ticket_id.to_string())
+            .await
+            .unwrap();
 
-        let err = require_registration_ticket(&session).await.unwrap_err();
+        let err = require_registration_ticket(&app_state, &session)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, WebauthnError::AttestationRequired),
             "a ceremony must not outlive its ticket"
@@ -1816,23 +1996,36 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_ticket_is_returned() {
-        use crate::device_check::{RegistrationTicket, SESSION_REG_TICKET_KEY};
+        use crate::device_check::{
+            EPH_NS_REG_TICKET, RegistrationTicket, SESSION_REG_TICKET_KEY,
+        };
+        let app_state = crate::test_helpers::build_test_app_state().await;
         let session = empty_session();
 
         let now = chrono::Utc::now().timestamp();
-        session
-            .insert(
-                SESSION_REG_TICKET_KEY,
-                RegistrationTicket {
+        let ticket_id = "live-ticket-id";
+        app_state
+            .ephemeral_store
+            .put_keyed(
+                EPH_NS_REG_TICKET,
+                ticket_id,
+                &RegistrationTicket {
                     key_id: "live".into(),
                     issued_at: now,
                     expires_at: now + 300,
                 },
+                300,
             )
             .await
             .unwrap();
+        session
+            .insert(SESSION_REG_TICKET_KEY, ticket_id.to_string())
+            .await
+            .unwrap();
 
-        let ticket = require_registration_ticket(&session).await.unwrap();
+        let ticket = require_registration_ticket(&app_state, &session)
+            .await
+            .unwrap();
         assert_eq!(ticket.key_id, "live");
     }
 }

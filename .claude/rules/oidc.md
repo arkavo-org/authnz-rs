@@ -19,12 +19,19 @@ paths:
   stable subject however they signed in; `idp` records which IdP was used),
   `aud`, `email`, `email_verified`, `idp`, `arkavo_account_id`,
   `arkavo_roles`, `arkavo_entitlements`
-- Authorization codes stored in an in-memory `AuthorizationCodeStore` (10-min
-  lifetime, single-use). For multi-instance deployments swap for a shared store.
-- Confidential clients use `client_secret`; public clients must use PKCE (S256).
+- Authorization codes and refresh tokens use Redis (`GETDEL` single-use) when
+  connected, failing closed on Redis write/read errors rather than splitting
+  across Redis and local memory; local memory fallback is used only when Redis
+  is unconfigured/disconnected.
+- Confidential clients authenticate via `client_secret` (HTTP Basic or form
+  body; Basic checks raw secret first, then RFC 6749 form-decoded). PKCE (S256)
+  is required for public clients and also enforced for confidential clients
+  whenever `code_challenge` was sent at `/oauth/authorize`. `redirect_uri` is
+  checked against the stored authorization code record on `/oauth/token`.
 - Upstream authentication: WebAuthn-issued Arkavo CWT (via `X-Auth-Token`),
-  Apple id_token (via `idp=apple` + `id_token` query/`X-Apple-Id-Token` header),
-  or Google via server-side redirect (`idp=google`, see google_signin.rs).
+  Apple id_token (via `idp=apple` + `X-Apple-Id-Token` header only — never query
+  string — with single-use replay cache in `EphemeralStore`), or Google via
+  server-side redirect (`idp=google`, see google_signin.rs).
 - RFC 8707 `resource` on `/oauth/authorize` and `/oauth/token`: accepted when
   it names the client itself or `OIDC_PLATFORM_AUDIENCE` (both already in
   `aud`); anything else is `invalid_target` (on the client's redirect URI

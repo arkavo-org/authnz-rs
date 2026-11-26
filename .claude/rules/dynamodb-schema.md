@@ -8,6 +8,12 @@ paths:
 
 ### credentials table
 - **Primary Key**: user_id (String/UUID)
+- **Registration write (0.42.1)**: new passkey accounts are created atomically
+  at `POST /register` via `create_user_with_credential` (`TransactWriteItems`
+  putting the `credentials` row with the verified passkey and claiming the
+  permanent `handles` row on `attribute_not_exists(handle)`). `start_register`
+  never persists zero-credential rows. Legacy zero-credential rows use
+  `add_credential_if_empty` (conditional on `credentials` absent or empty list).
 - **Attributes**: username (String), handle (String, the permanent
   `<label>.arkavo.social` written by `create_user`; absent on rows from before
   0.27.1, which read it as `<username>.arkavo.social`), credentials (List of

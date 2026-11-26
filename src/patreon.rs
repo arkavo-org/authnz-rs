@@ -302,69 +302,174 @@ pub struct SealedToken {
 }
 
 impl TokenSealer {
-    /// Seal a single plaintext token. Generates a fresh DEK so multiple
-    /// tokens stored together don't share a DEK + nonce reuse risk.
+    /// Seal a single plaintext token without caller-specific AAD/context (tests).
+    #[cfg(test)]
     pub async fn seal(&self, plaintext: &[u8]) -> Result<SealedToken, PatreonError> {
+        self.seal_with_context(plaintext, b"", &[]).await
+    }
+
+    /// Seal a single plaintext token bound to AES-GCM `aad` and KMS
+    /// `encryption_context` (preventing cross-user/cross-table ciphertext
+    /// transplant).
+    pub async fn seal_with_context(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+        context: &[(&str, &str)],
+    ) -> Result<SealedToken, PatreonError> {
+        let (first, _) = self
+            .seal_pair_with_context(plaintext, aad, None, context)
+            .await?;
+        Ok(first)
+    }
+
+    /// Seal one or two plaintexts under ONE freshly generated 256-bit DEK
+    /// with distinct GCM nonces and per-plaintext AAD, wrapping the DEK with
+    /// KMS **once** (with `encryption_context`) and zeroizing the DEK before
+    /// returning. Eliminates the second KMS decrypt round-trip.
+    pub async fn seal_pair_with_context(
+        &self,
+        first: &[u8],
+        first_aad: &[u8],
+        second: Option<(&[u8], &[u8])>,
+        context: &[(&str, &str)],
+    ) -> Result<(SealedToken, Option<SealedToken>), PatreonError> {
+        use aes_gcm::aead::Payload;
+        use aes_gcm::aead::rand_core::RngCore;
+
+        let mut dek = [0u8; 32];
         match self {
-            TokenSealer::Kms { client, key_id } => {
-                let mut dek = [0u8; 32];
-                use aes_gcm::aead::rand_core::RngCore;
-                OsRng.fill_bytes(&mut dek);
+            TokenSealer::Kms { .. } => OsRng.fill_bytes(&mut dek),
+            #[cfg(test)]
+            TokenSealer::Plaintext => {
+                // Deterministic zero key for unit tests so wrapped_dek can be
+                // opened without KMS.
+            }
+        }
 
-                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
-                let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
-                let ciphertext = cipher
-                    .encrypt(&nonce_bytes, plaintext)
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
+        let nonce1 = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct1 = cipher
+            .encrypt(
+                &nonce1,
+                Payload {
+                    msg: first,
+                    aad: first_aad,
+                },
+            )
+            .map_err(|_| PatreonError::Crypto("AES-256-GCM encrypt failed".into()))?;
+
+        let second_encrypted = match second {
+            Some((pt2, aad2)) => {
+                let nonce2 = Aes256Gcm::generate_nonce(&mut OsRng);
+                let ct2 = cipher
+                    .encrypt(
+                        &nonce2,
+                        Payload {
+                            msg: pt2,
+                            aad: aad2,
+                        },
+                    )
                     .map_err(|_| PatreonError::Crypto("AES-256-GCM encrypt failed".into()))?;
+                Some((nonce2.to_vec(), ct2))
+            }
+            None => None,
+        };
 
-                let wrap_resp = client
+        let wrapped_dek = match self {
+            TokenSealer::Kms { client, key_id } => {
+                let mut req = client
                     .encrypt()
                     .key_id(key_id)
-                    .plaintext(Blob::new(dek.to_vec()))
+                    .plaintext(Blob::new(dek.to_vec()));
+                for (k, v) in context {
+                    req = req.encryption_context(*k, *v);
+                }
+                let wrap_resp = req
                     .send()
                     .await
                     .map_err(|e| PatreonError::Kms(format!("Encrypt: {}", e)))?;
-                let wrapped_dek = wrap_resp
+                wrap_resp
                     .ciphertext_blob
                     .ok_or_else(|| PatreonError::Kms("missing ciphertext_blob".into()))?
-                    .into_inner();
-
-                // Zeroize the DEK eagerly; it has done its job. (Best-effort
-                // overwrite — `dek` is a stack array, no allocation tracking.)
-                for b in dek.iter_mut() {
-                    *b = 0;
-                }
-
-                Ok(SealedToken {
-                    wrapped_dek,
-                    nonce: nonce_bytes.to_vec(),
-                    ciphertext,
-                })
+                    .into_inner()
             }
             #[cfg(test)]
-            TokenSealer::Plaintext => {
-                let dek = [0u8; 32];
-                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
-                let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
-                let ciphertext = cipher
-                    .encrypt(&nonce_bytes, plaintext)
-                    .map_err(|_| PatreonError::Crypto("test sealer encrypt".into()))?;
-                // "Wrapped" DEK is the zero key itself so open() can recover it.
-                Ok(SealedToken {
-                    wrapped_dek: dek.to_vec(),
-                    nonce: nonce_bytes.to_vec(),
-                    ciphertext,
-                })
+            TokenSealer::Plaintext => dek.to_vec(),
+        };
+
+        // Zeroize DEK eagerly.
+        for b in dek.iter_mut() {
+            *b = 0;
+        }
+
+        let first_sealed = SealedToken {
+            wrapped_dek: wrapped_dek.clone(),
+            nonce: nonce1.to_vec(),
+            ciphertext: ct1,
+        };
+        let second_sealed = second_encrypted.map(|(nonce, ciphertext)| SealedToken {
+            wrapped_dek,
+            nonce,
+            ciphertext,
+        });
+        Ok((first_sealed, second_sealed))
+    }
+
+    #[cfg(test)]
+    pub async fn open(&self, sealed: &SealedToken) -> Result<Vec<u8>, PatreonError> {
+        self.open_with_context(sealed, b"", &[]).await
+    }
+
+    /// Open a sealed token, pinning `key_id` and `encryption_context` on KMS
+    /// decrypt and verifying AES-GCM `aad`.
+    ///
+    /// Backward compatibility: pre-0.42.1 rows were sealed with empty AES-GCM
+    /// AAD and no KMS `EncryptionContext`. When contextual decrypt fails and
+    /// `aad`/`context` are non-empty, fall back once to legacy decrypt (empty
+    /// AAD, no KMS `EncryptionContext`, still pinning `key_id` so only the
+    /// configured KMS key can unwrap). New contextual ciphertexts cannot be
+    /// opened by the legacy path because both KMS and AES-256-GCM authenticate
+    /// the original context/AAD.
+    pub async fn open_with_context(
+        &self,
+        sealed: &SealedToken,
+        aad: &[u8],
+        context: &[(&str, &str)],
+    ) -> Result<Vec<u8>, PatreonError> {
+        match self.open_once(sealed, aad, context).await {
+            Ok(plain) => Ok(plain),
+            Err(primary_err) if !aad.is_empty() || !context.is_empty() => {
+                match self.open_once(sealed, b"", &[]).await {
+                    Ok(plain) => {
+                        info!("Opened legacy pre-0.42.1 sealed token via empty-context fallback");
+                        Ok(plain)
+                    }
+                    Err(_) => Err(primary_err),
+                }
             }
+            Err(err) => Err(err),
         }
     }
 
-    pub async fn open(&self, sealed: &SealedToken) -> Result<Vec<u8>, PatreonError> {
-        let dek = match self {
-            TokenSealer::Kms { client, .. } => {
-                let resp = client
+    async fn open_once(
+        &self,
+        sealed: &SealedToken,
+        aad: &[u8],
+        context: &[(&str, &str)],
+    ) -> Result<Vec<u8>, PatreonError> {
+        use aes_gcm::aead::Payload;
+
+        let mut dek = match self {
+            TokenSealer::Kms { client, key_id } => {
+                let mut req = client
                     .decrypt()
-                    .ciphertext_blob(Blob::new(sealed.wrapped_dek.clone()))
+                    .key_id(key_id)
+                    .ciphertext_blob(Blob::new(sealed.wrapped_dek.clone()));
+                for (k, v) in context {
+                    req = req.encryption_context(*k, *v);
+                }
+                let resp = req
                     .send()
                     .await
                     .map_err(|e| PatreonError::Kms(format!("Decrypt: {}", e)))?;
@@ -392,15 +497,60 @@ impl TokenSealer {
                 dek
             }
         };
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
         if sealed.nonce.len() != 12 {
+            for b in dek.iter_mut() {
+                *b = 0;
+            }
             return Err(PatreonError::Crypto("nonce length != 12".into()));
         }
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
         let nonce = Nonce::from_slice(&sealed.nonce);
-        cipher
-            .decrypt(nonce, sealed.ciphertext.as_slice())
-            .map_err(|_| PatreonError::Crypto("AES-256-GCM decrypt failed".into()))
+        let result = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: sealed.ciphertext.as_slice(),
+                    aad,
+                },
+            )
+            .map_err(|_| PatreonError::Crypto("AES-256-GCM decrypt failed".into()));
+        for b in dek.iter_mut() {
+            *b = 0;
+        }
+        result
     }
+}
+
+fn patreon_aad(user_id: &Uuid, kind: &str) -> Vec<u8> {
+    format!("patreon:{user_id}:{kind}").into_bytes()
+}
+
+async fn seal_patreon_pair(
+    sealer: &TokenSealer,
+    user_id: &Uuid,
+    access: &[u8],
+    refresh: &[u8],
+) -> Result<(SealedToken, SealedToken), PatreonError> {
+    let uid = user_id.to_string();
+    let ctx = [("purpose", "patreon_tokens"), ("user_id", uid.as_str())];
+    let access_aad = patreon_aad(user_id, "access");
+    let refresh_aad = patreon_aad(user_id, "refresh");
+    let (a, r) = sealer
+        .seal_pair_with_context(access, &access_aad, Some((refresh, &refresh_aad)), &ctx)
+        .await?;
+    Ok((a, r.expect("second plaintext was provided")))
+}
+
+async fn open_patreon_token(
+    sealer: &TokenSealer,
+    user_id: &Uuid,
+    kind: &str,
+    sealed: &SealedToken,
+) -> Result<Vec<u8>, PatreonError> {
+    let uid = user_id.to_string();
+    let ctx = [("purpose", "patreon_tokens"), ("user_id", uid.as_str())];
+    let aad = patreon_aad(user_id, kind);
+    sealer.open_with_context(sealed, &aad, &ctx).await
 }
 
 /// Build the [`TokenSealer`] from env (`PATREON_KMS_KEY_ID`) + an existing
@@ -555,6 +705,10 @@ pub struct PatreonLink {
     pub wrapped_dek: Vec<u8>,
     pub token_expires_at: i64,
     pub linked_at: i64,
+    /// Last Unix timestamp when Patreon API confirmed this link's live state.
+    /// Used by `owner_fallback` so outage fallback reports a real timestamp
+    /// and expires after `PATREON_FALLBACK_MAX_STALE_SECONDS`.
+    pub last_verified_at: Option<i64>,
     /// Creator only: the owned campaign's tiers as last fetched (#99). What
     /// a creator keeps when a tier fetch fails, and in its fallback snapshot.
     /// Empty until the first fetch after linking.
@@ -706,14 +860,16 @@ pub async fn patreon_link_handler(
     // From here a failure gives back what this request took (#97), so it
     // never leaves a `patreon#` row that no token row points to.
     let stored: Result<PatreonLink, PatreonError> = async {
-        // Encrypt both tokens. Per the design note above, the access and
-        // refresh ciphertexts get their own nonces but share a DEK to keep
-        // storage small.
+        // Encrypt both tokens under one DEK in a single KMS round-trip,
+        // bound with per-user AAD and KMS EncryptionContext.
         let now = Utc::now().timestamp();
-        let sealed_access = sealer.seal(tokens.access_token.as_bytes()).await?;
-        let sealed_refresh = seal_under_existing_dek(
+        let linked_at = previous
+            .as_ref()
+            .map_or(now, |p| now.max(p.linked_at.saturating_add(1)));
+        let (sealed_access, sealed_refresh) = seal_patreon_pair(
             sealer,
-            &sealed_access.wrapped_dek,
+            &user_id,
+            tokens.access_token.as_bytes(),
             tokens.refresh_token.as_bytes(),
         )
         .await?;
@@ -730,12 +886,13 @@ pub async fn patreon_link_handler(
             refresh_token_nonce: sealed_refresh.nonce,
             wrapped_dek: sealed_access.wrapped_dek,
             token_expires_at: now + tokens.expires_in,
-            linked_at: now,
+            linked_at,
+            last_verified_at: Some(now),
             owned_tiers: OwnedCampaignTiers::default(),
         };
 
         // Give up what the link being replaced points to: its row is the
-        // only pointer to them, and the put below overwrites it.
+        // only pointer to them, and the conditional put below replaces it.
         if let Some(previous) = &previous {
             app_state
                 .db_store
@@ -754,15 +911,27 @@ pub async fn patreon_link_handler(
                     PatreonError::Db("replaced_link_release_failed".into())
                 })?;
         }
-        app_state
+        // Conditional write against `previous`: if a concurrent relink or
+        // unlink changed `patreon_tokens` between our read and write, refuse
+        // and roll back via `abandon_link` so no `patreon#` row is orphaned.
+        match app_state
             .db_store
-            .put_patreon_link(&link)
+            .put_patreon_link_expected(&link, previous.as_ref())
             .await
-            .map_err(|e| {
+        {
+            Ok(true) => Ok(link),
+            Ok(false) => {
+                warn!(
+                    "Concurrent Patreon relink/unlink detected for user {}; aborting link",
+                    user_id
+                );
+                Err(PatreonError::LinkConflict)
+            }
+            Err(e) => {
                 error!("Failed to persist patreon_tokens row: {}", e);
-                PatreonError::Db("patreon_tokens_write_failed".into())
-            })?;
-        Ok(link)
+                Err(PatreonError::Db("patreon_tokens_write_failed".into()))
+            }
+        }
     }
     .await;
     let link = match stored {
@@ -806,6 +975,31 @@ async fn abandon_link(
         return;
     }
     let db = &app_state.db_store;
+    // Re-read the current `patreon_tokens` row before touching `identity_links`:
+    // if a concurrent link request for the same user won with `patreon_user_id`,
+    // deleting `patreon#<patreon_user_id>` would strip the winner's uniqueness
+    // guard. If a third link won, do not restore the superseded `previous` link.
+    let current = match db.get_patreon_link_ref(&user_id).await {
+        Ok(cur) => cur,
+        Err(e) => {
+            warn!(
+                "Could not verify patreon_tokens before rollback for user {}: {}; skipping link delete",
+                user_id, e
+            );
+            return;
+        }
+    };
+    if current
+        .as_ref()
+        .is_some_and(|cur| cur.patreon_user_id == patreon_user_id)
+    {
+        debug!(
+            "Concurrent Patreon link for user {} already owns subject_prefix={}; preserving identity link",
+            user_id,
+            subject_prefix(patreon_user_id)
+        );
+        return;
+    }
     if let Err(e) = db
         .delete_identity_link_if_owned(crate::db::PATREON_PROVIDER, patreon_user_id, &user_id)
         .await
@@ -818,7 +1012,12 @@ async fn abandon_link(
             e
         );
     }
-    if let Some(previous) = previous
+    let should_restore_previous = match (previous, current.as_ref()) {
+        (Some(prev), Some(cur)) => cur.patreon_user_id == prev.patreon_user_id,
+        _ => false,
+    };
+    if should_restore_previous
+        && let Some(previous) = previous
         && let Err(e) = db
             .link_identity(
                 user_id,
@@ -903,20 +1102,17 @@ pub async fn patreon_unlink_handler(
 /// Used so the access + refresh tokens in a row share one wrapped DEK
 /// (saving a second KMS round-trip per link). Distinct GCM nonces are
 /// generated per call, so the (key, nonce) pair is never reused.
+#[cfg(test)]
 async fn seal_under_existing_dek(
     sealer: &TokenSealer,
     wrapped_dek: &[u8],
     plaintext: &[u8],
 ) -> Result<SealedToken, PatreonError> {
-    // Recover the DEK by asking the sealer to open just the wrapped DEK
-    // (using an empty ciphertext is not portable; instead we round-trip a
-    // throwaway plaintext to get back the DEK).
-    //
-    // Implementation: re-decrypt the wrapped_dek directly.
     let dek = match sealer {
-        TokenSealer::Kms { client, .. } => {
+        TokenSealer::Kms { client, key_id } => {
             let resp = client
                 .decrypt()
+                .key_id(key_id)
                 .ciphertext_blob(Blob::new(wrapped_dek.to_vec()))
                 .send()
                 .await
@@ -925,7 +1121,6 @@ async fn seal_under_existing_dek(
                 .ok_or_else(|| PatreonError::Kms("missing plaintext".into()))?
                 .into_inner()
         }
-        #[cfg(test)]
         TokenSealer::Plaintext => wrapped_dek.to_vec(),
     };
     if dek.len() != 32 {
@@ -1017,6 +1212,7 @@ fn merge_refreshed_link(
         wrapped_dek: sealed_access.wrapped_dek,
         token_expires_at: now + new_tokens.expires_in,
         linked_at: old.linked_at,
+        last_verified_at: old.last_verified_at,
         owned_tiers: old.owned_tiers.clone(),
     }
 }
@@ -1090,6 +1286,12 @@ async fn refresh_access_token(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            return Err(PatreonError::InvalidGrant);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(PatreonError::Unauthorized);
+        }
         return Err(PatreonError::Api(format!(
             "refresh endpoint returned {}: {}",
             status,
@@ -1232,7 +1434,7 @@ impl MembershipCache {
                 _ => None,
             }
         } else {
-            let mut map = self.local.lock().unwrap();
+            let mut map = self.local.lock().unwrap_or_else(|e| e.into_inner());
             let now = Utc::now().timestamp();
             map.retain(|_, (_, exp)| *exp > now);
             map.get(&key).map(|(m, _)| m.clone())
@@ -1243,6 +1445,11 @@ impl MembershipCache {
         let key = Self::key(user_id);
         let ser: SerializableMaterialized = snap.into();
         if self.redis.is_connected() {
+            // Clear any stale local copy so a later Redis flap cannot revive it.
+            self.local
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             if let Ok(json) = serde_json::to_string(&ser) {
                 let ttl = (snap.cache_expires_at - Utc::now().timestamp()).max(1);
                 let _: Result<(), _> = self
@@ -1257,10 +1464,7 @@ impl MembershipCache {
                     .await;
             }
         } else {
-            let mut map = self.local.lock().unwrap();
-            // Reclaim expired entries first, then enforce the cap. We still
-            // refresh an existing key even at capacity (it's not net growth);
-            // only brand-new keys are dropped once full.
+            let mut map = self.local.lock().unwrap_or_else(|e| e.into_inner());
             let now = Utc::now().timestamp();
             map.retain(|_, (_, exp)| *exp > now);
             if map.len() < MAX_LOCAL_CACHE_ENTRIES || map.contains_key(&key) {
@@ -1269,9 +1473,6 @@ impl MembershipCache {
         }
     }
 
-    /// [`MembershipCache::put`], but only when no snapshot is cached for
-    /// `user_id` — atomically (Redis `SET NX`; one lock on the in-memory
-    /// fallback). For fallback snapshots, which must never replace a real one.
     pub async fn put_if_absent(&self, user_id: Uuid, snap: &ArkavoPatreon) {
         let key = Self::key(user_id);
         let ser: SerializableMaterialized = snap.into();
@@ -1290,7 +1491,7 @@ impl MembershipCache {
                     .await;
             }
         } else {
-            let mut map = self.local.lock().unwrap();
+            let mut map = self.local.lock().unwrap_or_else(|e| e.into_inner());
             let now = Utc::now().timestamp();
             map.retain(|_, (_, exp)| *exp > now);
             if !map.contains_key(&key) && map.len() < MAX_LOCAL_CACHE_ENTRIES {
@@ -1299,12 +1500,13 @@ impl MembershipCache {
         }
     }
 
-    /// Remember that `user_id` has no Patreon link, so the next mint can skip
-    /// the DynamoDB lookup. Cleared by [`MembershipCache::invalidate`], which
-    /// the link handler calls, so linking takes effect immediately.
     pub async fn mark_unlinked(&self, user_id: Uuid) {
         let key = Self::unlinked_key(user_id);
         if self.redis.is_connected() {
+            self.local_unlinked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
             let _: Result<(), _> = self
                 .redis
                 .set(
@@ -1319,9 +1521,11 @@ impl MembershipCache {
                 .await;
         } else {
             let now = Utc::now().timestamp();
-            let mut map = self.local_unlinked.lock().unwrap();
+            let mut map = self
+                .local_unlinked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.retain(|_, exp| *exp > now);
-            // Same cap as the positive cache: bound memory while Redis is down.
             if map.len() < MAX_LOCAL_CACHE_ENTRIES || map.contains_key(&key) {
                 map.insert(key, now + PATREON_UNLINKED_CACHE_TTL_SECONDS);
             }
@@ -1334,21 +1538,31 @@ impl MembershipCache {
             matches!(self.redis.get::<Option<String>, _>(&key).await, Ok(Some(_)))
         } else {
             let now = Utc::now().timestamp();
-            let mut map = self.local_unlinked.lock().unwrap();
+            let mut map = self
+                .local_unlinked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.retain(|_, exp| *exp > now);
             map.contains_key(&key)
         }
     }
 
+    /// Clear BOTH local fallback and Redis (when connected) so pre-unlink
+    /// entitlements can never reappear across Redis disconnects/reconnects.
     pub async fn invalidate(&self, user_id: Uuid) {
         let key = Self::key(user_id);
         let unlinked = Self::unlinked_key(user_id);
+        self.local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        self.local_unlinked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&unlinked);
         if self.redis.is_connected() {
             let _: Result<(), _> = self.redis.del(&key).await;
             let _: Result<(), _> = self.redis.del(&unlinked).await;
-        } else {
-            self.local.lock().unwrap().remove(&key);
-            self.local_unlinked.lock().unwrap().remove(&unlinked);
         }
     }
 }
@@ -1557,16 +1771,52 @@ async fn lookup_link(app_state: &AppState, state: &PatreonState, user_id: Uuid) 
     }
 }
 
+/// Maximum age (seconds) of `last_verified_at` for which `owner_fallback` may
+/// sustain a creator's stored campaign/tiers across transient Patreon outages.
+const PATREON_FALLBACK_MAX_STALE_SECONDS: i64 = 24 * 3600;
+
+/// Errors that represent permanent OAuth revocation, removed client config, or
+/// corrupt token ciphertext — never transient outages. `owner_fallback` MUST
+/// fail closed on these rather than sustaining creator claims indefinitely.
+fn is_permanent_auth_or_config_error(err: &PatreonError) -> bool {
+    matches!(
+        err,
+        PatreonError::InvalidGrant
+            | PatreonError::Unauthorized
+            | PatreonError::NotConfigured
+            | PatreonError::Crypto(_)
+    )
+}
+
+/// Whether `link` is still the live account's current Patreon link row
+/// (same `patreon_user_id` and `linked_at`). Guards detached materialization
+/// against resurrecting `patreon-campaign#<cid>` or repopulating
+/// `MembershipCache` after an unlink, relink, or account deletion.
+async fn link_is_still_current(app_state: &AppState, link: &PatreonLink) -> bool {
+    let live = matches!(
+        app_state.db_store.is_account_live(&link.user_id).await,
+        Ok(true)
+    );
+    if !live {
+        return false;
+    }
+    matches!(
+        app_state.db_store.get_patreon_link_ref(&link.user_id).await,
+        Ok(Some(cur)) if cur.patreon_user_id == link.patreon_user_id && cur.linked_at == link.linked_at
+    )
+}
+
 /// The Patreon half of materialization: query, persist any rotated tokens,
-/// cache. A creator whose query fails gets (and caches, for
-/// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]) its fallback snapshot.
+/// cache. A creator whose transient query fails gets (and caches, for
+/// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]) its fallback snapshot, only while
+/// the link is still current and within [`PATREON_FALLBACK_MAX_STALE_SECONDS`].
 async fn materialize_link(
     app_state: &AppState,
     state: &PatreonState,
     link: &PatreonLink,
 ) -> Option<ArkavoPatreon> {
     let user_id = link.user_id;
-    let (snap, refreshed) = match materialize_from_link(state, link).await {
+    let (snap, refreshed) = match materialize_from_link_inner(Some(app_state), state, link).await {
         Ok(v) => v,
         Err(failure) => {
             warn!(
@@ -1579,28 +1829,50 @@ async fn materialize_link(
                     "no claim"
                 }
             );
-            // Even on failure, a refresh may have succeeded before the retry
-            // fetch broke. Patreon consumed the old refresh token the moment
-            // the refresh went through — persisting the rotated link is the
-            // only way the next mint can refresh at all.
-            persist_rotated_tokens(app_state, user_id, failure.refreshed.map(|l| *l)).await;
-            // A creator keeps its campaign claim (what it had before creator
-            // memberships were fetched) with no memberships, so nothing
-            // membership-derived is granted. Cached briefly so a creator with
-            // a dead refresh token does not pay the Patreon round-trips on
-            // every mint.
-            // Insert-if-absent: never overwrite a real snapshot a concurrent
-            // materialization already cached.
+            // If a refresh succeeded before a later failure and wasn't already
+            // persisted immediately, persist now with CAS on prior refresh nonce.
+            persist_rotated_tokens(
+                app_state,
+                user_id,
+                failure.refreshed.map(|l| *l),
+                Some(link.refresh_token_nonce.as_slice()),
+            )
+            .await;
             let fallback = failure.fallback.map(|f| *f)?;
-            state.cache.put_if_absent(user_id, &fallback).await;
-            return Some(fallback);
+            if link_is_still_current(app_state, link).await {
+                state.cache.put_if_absent(user_id, &fallback).await;
+                return Some(fallback);
+            }
+            return None;
         }
     };
 
-    persist_rotated_tokens(app_state, user_id, refreshed).await;
-    persist_ownership(app_state, link, &snap).await;
+    persist_rotated_tokens(
+        app_state,
+        user_id,
+        refreshed,
+        Some(link.refresh_token_nonce.as_slice()),
+    )
+    .await;
+    if !link_is_still_current(app_state, link).await {
+        debug!(
+            "Patreon link for user {} changed or account deleted during materialization; discarding",
+            user_id
+        );
+        return None;
+    }
+    let wrote_ownership = persist_ownership(app_state, link, &snap).await;
     let snap = with_creator_subs(app_state, snap).await;
 
+    if !link_is_still_current(app_state, link).await {
+        if wrote_ownership && let Some(cid) = snap.campaign_id.as_deref() {
+            let _ = app_state
+                .db_store
+                .delete_patreon_campaign_owner(cid, &user_id)
+                .await;
+        }
+        return None;
+    }
     state.cache.put(user_id, &snap).await;
     Some(snap)
 }
@@ -1720,13 +1992,22 @@ pub(crate) fn claim_snapshot(
 /// [`PATREON_FAILURE_CACHE_TTL_SECONDS`]. `None` for a link last seen owning
 /// no campaign, which fails closed with no claim at all.
 fn owner_fallback(link: &PatreonLink, now: i64) -> Option<ArkavoPatreon> {
+    // Enforce the 24h staleness cap whenever `last_verified_at` is recorded.
+    // Pre-0.42.1 rows without `last_verified_at` remain eligible until their
+    // first post-upgrade materialization records it.
+    if let Some(verified_at) = link.last_verified_at
+        && now.saturating_sub(verified_at) > PATREON_FALLBACK_MAX_STALE_SECONDS
+    {
+        return None;
+    }
+    let verified_at = link.last_verified_at.unwrap_or(link.linked_at);
     link.campaign_id.as_ref().map(|cid| ArkavoPatreon {
         role: ROLE_CREATOR.into(),
         patreon_user_id: link.patreon_user_id.clone(),
         campaign_id: Some(cid.clone()),
         memberships: Vec::new(),
         owned_tiers: link.owned_tiers.clone(),
-        verified_at: now,
+        verified_at,
         cache_expires_at: now + PATREON_FAILURE_CACHE_TTL_SECONDS,
     })
 }
@@ -1788,6 +2069,7 @@ pub async fn materialize_for_user_resolved(
     };
     let fallback = owner_fallback(&link, Utc::now().timestamp());
 
+    let link_for_check = link.clone();
     let app = app_state.clone();
     let patreon = state.clone();
     let handle = tokio::spawn(async move { materialize_link(&app, &patreon, &link).await });
@@ -1812,14 +2094,22 @@ pub async fn materialize_for_user_resolved(
                     "no claim"
                 }
             );
-            // Cache the creator fallback briefly unless the background task
-            // has already cached a real answer. Insert-if-absent is atomic, so
-            // a success landing between a check and a write cannot be
-            // clobbered; a later success still overwrites the fallback.
             if let Some(f) = &fallback {
-                state.cache.put_if_absent(user_id, f).await;
+                let still_current = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    link_is_still_current(app_state, &link_for_check),
+                )
+                .await
+                .unwrap_or(false);
+                if still_current {
+                    state.cache.put_if_absent(user_id, f).await;
+                    fallback
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            fallback
         }
     };
     snap.map_or(Materialized::Unavailable, |s| {
@@ -1827,23 +2117,21 @@ pub async fn materialize_for_user_resolved(
     })
 }
 
-/// Persist a rotated Patreon token bundle, if one was produced. Best-effort:
-/// a persist failure doesn't fail the mint, but it does mean the DB still
-/// holds the already-consumed refresh token — the next refresh attempt will
-/// be rejected by Patreon and the user fails closed until they re-link, so
-/// the failure is logged loudly. Written only while the row is still the
-/// link that was refreshed (#97): a rotation of a link unlinked or
-/// replaced meanwhile is dropped.
 async fn persist_rotated_tokens(
     app_state: &AppState,
     user_id: Uuid,
     refreshed: Option<PatreonLink>,
+    expected_refresh_nonce: Option<&[u8]>,
 ) {
     let Some(new_link) = refreshed else { return };
-    match app_state.db_store.put_rotated_patreon_link(&new_link).await {
+    match app_state
+        .db_store
+        .put_rotated_patreon_link(&new_link, expected_refresh_nonce)
+        .await
+    {
         Ok(true) => debug!("Persisted refreshed Patreon tokens for user {}", user_id),
         Ok(false) => debug!(
-            "Patreon link of user {} was unlinked or replaced meanwhile; refreshed tokens dropped",
+            "Patreon link of user {} was unlinked, replaced, or concurrently rotated; refreshed tokens dropped",
             user_id
         ),
         Err(e) => warn!(
@@ -1854,23 +2142,10 @@ async fn persist_rotated_tokens(
     }
 }
 
-/// Store what Patreon said the link owns (campaign, its tiers, and so the
-/// role) on the link row when it differs from the stored copy, so the next
-/// fallback agrees with it. Runs after [`persist_rotated_tokens`], whose
-/// whole-row put carries the old copy. Best-effort: a failed write only means
-/// the fallback uses an older copy until the next materialization.
-async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) {
-    record_campaign_owner(
-        app_state,
-        link.user_id,
-        link.campaign_id.as_deref(),
-        snap.campaign_id.as_deref(),
-    )
-    .await;
-    if snap.campaign_id == link.campaign_id && snap.owned_tiers == link.owned_tiers {
-        return;
-    }
-    match app_state
+async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &ArkavoPatreon) -> bool {
+    // Persist ownership + `last_verified_at` conditionally on `(patreon_user_id, linked_at)`
+    // FIRST, and only touch `patreon-campaign#<cid>` if the conditional write succeeded.
+    let updated = match app_state
         .db_store
         .put_patreon_ownership(
             link.user_id,
@@ -1878,24 +2153,46 @@ async fn persist_ownership(app_state: &AppState, link: &PatreonLink, snap: &Arka
             link.linked_at,
             snap.campaign_id.as_deref(),
             &snap.owned_tiers,
+            Some(snap.verified_at),
         )
         .await
     {
-        Ok(true) => info!(
-            "Patreon ownership for user {} is now campaign={} with {} tiers",
+        Ok(true) => {
+            if snap.campaign_id != link.campaign_id || snap.owned_tiers != link.owned_tiers {
+                info!(
+                    "Patreon ownership for user {} is now campaign={} with {} tiers",
+                    link.user_id,
+                    snap.campaign_id.as_deref().unwrap_or("none"),
+                    snap.owned_tiers.ids.len()
+                );
+            }
+            true
+        }
+        Ok(false) => {
+            debug!(
+                "Patreon link for user {} was re-linked or removed; ownership and campaign owner not stored",
+                link.user_id
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                "Failed to store Patreon ownership for user {}: {} — skipping campaign owner update",
+                link.user_id, e
+            );
+            false
+        }
+    };
+    if updated {
+        record_campaign_owner(
+            app_state,
             link.user_id,
-            snap.campaign_id.as_deref().unwrap_or("none"),
-            snap.owned_tiers.ids.len()
-        ),
-        Ok(false) => debug!(
-            "Patreon link for user {} was re-linked or removed; ownership not stored",
-            link.user_id
-        ),
-        Err(e) => warn!(
-            "Failed to store Patreon ownership for user {}: {} — the fallback keeps the older copy",
-            link.user_id, e
-        ),
+            link.campaign_id.as_deref(),
+            snap.campaign_id.as_deref(),
+        )
+        .await;
     }
+    updated
 }
 
 /// Keep the `patreon-campaign#<cid>` owner row (#128) in step with what
@@ -2010,19 +2307,32 @@ fn role_for(campaign_id: &Option<String>) -> &'static str {
 /// value alone opens none of the creator's own content). Without the
 /// `campaigns` scope the stored campaign (from a link made before #99) is
 /// kept as it was.
+#[cfg(test)]
 async fn materialize_from_link(
+    state: &PatreonState,
+    link: &PatreonLink,
+) -> Result<(ArkavoPatreon, Option<PatreonLink>), MaterializeFailure> {
+    materialize_from_link_inner(None, state, link).await
+}
+
+async fn materialize_from_link_inner(
+    app_state: Option<&AppState>,
     state: &PatreonState,
     link: &PatreonLink,
 ) -> Result<(ArkavoPatreon, Option<PatreonLink>), MaterializeFailure> {
     let sealer = state.sealer.as_ref().ok_or(PatreonError::NotConfigured)?;
 
-    let access_plain = sealer
-        .open(&SealedToken {
+    let access_plain = open_patreon_token(
+        sealer,
+        &link.user_id,
+        "access",
+        &SealedToken {
             wrapped_dek: link.wrapped_dek.clone(),
             nonce: link.access_token_nonce.clone(),
             ciphertext: link.access_token_ct.clone(),
-        })
-        .await?;
+        },
+    )
+    .await?;
     let access_token = String::from_utf8(access_plain)
         .map_err(|_| PatreonError::Crypto("access token not UTF-8 after decrypt".into()))?;
 
@@ -2032,8 +2342,6 @@ async fn materialize_from_link(
         owned_campaign: scope_granted(&link.scopes, PATREON_CAMPAIGNS_SCOPE),
     };
     if !query.memberships {
-        // info, not debug: an operator needs to see which links must
-        // re-link. Cached, so at most once per cache TTL.
         info!(
             "Patreon link for patreon_user_id_prefix={} lacks the {} scope; no memberships \
              (re-link to grant it)",
@@ -2043,11 +2351,18 @@ async fn materialize_from_link(
     }
 
     let (read, refreshed, access_token) = if query.memberships || query.owned_campaign {
-        match fetch_identity_with_refresh(state, link, &access_token, query).await {
+        match fetch_identity_with_refresh(app_state, state, link, &access_token, query).await {
             Ok(v) => v,
             Err(failure) => {
+                // Fail closed on permanent OAuth revocation / config / crypto
+                // errors; only transient upstream outages may use owner_fallback.
+                let fallback = if is_permanent_auth_or_config_error(&failure.error) {
+                    None
+                } else {
+                    owner_fallback(link, now).map(Box::new)
+                };
                 return Err(MaterializeFailure {
-                    fallback: owner_fallback(link, now).map(Box::new),
+                    fallback,
                     ..failure
                 });
             }
@@ -2134,6 +2449,7 @@ struct IdentityRead {
 /// path; fully serializing refreshes (distributed lock / conditional update) is
 /// intentionally out of scope here (tracked in #36).
 async fn fetch_identity_with_refresh(
+    app_state: Option<&AppState>,
     state: &PatreonState,
     link: &PatreonLink,
     access_token: &str,
@@ -2144,10 +2460,6 @@ async fn fetch_identity_with_refresh(
         Err(PatreonError::Unauthorized) => {
             let sealer = state.sealer.as_ref().ok_or(PatreonError::NotConfigured)?;
             let oauth = state.oauth.as_ref().ok_or(PatreonError::NotConfigured)?;
-            // Refresh must use the same client that minted the bundle —
-            // Patreon rejects a refresh token presented with another
-            // client's credentials. Unknown client_id (e.g. the operator
-            // dropped a client from env) fails closed: claim omitted.
             let Some(client) = oauth.client_by_id(&link.client_id) else {
                 warn!(
                     "Patreon link for patreon_user_id_prefix={} was issued by client_id no longer configured; cannot refresh",
@@ -2160,26 +2472,73 @@ async fn fetch_identity_with_refresh(
                 subject_prefix(&link.patreon_user_id)
             );
 
-            let refresh_plain = sealer
-                .open(&SealedToken {
+            let refresh_plain = open_patreon_token(
+                sealer,
+                &link.user_id,
+                "refresh",
+                &SealedToken {
                     wrapped_dek: link.wrapped_dek.clone(),
                     nonce: link.refresh_token_nonce.clone(),
                     ciphertext: link.refresh_token_ct.clone(),
-                })
-                .await?;
+                },
+            )
+            .await?;
             let refresh_token = String::from_utf8(refresh_plain).map_err(|_| {
                 PatreonError::Crypto("refresh token not UTF-8 after decrypt".into())
             })?;
 
             let new_tokens =
-                refresh_access_token(&state.http, client, &refresh_token, &state.token_url).await?;
+                match refresh_access_token(&state.http, client, &refresh_token, &state.token_url)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(PatreonError::InvalidGrant) => {
+                        // A concurrent mint may have already rotated this single-use
+                        // refresh token. Re-read `patreon_tokens`: if the same link
+                        // now carries a newer `refresh_token_nonce`, retry `/identity`
+                        // once with the freshly stored access token instead of
+                        // treating the race loser as permanently revoked.
+                        if let Some(app) = app_state
+                            && let Ok(Some(fresh)) = app.db_store.get_patreon_link(link.user_id).await
+                            && fresh.patreon_user_id == link.patreon_user_id
+                            && fresh.linked_at == link.linked_at
+                            && fresh.refresh_token_nonce != link.refresh_token_nonce
+                            && let Ok(fresh_plain) = open_patreon_token(
+                                sealer,
+                                &fresh.user_id,
+                                "access",
+                                &SealedToken {
+                                    wrapped_dek: fresh.wrapped_dek.clone(),
+                                    nonce: fresh.access_token_nonce.clone(),
+                                    ciphertext: fresh.access_token_ct.clone(),
+                                },
+                            )
+                            .await
+                            && let Ok(fresh_access) = String::from_utf8(fresh_plain)
+                        {
+                            return match fetch_identity_read(
+                                &state.http,
+                                &fresh_access,
+                                &state.identity_url,
+                                query,
+                            )
+                            .await
+                            {
+                                Ok(read) => Ok((read, None, fresh_access)),
+                                Err(err) => Err(err.into()),
+                            };
+                        }
+                        return Err(PatreonError::InvalidGrant.into());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
-            // Re-seal both rotated tokens under a fresh per-row DEK (distinct
-            // GCM nonces; one wrapped DEK per row).
-            let sealed_access = sealer.seal(new_tokens.access_token.as_bytes()).await?;
-            let sealed_refresh = seal_under_existing_dek(
+            // Re-seal both rotated tokens under ONE fresh DEK in a single KMS
+            // round-trip, bound to per-user AAD & EncryptionContext.
+            let (sealed_access, sealed_refresh) = seal_patreon_pair(
                 sealer,
-                &sealed_access.wrapped_dek,
+                &link.user_id,
+                new_tokens.access_token.as_bytes(),
                 new_tokens.refresh_token.as_bytes(),
             )
             .await?;
@@ -2187,10 +2546,22 @@ async fn fetch_identity_with_refresh(
             let refreshed_link =
                 merge_refreshed_link(link, &new_tokens, sealed_access, sealed_refresh, now);
 
-            // Retry once with the new access token. A failure here propagates
-            // (fail-closed) rather than triggering a second refresh — but it
-            // carries the rotated link: the refresh already consumed the old
-            // refresh token, so dropping the new one would strand the user.
+            // Persist the single-use rotated refresh token IMMEDIATELY (CAS on
+            // the prior refresh_token_nonce) BEFORE making the retry HTTP call
+            // so a slow/failing retry or process crash never strands the user.
+            let unpersisted = if let Some(app) = app_state {
+                persist_rotated_tokens(
+                    app,
+                    link.user_id,
+                    Some(refreshed_link),
+                    Some(link.refresh_token_nonce.as_slice()),
+                )
+                .await;
+                None
+            } else {
+                Some(refreshed_link)
+            };
+
             match fetch_identity_read(
                 &state.http,
                 &new_tokens.access_token,
@@ -2199,10 +2570,10 @@ async fn fetch_identity_with_refresh(
             )
             .await
             {
-                Ok(read) => Ok((read, Some(refreshed_link), new_tokens.access_token)),
+                Ok(read) => Ok((read, unpersisted, new_tokens.access_token)),
                 Err(error) => Err(MaterializeFailure {
                     error,
-                    refreshed: Some(Box::new(refreshed_link)),
+                    refreshed: unpersisted.map(Box::new),
                     fallback: None,
                 }),
             }
@@ -2505,10 +2876,16 @@ fn tier_slugs_by_id(included: &[serde_json::Value]) -> HashMap<&str, String> {
             continue;
         };
         if !title.trim().is_empty() {
-            let mut slug = slugify_tier(title);
-            if slug.is_empty() {
-                slug = format!("tier-{id}");
-            }
+            let slug = slugify_tier(title);
+            let slug = if slug.is_empty() {
+                format!("tier-{id}")
+            } else if slug.strip_prefix("tier-").is_some_and(is_patreon_id) {
+                // Drop `tier-<digits>` impersonation titles so a tier cannot
+                // spoof another tier's id-based slug in `tier_slugs`.
+                continue;
+            } else {
+                slug
+            };
             out.insert(id, slug);
         }
     }
@@ -2590,20 +2967,27 @@ pub(crate) fn parse_memberships_from_identity(
 
 // --------- Helpers (copied from apple_signin to avoid cross-module coupling) ---------
 
+/// Maximum length (bytes/ASCII chars) of a slugified tier title, matching
+/// `DISPLAY_TEXT_MAX_BYTES` so long Patreon tier titles cannot push CWTs past
+/// the 64 KiB HTTP/2 header limit.
+const MAX_TIER_SLUG_LEN: usize = 64;
+
 /// Slugify a Patreon tier title to the campaign-qualified entitlement form
 /// the platform expects: lowercase ASCII alphanumerics, runs of other
-/// characters collapsed to a single '-', trimmed. Notably produces no '_'
-/// (the platform's <campaign_id>_<tier_slug> separator) and no spaces.
+/// characters collapsed to a single '-', trimmed, capped at [`MAX_TIER_SLUG_LEN`].
 pub(crate) fn slugify_tier(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
+    let mut out = String::with_capacity(title.len().min(MAX_TIER_SLUG_LEN));
     let mut prev_dash = false;
     for ch in title.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_dash = false;
-        } else if !prev_dash {
+        } else if !prev_dash && !out.is_empty() {
             out.push('-');
             prev_dash = true;
+        }
+        if out.len() >= MAX_TIER_SLUG_LEN {
+            break;
         }
     }
     out.trim_matches('-').to_string()
@@ -2696,8 +3080,9 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -3467,13 +3852,13 @@ mod tests {
     }
 
     async fn consumer_link_with_token(sealer: &TokenSealer, token: &[u8]) -> PatreonLink {
-        let access = sealer.seal(token).await.expect("seal access");
-        let refresh = seal_under_existing_dek(sealer, &access.wrapped_dek, b"refresh")
+        let user_id = Uuid::new_v4();
+        let (access, refresh) = seal_patreon_pair(sealer, &user_id, token, b"refresh")
             .await
-            .expect("seal refresh");
+            .expect("seal pair");
         let now = Utc::now().timestamp();
         PatreonLink {
-            user_id: Uuid::new_v4(),
+            user_id,
             role: "consumer".into(),
             client_id: "c".into(),
             patreon_user_id: "p-1".into(),
@@ -3487,6 +3872,7 @@ mod tests {
             token_expires_at: now + 3600,
             owned_tiers: Default::default(),
             linked_at: now,
+            last_verified_at: Some(now),
         }
     }
 
@@ -3671,15 +4057,43 @@ mod tests {
         let new_link = refreshed.expect("a refresh should have produced a new link");
         assert_eq!(new_link.user_id, link.user_id);
         assert_eq!(new_link.patreon_user_id, link.patreon_user_id);
-        let opened = sealer
-            .open(&SealedToken {
+        let opened = open_patreon_token(
+            &sealer,
+            &new_link.user_id,
+            "access",
+            &SealedToken {
                 wrapped_dek: new_link.wrapped_dek.clone(),
                 nonce: new_link.access_token_nonce.clone(),
                 ciphertext: new_link.access_token_ct.clone(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(opened, b"new-access");
+        // Bound to user_id via AAD: another user's ID cannot open the same blob.
+        // Bound to user_id via AAD: another user's ID cannot open a newly sealed blob.
+        assert!(
+            open_patreon_token(
+                &sealer,
+                &Uuid::new_v4(),
+                "access",
+                &SealedToken {
+                    wrapped_dek: new_link.wrapped_dek.clone(),
+                    nonce: new_link.access_token_nonce.clone(),
+                    ciphertext: new_link.access_token_ct.clone(),
+                },
+            )
+            .await
+            .is_err()
+        );
+        // Legacy pre-0.42.1 ciphertext (empty AAD, no KMS context) still opens
+        // cleanly for zero-downtime upgrade.
+        let legacy_blob = sealer.seal(b"legacy-access").await.unwrap();
+        let opened_legacy =
+            open_patreon_token(&sealer, &new_link.user_id, "access", &legacy_blob)
+                .await
+                .unwrap();
+        assert_eq!(opened_legacy, b"legacy-access");
     }
 
     #[tokio::test]
@@ -3721,14 +4135,18 @@ mod tests {
         let new_link = failure
             .refreshed
             .expect("rotated link must survive the failed retry fetch");
-        let opened = sealer
-            .open(&SealedToken {
+        let opened = open_patreon_token(
+            &sealer,
+            &new_link.user_id,
+            "refresh",
+            &SealedToken {
                 wrapped_dek: new_link.wrapped_dek.clone(),
                 nonce: new_link.refresh_token_nonce.clone(),
                 ciphertext: new_link.refresh_token_ct.clone(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(opened, b"new-refresh");
     }
 
@@ -4426,7 +4844,29 @@ mod tests {
         let app_state =
             crate::test_helpers::build_test_app_state_with_store(std::sync::Arc::new(store));
         let sealer = TokenSealer::Plaintext;
-        let link = creator_link_with_token(&sealer, b"access", "").await;
+        let user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) = seal_patreon_pair(&sealer, &user.user_id, b"access", b"refresh")
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let link = PatreonLink {
+            user_id: user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "").await
+        };
         app_state.db_store.put_patreon_link(&link).await.unwrap();
         let state = enabled_state(
             &sealer,
@@ -4496,8 +4936,29 @@ mod tests {
         ))
         .await;
         let sealer = TokenSealer::Plaintext;
-        let link =
-            creator_link_with_token(&sealer, b"access", "identity identity.memberships").await;
+        let user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) = seal_patreon_pair(&sealer, &user.user_id, b"access", b"refresh")
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let link = PatreonLink {
+            user_id: user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "identity identity.memberships").await
+        };
         app_state.db_store.put_patreon_link(&link).await.unwrap();
         let state = enabled_state(
             &sealer,
@@ -4588,7 +5049,30 @@ mod tests {
                 .is_none()
         );
 
-        let creator = creator_link_with_token(&sealer, b"access", "").await;
+        let creator_user = app_state
+            .db_store
+            .create_user(
+                &format!("pat-{}", Uuid::new_v4().simple()),
+                "did:key:z6MkPatreonTest",
+            )
+            .await
+            .unwrap();
+        let (access, refresh) =
+            seal_patreon_pair(&sealer, &creator_user.user_id, b"access", b"refresh")
+                .await
+                .unwrap();
+        let now = Utc::now().timestamp();
+        let creator = PatreonLink {
+            user_id: creator_user.user_id,
+            access_token_ct: access.ciphertext,
+            access_token_nonce: access.nonce,
+            refresh_token_ct: refresh.ciphertext,
+            refresh_token_nonce: refresh.nonce,
+            wrapped_dek: access.wrapped_dek,
+            linked_at: now,
+            last_verified_at: Some(now),
+            ..creator_link_with_token(&sealer, b"access", "").await
+        };
         app_state.db_store.put_patreon_link(&creator).await.unwrap();
         match materialize_for_user_resolved(&app_state, &state, creator.user_id).await {
             Materialized::Snapshot(s) => {
@@ -5084,8 +5568,27 @@ mod tests {
             role: "consumer".into(),
             linked_at: 1,
         };
+        let prev_row = PatreonLink {
+            user_id: me,
+            role: "consumer".into(),
+            client_id: String::new(),
+            patreon_user_id: old.clone(),
+            campaign_id: None,
+            scopes: "identity".into(),
+            access_token_ct: vec![1],
+            access_token_nonce: vec![0; 12],
+            refresh_token_ct: vec![2],
+            refresh_token_nonce: vec![0; 12],
+            wrapped_dek: vec![3],
+            token_expires_at: 9_999_999_999,
+            linked_at: 1,
+            last_verified_at: Some(1),
+            owned_tiers: OwnedCampaignTiers::default(),
+        };
 
-        // Claimed the new row, released the old one, then the put failed.
+        // Claimed the new row, released the old one, then the put failed: the
+        // previous `patreon_tokens` row is still live, so `old` is restored.
+        store.put_patreon_link(&prev_row).await.unwrap();
         store
             .link_identity(me, crate::db::PATREON_PROVIDER, &new)
             .await
@@ -5093,6 +5596,30 @@ mod tests {
         abandon_link(&app_state, me, &new, Some(&previous)).await;
         assert_eq!(row(new.clone()).await, None);
         assert_eq!(row(old.clone()).await, Some(me));
+
+        // The same Patreon account again: its row stays.
+        abandon_link(&app_state, me, &old, Some(&previous)).await;
+        assert_eq!(row(old.clone()).await, Some(me));
+
+        // If `patreon_tokens` was concurrently unlinked before `abandon_link`
+        // runs, `abandon_link` must NOT resurrect the deleted `old` row.
+        store.delete_patreon_link(&me).await.unwrap();
+        store
+            .delete_identity_link_if_owned(crate::db::PATREON_PROVIDER, &old, &me)
+            .await
+            .unwrap();
+        let after_unlink = pid();
+        store
+            .link_identity(me, crate::db::PATREON_PROVIDER, &after_unlink)
+            .await
+            .unwrap();
+        abandon_link(&app_state, me, &after_unlink, Some(&previous)).await;
+        assert_eq!(row(after_unlink).await, None);
+        assert_eq!(
+            row(old.clone()).await,
+            None,
+            "unlinked previous row must not be resurrected"
+        );
 
         // A first link (nothing replaced) gives back only its own claim.
         let first = pid();
@@ -5102,10 +5629,6 @@ mod tests {
             .unwrap();
         abandon_link(&app_state, me, &first, None).await;
         assert_eq!(row(first).await, None);
-
-        // The same Patreon account again: its row stays.
-        abandon_link(&app_state, me, &old, Some(&previous)).await;
-        assert_eq!(row(old).await, Some(me));
     }
 
     /// The link mock answers each code with its own Patreon user (so the

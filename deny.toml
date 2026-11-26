@@ -12,6 +12,7 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa, via jsonwebtoken's rust_crypto backend: the Marvin attack times RSA private-key operations. Identity holds no RSA private key; it only verifies Apple and Google RS256 id_tokens with their public keys. No fixed rsa release exists." },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5, under p256/ecdsa 0.13 (the CWT and JWT signing key): compiler- and CPU-dependent timing variability. Fixed only in 0.7, which needs the p256 0.14 line. Retire with that upgrade, or by signing in KMS." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (not vulnerable). It parses the operator's PEM files once at boot. Replace it with rustls-pki-types' PemObject." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (not vulnerable; no upgrade). Used for UTC unix timestamps and RFC 3339 formatting, and also pulled in transitively via didwebvh-rs. Retire by migrating to jiff or time in a dedicated follow-up." },
 ]
 
 [sources]

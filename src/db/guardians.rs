@@ -94,10 +94,18 @@ impl DynamoDBStore {
                 .cloned()
                 .ok_or_else(|| DynamoDBError::Internal(format!("guardian row missing {k}")))
         };
-        let number = |k: &str| {
-            item.get(k)
-                .and_then(|v| v.as_n().ok())
-                .and_then(|v| v.parse::<i64>().ok())
+        let opt_number = |k: &str| -> Result<Option<i64>, DynamoDBError> {
+            match item.get(k) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_n()
+                    .ok()
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        DynamoDBError::Internal(format!("guardian row has malformed {k}"))
+                    }),
+            }
         };
         let public_key = item
             .get("public_key")
@@ -109,9 +117,9 @@ impl DynamoDBStore {
             owner: Uuid::parse_str(&text("owner")?)?,
             name: text("name")?,
             public_key,
-            created_at: number("created_at")
+            created_at: opt_number("created_at")?
                 .ok_or_else(|| DynamoDBError::Internal("guardian row missing created_at".into()))?,
-            revoked_at: number("revoked_at"),
+            revoked_at: opt_number("revoked_at")?,
         }))
     }
 

@@ -217,6 +217,7 @@ mod tests {
             wrapped_dek: vec![5],
             token_expires_at: 2,
             linked_at: 1,
+            last_verified_at: None,
             owned_tiers: OwnedCampaignTiers::default(),
         }
     }
@@ -321,14 +322,19 @@ mod tests {
         let old = link(me, &unique('7'), None);
 
         // Unlinked: no row comes back.
-        assert!(!store.put_rotated_patreon_link(&old).await.unwrap());
+        assert!(!store.put_rotated_patreon_link(&old, None).await.unwrap());
         assert!(store.get_patreon_link_ref(&me).await.unwrap().is_none());
 
         // Current: written.
         store.put_patreon_link(&old).await.unwrap();
         let mut rotated = old.clone();
         rotated.token_expires_at = 99;
-        assert!(store.put_rotated_patreon_link(&rotated).await.unwrap());
+        assert!(
+            store
+                .put_rotated_patreon_link(&rotated, None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_patreon_link(me)
@@ -342,7 +348,12 @@ mod tests {
         // Relinked to another Patreon account: the new link stays.
         let new = link(me, &unique('8'), None);
         store.put_patreon_link(&new).await.unwrap();
-        assert!(!store.put_rotated_patreon_link(&rotated).await.unwrap());
+        assert!(
+            !store
+                .put_rotated_patreon_link(&rotated, None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_patreon_link_ref(&me)

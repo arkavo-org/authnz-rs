@@ -304,7 +304,10 @@ struct ErrorResponse {
 /// Apple's sanitized `error` code); 429, 5xx and anything else are
 /// transient. Same split as `patreon::token_exchange_error`.
 fn apple_failure(status: reqwest::StatusCode, body: &str) -> AppleTokenError {
-    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if status.is_client_error()
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+    {
         let code = serde_json::from_str::<ErrorResponse>(body)
             .ok()
             .and_then(|b| b.error)
@@ -466,19 +469,39 @@ impl AppleTokens {
         }
     }
 
-    pub async fn seal(&self, refresh_token: &str) -> Result<SealedToken, AppleTokenError> {
+    pub async fn seal(
+        &self,
+        user_id: &Uuid,
+        refresh_token: &str,
+    ) -> Result<SealedToken, AppleTokenError> {
+        let uid = user_id.to_string();
+        let aad = format!("apple_tokens:v1:{uid}");
         self.enabled()?
             .sealer
-            .seal(refresh_token.as_bytes())
+            .seal_with_context(
+                refresh_token.as_bytes(),
+                aad.as_bytes(),
+                &[("purpose", "apple_tokens"), ("user_id", &uid)],
+            )
             .await
             .map_err(from_sealer)
     }
 
-    pub async fn open(&self, sealed: &SealedToken) -> Result<String, AppleTokenError> {
+    pub async fn open(
+        &self,
+        user_id: &Uuid,
+        sealed: &SealedToken,
+    ) -> Result<String, AppleTokenError> {
+        let uid = user_id.to_string();
+        let aad = format!("apple_tokens:v1:{uid}");
         let bytes = self
             .enabled()?
             .sealer
-            .open(sealed)
+            .open_with_context(
+                sealed,
+                aad.as_bytes(),
+                &[("purpose", "apple_tokens"), ("user_id", &uid)],
+            )
             .await
             .map_err(from_sealer)?;
         String::from_utf8(bytes)
@@ -488,7 +511,7 @@ impl AppleTokens {
     /// Revoke a stored token: open it, then revoke it for the client it was
     /// issued to.
     pub async fn revoke_stored(&self, row: &AppleTokenRow) -> Result<(), AppleTokenError> {
-        let token = self.open(&row.sealed).await?;
+        let token = self.open(&row.user_id, &row.sealed).await?;
         self.revoke(&row.client_id, &token).await
     }
 }
@@ -1227,11 +1250,12 @@ mod tests {
         let stub = StubApple::start(vec![]).await;
         let apple = tokens(&stub);
         stub.reply_revoke(200, json!(null));
+        let uid = uuid::Uuid::new_v4();
         let row = AppleTokenRow {
             link_key: apple_link_key("001234.abc"),
-            user_id: uuid::Uuid::new_v4(),
+            user_id: uid,
             client_id: "com.arkavo.web".into(),
-            sealed: apple.seal("rt-9").await.unwrap(),
+            sealed: apple.seal(&uid, "rt-9").await.unwrap(),
             stored_at: 0,
         };
         assert_ne!(
@@ -1239,7 +1263,11 @@ mod tests {
             b"rt-9".to_vec(),
             "stored in the clear"
         );
-        assert_eq!(apple.open(&row.sealed).await.unwrap(), "rt-9");
+        assert_eq!(apple.open(&uid, &row.sealed).await.unwrap(), "rt-9");
+        assert!(
+            apple.open(&uuid::Uuid::new_v4(), &row.sealed).await.is_err(),
+            "token sealed for one user must not open for another"
+        );
         apple.revoke_stored(&row).await.unwrap();
         let form = &stub.calls("/auth/revoke")[0];
         assert_eq!(form["token"], "rt-9");
@@ -1258,7 +1286,7 @@ mod tests {
             Err(AppleTokenError::NotConfigured)
         ));
         assert!(matches!(
-            off.seal("rt").await,
+            off.seal(&uuid::Uuid::new_v4(), "rt").await,
             Err(AppleTokenError::NotConfigured)
         ));
     }
