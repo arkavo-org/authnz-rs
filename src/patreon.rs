@@ -5564,8 +5564,27 @@ mod tests {
             role: "consumer".into(),
             linked_at: 1,
         };
+        let prev_row = PatreonLink {
+            user_id: me,
+            role: "consumer".into(),
+            client_id: String::new(),
+            patreon_user_id: old.clone(),
+            campaign_id: None,
+            scopes: "identity".into(),
+            access_token_ct: vec![1],
+            access_token_nonce: vec![0; 12],
+            refresh_token_ct: vec![2],
+            refresh_token_nonce: vec![0; 12],
+            wrapped_dek: vec![3],
+            token_expires_at: 9_999_999_999,
+            linked_at: 1,
+            last_verified_at: Some(1),
+            owned_tiers: OwnedCampaignTiers::default(),
+        };
 
-        // Claimed the new row, released the old one, then the put failed.
+        // Claimed the new row, released the old one, then the put failed: the
+        // previous `patreon_tokens` row is still live, so `old` is restored.
+        store.put_patreon_link(&prev_row).await.unwrap();
         store
             .link_identity(me, crate::db::PATREON_PROVIDER, &new)
             .await
@@ -5573,6 +5592,30 @@ mod tests {
         abandon_link(&app_state, me, &new, Some(&previous)).await;
         assert_eq!(row(new.clone()).await, None);
         assert_eq!(row(old.clone()).await, Some(me));
+
+        // The same Patreon account again: its row stays.
+        abandon_link(&app_state, me, &old, Some(&previous)).await;
+        assert_eq!(row(old.clone()).await, Some(me));
+
+        // If `patreon_tokens` was concurrently unlinked before `abandon_link`
+        // runs, `abandon_link` must NOT resurrect the deleted `old` row.
+        store.delete_patreon_link(&me).await.unwrap();
+        store
+            .delete_identity_link_if_owned(crate::db::PATREON_PROVIDER, &old, &me)
+            .await
+            .unwrap();
+        let after_unlink = pid();
+        store
+            .link_identity(me, crate::db::PATREON_PROVIDER, &after_unlink)
+            .await
+            .unwrap();
+        abandon_link(&app_state, me, &after_unlink, Some(&previous)).await;
+        assert_eq!(row(after_unlink).await, None);
+        assert_eq!(
+            row(old.clone()).await,
+            None,
+            "unlinked previous row must not be resurrected"
+        );
 
         // A first link (nothing replaced) gives back only its own claim.
         let first = pid();
@@ -5582,10 +5625,6 @@ mod tests {
             .unwrap();
         abandon_link(&app_state, me, &first, None).await;
         assert_eq!(row(first).await, None);
-
-        // The same Patreon account again: its row stays.
-        abandon_link(&app_state, me, &old, Some(&previous)).await;
-        assert_eq!(row(old).await, Some(me));
     }
 
     /// The link mock answers each code with its own Patreon user (so the
