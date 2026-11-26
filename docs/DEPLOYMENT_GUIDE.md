@@ -463,7 +463,7 @@ the underlying per-item actions on each referenced table:
 | `DYNAMODB_CREDENTIALS_TABLE` | **`dynamodb:ConditionCheckItem`** (new, for App Store link transactions), plus existing `PutItem`, `UpdateItem`, `GetItem`, `DeleteItem`, `Scan`, and `Query` on `username-index` |
 | `DYNAMODB_HANDLES_TABLE` | **`dynamodb:PutItem`** (new, for transactional handle reservation at registration), plus existing `GetItem`, `UpdateItem` |
 | `DYNAMODB_IDENTITY_LINKS_TABLE` | existing `UpdateItem`, `GetItem`, `DeleteItem`, `Scan`, `BatchGetItem`, `PutItem` |
-| `PATREON_KMS_KEY_ID` | existing `kms:Encrypt` and `kms:Decrypt`; new writes pass per-user `EncryptionContext` (`purpose=patreon_tokens, user_id=<uuid>` or `purpose=apple_tokens, user_id=<uuid>`) while `Decrypt` falls back to empty context without pinning `key_id` for pre-0.42.1 rows — ensure no key policy or IAM condition restricts `kms:EncryptionContext:*` |
+| `PATREON_KMS_KEY_ID` | existing `kms:Encrypt` and `kms:Decrypt`; new writes pass per-user `EncryptionContext` (`purpose=patreon_tokens, user_id=<uuid>` or `purpose=apple_tokens, user_id=<uuid>`) while `Decrypt` falls back to empty context (still pinning `key_id`) for pre-0.42.1 rows — ensure no key policy or IAM condition restricts `kms:EncryptionContext:*` |
 
 ### Systemd Service Setup
 

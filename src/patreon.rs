@@ -425,11 +425,10 @@ impl TokenSealer {
     /// decrypt and verifying AES-GCM `aad`.
     ///
     /// Backward compatibility: pre-0.42.1 rows were sealed with empty AES-GCM
-    /// AAD and no KMS `EncryptionContext` (and may predate a KMS alias
-    /// retarget). When contextual decrypt fails and `aad`/`context` are
-    /// non-empty, fall back once to legacy decrypt (empty AAD, no KMS
-    /// `EncryptionContext`, no `key_id` pin so KMS uses the key ARN in the
-    /// ciphertext blob under IAM policy). New contextual ciphertexts cannot be
+    /// AAD and no KMS `EncryptionContext`. When contextual decrypt fails and
+    /// `aad`/`context` are non-empty, fall back once to legacy decrypt (empty
+    /// AAD, no KMS `EncryptionContext`, still pinning `key_id` so only the
+    /// configured KMS key can unwrap). New contextual ciphertexts cannot be
     /// opened by the legacy path because both KMS and AES-256-GCM authenticate
     /// the original context/AAD.
     pub async fn open_with_context(
@@ -438,11 +437,14 @@ impl TokenSealer {
         aad: &[u8],
         context: &[(&str, &str)],
     ) -> Result<Vec<u8>, PatreonError> {
-        match self.open_once(sealed, aad, context, true).await {
+        match self.open_once(sealed, aad, context).await {
             Ok(plain) => Ok(plain),
             Err(primary_err) if !aad.is_empty() || !context.is_empty() => {
-                match self.open_once(sealed, b"", &[], false).await {
-                    Ok(plain) => Ok(plain),
+                match self.open_once(sealed, b"", &[]).await {
+                    Ok(plain) => {
+                        info!("Opened legacy pre-0.42.1 sealed token via empty-context fallback");
+                        Ok(plain)
+                    }
                     Err(_) => Err(primary_err),
                 }
             }
@@ -455,7 +457,6 @@ impl TokenSealer {
         sealed: &SealedToken,
         aad: &[u8],
         context: &[(&str, &str)],
-        pin_key_id: bool,
     ) -> Result<Vec<u8>, PatreonError> {
         use aes_gcm::aead::Payload;
 
@@ -463,10 +464,8 @@ impl TokenSealer {
             TokenSealer::Kms { client, key_id } => {
                 let mut req = client
                     .decrypt()
+                    .key_id(key_id)
                     .ciphertext_blob(Blob::new(sealed.wrapped_dek.clone()));
-                if pin_key_id {
-                    req = req.key_id(key_id);
-                }
                 for (k, v) in context {
                     req = req.encryption_context(*k, *v);
                 }

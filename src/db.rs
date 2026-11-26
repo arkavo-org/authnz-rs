@@ -1074,66 +1074,76 @@ impl DynamoDBStore {
             .build()
             .map_err(|e| DynamoDBError::Internal(format!("build credentials Put failed: {e}")))?;
 
-        let result = self
-            .client
-            .transact_write_items()
-            .transact_items(TransactWriteItem::builder().put(put_handle).build())
-            .transact_items(TransactWriteItem::builder().put(put_credentials).build())
-            .send()
-            .await;
+        for attempt in 0..3 {
+            let result = self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().put(put_handle.clone()).build())
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .put(put_credentials.clone())
+                        .build(),
+                )
+                .send()
+                .await;
 
-        match result {
-            Ok(_) => {
-                info!(
-                    "Atomically claimed handle {} and created credentials row for {}",
-                    handle, user_id
-                );
-                Ok(UserCredentials {
-                    user_id,
-                    username: username.to_string(),
-                    handle,
-                    credentials: vec![credential],
-                    did: did.to_string(),
-                    entitlements: self.default_entitlements.clone(),
-                    apple_linked: false,
-                })
-            }
-            Err(err) => {
-                if let SdkError::ServiceError(ref service_error) = err {
-                    if let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(canceled) =
-                        service_error.err()
-                    {
-                        let reasons = canceled.cancellation_reasons();
-                        if reasons
-                            .first()
-                            .and_then(|r| r.code())
-                            == Some("ConditionalCheckFailed")
-                        {
-                            warn!(
-                                "create_user_with_credential: handle {} already claimed",
-                                handle
-                            );
-                            return Err(DynamoDBError::LinkConflict);
-                        }
-                        if reasons
-                            .get(1)
-                            .and_then(|r| r.code())
-                            == Some("ConditionalCheckFailed")
-                        {
-                            return Err(DynamoDBError::ConditionalConflict);
-                        }
-                    }
-                    if service_error.err().meta().code() == Some("ResourceNotFoundException") {
-                        return Err(DynamoDBError::TableNotExists("credentials".to_string()));
-                    }
+            match result {
+                Ok(_) => {
+                    info!(
+                        "Atomically claimed handle {} and created credentials row for {}",
+                        handle, user_id
+                    );
+                    return Ok(UserCredentials {
+                        user_id,
+                        username: username.to_string(),
+                        handle,
+                        credentials: vec![credential],
+                        did: did.to_string(),
+                        entitlements: self.default_entitlements.clone(),
+                        apple_linked: false,
+                    });
                 }
-                error!(
-                    "Failed transactional user+handle creation for {}: {:?}",
-                    username, err
-                );
-                Err(DynamoDBError::SdkError(err.to_string()))
+                Err(err) => {
+                    if let SdkError::ServiceError(ref service_error) = err {
+                        if let aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(canceled) =
+                            service_error.err()
+                        {
+                            let reasons = canceled.cancellation_reasons();
+                            if reasons.first().and_then(|r| r.code())
+                                == Some("ConditionalCheckFailed")
+                            {
+                                warn!(
+                                    "create_user_with_credential: handle {} already claimed",
+                                    handle
+                                );
+                                return Err(DynamoDBError::LinkConflict);
+                            }
+                            if reasons.get(1).and_then(|r| r.code())
+                                == Some("ConditionalCheckFailed")
+                            {
+                                return Err(DynamoDBError::ConditionalConflict);
+                            }
+                            if reasons
+                                .iter()
+                                .any(|r| r.code() == Some("TransactionConflict"))
+                                && attempt < 2
+                            {
+                                continue;
+                            }
+                        }
+                        if service_error.err().meta().code() == Some("ResourceNotFoundException") {
+                            return Err(DynamoDBError::TableNotExists("credentials".to_string()));
+                        }
+                    }
+                    error!(
+                        "Failed transactional user+handle creation for {}: {:?}",
+                        username, err
+                    );
+                    return Err(DynamoDBError::SdkError(err.to_string()));
+                }
             }
         }
+        Err(DynamoDBError::LinkConflict)
     }
 
     pub async fn get_user_by_name(
