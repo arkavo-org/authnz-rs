@@ -1491,16 +1491,28 @@ impl DynamoDBStore {
         log::debug!("Parsed DID: {}", did);
         let entitlements = match item.get("entitlements") {
             None => default_entitlements.to_vec(),
-            Some(av) => av
-                .as_l()
-                .map_err(|_| DynamoDBError::Internal("Invalid entitlements format".into()))?
-                .iter()
-                .map(|elem| {
-                    elem.as_s().map(|s| s.to_string()).map_err(|_| {
-                        DynamoDBError::Internal("Invalid entitlement element format".into())
+            Some(av) => match av.as_l() {
+                Ok(list) => list
+                    .iter()
+                    .filter_map(|elem| match elem.as_s() {
+                        Ok(s) => Some(s.to_string()),
+                        Err(_) => {
+                            warn!(
+                                "Ignoring non-string entitlement element on credentials row for {}",
+                                user_id
+                            );
+                            None
+                        }
                     })
-                })
-                .collect::<Result<Vec<String>, DynamoDBError>>()?,
+                    .collect(),
+                Err(_) => {
+                    warn!(
+                        "Malformed non-list entitlements attribute on credentials row for {}; treating as empty",
+                        user_id
+                    );
+                    Vec::new()
+                }
+            },
         };
         // Patreon-namespace entitlements are derived at mint (#91). A
         // stored copy (written before `validate_fqns` refused it) would

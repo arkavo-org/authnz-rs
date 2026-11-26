@@ -41,10 +41,11 @@ paths:
   `/oauth/apple/nonce` first; server consumes session nonce (single-use) and
   validates the id_token against it
 - `POST /oauth/apple/link`: **Auth-required** link path. Caller presents a
-  fresh passkey auth CWT (`webauthn_auth_time` ≤ `ENROLLMENT_TOKEN_MAX_AGE_SECONDS`,
-  never a ~99-year registration CWT) via `X-Auth-Token`; server atomically
-  consumes the single-use nonce from `EphemeralStore`, validates the Apple
-  id_token, and writes `(user_id, "apple", sub)` to the `identity_links` table.
+  passkey auth CWT (`webauthn_auth_time.is_some()`, never a ~99-year
+  registration CWT; renewed passkey session CWTs are accepted) via
+  `X-Auth-Token`; server atomically consumes the single-use nonce from
+  `EphemeralStore`, validates the Apple id_token, and writes
+  `(user_id, "apple", sub)` to the `identity_links` table.
   Idempotent on repeat; returns HTTP 409 if the same Apple `sub` is already
   linked to a different arkavo user. **Minimum-PII**:
   no email/name/relay claims are persisted, even if Apple sends them.

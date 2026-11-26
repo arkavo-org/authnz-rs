@@ -309,86 +309,111 @@ impl DynamoDBStore {
         let now = chrono::Utc::now().timestamp();
         let live_check = self.live_account_check(user_id)?;
 
-        // Attempt 1: brand-new binding (`attribute_not_exists(link_pk)`).
-        let create_link = Update::builder()
-            .table_name(&self.identity_links_table)
-            .key("link_pk", s(&link_pk(otid)))
-            .update_expression("SET user_id = :uid, created_at = :now")
-            .condition_expression("attribute_not_exists(link_pk)")
-            .expression_attribute_values(":uid", s(&user_id.to_string()))
-            .expression_attribute_values(":now", n(now))
-            .build()
-            .map_err(|e| DynamoDBError::Internal(format!("build app store link create failed: {e}")))?;
-        match self
-            .client
-            .transact_write_items()
-            .transact_items(TransactWriteItem::builder().update(create_link).build())
-            .transact_items(
-                TransactWriteItem::builder()
-                    .condition_check(live_check.clone())
-                    .build(),
-            )
-            .send()
-            .await
-        {
-            Ok(_) => return Ok(LinkOutcome::Bound),
-            Err(e) => {
-                if let SdkError::ServiceError(ref se) = e
-                    && let TransactWriteItemsError::TransactionCanceledException(canceled) =
-                        se.err()
-                {
-                    let reasons = canceled.cancellation_reasons();
-                    if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
-                        return Err(DynamoDBError::AccountGone);
-                    }
-                    if reasons.first().and_then(|r| r.code()) != Some("ConditionalCheckFailed") {
+        for _ in 0..3 {
+            // Attempt 1: brand-new binding (`attribute_not_exists(link_pk)`).
+            let create_link = Update::builder()
+                .table_name(&self.identity_links_table)
+                .key("link_pk", s(&link_pk(otid)))
+                .update_expression("SET user_id = :uid, created_at = :now")
+                .condition_expression("attribute_not_exists(link_pk)")
+                .expression_attribute_values(":uid", s(&user_id.to_string()))
+                .expression_attribute_values(":now", n(now))
+                .build()
+                .map_err(|e| {
+                    DynamoDBError::Internal(format!("build app store link create failed: {e}"))
+                })?;
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().update(create_link).build())
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .condition_check(live_check.clone())
+                        .build(),
+                )
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(LinkOutcome::Bound),
+                Err(e) => {
+                    if let SdkError::ServiceError(ref se) = e
+                        && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                            se.err()
+                    {
+                        let reasons = canceled.cancellation_reasons();
+                        if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                            return Err(DynamoDBError::AccountGone);
+                        }
+                        if reasons
+                            .iter()
+                            .any(|r| r.code() == Some("TransactionConflict"))
+                        {
+                            continue;
+                        }
+                        if reasons.first().and_then(|r| r.code()) != Some("ConditionalCheckFailed")
+                        {
+                            return Err(classify(e, &self.identity_links_table));
+                        }
+                    } else {
                         return Err(classify(e, &self.identity_links_table));
                     }
-                } else {
+                }
+            }
+
+            // Attempt 2: already bound to `user_id` (preserves `created_at`).
+            let rebind_link = Update::builder()
+                .table_name(&self.identity_links_table)
+                .key("link_pk", s(&link_pk(otid)))
+                .update_expression(
+                    "SET user_id = :uid, created_at = if_not_exists(created_at, :now)",
+                )
+                .condition_expression("user_id = :uid")
+                .expression_attribute_values(":uid", s(&user_id.to_string()))
+                .expression_attribute_values(":now", n(now))
+                .build()
+                .map_err(|e| {
+                    DynamoDBError::Internal(format!("build app store rebind failed: {e}"))
+                })?;
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().update(rebind_link).build())
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .condition_check(live_check.clone())
+                        .build(),
+                )
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(LinkOutcome::AlreadyYours),
+                Err(e) => {
+                    if let SdkError::ServiceError(ref se) = e
+                        && let TransactWriteItemsError::TransactionCanceledException(canceled) =
+                            se.err()
+                    {
+                        let reasons = canceled.cancellation_reasons();
+                        if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                            return Err(DynamoDBError::AccountGone);
+                        }
+                        if reasons
+                            .iter()
+                            .any(|r| r.code() == Some("TransactionConflict"))
+                        {
+                            continue;
+                        }
+                        if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed")
+                        {
+                            return Ok(LinkOutcome::BoundElsewhere);
+                        }
+                    }
                     return Err(classify(e, &self.identity_links_table));
                 }
             }
         }
-
-        // Attempt 2: already bound to `user_id` (preserves `created_at`).
-        let rebind_link = Update::builder()
-            .table_name(&self.identity_links_table)
-            .key("link_pk", s(&link_pk(otid)))
-            .update_expression("SET user_id = :uid, created_at = if_not_exists(created_at, :now)")
-            .condition_expression("user_id = :uid")
-            .expression_attribute_values(":uid", s(&user_id.to_string()))
-            .expression_attribute_values(":now", n(now))
-            .build()
-            .map_err(|e| DynamoDBError::Internal(format!("build app store rebind failed: {e}")))?;
-        match self
-            .client
-            .transact_write_items()
-            .transact_items(TransactWriteItem::builder().update(rebind_link).build())
-            .transact_items(
-                TransactWriteItem::builder()
-                    .condition_check(live_check)
-                    .build(),
-            )
-            .send()
-            .await
-        {
-            Ok(_) => Ok(LinkOutcome::AlreadyYours),
-            Err(e) => {
-                if let SdkError::ServiceError(ref se) = e
-                    && let TransactWriteItemsError::TransactionCanceledException(canceled) =
-                        se.err()
-                {
-                    let reasons = canceled.cancellation_reasons();
-                    if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
-                        return Err(DynamoDBError::AccountGone);
-                    }
-                    if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
-                        return Ok(LinkOutcome::BoundElsewhere);
-                    }
-                }
-                Err(classify(e, &self.identity_links_table))
-            }
-        }
+        Err(DynamoDBError::Internal(
+            "app store link transaction conflicted on every attempt".into(),
+        ))
     }
 
     /// Atomically move `appstore#<otid>` from `from` to `to` while verifying
@@ -436,7 +461,11 @@ impl DynamoDBStore {
                     if reasons.get(1).and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
                         return Err(DynamoDBError::AccountGone);
                     }
-                    if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed") {
+                    if reasons.first().and_then(|r| r.code()) == Some("ConditionalCheckFailed")
+                        || reasons
+                            .iter()
+                            .any(|r| r.code() == Some("TransactionConflict"))
+                    {
                         return Ok(false);
                     }
                 }

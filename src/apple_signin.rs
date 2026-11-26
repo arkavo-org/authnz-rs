@@ -891,7 +891,7 @@ pub async fn apple_link_handler(
 
     // 1. Caller must be authenticated. The CWT's `sub` is the arkavo user_id
     //    we'll bind the Apple identity to.
-    let user_id = match extract_fresh_authenticated_user_id(&app_state, &headers) {
+    let user_id = match extract_passkey_auth_user_id(&app_state, &headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
@@ -1110,7 +1110,7 @@ async fn link_with_token(
     //    depends on who holds the authorization (see the 409 below): a link
     //    already there, this account's or another's, holds it, and only a
     //    token for an identity linked to nobody is revoked.
-    let sealed = match apple.seal(&tokens.refresh_token).await {
+    let sealed = match apple.seal(&user_id, &tokens.refresh_token).await {
         Ok(s) => s,
         Err(e) => {
             error!(
@@ -1278,7 +1278,7 @@ pub async fn apple_unlink_handler(
     headers: HeaderMap,
 ) -> Response {
     let user_id = match extract_passkey_auth_user_id(&app_state, &headers) {
-        Ok((id, _)) => id,
+        Ok(id) => id,
         Err(e) => return e.into_response(),
     };
     match app_state.db_store.is_account_live(&user_id).await {
@@ -1435,11 +1435,12 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
 
 /// Extract the authenticated arkavo user_id from the inbound `X-Auth-Token`
 /// CWT header, requiring a passkey auth CWT (never a ~99-year registration
-/// CWT). Renewed session passkey CWTs are accepted.
+/// CWT). Renewed session passkey CWTs are accepted so Creator and mobile apps
+/// can link/unlink without forcing an extra passkey prompt.
 fn extract_passkey_auth_user_id(
     app_state: &AppState,
     headers: &HeaderMap,
-) -> Result<(Uuid, i64), AppleSigninError> {
+) -> Result<Uuid, AppleSigninError> {
     let token_header = headers
         .get("X-Auth-Token")
         .ok_or(AppleSigninError::MissingAuth)?;
@@ -1452,38 +1453,14 @@ fn extract_passkey_auth_user_id(
         AppleSigninError::InvalidAuth
     })?;
     // Reject ~99-year registration CWTs.
-    let Some(asserted_at) = crate::oidc::webauthn_auth_time(&claims) else {
+    if crate::oidc::webauthn_auth_time(&claims).is_none() {
         warn!("X-Auth-Token rejected for Apple link/unlink: requires passkey auth CWT");
         return Err(AppleSigninError::InvalidAuth);
-    };
-    let user_id = Uuid::parse_str(&claims.sub).map_err(|e| {
+    }
+    Uuid::parse_str(&claims.sub).map_err(|e| {
         warn!("X-Auth-Token rejected: CWT sub is not a valid UUID ({})", e);
         AppleSigninError::InvalidAuth
-    })?;
-    Ok((user_id, asserted_at))
-}
-
-/// Extract the authenticated arkavo user_id from `X-Auth-Token`, requiring a
-/// fresh passkey assertion (≤ `ENROLLMENT_TOKEN_MAX_AGE_SECONDS`). Used for
-/// `POST /oauth/apple/link`.
-fn extract_fresh_authenticated_user_id(
-    app_state: &AppState,
-    headers: &HeaderMap,
-) -> Result<Uuid, AppleSigninError> {
-    let (user_id, asserted_at) = extract_passkey_auth_user_id(app_state, headers)?;
-    if !crate::oidc::within_age(
-        asserted_at,
-        Utc::now().timestamp(),
-        crate::constants::ENROLLMENT_TOKEN_MAX_AGE_SECONDS,
-    ) {
-        warn!(
-            "X-Auth-Token rejected for Apple link: assertion at {} is older than {}s",
-            asserted_at,
-            crate::constants::ENROLLMENT_TOKEN_MAX_AGE_SECONDS
-        );
-        return Err(AppleSigninError::InvalidAuth);
-    }
-    Ok(user_id)
+    })
 }
 
 #[derive(Debug, Deserialize)]

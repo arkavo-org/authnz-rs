@@ -287,17 +287,11 @@ pub async fn google_link_handler(
             .unwrap_or_default(),
     ) {
         Ok(claims) => {
-            // Require a fresh short-lived passkey auth CWT (not a ~99-year registration CWT).
-            let Some(asserted_at) = crate::oidc::webauthn_auth_time(&claims) else {
+            // Require a passkey auth CWT (never a ~99-year registration CWT).
+            // Renewed passkey session tokens are accepted so mobile/desktop
+            // clients do not need an extra passkey prompt before linking.
+            if crate::oidc::webauthn_auth_time(&claims).is_none() {
                 warn!("X-Auth-Token rejected for Google link: requires passkey auth CWT");
-                return GoogleSigninError::Unauthenticated.into_response();
-            };
-            if !crate::oidc::within_age(
-                asserted_at,
-                Utc::now().timestamp(),
-                crate::constants::ENROLLMENT_TOKEN_MAX_AGE_SECONDS,
-            ) {
-                warn!("X-Auth-Token rejected for Google link: assertion too old");
                 return GoogleSigninError::Unauthenticated.into_response();
             }
             match Uuid::parse_str(&claims.sub) {
@@ -345,11 +339,13 @@ pub async fn google_link_handler(
                     return GoogleSigninError::Unauthenticated.into_response();
                 }
                 Err(e) => {
-                    error!("Post-link liveness check failed for {}: {}", user_id, e);
-                    let _ = app_state
-                        .db_store
-                        .delete_identity_link("google", &claims.sub, &user_id)
-                        .await;
+                    // Do NOT delete the link on a transient lookup error: a
+                    // re-link against an already-linked account is idempotent,
+                    // so rolling back here would destroy an existing live link.
+                    warn!(
+                        "Post-link liveness check failed for {}; keeping link: {}",
+                        user_id, e
+                    );
                     return GoogleSigninError::Storage.into_response();
                 }
             }

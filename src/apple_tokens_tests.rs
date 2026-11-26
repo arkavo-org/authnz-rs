@@ -247,7 +247,13 @@ async fn a_link_with_a_code_stores_the_sealed_refresh_token() {
         .expect("a token row");
     assert_eq!(row.user_id, uid);
     assert_eq!(row.client_id, ts::CLIENT_ID);
-    assert_eq!(ts::tokens(&h.stub).open(&row.sealed).await.unwrap(), "rt-1");
+    assert_eq!(
+        ts::tokens(&h.stub)
+            .open(&row.user_id, &row.sealed)
+            .await
+            .unwrap(),
+        "rt-1"
+    );
     assert!(h.stub.revoked().is_empty());
 }
 
@@ -515,7 +521,13 @@ async fn re_linking_the_same_identity_replaces_the_token_without_revoking() {
         .await
         .unwrap();
     assert_eq!(row.user_id, uid);
-    assert_eq!(ts::tokens(&h.stub).open(&row.sealed).await.unwrap(), "rt-2");
+    assert_eq!(
+        ts::tokens(&h.stub)
+            .open(&row.user_id, &row.sealed)
+            .await
+            .unwrap(),
+        "rt-2"
+    );
 }
 
 /// A re-link's authorization is already held by the existing link and its
@@ -553,7 +565,10 @@ async fn a_failed_seal_on_a_relink_revokes_nothing() {
         .await
         .unwrap();
     assert_eq!(
-        ts::tokens(&ok.stub).open(&row.sealed).await.unwrap(),
+        ts::tokens(&ok.stub)
+            .open(&row.user_id, &row.sealed)
+            .await
+            .unwrap(),
         "rt-1"
     );
 }
@@ -741,7 +756,13 @@ async fn deleted_account_with_tokens(h: &Harness, tokens: &[&str]) -> (Uuid, Vec
     for t in tokens {
         let sub = new_sub();
         h.store
-            .link_apple_with_token(uid, &sub, ts::CLIENT_ID, &apple.seal(t).await.unwrap(), 1)
+            .link_apple_with_token(
+                uid,
+                &sub,
+                ts::CLIENT_ID,
+                &apple.seal(&uid, t).await.unwrap(),
+                1,
+            )
             .await
             .unwrap();
         subs.push(sub);
@@ -1204,7 +1225,13 @@ async fn a_permanent_revocation_failure_is_reported_ahead_of_a_transient_one() {
     let subs = [new_sub(), new_sub()];
     for (sub, rt) in subs.iter().zip(["rt-x", "rt-y"]) {
         h.store
-            .link_apple_with_token(uid, sub, ts::CLIENT_ID, &apple.seal(rt).await.unwrap(), 1)
+            .link_apple_with_token(
+                uid,
+                sub,
+                ts::CLIENT_ID,
+                &apple.seal(&uid, rt).await.unwrap(),
+                1,
+            )
             .await
             .unwrap();
     }

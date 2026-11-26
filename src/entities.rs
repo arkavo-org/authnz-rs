@@ -123,16 +123,23 @@ pub async fn get_entity(
                 return Err(EntityError::NotFound);
             }
             let now = Utc::now().timestamp();
-            let effective_state = d.trust.effective(now);
+            let is_revoked = d.revoked_at.is_some() || !owner_live;
+            let effective_state = if d.trust.state == crate::db::AgentState::Quarantined {
+                "quarantined"
+            } else if is_revoked {
+                "revoked"
+            } else {
+                d.trust.effective(now).as_str()
+            };
             let mut claims = serde_json::json!({
                 "sub": d.agent_did,
                 "arkavo_account_id": d.root_user_id,
                 "arkavo_roles": ["agent"],
                 "arkavo_entitlements": crate::db::strip_derived_only(d.entitlements.clone(), &d.agent_did),
                 "arkavo_npe": {"type": "agent", "delegation_id": d.agent_did, "depth": d.depth, "chain": d.chain},
-                "revoked": d.revoked_at.is_some() || !owner_live,
+                "revoked": is_revoked,
                 "expires_at": d.expires_at,
-                "state": effective_state.as_str(),
+                "state": effective_state,
                 "state_version": d.trust.state_version,
             });
             if let Some(until) = d.trust.appraised_until {

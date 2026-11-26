@@ -608,9 +608,11 @@ pub(crate) fn claims_to_cbor(c: &ArkavoClaims) -> Result<Vec<u8>, CwtError> {
             .clone()
             .to_cbor_value()
             .map_err(|_| CwtError::Malformed)?;
-        // RFC 8747 §3.2: 1 = COSE_Key, 3 = kid (2 is Encrypted_COSE_Key).
+        // Keep emitting `kid` at label 2 for wire compatibility with existing
+        // downstream verifiers until all consumers accept RFC 8747 label 3.
+        // The decoder accepts both label 3 and label 2.
         cnf_entries.push((Value::Integer(1.into()), cose_key_value));
-        cnf_entries.push((Value::Integer(3.into()), Value::Bytes(cnf.kid.clone())));
+        cnf_entries.push((Value::Integer(2.into()), Value::Bytes(cnf.kid.clone())));
         entries.push((Value::Integer(8.into()), Value::Map(cnf_entries)));
     }
 

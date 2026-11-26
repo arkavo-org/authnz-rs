@@ -325,6 +325,14 @@ impl EphemeralStore {
                 )
                 .await
                 .map_err(|e| format!("Redis SET NX failed ({namespace}): {e}"))?;
+            // Mirror the replay marker locally so a subsequent Redis
+            // disconnect cannot let an already-consumed token be replayed
+            // against this process.
+            let mut map = self.lock_consumed();
+            map.retain(|_, exp| *exp > now);
+            if map.len() < self.max_consumed_entries {
+                map.insert(key, expires_at);
+            }
             return Ok(res.is_some());
         }
 

@@ -729,7 +729,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         fred::types::RedisConfig::default()
     });
-    let redis_client = fred::clients::RedisClient::new(redis_config, None, None, None);
+    let reconnect_policy = fred::types::ReconnectPolicy::new_exponential(0, 100, 5_000, 2);
+    let redis_client =
+        fred::clients::RedisClient::new(redis_config, None, None, Some(reconnect_policy));
 
     // Spawn connection in the background so a connection failure doesn't crash app startup
     let redis_conn_client = redis_client.clone();
@@ -991,7 +993,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/passkeys/credentials/:credential_id/status",
-            get(passkeys::credential_status).layer(oauth_limit),
+            get(passkeys::credential_status),
         )
         // Passkey session renewal (#108): open with a fresh passkey auth CWT
         // and a device key; renew and sign out with that key's signature.
